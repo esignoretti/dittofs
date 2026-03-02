@@ -80,6 +80,14 @@ type PersistedLock struct {
 	// Breaking indicates a lease break is in progress awaiting acknowledgment.
 	// False for byte-range locks.
 	Breaking bool `json:"breaking,omitempty"`
+
+	// ParentLeaseKey is the V2 parent lease key for cache tree correlation.
+	// Empty for byte-range locks and V1 leases.
+	ParentLeaseKey []byte `json:"parent_lease_key,omitempty"`
+
+	// IsDirectory indicates this lease is on a directory.
+	// False for byte-range locks and file leases.
+	IsDirectory bool `json:"is_directory,omitempty"`
 }
 
 // IsLease returns true if this persisted lock is an SMB lease.
@@ -259,6 +267,12 @@ func ToPersistedLock(lock *UnifiedLock, epoch uint64) *PersistedLock {
 		pl.LeaseEpoch = lock.Lease.Epoch
 		pl.BreakToState = lock.Lease.BreakToState
 		pl.Breaking = lock.Lease.Breaking
+		pl.IsDirectory = lock.Lease.IsDirectory
+
+		// Only set ParentLeaseKey when non-zero so omitempty works for V1 leases
+		if lock.Lease.ParentLeaseKey != [16]byte{} {
+			pl.ParentLeaseKey = lock.Lease.ParentLeaseKey[:]
+		}
 	}
 
 	return pl
@@ -296,12 +310,20 @@ func FromPersistedLock(pl *PersistedLock) *UnifiedLock {
 	if len(pl.LeaseKey) == 16 {
 		var leaseKey [16]byte
 		copy(leaseKey[:], pl.LeaseKey)
+
+		var parentLeaseKey [16]byte
+		if len(pl.ParentLeaseKey) == 16 {
+			copy(parentLeaseKey[:], pl.ParentLeaseKey)
+		}
+
 		el.Lease = &OpLock{
-			LeaseKey:     leaseKey,
-			LeaseState:   pl.LeaseState,
-			Epoch:        pl.LeaseEpoch,
-			BreakToState: pl.BreakToState,
-			Breaking:     pl.Breaking,
+			LeaseKey:       leaseKey,
+			LeaseState:     pl.LeaseState,
+			Epoch:          pl.LeaseEpoch,
+			BreakToState:   pl.BreakToState,
+			Breaking:       pl.Breaking,
+			ParentLeaseKey: parentLeaseKey,
+			IsDirectory:    pl.IsDirectory,
 			// BreakStarted is runtime-only, not persisted
 		}
 	}

@@ -298,12 +298,42 @@ func (h *Handler) Close(ctx *SMBHandlerContext, req *CloseRequest) (*CloseRespon
 	}
 
 	// ========================================================================
-	// Step 9: Release oplock if held
+	// Step 9: Release oplock/lease if held
 	// ========================================================================
 
-	if openFile.OplockLevel != OplockLevelNone {
-		oplockPath := BuildOplockPath(openFile.ShareName, openFile.Path)
-		h.OplockManager.ReleaseOplock(oplockPath, req.FileID)
+	if openFile.OplockLevel == OplockLevelLease && h.LeaseManager != nil {
+		leaseKey := openFile.LeaseKey
+		zeroKey := [16]byte{}
+
+		if leaseKey != zeroKey {
+			// Check if any other open shares this lease key
+			hasOtherOpen := false
+			h.files.Range(func(key, value any) bool {
+				other := value.(*OpenFile)
+				if other.FileID != openFile.FileID && other.LeaseKey == leaseKey {
+					hasOtherOpen = true
+					return false // stop iteration
+				}
+				return true
+			})
+
+			if !hasOtherOpen {
+				// Last handle with this lease key - release the lease
+				if err := h.LeaseManager.ReleaseLease(ctx.Context, leaseKey); err != nil {
+					logger.Debug("CLOSE: failed to release lease",
+						"path", openFile.Path,
+						"leaseKey", fmt.Sprintf("%x", leaseKey),
+						"error", err)
+				} else {
+					logger.Debug("CLOSE: released lease (last handle closed)",
+						"path", openFile.Path,
+						"leaseKey", fmt.Sprintf("%x", leaseKey))
+				}
+			} else {
+				logger.Debug("CLOSE: lease handle closed (other opens share lease key)",
+					"path", openFile.Path)
+			}
+		}
 	}
 
 	// ========================================================================
