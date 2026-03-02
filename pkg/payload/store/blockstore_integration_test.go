@@ -5,6 +5,7 @@ package store_test
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"testing"
 	"time"
@@ -23,6 +24,9 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// sharedHelper is a package-level Localstack container shared across all tests.
+var sharedHelper *localstackHelper
+
 // localstackHelper manages the Localstack container for integration tests.
 type localstackHelper struct {
 	container testcontainers.Container
@@ -30,16 +34,17 @@ type localstackHelper struct {
 	client    *s3.Client
 }
 
-// newLocalstackHelper starts a Localstack container or connects to an existing one.
-func newLocalstackHelper(t *testing.T) *localstackHelper {
-	t.Helper()
+// startSharedLocalstack starts a single Localstack container for the entire
+// test package. Returns a cleanup function.
+func startSharedLocalstack() func() {
 	ctx := context.Background()
 
 	// Check if external Localstack is configured via environment
 	if endpoint := os.Getenv("LOCALSTACK_ENDPOINT"); endpoint != "" {
 		helper := &localstackHelper{endpoint: endpoint}
-		helper.createClient(t)
-		return helper
+		helper.initClient()
+		sharedHelper = helper
+		return func() {}
 	}
 
 	// Start Localstack container using testcontainers
@@ -64,33 +69,35 @@ func newLocalstackHelper(t *testing.T) *localstackHelper {
 		Started:          true,
 	})
 	if err != nil {
-		t.Fatalf("failed to start localstack container: %v", err)
+		log.Fatalf("failed to start localstack container: %v", err)
 	}
 
 	host, err := container.Host(ctx)
 	if err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("failed to get container host: %v", err)
+		log.Fatalf("failed to get container host: %v", err)
 	}
 
 	port, err := container.MappedPort(ctx, "4566")
 	if err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("failed to get container port: %v", err)
+		log.Fatalf("failed to get container port: %v", err)
 	}
 
 	helper := &localstackHelper{
 		container: container,
 		endpoint:  fmt.Sprintf("http://%s:%s", host, port.Port()),
 	}
-	helper.createClient(t)
+	helper.initClient()
+	sharedHelper = helper
 
-	return helper
+	return func() {
+		_ = container.Terminate(ctx)
+	}
 }
 
-// createClient creates an S3 client configured for Localstack.
-func (lh *localstackHelper) createClient(t *testing.T) {
-	t.Helper()
+// initClient creates an S3 client configured for Localstack.
+func (lh *localstackHelper) initClient() {
 	ctx := context.Background()
 
 	cfg, err := awsConfig.LoadDefaultConfig(ctx,
@@ -100,7 +107,7 @@ func (lh *localstackHelper) createClient(t *testing.T) {
 		)),
 	)
 	if err != nil {
-		t.Fatalf("Failed to load AWS config: %v", err)
+		log.Fatalf("Failed to load AWS config: %v", err)
 	}
 
 	lh.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
@@ -143,27 +150,23 @@ func (lh *localstackHelper) cleanupBucket(bucketName string) {
 	})
 }
 
-// cleanup terminates the container if we started one.
-func (lh *localstackHelper) cleanup() {
-	if lh.container != nil {
-		ctx := context.Background()
-		_ = lh.container.Terminate(ctx)
-	}
+func TestMain(m *testing.M) {
+	cleanup := startSharedLocalstack()
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
 }
 
 // TestS3BlockStore_Integration runs block store tests against Localstack.
 func TestS3BlockStore_Integration(t *testing.T) {
 	ctx := context.Background()
 
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	bucketName := "dittofs-blockstore-test"
-	helper.createBucket(t, bucketName)
-	defer helper.cleanupBucket(bucketName)
+	sharedHelper.createBucket(t, bucketName)
+	defer sharedHelper.cleanupBucket(bucketName)
 
 	// Create block store
-	blockStore := blocks3.New(helper.client, blocks3.Config{
+	blockStore := blocks3.New(sharedHelper.client, blocks3.Config{
 		Bucket:    bucketName,
 		KeyPrefix: "blocks/",
 	})
@@ -292,15 +295,12 @@ func TestS3BlockStore_Integration(t *testing.T) {
 func TestFlusher_Integration(t *testing.T) {
 	ctx := context.Background()
 
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	bucketName := "dittofs-flusher-test"
-	helper.createBucket(t, bucketName)
-	defer helper.cleanupBucket(bucketName)
+	sharedHelper.createBucket(t, bucketName)
+	defer sharedHelper.cleanupBucket(bucketName)
 
 	// Create block store
-	blockStore := blocks3.New(helper.client, blocks3.Config{
+	blockStore := blocks3.New(sharedHelper.client, blocks3.Config{
 		Bucket:    bucketName,
 		KeyPrefix: "blocks/",
 	})
