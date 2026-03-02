@@ -5,6 +5,7 @@ package s3
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"testing"
 	"time"
@@ -18,6 +19,10 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// sharedHelper is a package-level Localstack container shared across all tests.
+// Started once in TestMain, terminated after all tests complete.
+var sharedHelper *localstackHelper
+
 // localstackHelper manages the Localstack container for S3 integration tests.
 type localstackHelper struct {
 	container testcontainers.Container
@@ -25,16 +30,17 @@ type localstackHelper struct {
 	client    *s3.Client
 }
 
-// newLocalstackHelper starts a Localstack container or connects to an existing one.
-func newLocalstackHelper(t *testing.T) *localstackHelper {
-	t.Helper()
+// startSharedLocalstack starts a single Localstack container for the entire
+// test package. Returns a cleanup function.
+func startSharedLocalstack() func() {
 	ctx := context.Background()
 
 	// Check if external Localstack is configured via environment
 	if endpoint := os.Getenv("LOCALSTACK_ENDPOINT"); endpoint != "" {
 		helper := &localstackHelper{endpoint: endpoint}
-		helper.createClient(t)
-		return helper
+		helper.initClient()
+		sharedHelper = helper
+		return func() {} // nothing to clean up for external instances
 	}
 
 	// Start Localstack container using testcontainers
@@ -59,33 +65,36 @@ func newLocalstackHelper(t *testing.T) *localstackHelper {
 		Started:          true,
 	})
 	if err != nil {
-		t.Fatalf("failed to start localstack container: %v", err)
+		log.Fatalf("failed to start localstack container: %v", err)
 	}
 
 	host, err := container.Host(ctx)
 	if err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("failed to get container host: %v", err)
+		log.Fatalf("failed to get container host: %v", err)
 	}
 
 	port, err := container.MappedPort(ctx, "4566")
 	if err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("failed to get container port: %v", err)
+		log.Fatalf("failed to get container port: %v", err)
 	}
 
 	helper := &localstackHelper{
 		container: container,
 		endpoint:  fmt.Sprintf("http://%s:%s", host, port.Port()),
 	}
-	helper.createClient(t)
+	helper.initClient()
+	sharedHelper = helper
 
-	return helper
+	return func() {
+		_ = container.Terminate(ctx)
+	}
 }
 
-// createClient creates an S3 client configured for Localstack.
-func (lh *localstackHelper) createClient(t *testing.T) {
-	t.Helper()
+// initClient creates an S3 client configured for Localstack.
+// Used during TestMain setup (before *testing.T is available).
+func (lh *localstackHelper) initClient() {
 	ctx := context.Background()
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
@@ -95,7 +104,7 @@ func (lh *localstackHelper) createClient(t *testing.T) {
 		)),
 	)
 	if err != nil {
-		t.Fatalf("failed to load AWS config: %v", err)
+		log.Fatalf("failed to load AWS config: %v", err)
 	}
 
 	lh.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
@@ -117,12 +126,11 @@ func (lh *localstackHelper) createBucket(t *testing.T, bucketName string) {
 	}
 }
 
-// cleanup terminates the container if we started one.
-func (lh *localstackHelper) cleanup() {
-	if lh.container != nil {
-		ctx := context.Background()
-		_ = lh.container.Terminate(ctx)
-	}
+func TestMain(m *testing.M) {
+	cleanup := startSharedLocalstack()
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
 }
 
 // testStore holds the test store and cleanup function.
@@ -132,7 +140,7 @@ type testStore struct {
 	helper     *localstackHelper
 }
 
-// newTestStore creates a new S3 store for testing.
+// newTestStore creates a new S3 store for testing using the shared container.
 func newTestStore(t *testing.T, helper *localstackHelper) *testStore {
 	t.Helper()
 
@@ -152,11 +160,8 @@ func newTestStore(t *testing.T, helper *localstackHelper) *testStore {
 }
 
 func TestStore_WriteAndRead(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	blockKey := "share1/content123/chunk-0/block-0"
@@ -179,11 +184,8 @@ func TestStore_WriteAndRead(t *testing.T) {
 }
 
 func TestStore_ReadBlockNotFound(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	_, err := s.ReadBlock(ctx, "nonexistent")
@@ -193,11 +195,8 @@ func TestStore_ReadBlockNotFound(t *testing.T) {
 }
 
 func TestStore_ReadBlockRange(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	blockKey := "share1/content123/chunk-0/block-0"
@@ -229,11 +228,8 @@ func TestStore_ReadBlockRange(t *testing.T) {
 }
 
 func TestStore_ReadBlockRangeNotFound(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	_, err := s.ReadBlockRange(ctx, "nonexistent", 0, 10)
@@ -243,11 +239,8 @@ func TestStore_ReadBlockRangeNotFound(t *testing.T) {
 }
 
 func TestStore_DeleteBlock(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	blockKey := "share1/content123/chunk-0/block-0"
@@ -270,11 +263,8 @@ func TestStore_DeleteBlock(t *testing.T) {
 }
 
 func TestStore_DeleteByPrefix(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	// Write multiple blocks
@@ -321,11 +311,8 @@ func TestStore_DeleteByPrefix(t *testing.T) {
 }
 
 func TestStore_ListByPrefix(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	// Write multiple blocks
@@ -374,11 +361,8 @@ func TestStore_ListByPrefix(t *testing.T) {
 }
 
 func TestStore_ListByPrefix_Empty(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	// List non-existent prefix
@@ -393,11 +377,8 @@ func TestStore_ListByPrefix_Empty(t *testing.T) {
 }
 
 func TestStore_ClosedOperations(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 
 	// Close the store
 	if err := s.Close(); err != nil {
@@ -427,11 +408,8 @@ func TestStore_ClosedOperations(t *testing.T) {
 }
 
 func TestStore_HealthCheck(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	// Should be healthy
@@ -441,11 +419,8 @@ func TestStore_HealthCheck(t *testing.T) {
 }
 
 func TestStore_OverwriteBlock(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	blockKey := "share1/content123/chunk-0/block-0"
@@ -472,11 +447,8 @@ func TestStore_OverwriteBlock(t *testing.T) {
 }
 
 func TestStore_LargeBlock(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	blockKey := "share1/content123/chunk-0/block-0"
@@ -522,11 +494,8 @@ func TestStore_LargeBlock(t *testing.T) {
 }
 
 func TestStore_DeleteNonExistent(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
-	s := newTestStore(t, helper)
+	s := newTestStore(t, sharedHelper)
 	defer s.Close()
 
 	// Delete non-existent block should not error (S3 behavior)
@@ -541,15 +510,12 @@ func TestStore_DeleteNonExistent(t *testing.T) {
 }
 
 func TestStore_KeyPrefix(t *testing.T) {
-	helper := newLocalstackHelper(t)
-	defer helper.cleanup()
-
 	ctx := context.Background()
 	bucketName := fmt.Sprintf("test-bucket-%d", time.Now().UnixNano())
-	helper.createBucket(t, bucketName)
+	sharedHelper.createBucket(t, bucketName)
 
 	// Create store with custom prefix
-	s := New(helper.client, Config{
+	s := New(sharedHelper.client, Config{
 		Bucket:    bucketName,
 		KeyPrefix: "custom/prefix/",
 	})
@@ -563,7 +529,7 @@ func TestStore_KeyPrefix(t *testing.T) {
 	}
 
 	// Verify key includes prefix by listing directly from S3
-	resp, err := helper.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	resp, err := sharedHelper.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucketName),
 	})
 	if err != nil {

@@ -5,6 +5,7 @@ package gc
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,6 +23,9 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// sharedHelper is a package-level Localstack container shared across all tests.
+var sharedHelper *localstackHelper
+
 // localstackHelper manages Localstack container for S3 tests.
 type localstackHelper struct {
 	container testcontainers.Container
@@ -29,16 +33,17 @@ type localstackHelper struct {
 	client    *s3.Client
 }
 
-// newLocalstackHelper starts or connects to Localstack.
-func newLocalstackHelper(t *testing.T) *localstackHelper {
-	t.Helper()
+// startSharedLocalstack starts a single Localstack container for the entire
+// test package. Returns a cleanup function.
+func startSharedLocalstack() func() {
 	ctx := context.Background()
 
 	// Check for external Localstack
 	if endpoint := os.Getenv("LOCALSTACK_ENDPOINT"); endpoint != "" {
 		helper := &localstackHelper{endpoint: endpoint}
-		helper.createClient(t)
-		return helper
+		helper.initClient()
+		sharedHelper = helper
+		return func() {}
 	}
 
 	// Start Localstack container
@@ -63,31 +68,35 @@ func newLocalstackHelper(t *testing.T) *localstackHelper {
 		Started:          true,
 	})
 	if err != nil {
-		t.Fatalf("failed to start localstack: %v", err)
+		log.Fatalf("failed to start localstack: %v", err)
 	}
 
 	host, err := container.Host(ctx)
 	if err != nil {
 		container.Terminate(ctx)
-		t.Fatalf("failed to get host: %v", err)
+		log.Fatalf("failed to get host: %v", err)
 	}
 
 	port, err := container.MappedPort(ctx, "4566")
 	if err != nil {
 		container.Terminate(ctx)
-		t.Fatalf("failed to get port: %v", err)
+		log.Fatalf("failed to get port: %v", err)
 	}
 
 	helper := &localstackHelper{
 		container: container,
 		endpoint:  fmt.Sprintf("http://%s:%s", host, port.Port()),
 	}
-	helper.createClient(t)
-	return helper
+	helper.initClient()
+	sharedHelper = helper
+
+	return func() {
+		_ = container.Terminate(ctx)
+	}
 }
 
-func (h *localstackHelper) createClient(t *testing.T) {
-	t.Helper()
+// initClient creates an S3 client configured for Localstack.
+func (h *localstackHelper) initClient() {
 	ctx := context.Background()
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
@@ -95,7 +104,7 @@ func (h *localstackHelper) createClient(t *testing.T) {
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
 	)
 	if err != nil {
-		t.Fatalf("failed to load AWS config: %v", err)
+		log.Fatalf("failed to load AWS config: %v", err)
 	}
 
 	h.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
@@ -116,12 +125,11 @@ func (h *localstackHelper) createBucket(t *testing.T, bucket string) {
 	}
 }
 
-func (h *localstackHelper) close(t *testing.T) {
-	if h.container != nil {
-		if err := h.container.Terminate(context.Background()); err != nil {
-			t.Logf("warning: failed to terminate container: %v", err)
-		}
-	}
+func TestMain(m *testing.M) {
+	cleanup := startSharedLocalstack()
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
 }
 
 // ============================================================================
@@ -226,16 +234,12 @@ func TestCollectGarbage_Filesystem_LargeScale(t *testing.T) {
 func TestCollectGarbage_S3(t *testing.T) {
 	ctx := context.Background()
 
-	// Reuse the shared localstackHelper.
-	helper := newLocalstackHelper(t)
-	defer helper.close(t)
-
 	// Create a dedicated bucket for GC testing with unique name to avoid flakiness.
 	bucketName := fmt.Sprintf("gc-test-%d", time.Now().UnixNano())
-	helper.createBucket(t, bucketName)
+	sharedHelper.createBucket(t, bucketName)
 
-	// Create S3 block store using the helper's client.
-	blockStore := s3store.New(helper.client, s3store.Config{
+	// Create S3 block store using the shared helper's client.
+	blockStore := s3store.New(sharedHelper.client, s3store.Config{
 		Bucket:    bucketName,
 		KeyPrefix: "blocks/",
 	})
