@@ -16,7 +16,7 @@ import (
 // Lifecycle: Created by the SMB adapter during Serve(), runs in a background
 // goroutine, and stops when the serve context is cancelled.
 //
-// On first run it adjusts timeouts for handles persisted across a server restart.
+// On first run it expires handles whose timeout elapsed during server downtime.
 type DurableHandleScavenger struct {
 	store     lock.DurableHandleStore
 	handler   *Handler      // for cleanup operations (may be nil in tests)
@@ -45,11 +45,11 @@ func NewDurableHandleScavenger(
 
 // Run starts the scavenger loop. It blocks until ctx is cancelled.
 //
-// On first run, it adjusts timeouts for handles that survived a server restart.
+// On first run, it expires handles whose timeout elapsed during server downtime.
 // Then it enters a ticker loop, calling expireHandles on each tick.
 func (s *DurableHandleScavenger) Run(ctx context.Context) {
-	// Adjust timeouts for handles from a previous server instance
-	s.adjustTimeoutsForRestart(ctx)
+	// Expire handles from a previous server instance whose timeout elapsed during downtime
+	s.expireHandlesFromPreviousInstance(ctx)
 
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -64,9 +64,9 @@ func (s *DurableHandleScavenger) Run(ctx context.Context) {
 	}
 }
 
-// adjustTimeoutsForRestart checks persisted handles from a previous server
-// instance and expires those whose timeout has already elapsed during downtime.
-func (s *DurableHandleScavenger) adjustTimeoutsForRestart(ctx context.Context) {
+// expireHandlesFromPreviousInstance expires persisted handles from a previous
+// server instance whose timeout elapsed during downtime. No timeout fields are mutated.
+func (s *DurableHandleScavenger) expireHandlesFromPreviousInstance(ctx context.Context) {
 	handles, err := s.store.ListDurableHandles(ctx)
 	if err != nil {
 		logger.Warn("DurableHandleScavenger: failed to list handles for restart adjustment",
@@ -138,7 +138,7 @@ func (s *DurableHandleScavenger) cleanupAndDelete(ctx context.Context, h *lock.P
 		metaSvc := s.handler.Registry.GetMetadataService()
 
 		// Release byte-range locks
-		if len(h.MetadataHandle) > 0 {
+		if metaSvc != nil && len(h.MetadataHandle) > 0 {
 			// Use session ID 0 to indicate scavenger cleanup (not tied to a session)
 			if err := metaSvc.UnlockAllForSession(ctx, h.MetadataHandle, 0); err != nil {
 				logger.Debug("DurableHandleScavenger: failed to release locks",

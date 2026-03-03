@@ -56,6 +56,11 @@ func (s *memoryDurableStore) GetDurableHandleByFileID(ctx context.Context, fileI
 		return nil, err
 	}
 
+	// Zero FileID would match all handles without a real FileID — reject early
+	if fileID == ([16]byte{}) {
+		return nil, nil
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -73,6 +78,11 @@ func (s *memoryDurableStore) GetDurableHandleByCreateGuid(ctx context.Context, c
 		return nil, err
 	}
 
+	// Zero GUID matches all V1 handles and unrelated handles — reject early
+	if createGuid == ([16]byte{}) {
+		return nil, nil
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -88,6 +98,11 @@ func (s *memoryDurableStore) GetDurableHandleByCreateGuid(ctx context.Context, c
 func (s *memoryDurableStore) GetDurableHandlesByAppInstanceId(ctx context.Context, appInstanceId [16]byte) ([]*lock.PersistedDurableHandle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+
+	// Zero AppInstanceId would match all handles without an AppInstanceId — reject early
+	if appInstanceId == ([16]byte{}) {
+		return nil, nil
 	}
 
 	s.mu.RLock()
