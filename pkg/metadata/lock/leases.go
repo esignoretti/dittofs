@@ -117,6 +117,23 @@ func (lm *Manager) requestLeaseImpl(ctx context.Context, fileHandle FileHandle, 
 
 	locks := lm.unifiedLocks[handleKey]
 
+	// Check for delegation conflicts before granting a lease
+	for _, lock := range locks {
+		if lock.Delegation != nil {
+			// Create a temporary OpLock to check coexistence
+			tempLease := &OpLock{LeaseState: requestedState}
+			if DelegationConflictsWithLease(lock.Delegation, tempLease) {
+				lm.mu.Unlock()
+				logger.Debug("RequestLease: delegation conflict, denying lease",
+					"fileHandle", handleKey,
+					"delegationType", lock.Delegation.DelegType.String(),
+					"requestedState", LeaseStateToString(requestedState))
+				return LeaseStateNone, 0, fmt.Errorf("lease denied: conflicts with %s delegation on file",
+					lock.Delegation.DelegType.String())
+			}
+		}
+	}
+
 	// Search for existing lease with same key
 	for i, lock := range locks {
 		if lock.Lease == nil || lock.Lease.LeaseKey != leaseKey {
@@ -308,6 +325,7 @@ func (lm *Manager) acknowledgeLeaseBreakImpl(ctx context.Context, leaseKey [16]b
 
 		logger.Debug("AcknowledgeLeaseBreak: lease fully released",
 			"leaseKey", fmt.Sprintf("%x", leaseKey))
+		lm.signalBreakWaitLocked(handleKey)
 		return nil
 	}
 
@@ -332,6 +350,7 @@ func (lm *Manager) acknowledgeLeaseBreakImpl(ctx context.Context, leaseKey [16]b
 		"newState", LeaseStateToString(acknowledgedState),
 		"epoch", lock.Lease.Epoch)
 
+	lm.signalBreakWaitLocked(handleKey)
 	return nil
 }
 

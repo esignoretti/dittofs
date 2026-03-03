@@ -70,22 +70,34 @@ type BreakCallbacks interface {
 	//   - existingLock: The lock holding the conflicting access mode
 	//   - requestedMode: The access mode that was requested
 	OnAccessConflict(handleKey string, existingLock *UnifiedLock, requestedMode AccessMode)
+
+	// OnDelegationRecall is called when a delegation must be recalled.
+	//
+	// The client holding the delegation should return it or the server
+	// will force-revoke it after the recall timeout expires.
+	//
+	// Parameters:
+	//   - handleKey: The file handle key for the affected file
+	//   - lock: The lock whose delegation must be recalled
+	OnDelegationRecall(handleKey string, lock *UnifiedLock)
 }
 
-// OpLockBreakScanner monitors breaking leases and force-revokes on timeout.
+// OpLockBreakScanner monitors breaking leases and delegations, force-revoking on timeout.
 //
 // The scanner runs in the background, periodically checking for leases
-// that are in the "breaking" state and have exceeded the timeout.
+// and delegations that are in the "breaking" state and have exceeded the timeout.
 //
 // When a break times out:
-//  1. The lease is deleted from the store (force-revoked)
+//  1. The lease/delegation is deleted from the store (force-revoked)
 //  2. The callback is notified so it can clean up tracking state
 //  3. The conflicting operation can proceed
 type OpLockBreakScanner struct {
-	lockStore    LockStore
-	callback     OpLockBreakCallback
-	timeout      time.Duration
-	scanInterval time.Duration
+	lockStore         LockStore
+	callback          OpLockBreakCallback
+	timeout           time.Duration
+	delegationTimeout time.Duration
+	scanInterval      time.Duration
+	lockManager       *Manager // for delegation force-revoke
 
 	stop    chan struct{}
 	stopped chan struct{}
@@ -185,6 +197,24 @@ func (s *OpLockBreakScanner) GetTimeout() time.Duration {
 	return s.timeout
 }
 
+// SetLockManager sets the lock manager for delegation force-revoke operations.
+func (s *OpLockBreakScanner) SetLockManager(lm *Manager) {
+	// Read delegation timeout before acquiring s.mu to avoid nested lock
+	// ordering (s.mu -> lm.mu). DelegationRecallTimeout acquires lm.mu.RLock.
+	delegTimeout := lm.DelegationRecallTimeout()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lockManager = lm
+	s.delegationTimeout = delegTimeout
+}
+
+// SetDelegationTimeout updates the delegation recall timeout.
+func (s *OpLockBreakScanner) SetDelegationTimeout(timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delegationTimeout = timeout
+}
+
 // scanLoop is the main background loop.
 func (s *OpLockBreakScanner) scanLoop() {
 	defer close(s.stopped)
@@ -202,8 +232,14 @@ func (s *OpLockBreakScanner) scanLoop() {
 	}
 }
 
-// scanExpiredBreaks checks for and revokes expired lease breaks.
+// scanExpiredBreaks checks for and revokes expired lease breaks and delegation recalls.
 func (s *OpLockBreakScanner) scanExpiredBreaks(now time.Time) {
+	s.scanExpiredLeaseBreaks(now)
+	s.scanExpiredDelegationRecalls(now)
+}
+
+// scanExpiredLeaseBreaks checks for and revokes expired lease breaks.
+func (s *OpLockBreakScanner) scanExpiredLeaseBreaks(now time.Time) {
 	ctx := context.Background()
 
 	// Get current timeout (under lock)
@@ -259,6 +295,37 @@ func (s *OpLockBreakScanner) scanExpiredBreaks(now time.Time) {
 
 		if s.callback != nil {
 			s.callback.OnLeaseBreakTimeout(leaseKey)
+		}
+	}
+}
+
+// scanExpiredDelegationRecalls checks for and force-revokes expired delegation recalls.
+// Scans the in-memory lock manager for delegations with Breaking=true and
+// BreakStarted + delegationRecallTimeout exceeded.
+func (s *OpLockBreakScanner) scanExpiredDelegationRecalls(now time.Time) {
+	s.mu.Lock()
+	lm := s.lockManager
+	delegTimeout := s.delegationTimeout
+	s.mu.Unlock()
+
+	if lm == nil || delegTimeout == 0 {
+		return
+	}
+
+	// Collect expired delegations via public API (avoids accessing internal fields).
+	expired := lm.CollectExpiredDelegationRecalls(now, delegTimeout)
+
+	// Force-revoke expired delegations
+	for _, e := range expired {
+		logger.Debug("OpLockBreakScanner: delegation recall timeout expired",
+			"handleKey", e.HandleKey,
+			"delegationID", e.DelegationID,
+			"timeout", delegTimeout)
+
+		if err := lm.RevokeDelegation(e.HandleKey, e.DelegationID); err != nil {
+			logger.Warn("OpLockBreakScanner: failed to revoke expired delegation",
+				"delegationID", e.DelegationID,
+				"error", err)
 		}
 	}
 }

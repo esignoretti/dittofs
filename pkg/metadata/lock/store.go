@@ -3,6 +3,8 @@ package lock
 import (
 	"context"
 	"time"
+
+	"github.com/marmos91/dittofs/internal/logger"
 )
 
 // ============================================================================
@@ -85,9 +87,35 @@ type PersistedLock struct {
 	// Empty for byte-range locks and V1 leases.
 	ParentLeaseKey []byte `json:"parent_lease_key,omitempty"`
 
-	// IsDirectory indicates this lease is on a directory.
-	// False for byte-range locks and file leases.
+	// IsDirectory indicates this lock is on a directory.
+	// Shared by both leases and delegations: only one of Lease or Delegation
+	// should be non-nil per UnifiedLock, so this field is unambiguous.
+	// False for byte-range locks and file leases/delegations.
 	IsDirectory bool `json:"is_directory,omitempty"`
+
+	// ========================================================================
+	// Delegation Fields (omitempty for non-delegation locks)
+	// ========================================================================
+
+	// DelegationID is the unique identifier for this delegation.
+	// Empty for byte-range locks and leases.
+	DelegationID string `json:"delegation_id,omitempty"`
+
+	// DelegType is the delegation type (0=read, 1=write).
+	// Only meaningful when DelegationID is non-empty.
+	DelegType int `json:"deleg_type,omitempty"`
+
+	// DelegBreaking indicates a delegation recall is in progress.
+	DelegBreaking bool `json:"deleg_breaking,omitempty"`
+
+	// DelegRecalled indicates the delegation recall was sent.
+	DelegRecalled bool `json:"deleg_recalled,omitempty"`
+
+	// DelegRevoked indicates the delegation was force-revoked.
+	DelegRevoked bool `json:"deleg_revoked,omitempty"`
+
+	// DelegNotificationMask is the directory change notification bitmask.
+	DelegNotificationMask uint32 `json:"deleg_notification_mask,omitempty"`
 }
 
 // IsLease returns true if this persisted lock is an SMB lease.
@@ -246,6 +274,15 @@ type LockStore interface {
 // For leases, the Lease field must be non-nil. The 128-bit LeaseKey,
 // LeaseState, Epoch, BreakToState, and Breaking are all preserved.
 func ToPersistedLock(lock *UnifiedLock, epoch uint64) *PersistedLock {
+	// Guard invariant: at most one of Lease or Delegation should be non-nil.
+	// Both being set would cause IsDirectory to be overwritten ambiguously.
+	if lock.Lease != nil && lock.Delegation != nil {
+		logger.Error("ToPersistedLock: invariant violation - lock has both Lease and Delegation",
+			"lockID", lock.ID)
+		// Persist only the lease path; delegation fields are skipped to avoid
+		// ambiguous IsDirectory. Callers should fix the root cause.
+	}
+
 	pl := &PersistedLock{
 		ID:          lock.ID,
 		ShareName:   lock.Owner.ShareName,
@@ -273,6 +310,17 @@ func ToPersistedLock(lock *UnifiedLock, epoch uint64) *PersistedLock {
 		if lock.Lease.ParentLeaseKey != [16]byte{} {
 			pl.ParentLeaseKey = lock.Lease.ParentLeaseKey[:]
 		}
+	}
+
+	// Persist delegation fields if this is a delegation
+	if lock.Delegation != nil {
+		pl.DelegationID = lock.Delegation.DelegationID
+		pl.DelegType = int(lock.Delegation.DelegType)
+		pl.IsDirectory = lock.Delegation.IsDirectory
+		pl.DelegBreaking = lock.Delegation.Breaking
+		pl.DelegRecalled = lock.Delegation.Recalled
+		pl.DelegRevoked = lock.Delegation.Revoked
+		pl.DelegNotificationMask = lock.Delegation.NotificationMask
 	}
 
 	return pl
@@ -324,6 +372,22 @@ func FromPersistedLock(pl *PersistedLock) *UnifiedLock {
 			Breaking:       pl.Breaking,
 			ParentLeaseKey: parentLeaseKey,
 			IsDirectory:    pl.IsDirectory,
+			// BreakStarted is runtime-only, not persisted
+		}
+	}
+
+	// Restore delegation fields if this is a delegation (DelegationID present)
+	if pl.DelegationID != "" {
+		el.Delegation = &Delegation{
+			DelegationID:     pl.DelegationID,
+			DelegType:        DelegationType(pl.DelegType),
+			IsDirectory:      pl.IsDirectory,
+			ClientID:         pl.ClientID,
+			ShareName:        pl.ShareName,
+			Breaking:         pl.DelegBreaking,
+			Recalled:         pl.DelegRecalled,
+			Revoked:          pl.DelegRevoked,
+			NotificationMask: pl.DelegNotificationMask,
 			// BreakStarted is runtime-only, not persisted
 		}
 	}
