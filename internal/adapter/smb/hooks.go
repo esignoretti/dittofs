@@ -27,7 +27,7 @@ func init() {
 	beforeHooks = make(map[types.Command][]DispatchHook)
 	afterHooks = make(map[types.Command][]DispatchHook)
 
-	// Register preauth integrity hash hooks for NEGOTIATE.
+	// Register preauth integrity hash hooks for NEGOTIATE and SESSION_SETUP.
 	// Per [MS-SMB2] 3.3.5.4: the preauth integrity hash chain is updated
 	// with the raw bytes of every NEGOTIATE and SESSION_SETUP message.
 	//
@@ -35,10 +35,12 @@ func init() {
 	// The dialect is not yet known at request time, so we always hash.
 	// If the negotiated dialect is not 3.1.1, the hash is simply unused.
 	registerBeforeHook(types.CommandNegotiate, preauthHashBeforeHook)
+	registerBeforeHook(types.CommandSessionSetup, preauthHashBeforeHook)
 
 	// After-hook: updates the hash with the response bytes, but only if
 	// the negotiated dialect is 3.1.1 (checked via CryptoState.Dialect).
 	registerAfterHook(types.CommandNegotiate, preauthHashAfterHook)
+	registerAfterHook(types.CommandSessionSetup, preauthHashAfterHook)
 }
 
 // registerBeforeHook appends a hook to run before handler execution for the given command.
@@ -67,35 +69,44 @@ func RunAfterHooks(connInfo *ConnInfo, cmd types.Command, rawMessage []byte) {
 	}
 }
 
-// preauthHashBeforeHook updates the preauth integrity hash with the NEGOTIATE
-// request bytes. Called before the handler processes the request.
+// preauthHashBeforeHook updates the preauth integrity hash with request bytes.
+// Called before the handler processes NEGOTIATE or SESSION_SETUP requests.
 //
 // Per [MS-SMB2] 3.3.5.4: H(i) = SHA-512(H(i-1) || Message(i))
-// We always update here because the dialect is not yet known. If the final
-// negotiated dialect is not 3.1.1, the hash value is simply unused.
-func preauthHashBeforeHook(connInfo *ConnInfo, _ types.Command, rawMessage []byte) {
+// We always update here because the dialect is not yet known at NEGOTIATE time.
+// If the final negotiated dialect is not 3.1.1, the hash value is simply unused.
+//
+// For SESSION_SETUP, this ensures the preauth hash includes the request bytes
+// BEFORE the handler derives signing keys (critical for SMB 3.1.1 key derivation).
+func preauthHashBeforeHook(connInfo *ConnInfo, cmd types.Command, rawMessage []byte) {
 	if connInfo.CryptoState == nil {
 		return
 	}
 	connInfo.CryptoState.UpdatePreauthHash(rawMessage)
-	logger.Debug("Preauth hash updated with NEGOTIATE request",
+	logger.Debug("Preauth hash updated with request",
+		"command", cmd.String(),
 		"messageLen", len(rawMessage))
 }
 
-// preauthHashAfterHook updates the preauth integrity hash with the NEGOTIATE
-// response bytes. Only updates if the negotiated dialect is 3.1.1.
+// preauthHashAfterHook updates the preauth integrity hash with response bytes.
+// Called after NEGOTIATE or SESSION_SETUP responses are sent.
+// Only updates if the negotiated dialect is 3.1.1.
 //
 // Per [MS-SMB2] 3.3.5.4: The response hash is computed only when 3.1.1 is selected.
-func preauthHashAfterHook(connInfo *ConnInfo, _ types.Command, rawMessage []byte) {
+//
+// For SESSION_SETUP, the after-hook runs AFTER the response is signed and sent,
+// so the final SESSION_SETUP response hash does not affect the signing key used
+// for that response (which is correct per spec — the key is derived from the
+// hash up to and including the final SESSION_SETUP request).
+func preauthHashAfterHook(connInfo *ConnInfo, cmd types.Command, rawMessage []byte) {
 	if connInfo.CryptoState == nil {
 		return
 	}
-	// Only update the hash for 3.1.1 — the handler sets Dialect on CryptoState
-	// after selecting the negotiated dialect.
 	if connInfo.CryptoState.GetDialect() != types.Dialect0311 {
 		return
 	}
 	connInfo.CryptoState.UpdatePreauthHash(rawMessage)
-	logger.Debug("Preauth hash updated with NEGOTIATE response",
+	logger.Debug("Preauth hash updated with response",
+		"command", cmd.String(),
 		"messageLen", len(rawMessage))
 }
