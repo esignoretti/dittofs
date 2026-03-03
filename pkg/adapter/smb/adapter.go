@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
+	"time"
 
 	smblease "github.com/marmos91/dittofs/internal/adapter/smb/lease"
 	"github.com/marmos91/dittofs/internal/adapter/smb/session"
@@ -290,6 +292,29 @@ func (s *Adapter) applySMBSettings(rt *runtime.Runtime) {
 // Thread safety:
 // Serve() should only be called once per Adapter instance.
 func (s *Adapter) Serve(ctx context.Context) error {
+	// Start durable handle scavenger if a DurableHandleStore is available.
+	// The scavenger runs in the background and stops when ctx is cancelled.
+	if durableStore := s.findDurableHandleStore(); durableStore != nil {
+		s.handler.DurableStore = durableStore
+
+		durableTimeout := uint32(DefaultDurableHandleTimeout)
+		if s.handler.DurableTimeoutMs != 0 {
+			durableTimeout = s.handler.DurableTimeoutMs
+		}
+
+		scavenger := handlers.NewDurableHandleScavenger(
+			durableStore,
+			s.handler,
+			DefaultDurableScavengerInterval,
+			durableTimeout,
+			s.handler.StartTime,
+		)
+		go scavenger.Run(ctx)
+		logger.Info("SMB adapter: durable handle scavenger started",
+			"interval", DefaultDurableScavengerInterval,
+			"timeout_ms", durableTimeout)
+	}
+
 	return s.ServeWithFactory(ctx, s, s.preAcceptCheck, nil)
 }
 
@@ -350,9 +375,45 @@ func (s *Adapter) SetKerberosProvider(provider *kerberos.Provider) {
 		"stripRealm", s.handler.IdentityConfig.StripRealm)
 }
 
-// ============================================================================
-// Session Reconnection for Grace Period Recovery
-// ============================================================================
+const (
+	// DefaultDurableScavengerInterval is how often the scavenger checks for expired handles.
+	DefaultDurableScavengerInterval = 10 * time.Second
+
+	// DefaultDurableHandleTimeout is the default durable handle timeout in milliseconds.
+	DefaultDurableHandleTimeout = 60000
+)
+
+// durableHandleStoreProvider is a local interface for metadata stores that
+// provide a DurableHandleStore accessor. Mirrors storetest.DurableHandleStoreProvider
+// to avoid importing the test package from production code.
+type durableHandleStoreProvider interface {
+	DurableHandleStore() lock.DurableHandleStore
+}
+
+// findDurableHandleStore searches registered metadata stores for one that
+// implements durableHandleStoreProvider and returns the DurableHandleStore.
+// Iterates stores in sorted order for deterministic selection.
+// Returns nil if no metadata store supports durable handles.
+func (s *Adapter) findDurableHandleStore() lock.DurableHandleStore {
+	if s.Registry == nil {
+		return nil
+	}
+
+	names := s.Registry.ListMetadataStores()
+	sort.Strings(names)
+
+	for _, name := range names {
+		metaStore, err := s.Registry.GetMetadataStore(name)
+		if err != nil {
+			continue
+		}
+		if provider, ok := metaStore.(durableHandleStoreProvider); ok {
+			return provider.DurableHandleStore()
+		}
+	}
+
+	return nil
+}
 
 // OnReconnect is called when an SMB session reconnects after server restart.
 //

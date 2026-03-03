@@ -52,11 +52,11 @@ Requirements for SMB3 protocol upgrade. Each maps to roadmap phases.
 
 ### Durable Handles
 
-- [ ] **DH-01**: Server grants durable handles V1 (DHnQ) and reconnects via DHnC with timeout
-- [ ] **DH-02**: Server grants durable handles V2 (DH2Q) with CreateGuid for idempotent reconnection
-- [ ] **DH-03**: Durable handle state persists in control plane store surviving disconnects
-- [ ] **DH-04**: Server validates all reconnect conditions (14+ checks per MS-SMB2 spec)
-- [ ] **DH-05**: Durable handle management logic lives in metadata service layer, reusing NFSv4 state patterns
+- [x] **DH-01**: Server grants durable handles V1 (DHnQ) and reconnects via DHnC with timeout
+- [x] **DH-02**: Server grants durable handles V2 (DH2Q) with CreateGuid for idempotent reconnection
+- [x] **DH-03**: Durable handle state persists in control plane store surviving disconnects
+- [x] **DH-04**: Server validates all reconnect conditions (14+ checks per MS-SMB2 spec)
+- [x] **DH-05**: Durable handle management logic lives in metadata service layer, reusing NFSv4 state patterns
 
 ### Secure Dialect
 
@@ -150,11 +150,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | LEASE-02 | Phase 37 | Complete |
 | LEASE-03 | Phase 37 | Complete |
 | LEASE-04 | Phase 37 | Complete |
-| DH-01 | Phase 38 | Pending |
-| DH-02 | Phase 38 | Pending |
-| DH-03 | Phase 38 | Pending |
-| DH-04 | Phase 38 | Pending |
-| DH-05 | Phase 38 | Pending |
+| DH-01 | Phase 38 | Complete |
+| DH-02 | Phase 38 | Complete |
+| DH-03 | Phase 38 | Complete |
+| DH-04 | Phase 38 | Complete |
+| DH-05 | Phase 38 | Complete |
 | SDIAL-01 | Phase 33 | Complete |
 | XPROT-01 | Phase 39 | Pending |
 | XPROT-02 | Phase 39 | Pending |

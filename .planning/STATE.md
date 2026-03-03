@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v3.8
 milestone_name: SMB3 Protocol Upgrade
-status: in-progress
-last_updated: "2026-03-02T12:34:00Z"
+status: phase-complete
+last_updated: "2026-03-02T14:42:17.761Z"
 progress:
   total_phases: 39
-  completed_phases: 38
-  total_plans: 131
-  completed_plans: 131
+  completed_phases: 39
+  total_plans: 134
+  completed_plans: 134
 ---
 
 # Project State
@@ -18,16 +18,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-28)
 
 **Core value:** Enterprise-grade multi-protocol file access with unified locking, Kerberos authentication, and session reliability
-**Current focus:** v3.8 SMB3 Protocol Upgrade — Phase 37 (SMB3 Leases and Directory Leasing)
+**Current focus:** v3.8 SMB3 Protocol Upgrade — Phase 38 (Durable Handles)
 
 ## Current Position
 
-Phase: 37 of 40 (SMB3 Leases and Directory Leasing)
+Phase: 38 of 40 (Durable Handles)
 Plan: 3 of 3 complete
-Status: Phase Complete
-Last activity: 2026-03-02 — Completed 37-02 (SMB LeaseManager wrapper, OplockManager deletion)
+Status: Phase 38 Complete
+Last activity: 2026-03-02 — Completed 38-02 (Durable handle CREATE context processing)
 
-Progress: [######░░░░] 64%
+Progress: [##########] 100%
 
 ## Completed Milestones
 
@@ -42,9 +42,9 @@ Progress: [######░░░░] 64%
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 133 (19 v1.0 + 42 v2.0 + 25 v3.0 + 22 v3.5 + 12 v3.6 + 4 inserted + 9 v3.8)
-- 5 milestones in 28 days
-- Average: ~4.5 plans/day
+- Total plans completed: 136 (19 v1.0 + 42 v2.0 + 25 v3.0 + 22 v3.5 + 12 v3.6 + 4 inserted + 12 v3.8)
+- 5 milestones in 29 days
+- Average: ~4.7 plans/day
 
 | Phase | Plan | Duration | Tasks | Files |
 |-------|------|----------|-------|-------|
@@ -58,10 +58,13 @@ Progress: [######░░░░] 64%
 | 35    | 03   | 12min    | 2     | 9     |
 | 36    | 01   | 7min     | 2     | 8     |
 | 36    | 02   | 10min    | 2     | 8     |
-| 36    | 03   | 8min     | 2     | 9     |
+| 36    | 03   | 8min     | 2     | 7     |
 | 37    | 01   | 9min     | 2     | 10    |
-| 37    | 02   | 35min    | 2     | 14    |
-| 37    | 03   | 8min     | 2     | 10    |
+| 37    | 02   | 11min    | 2     | 9     |
+| 37    | 03   | 8min     | 2     | 7     |
+| 38    | 01   | 7min     | 2     | 11    |
+| 38    | 02   | 16min    | 1     | 4     |
+| 38    | 03   | 10min    | 2     | 6     |
 
 ## Accumulated Context
 
@@ -121,14 +124,28 @@ Progress: [######░░░░] 64%
 - [Phase 37-01]: Recently-broken cache uses 5s TTL to prevent directory lease grant-break storms
 - [Phase 37-01]: Cross-key conflicts break to LeaseStateNone (simplest correct behavior per MS-SMB2)
 - [Phase 37-01]: Lease upgrade whitelist: R->RW, R->RH, R->RWH, RH->RWH, RW->RWH
-- [Phase 37-03]: Auto-wire LockManager as DirChangeNotifier in RegisterStoreForShare
-- [Phase 37-03]: ctx.ClientAddr used as originClientID (AuthContext has no Identity.ClientID)
-- [Phase 37-03]: setattr retains direct NotifyDirChange (NFS4-specific, not in DirChangeType enum)
-- [Phase 37-03]: NFS4 delegation recall for removed dirs kept as direct StateManager call (cleanup, not notification)
 - [Phase 37-02]: LockManagerResolver interface pattern for per-share LockManager resolution at request time
 - [Phase 37-02]: metadataServiceResolver bridges MetadataService to lease package (uses DecodeFileHandle)
 - [Phase 37-02]: Surviving oplock wire-format types moved to oplock_constants.go (CREATE response uses OplockLevel)
 - [Phase 37-02]: Traditional oplock code paths fully removed (not just disabled)
+- [Phase 37-03]: Auto-wire LockManager as DirChangeNotifier in RegisterStoreForShare
+- [Phase 37-03]: ctx.ClientAddr used as originClientID (AuthContext has no Identity.ClientID)
+- [Phase 37-03]: setattr retains direct NotifyDirChange (NFS4-specific, not in DirChangeType enum)
+- [Phase 37-03]: NFS4 delegation recall for removed dirs kept as direct StateManager call (cleanup, not notification)
+- [Phase 38-01]: DurableHandleStore follows ClientRegistrationStore sub-interface pattern exactly
+- [Phase 38-01]: Memory store uses linear scans for secondary lookups (acceptable for low handle counts)
+- [Phase 38-01]: BadgerDB uses hex-encoded composite keys for multi-value indices (dh:appid:{hex}:{id})
+- [Phase 38-01]: PostgreSQL uses SQL interval arithmetic for server-side expired handle cleanup
+- [Phase 38-01]: Optional [16]byte fields stored as NULL in PostgreSQL when zero-value
+- [Phase 38-02]: V2 (DH2Q) takes precedence over V1 (DHnQ) when both present per MS-SMB2
+- [Phase 38-02]: V1 requires batch oplock for grant; V2 has no oplock requirement
+- [Phase 38-02]: Reconnect early-exit at Step 4b in CREATE handler avoids unnecessary file operations
+- [Phase 38-02]: Session key hash = SHA-256 of session signing key for reconnect security
+- [Phase 38-02]: DurableTimeoutMs defaults to 60000ms (60 seconds) in handler constructor
+- [Phase 38-02]: IsDurable NOT set on restored handle -- client must re-request after reconnect
+- [Phase 38-03]: Scavenger iterates all handles client-side (not bulk delete) to perform cleanup before deletion
+- [Phase 38-03]: Local durableHandleStoreProvider interface avoids importing storetest from production code
+- [Phase 38-03]: Scavenger lifecycle tied to Serve context -- stops automatically on adapter shutdown
 
 ### Pending Todos
 
@@ -141,5 +158,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-02
-Stopped at: Completed 37-02-PLAN.md (SMB LeaseManager wrapper, OplockManager deletion)
+Stopped at: Completed 38-02-PLAN.md (Durable handle CREATE context processing — Phase 38 complete)
 Resume file: None
