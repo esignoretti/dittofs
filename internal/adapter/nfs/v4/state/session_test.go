@@ -1136,3 +1136,104 @@ func TestCacheCreateSessionResponse_UnknownClient(t *testing.T) {
 	// Should not panic
 	sm.CacheCreateSessionResponse(99999, []byte("test"))
 }
+
+// ============================================================================
+// Custom Session Limit Tests (#217)
+// ============================================================================
+
+func TestCreateSession_CustomMaxSlots(t *testing.T) {
+	sm := NewStateManager(DefaultLeaseDuration)
+	sm.SetMaxSessionSlots(32)
+
+	clientID, seqID := registerV41Client(t, sm)
+
+	// Client requests 64 slots, but server limit is 32
+	foreAttrs := types.ChannelAttrs{
+		MaxRequestSize:        1048576,
+		MaxResponseSize:       1048576,
+		MaxResponseSizeCached: 65536,
+		MaxRequests:           64,
+	}
+
+	result, _, err := sm.CreateSession(
+		clientID, seqID, 0,
+		foreAttrs, defaultBackAttrs(), 0, nil,
+	)
+	if err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+
+	// Negotiated fore channel slots should be clamped to 32
+	if result.ForeChannelAttrs.MaxRequests != 32 {
+		t.Errorf("ForeChannelAttrs.MaxRequests = %d, want 32", result.ForeChannelAttrs.MaxRequests)
+	}
+
+	// Verify the session's slot table also has 32 slots
+	session := sm.GetSession(result.SessionID)
+	if session == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if session.ForeChannelSlots.MaxSlots() != 32 {
+		t.Errorf("ForeChannelSlots.MaxSlots() = %d, want 32", session.ForeChannelSlots.MaxSlots())
+	}
+}
+
+func TestCreateSession_MaxSlotsClamped(t *testing.T) {
+	sm := NewStateManager(DefaultLeaseDuration)
+	// Setting above DefaultMaxSlots (64) should be clamped
+	sm.SetMaxSessionSlots(200)
+
+	clientID, seqID := registerV41Client(t, sm)
+
+	foreAttrs := types.ChannelAttrs{
+		MaxRequestSize:        1048576,
+		MaxResponseSize:       1048576,
+		MaxResponseSizeCached: 65536,
+		MaxRequests:           200,
+	}
+
+	result, _, err := sm.CreateSession(
+		clientID, seqID, 0,
+		foreAttrs, defaultBackAttrs(), 0, nil,
+	)
+	if err != nil {
+		t.Fatalf("CreateSession error: %v", err)
+	}
+
+	// Should be clamped to DefaultMaxSlots (64), not 200
+	if result.ForeChannelAttrs.MaxRequests != DefaultMaxSlots {
+		t.Errorf("ForeChannelAttrs.MaxRequests = %d, want %d (DefaultMaxSlots)",
+			result.ForeChannelAttrs.MaxRequests, DefaultMaxSlots)
+	}
+}
+
+func TestCreateSession_CustomMaxSessionsPerClient(t *testing.T) {
+	sm := NewStateManager(DefaultLeaseDuration)
+	sm.SetMaxSessionsPerClient(2)
+
+	clientID, seqID := registerV41Client(t, sm)
+
+	// Create 2 sessions (the new max)
+	for i := 0; i < 2; i++ {
+		_, _, err := sm.CreateSession(
+			clientID, seqID+uint32(i), 0,
+			defaultForeAttrs(), defaultBackAttrs(), 0, nil,
+		)
+		if err != nil {
+			t.Fatalf("CreateSession #%d error: %v", i+1, err)
+		}
+		sm.CacheCreateSessionResponse(clientID, []byte("cached"))
+	}
+
+	// 3rd should fail
+	_, _, err := sm.CreateSession(
+		clientID, seqID+2, 0,
+		defaultForeAttrs(), defaultBackAttrs(), 0, nil,
+	)
+	if err == nil {
+		t.Fatal("Expected error for session limit exceeded")
+	}
+	if !errors.Is(err, ErrTooManySessions) {
+		t.Errorf("Expected ErrTooManySessions, got: %v", err)
+	}
+}
