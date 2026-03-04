@@ -41,7 +41,7 @@ type NFSAdapterSettings struct {
 
 	// Version negotiation
 	MinVersion string `gorm:"default:3;size:10" json:"min_version"`
-	MaxVersion string `gorm:"default:4.0;size:10" json:"max_version"`
+	MaxVersion string `gorm:"default:4.1;size:10" json:"max_version"`
 
 	// Timeouts (seconds)
 	LeaseTime               int `gorm:"default:90" json:"lease_time"`
@@ -129,7 +129,7 @@ type SMBAdapterSettings struct {
 
 	// Dialect negotiation
 	MinDialect string `gorm:"default:SMB2.0;size:20" json:"min_dialect"`
-	MaxDialect string `gorm:"default:SMB2.1;size:20" json:"max_dialect"`
+	MaxDialect string `gorm:"default:SMB3.1.1;size:20" json:"max_dialect"`
 
 	// Timeouts (seconds)
 	SessionTimeout     int `gorm:"default:900" json:"session_timeout"`     // 15 minutes
@@ -208,7 +208,7 @@ func NewDefaultNFSSettings(adapterID string) *NFSAdapterSettings {
 		ID:                         uuid.New().String(),
 		AdapterID:                  adapterID,
 		MinVersion:                 "3",
-		MaxVersion:                 "4.0",
+		MaxVersion:                 "4.1",
 		LeaseTime:                  90,
 		GracePeriod:                90,
 		DelegationRecallTimeout:    90,
@@ -240,7 +240,7 @@ func NewDefaultSMBSettings(adapterID string) *SMBAdapterSettings {
 		ID:                      uuid.New().String(),
 		AdapterID:               adapterID,
 		MinDialect:              "SMB2.0",
-		MaxDialect:              "SMB2.1",
+		MaxDialect:              "SMB3.1.1",
 		SessionTimeout:          900,
 		OplockBreakTimeout:      35,
 		MaxConnections:          0,
@@ -341,7 +341,7 @@ func DefaultSMBSettingsValidRange() SMBSettingsValidRange {
 }
 
 // ValidNFSVersions lists supported NFS version strings.
-var ValidNFSVersions = []string{"3", "4.0"}
+var ValidNFSVersions = []string{"3", "4.0", "4.1"}
 
 // ValidSMBDialects lists supported SMB dialect strings.
 var ValidSMBDialects = []string{"SMB2.0", "SMB2.1", "SMB3.0", "SMB3.0.2", "SMB3.1.1"}

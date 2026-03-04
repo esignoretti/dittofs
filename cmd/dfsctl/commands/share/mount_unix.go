@@ -4,6 +4,7 @@ package share
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -165,7 +166,12 @@ func mountSMBDarwin(sharePath, mountPoint string, port int, username, password, 
 	// On macOS, use mount_smbfs with file/dir mode flags.
 	// If running with sudo, use sudo -u to mount as original user
 	// (macOS security restriction: only mount owner can access files).
-	smbURL := fmt.Sprintf("smb://%s:%s@%s:%d%s", username, password, serverHost, port, sharePath)
+	//
+	// URL-encode username and password so special characters (/, =, +, @, etc.)
+	// don't break the smb:// URL parsing in mount_smbfs.
+	smbURL := fmt.Sprintf("smb://%s:%s@%s:%d%s",
+		url.PathEscape(username), url.PathEscape(password),
+		serverHost, port, sharePath)
 
 	args := []string{}
 	if mountFileMode != "" {
