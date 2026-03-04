@@ -58,17 +58,31 @@ const (
 )
 
 // =============================================================================
+// Identity Resolution
+// =============================================================================
+
+// IdentityResolver resolves Unix UIDs/GIDs to human-readable names
+// from the control plane store. When nil, the handler falls back to
+// generic "unix_user:{uid}" / "unix_group:{gid}" names.
+type IdentityResolver interface {
+	LookupUsernameByUID(uid uint32) (string, bool)
+	LookupGroupNameByGID(gid uint32) (string, bool)
+}
+
+// =============================================================================
 // LSA Handler
 // =============================================================================
 
 // LSARPCHandler handles LSA RPC calls for SID-to-name resolution.
 type LSARPCHandler struct {
 	sidMapper *sid.SIDMapper
+	resolver  IdentityResolver
 }
 
-// NewLSARPCHandler creates a new LSA RPC handler with the given SID mapper.
-func NewLSARPCHandler(sidMapper *sid.SIDMapper) *LSARPCHandler {
-	return &LSARPCHandler{sidMapper: sidMapper}
+// NewLSARPCHandler creates a new LSA RPC handler with the given SID mapper
+// and optional identity resolver for real name resolution.
+func NewLSARPCHandler(sidMapper *sid.SIDMapper, resolver IdentityResolver) *LSARPCHandler {
+	return &LSARPCHandler{sidMapper: sidMapper, resolver: resolver}
 }
 
 // HandleBind processes a BIND request and returns a BIND_ACK for the LSA interface.
@@ -163,49 +177,70 @@ type resolvedSID struct {
 	domainSID  *sid.SID
 }
 
+// resolveNameOrFallback attempts to resolve a name via the lookup function.
+// If the resolver is nil or the lookup misses, the fallback is returned.
+func resolveNameOrFallback(fallback string, resolver IdentityResolver, lookup func(IdentityResolver) (string, bool)) string {
+	if resolver == nil {
+		return fallback
+	}
+	if resolved, ok := lookup(resolver); ok {
+		return resolved
+	}
+	return fallback
+}
+
 // resolveSID resolves a single SID to a display name and type.
 func (h *LSARPCHandler) resolveSID(s *sid.SID) resolvedSID {
 	// Check well-known SIDs
 	if name, ok := sid.WellKnownName(s); ok {
-		// Determine SID type and domain from well-known name
 		sidType := SidTypeWellKnownGroup
-		var domainName string
-		var domainSID *sid.SID
 
-		if strings.HasPrefix(name, "NT AUTHORITY\\") {
-			domainName = "NT AUTHORITY"
-			domainSID = sid.ParseSIDMust("S-1-5")
-			localName := strings.TrimPrefix(name, "NT AUTHORITY\\")
-			return resolvedSID{name: localName, sidType: sidType, domainName: domainName, domainSID: domainSID}
+		if localName, ok := strings.CutPrefix(name, "NT AUTHORITY\\"); ok {
+			return resolvedSID{
+				name:       localName,
+				sidType:    sidType,
+				domainName: "NT AUTHORITY",
+				domainSID:  sid.ParseSIDMust("S-1-5"),
+			}
 		}
-		if strings.HasPrefix(name, "BUILTIN\\") {
-			domainName = "BUILTIN"
-			domainSID = sid.ParseSIDMust("S-1-5-32")
-			sidType = SidTypeAlias
-			localName := strings.TrimPrefix(name, "BUILTIN\\")
-			return resolvedSID{name: localName, sidType: sidType, domainName: domainName, domainSID: domainSID}
+		if localName, ok := strings.CutPrefix(name, "BUILTIN\\"); ok {
+			return resolvedSID{
+				name:       localName,
+				sidType:    SidTypeAlias,
+				domainName: "BUILTIN",
+				domainSID:  sid.ParseSIDMust("S-1-5-32"),
+			}
 		}
 		// No domain prefix (e.g., "Everyone")
-		return resolvedSID{name: name, sidType: sidType, domainName: "", domainSID: nil}
+		return resolvedSID{name: name, sidType: sidType}
 	}
 
-	// Check machine domain SIDs
+	// Check machine domain SIDs (user)
 	if uid, ok := h.sidMapper.UIDFromSID(s); ok {
-		name := fmt.Sprintf("unix_user:%d", uid)
+		name := resolveNameOrFallback(
+			fmt.Sprintf("unix_user:%d", uid),
+			h.resolver,
+			func(r IdentityResolver) (string, bool) { return r.LookupUsernameByUID(uid) },
+		)
 		return resolvedSID{
 			name:       name,
 			sidType:    SidTypeUser,
-			domainName: "UNIX",
+			domainName: "DITTOFS",
 			domainSID:  h.machineDomainSID(),
 		}
 	}
 
+	// Check machine domain SIDs (group)
 	if gid, ok := h.sidMapper.GIDFromSID(s); ok {
-		name := fmt.Sprintf("unix_group:%d", gid)
+		name := resolveNameOrFallback(
+			fmt.Sprintf("unix_group:%d", gid),
+			h.resolver,
+			func(r IdentityResolver) (string, bool) { return r.LookupGroupNameByGID(gid) },
+		)
 		return resolvedSID{
 			name:       name,
 			sidType:    SidTypeGroup,
-			domainName: "UNIX",
+			domainName: "DITTOFS",
 			domainSID:  h.machineDomainSID(),
 		}
 	}
