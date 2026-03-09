@@ -102,9 +102,10 @@ create_payload_store() {
         memory)
             $DFSCTL store payload add --name default --type memory
             ;;
-        *-fs)
-            $DFSCTL store payload add --name default --type filesystem \
-                --config '{"path":"/data/content"}'
+        *-s3-legacy|*-fs)
+            # Legacy profile names kept for CI compatibility.
+            # Filesystem payload store was removed in Phase 42; these use memory.
+            $DFSCTL store payload add --name default --type memory
             ;;
         *-s3)
             $DFSCTL store payload add --name default --type s3 \

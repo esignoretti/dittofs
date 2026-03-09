@@ -90,8 +90,8 @@ Options:
 
 Profiles:
   memory        Memory metadata + memory payload (fastest)
-  memory-fs     Memory metadata + filesystem payload
-  badger-fs     BadgerDB metadata + filesystem payload
+  memory-fs     Memory metadata + memory payload (legacy name, same as memory)
+  badger-fs     BadgerDB metadata + memory payload (legacy name)
 
 Examples:
   $(basename "$0")                              # Full smb2 suite with memory
@@ -270,9 +270,14 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 
 # Common smbtorture arguments
+# NOTE: "netbios name=localhost" is required because smbtorture uses its
+# NetBIOS name for secondary IPC$ connections. Without this, the default
+# name ("smbtorture" - the binary name) doesn't resolve in Docker and
+# secondary connections fail with NT_STATUS_OBJECT_NAME_NOT_FOUND.
 SMBTORTURE_ARGS=(
     "//localhost/smbbasic"
     "-U" "wpts-admin%TestPassword01!"
+    "--option=netbios name=localhost"
     "--option=client min protocol=SMB2_02"
     "--option=client max protocol=SMB3"
 )
