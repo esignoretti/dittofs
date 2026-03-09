@@ -32,13 +32,69 @@ func (m *Offloader) getUploadState(payloadID string) *fileUploadState {
 	return m.uploads[payloadID]
 }
 
+// isUploaded returns true if the block has been uploaded.
+func (s *fileUploadState) isUploaded(key blockKey) bool {
+	s.blocksMu.Lock()
+	defer s.blocksMu.Unlock()
+	return s.uploaded[key]
+}
+
+// markInProgress atomically checks and marks a block as in-progress.
+// Returns false if the block was already marked (skip duplicate work).
+func (s *fileUploadState) markInProgress(key blockKey) bool {
+	s.blocksMu.Lock()
+	defer s.blocksMu.Unlock()
+	if s.uploaded[key] {
+		return false
+	}
+	s.uploaded[key] = true
+	return true
+}
+
+// markUploaded marks a block as uploaded (without recording a hash).
+func (s *fileUploadState) markUploaded(key blockKey) {
+	s.blocksMu.Lock()
+	s.uploaded[key] = true
+	s.blocksMu.Unlock()
+}
+
+// revertUploaded marks a block as not uploaded (without touching hashes).
+func (s *fileUploadState) revertUploaded(key blockKey) {
+	s.blocksMu.Lock()
+	s.uploaded[key] = false
+	s.blocksMu.Unlock()
+}
+
+// setBlockUploaded marks a block as uploaded and records its hash.
+func (s *fileUploadState) setBlockUploaded(key blockKey, hash [32]byte) {
+	s.blocksMu.Lock()
+	s.uploaded[key] = true
+	s.blockHashes[key] = hash
+	s.blocksMu.Unlock()
+}
+
+// revertBlock marks a block as not uploaded and removes its hash.
+func (s *fileUploadState) revertBlock(key blockKey) {
+	s.blocksMu.Lock()
+	s.uploaded[key] = false
+	delete(s.blockHashes, key)
+	s.blocksMu.Unlock()
+}
+
 // handleUploadSuccess performs common post-upload tasks:
 // 1. Registers block in ObjectStore for deduplication
 // 2. Tracks block hash for finalization
-// 3. Marks block as uploaded in cache
+// 3. Marks block as uploaded in cache (with generation check)
+//
+// The generation parameter is the upload generation captured when the upload started.
+// If the block was re-dirtied during upload, MarkBlockUploaded will reject the stale
+// completion and the block will be retried on the next flush.
+//
+// Returns true if the block was successfully marked as uploaded, false if the generation
+// was stale (block was re-dirtied during upload).
 //
 // This consolidates the success handling from both startBlockUpload and uploadRemainingBlocks.
-func (m *Offloader) handleUploadSuccess(ctx context.Context, payloadID string, chunkIdx, blockIdx uint32, hash [32]byte, dataSize uint32) {
+func (m *Offloader) handleUploadSuccess(ctx context.Context, payloadID string, chunkIdx, blockIdx uint32, hash [32]byte, dataSize uint32, generation uint64) bool {
 	// Register block in ObjectStore for deduplication
 	objBlock := metadata.NewObjectBlock(
 		metadata.ContentHash{}, // ChunkHash - will be set during finalization
@@ -55,17 +111,31 @@ func (m *Offloader) handleUploadSuccess(ctx context.Context, payloadID string, c
 			"error", err)
 	}
 
-	// Track block hash for finalization
+	key := blockKey{chunkIdx: chunkIdx, blockIdx: blockIdx}
 	state := m.getUploadState(payloadID)
+
+	// Track block hash for finalization
 	if state != nil {
-		key := blockKey{chunkIdx: chunkIdx, blockIdx: blockIdx}
-		state.blocksMu.Lock()
-		state.blockHashes[key] = hash
-		state.blocksMu.Unlock()
+		state.setBlockUploaded(key, hash)
 	}
 
-	// Mark block as uploaded so it can be evicted
-	m.cache.MarkBlockUploaded(ctx, payloadID, chunkIdx, blockIdx)
+	// Mark block as uploaded so it can be evicted.
+	// If the generation doesn't match (block was re-dirtied during upload),
+	// MarkBlockUploaded returns false and we need to revert state.uploaded
+	// so the block will be retried on next flush.
+	if !m.cache.MarkBlockUploaded(ctx, payloadID, chunkIdx, blockIdx, generation) {
+		logger.Warn("Stale upload detected: block was re-dirtied during upload",
+			"payloadID", payloadID,
+			"chunkIdx", chunkIdx,
+			"blockIdx", blockIdx,
+			"generation", generation)
+
+		if state != nil {
+			state.revertBlock(key)
+		}
+		return false
+	}
+	return true
 }
 
 // getOrderedBlockHashes returns block hashes in order (sorted by chunk/block index).
@@ -109,11 +179,13 @@ func (m *Offloader) invokeFinalizationCallback(ctx context.Context, payloadID st
 	callback := m.onFinalized
 	m.mu.RUnlock()
 
-	if callback != nil {
-		hashes := m.getOrderedBlockHashes(payloadID)
-		if len(hashes) > 0 {
-			callback(ctx, payloadID, hashes)
-		}
+	if callback == nil {
+		return
+	}
+
+	hashes := m.getOrderedBlockHashes(payloadID)
+	if len(hashes) > 0 {
+		callback(ctx, payloadID, hashes)
 	}
 }
 

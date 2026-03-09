@@ -4,6 +4,7 @@ package cache
 import (
 	"errors"
 	"sync/atomic"
+	"time"
 
 	"github.com/marmos91/dittofs/pkg/payload/block"
 	"github.com/marmos91/dittofs/pkg/payload/chunk"
@@ -30,8 +31,10 @@ const (
 
 // Backpressure constants.
 // MaxPendingSize limits pending (dirty) data to prevent OOM even when cache is unlimited.
+// The 2GB default matches typical cache sizes and provides headroom for async flushes
+// on S3 backends, while memory backends drain instantly so the limit is never reached.
 const (
-	DefaultMaxPendingSize = 512 * 1024 * 1024 // 512MB default limit for pending data
+	DefaultMaxPendingSize = 2 * 1024 * 1024 * 1024 // 2GB default limit for pending data
 )
 
 // ============================================================================
@@ -149,6 +152,18 @@ type blockBuffer struct {
 	// uploadCancel cancels a pending upload when new writes arrive.
 	// Set when transitioning to ReadyForUpload, called if write arrives before upload starts.
 	uploadCancel func()
+
+	// uploadGeneration is bumped on every dirty transition (Uploading→Pending,
+	// ReadyForUpload→Pending, Uploaded→Pending). Uploads capture the generation
+	// at start and verify it at completion to detect stale uploads that raced
+	// with new writes.
+	uploadGeneration uint64
+
+	// lastDirtied records when this block last transitioned to Pending state.
+	// Used by the offloader's coalescing delay to skip eager uploads on blocks
+	// that are being rapidly re-dirtied (e.g., random write bursts), avoiding
+	// wasted S3 uploads that will be immediately invalidated.
+	lastDirtied time.Time
 }
 
 // PendingBlock represents a block ready for upload.
@@ -175,6 +190,15 @@ type PendingBlock struct {
 
 	// State is the current block state.
 	State BlockState
+
+	// Generation is the upload generation counter at the time the block was read.
+	// Used by the offloader to detect stale uploads that raced with new writes.
+	Generation uint64
+
+	// LastDirtied is when this block last transitioned to Pending state.
+	// Used by the offloader's coalescing delay to avoid uploading blocks
+	// that are being rapidly re-dirtied.
+	LastDirtied time.Time
 }
 
 // ============================================================================

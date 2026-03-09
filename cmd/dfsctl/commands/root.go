@@ -6,6 +6,7 @@ import (
 
 	"github.com/marmos91/dittofs/cmd/dfsctl/cmdutil"
 	adaptercmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/adapter"
+	benchcmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/bench"
 	clientcmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/client"
 	ctxcmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/context"
 	gracecmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/grace"
@@ -15,6 +16,7 @@ import (
 	settingscmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/settings"
 	sharecmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/share"
 	storecmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/store"
+	systemcmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/system"
 	usercmd "github.com/marmos91/dittofs/cmd/dfsctl/commands/user"
 	"github.com/spf13/cobra"
 )
@@ -82,6 +84,8 @@ func init() {
 	rootCmd.AddCommand(idmapcmd.Cmd)
 	rootCmd.AddCommand(settingscmd.Cmd)
 	rootCmd.AddCommand(switchUserCmd)
+	rootCmd.AddCommand(systemcmd.Cmd)
+	rootCmd.AddCommand(benchcmd.Cmd)
 	rootCmd.AddCommand(completionCmd)
 
 	// Hide the default completion command (we provide our own)

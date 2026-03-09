@@ -50,6 +50,11 @@ type fileEntry struct {
 // Cache Implementation
 // ============================================================================
 
+// BackpressureTimeout is the maximum time a write will block waiting for
+// the offloader to drain pending data. After this timeout, ErrCacheFull
+// is returned.
+const BackpressureTimeout = 5 * time.Minute
+
 // Cache is the mandatory cache layer for all content operations.
 //
 // It uses 4MB block buffers as first-class citizens, storing data directly
@@ -86,13 +91,12 @@ type Cache struct {
 // Parameters:
 //   - maxSize: Maximum total cache size in bytes. Use 0 for unlimited.
 func New(maxSize uint64) *Cache {
-	c := &Cache{
+	return &Cache{
 		files:          make(map[string]*fileEntry),
 		maxSize:        maxSize,
 		maxPendingSize: scalePendingSize(maxSize),
 		pendingCond:    sync.NewCond(&sync.Mutex{}),
 	}
-	return c
 }
 
 // NewWithWal creates a new cache with WAL persistence for crash recovery.
@@ -142,59 +146,48 @@ func (c *Cache) recoverFromWal() error {
 		return err
 	}
 
-	for _, entry := range result.Entries {
-		fileEntry := c.getFileEntry(entry.PayloadID)
-		fileEntry.mu.Lock()
+	for _, walEntry := range result.Entries {
+		fe := c.getFileEntry(walEntry.PayloadID)
+		fe.mu.Lock()
 
-		chunk, exists := fileEntry.chunks[entry.ChunkIdx]
+		chunk, exists := fe.chunks[walEntry.ChunkIdx]
 		if !exists {
-			chunk = &chunkEntry{
-				blocks: make(map[uint32]*blockBuffer),
+			chunk = &chunkEntry{blocks: make(map[uint32]*blockBuffer)}
+			fe.chunks[walEntry.ChunkIdx] = chunk
+		}
+
+		wasUploaded := result.UploadedBlocks[wal.BlockKey{
+			PayloadID: walEntry.PayloadID,
+			ChunkIdx:  walEntry.ChunkIdx,
+			BlockIdx:  walEntry.BlockIdx,
+		}]
+
+		blk, exists := chunk.blocks[walEntry.BlockIdx]
+		if !exists {
+			initialState := BlockStatePending
+			if wasUploaded {
+				initialState = BlockStateUploaded
 			}
-			fileEntry.chunks[entry.ChunkIdx] = chunk
-		}
-
-		// Check if this block was already uploaded to S3
-		blockKey := wal.BlockKey{
-			PayloadID: entry.PayloadID,
-			ChunkIdx:  entry.ChunkIdx,
-			BlockIdx:  entry.BlockIdx,
-		}
-		wasUploaded := result.UploadedBlocks[blockKey]
-
-		// Determine initial state: Uploaded if already in S3, Pending otherwise
-		initialState := BlockStatePending
-		if wasUploaded {
-			initialState = BlockStateUploaded
-		}
-
-		// Get or create block buffer
-		block, exists := chunk.blocks[entry.BlockIdx]
-		if !exists {
-			block = &blockBuffer{
+			blk = &blockBuffer{
 				data:     make([]byte, BlockSize),
 				coverage: newCoverageBitmap(),
 				state:    initialState,
 			}
-			chunk.blocks[entry.BlockIdx] = block
-			// Track BlockSize for new block buffers (memory allocation tracking)
+			chunk.blocks[walEntry.BlockIdx] = blk
 			c.totalSize.Add(BlockSize)
-			// Only count against pendingSize if block is Pending (needs upload)
 			if initialState == BlockStatePending {
 				c.pendingSize.Add(BlockSize)
 			}
 		}
 
-		// Copy data to block buffer at correct offset
-		copy(block.data[entry.OffsetInBlock:], entry.Data)
-		markCoverage(block.coverage, entry.OffsetInBlock, uint32(len(entry.Data)))
+		copy(blk.data[walEntry.OffsetInBlock:], walEntry.Data)
+		markCoverage(blk.coverage, walEntry.OffsetInBlock, uint32(len(walEntry.Data)))
 
-		// Update data size
-		if end := entry.OffsetInBlock + uint32(len(entry.Data)); end > block.dataSize {
-			block.dataSize = end
+		if end := walEntry.OffsetInBlock + uint32(len(walEntry.Data)); end > blk.dataSize {
+			blk.dataSize = end
 		}
 
-		fileEntry.mu.Unlock()
+		fe.mu.Unlock()
 	}
 
 	return nil
@@ -229,6 +222,19 @@ func (c *Cache) getFileEntry(payloadID string) *fileEntry {
 	}
 	c.files[payloadID] = entry
 	return entry
+}
+
+// MaxSize returns the configured maximum cache size in bytes.
+// Returns 0 if the cache is unlimited.
+func (c *Cache) MaxSize() uint64 {
+	return c.maxSize
+}
+
+// SetMaxPendingSize sets the maximum pending (dirty) data size in bytes.
+// When pending data exceeds this limit, writes block until the offloader
+// drains enough data. Use 0 to revert to the default (2GB).
+func (c *Cache) SetMaxPendingSize(size uint64) {
+	c.maxPendingSize = size
 }
 
 // touchFile updates the last access time for LRU tracking.
@@ -289,6 +295,25 @@ func getBlockUnlocked(entry *fileEntry, chunkIdx, blockIdx uint32) *blockBuffer 
 		return nil
 	}
 	return chunk.blocks[blockIdx]
+}
+
+// GetBlockLastDirtied returns the time a block last transitioned to Pending state.
+// Returns the zero time if the block doesn't exist.
+// Used by the offloader's coalescing delay to skip eager uploads on recently-dirtied blocks.
+func (c *Cache) GetBlockLastDirtied(ctx context.Context, payloadID string, chunkIdx, blockIdx uint32) time.Time {
+	if c.checkClosed(ctx) != nil {
+		return time.Time{}
+	}
+
+	entry := c.getFileEntry(payloadID)
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+
+	blk := getBlockUnlocked(entry, chunkIdx, blockIdx)
+	if blk == nil {
+		return time.Time{}
+	}
+	return blk.lastDirtied
 }
 
 // scalePendingSize computes the maxPendingSize based on cache maxSize.

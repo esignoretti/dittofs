@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/cache/wal"
 	"github.com/marmos91/dittofs/pkg/payload/block"
 )
@@ -179,14 +180,13 @@ func (c *Cache) writeAtInternal(ctx context.Context, payloadID string, chunkIdx 
 	// Backpressure on pending data (applies even when maxSize=0).
 	// This prevents OOM when uploads can't keep up with writes.
 	// Skip for downloaded data - it's already in block store, not pending.
-	if !opts.isDownloaded {
-		maxPending := c.maxPendingSize
-		if maxPending == 0 {
-			maxPending = DefaultMaxPendingSize
-		}
-		if newMemory > 0 && c.pendingSize.Load()+newMemory > maxPending {
-			entry.mu.Unlock()
-			return ErrCacheFull
+	//
+	// When pending data exceeds the limit, the write BLOCKS until the offloader
+	// drains enough data (signaled via pendingCond). This provides proper
+	// backpressure for slow backends like S3, instead of returning ErrCacheFull.
+	if !opts.isDownloaded && newMemory > 0 {
+		if err := c.checkPendingBackpressure(ctx, entry, newMemory); err != nil {
+			return err
 		}
 	}
 
@@ -203,6 +203,88 @@ func (c *Cache) writeAtInternal(ctx context.Context, payloadID string, chunkIdx 
 	}
 
 	return nil
+}
+
+// checkPendingBackpressure checks if pendingSize exceeds the limit and blocks
+// until it drains. Caller must hold entry.mu; this method releases and re-acquires
+// it around the wait. The addedSize parameter is the bytes just added to pendingSize.
+func (c *Cache) checkPendingBackpressure(ctx context.Context, entry *fileEntry, addedSize uint64) error {
+	maxPending := c.maxPendingSize
+	if maxPending == 0 {
+		maxPending = DefaultMaxPendingSize
+	}
+	if c.pendingSize.Load() > maxPending {
+		entry.mu.Unlock()
+		if err := c.waitForPendingDrain(ctx, addedSize, maxPending); err != nil {
+			entry.mu.Lock() // Re-acquire before returning
+			return err
+		}
+		entry.mu.Lock()
+	}
+	return nil
+}
+
+// waitForPendingDrain blocks until pendingSize drops below the threshold or
+// the context/cache is cancelled. This is the core backpressure mechanism
+// that prevents ErrCacheFull by waiting for the offloader to drain data.
+//
+// The method uses sync.Cond for efficient signaling: writers sleep here and
+// are woken up by MarkBlockUploaded when pending data decreases.
+//
+// Returns nil when there is room to write, or an error if:
+//   - BackpressureTimeout is exceeded (returns ErrCacheFull)
+//   - Context is cancelled (returns context error)
+//   - Cache is closed (returns ErrCacheClosed)
+func (c *Cache) waitForPendingDrain(ctx context.Context, newMemory, maxPending uint64) error {
+	deadline := time.Now().Add(BackpressureTimeout)
+	logged := false
+
+	c.pendingCond.L.Lock()
+	defer c.pendingCond.L.Unlock()
+
+	for {
+		// Check if there's room now
+		if c.pendingSize.Load()+newMemory <= maxPending {
+			return nil
+		}
+
+		// Check context cancellation
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Check if cache is closed
+		if err := c.checkClosed(ctx); err != nil {
+			return err
+		}
+
+		// Check timeout
+		if time.Now().After(deadline) {
+			logger.Error("Backpressure timeout exceeded, cache still full",
+				"pendingSize", c.pendingSize.Load(),
+				"maxPending", maxPending,
+				"timeout", BackpressureTimeout)
+			return ErrCacheFull
+		}
+
+		if !logged {
+			logger.Warn("Write blocked by cache backpressure, waiting for offloader to drain",
+				"pendingSize", c.pendingSize.Load(),
+				"maxPending", maxPending,
+				"newMemory", newMemory)
+			logged = true
+		}
+
+		// Wait with a periodic wake-up to check context/timeout.
+		// time.AfterFunc avoids spawning a goroutine per iteration — the timer
+		// fires once and broadcasts to wake us so we can re-check conditions.
+		timer := time.AfterFunc(500*time.Millisecond, func() {
+			c.pendingCond.Broadcast()
+		})
+
+		c.pendingCond.Wait()
+		timer.Stop()
+	}
 }
 
 // countNewBlockMemory calculates memory needed for new blocks in the given range.
@@ -222,27 +304,18 @@ func (c *Cache) writeToBlock(ctx context.Context, entry *fileEntry, payloadID st
 	// Get or create block buffer
 	blk, isNew := c.getOrCreateBlock(entry, chunkIdx, blockIdx)
 
-	// For normal writes (not downloaded), handle state transitions
-	if !opts.isDownloaded {
-		// Write to a block that is currently being uploaded.
-		// Since flush upload uses a copy of the data (not detach), it's safe to
-		// write new data here. The in-flight upload will complete with the old data,
-		// and this block will need to be re-uploaded with the new data.
-		// We revert to Pending so the block will be picked up by the next flush.
-		if !isNew && blk.state == BlockStateUploading {
-			blk.state = BlockStatePending
-			blk.hash = [32]byte{} // Invalidate hash - data has changed
+	// For normal writes (not downloaded), handle state transitions.
+	// Both Uploading and ReadyForUpload revert to Pending so the block
+	// will be picked up by the next flush cycle.
+	if !opts.isDownloaded && !isNew && (blk.state == BlockStateUploading || blk.state == BlockStateReadyForUpload) {
+		if blk.state == BlockStateReadyForUpload && blk.uploadCancel != nil {
+			blk.uploadCancel()
+			blk.uploadCancel = nil
 		}
-
-		// Handle write to ReadyForUpload block - cancel pending upload and revert to Pending.
-		if !isNew && blk.state == BlockStateReadyForUpload {
-			if blk.uploadCancel != nil {
-				blk.uploadCancel()
-				blk.uploadCancel = nil
-			}
-			blk.state = BlockStatePending
-			blk.hash = [32]byte{} // Invalidate hash - will be recomputed on completion
-		}
+		blk.state = BlockStatePending
+		blk.hash = [32]byte{}
+		blk.uploadGeneration++
+		blk.lastDirtied = time.Now()
 	}
 
 	// Track memory and set initial state for new block buffers
@@ -254,6 +327,7 @@ func (c *Cache) writeToBlock(ctx context.Context, entry *fileEntry, payloadID st
 		} else {
 			// Normal writes start as Pending
 			c.pendingSize.Add(BlockSize)
+			blk.lastDirtied = time.Now()
 		}
 	}
 
@@ -285,7 +359,15 @@ func (c *Cache) writeToBlock(ctx context.Context, entry *fileEntry, payloadID st
 	// For normal writes, mark block as dirty if it was uploaded (re-dirty)
 	if !opts.isDownloaded && blk.state == BlockStateUploaded {
 		blk.state = BlockStatePending
+		blk.uploadGeneration++       // Bump generation for re-dirtied block
+		blk.lastDirtied = time.Now() // Coalescing delay: track when block was re-dirtied
 		c.pendingSize.Add(BlockSize) // Re-dirtied block becomes pending again
+
+		// Spread backpressure evenly: re-dirtied blocks also check pending limit
+		// instead of concentrating the stall on new-block writes only.
+		if err := c.checkPendingBackpressure(ctx, entry, BlockSize); err != nil {
+			return err
+		}
 	}
 
 	// Persist to WAL if enabled (only for normal writes)

@@ -33,8 +33,18 @@ type (
 // CacheConfig holds cache WAL path and size limit.
 // Kept here (instead of pkg/config) to avoid import cycles.
 type CacheConfig struct {
-	Path string // Directory for the cache WAL file
-	Size uint64 // Maximum cache size in bytes
+	Path           string // Directory for the cache WAL file
+	Size           uint64 // Maximum cache size in bytes
+	MaxPendingSize uint64 // Maximum pending (dirty) data size (0 = default 2GB)
+}
+
+// OffloaderConfig holds offloader settings for background data transfer.
+// Kept here (instead of pkg/config) to avoid import cycles.
+type OffloaderConfig struct {
+	ParallelUploads    int   // Concurrent block uploads (0 = auto-scaled based on CPU count)
+	ParallelDownloads  int   // Concurrent block downloads per file (0 = auto-scaled based on CPU count)
+	PrefetchBlocks     int   // Blocks to prefetch ahead (0 = auto-scaled based on cache size)
+	SmallFileThreshold int64 // Sync flush threshold in bytes (0 = disabled)
 }
 
 type payloadServiceHelper struct {
@@ -90,6 +100,7 @@ type Runtime struct {
 	mountTracker *MountTracker
 
 	cacheConfig     *CacheConfig
+	offloaderConfig *OffloaderConfig
 	settingsWatcher *SettingsWatcher
 
 	adapterProviders   map[string]any
@@ -325,6 +336,12 @@ func (r *Runtime) GetCacheConfig() *CacheConfig {
 	return r.cacheConfig
 }
 
+func (r *Runtime) SetOffloaderConfig(cfg *OffloaderConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.offloaderConfig = cfg
+}
+
 func (r *Runtime) SetCache(c *cache.Cache) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -335,6 +352,18 @@ func (r *Runtime) GetCache() *cache.Cache {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.cacheInstance
+}
+
+// DrainAllUploads waits for all in-flight uploads across all files to complete.
+// Returns nil if no payload service is configured or all uploads drained successfully.
+func (r *Runtime) DrainAllUploads(ctx context.Context) error {
+	r.mu.RLock()
+	ps := r.payloadService
+	r.mu.RUnlock()
+	if ps == nil {
+		return nil
+	}
+	return ps.DrainAllUploads(ctx)
 }
 
 func (r *Runtime) GetUserStore() models.UserStore         { return r.store }

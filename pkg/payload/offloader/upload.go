@@ -30,6 +30,11 @@ func (m *Offloader) OnWriteComplete(ctx context.Context, payloadID string, chunk
 	}
 }
 
+// eagerUploadCooldown is the minimum time after a block is dirtied before it is
+// eligible for eager upload. This lets random writes coalesce within the same block
+// before starting an S3 upload that would be immediately invalidated.
+const eagerUploadCooldown = 500 * time.Millisecond
+
 // tryEagerUpload checks if a block is complete and starts an async upload if ready.
 // Only complete 4MB blocks are uploaded; partial blocks are flushed during Flush().
 //
@@ -48,6 +53,15 @@ func (m *Offloader) tryEagerUpload(ctx context.Context, payloadID string, chunkI
 	// Check if fully covered (no zero-filled gaps) - fast bitmap check
 	covered, err := m.cache.IsRangeCovered(ctx, payloadID, chunkIdx, blockStart, BlockSize)
 	if err != nil || !covered {
+		return
+	}
+
+	// Coalescing delay: skip blocks dirtied less than 500ms ago.
+	// Random writes re-dirty blocks faster than S3 can drain them.
+	// Letting writes coalesce avoids wasted uploads that are immediately
+	// invalidated by new writes to the same block.
+	lastDirtied := m.cache.GetBlockLastDirtied(ctx, payloadID, chunkIdx, blockIdx)
+	if !lastDirtied.IsZero() && time.Since(lastDirtied) < eagerUploadCooldown {
 		return
 	}
 
@@ -93,25 +107,17 @@ func (m *Offloader) startBlockUpload(ctx context.Context,
 
 	// Check if already uploaded (deduplication)
 	key := blockKey{chunkIdx: chunkIdx, blockIdx: blockIdx}
-	state.blocksMu.Lock()
-	if state.uploaded[key] {
-		state.blocksMu.Unlock()
-		blockPool.Put(dataPtr) // Return unused buffer
+	if !state.markInProgress(key) {
+		blockPool.Put(dataPtr)
 		return
 	}
-	state.uploaded[key] = true // Mark as in-progress
-	state.blocksMu.Unlock()
 
-	// Try to acquire semaphore slot (non-blocking)
-	// If all slots are taken, skip eager upload - block will be uploaded during Flush
+	// Try to acquire semaphore slot (non-blocking).
+	// If all slots are taken, skip eager upload -- block will be uploaded during Flush.
 	select {
 	case m.uploadSem <- struct{}{}:
-		// Got slot, proceed with upload
 	default:
-		// All slots taken, skip eager upload
-		state.blocksMu.Lock()
-		state.uploaded[key] = false // Unmark so Flush will upload it
-		state.blocksMu.Unlock()
+		state.revertUploaded(key)
 		blockPool.Put(dataPtr)
 		return
 	}
@@ -140,8 +146,10 @@ func (m *Offloader) startBlockUpload(ctx context.Context,
 			if err == nil && existing != nil && existing.IsUploaded() {
 				// Block already exists and is uploaded - increment RefCount and skip upload
 				_, _ = m.objectStore.IncrementBlockRefCount(ctx, hash)
-				m.cache.MarkBlockReadyForUpload(ctx, payloadID, chunkIdx, blockIdx, hash, nil)
-				m.cache.MarkBlockUploaded(ctx, payloadID, chunkIdx, blockIdx)
+				gen, ok := m.cache.MarkBlockReadyForUpload(ctx, payloadID, chunkIdx, blockIdx, hash, nil)
+				if ok {
+					m.cache.MarkBlockUploaded(ctx, payloadID, chunkIdx, blockIdx, gen)
+				}
 
 				logger.Debug("Dedup: block already exists, skipping upload",
 					"payloadID", payloadID,
@@ -150,6 +158,17 @@ func (m *Offloader) startBlockUpload(ctx context.Context,
 					"hash", hashB64(hash))
 				return
 			}
+		}
+
+		// Mark block as ReadyForUpload and capture generation for staleness detection
+		gen, ok := m.cache.MarkBlockReadyForUpload(ctx, payloadID, chunkIdx, blockIdx, hash, nil)
+		if !ok {
+			// Block was evicted or state changed since we read it
+			logger.Debug("Eager upload: block no longer pending, skipping",
+				"payloadID", payloadID,
+				"chunkIdx", chunkIdx,
+				"blockIdx", blockIdx)
+			return
 		}
 
 		logger.Debug("Eager upload starting",
@@ -170,14 +189,12 @@ func (m *Offloader) startBlockUpload(ctx context.Context,
 			state.errorsMu.Unlock()
 
 			// Mark as not uploaded so it can be retried
-			state.blocksMu.Lock()
-			state.uploaded[key] = false
-			state.blocksMu.Unlock()
+			state.revertUploaded(key)
 			return
 		}
 
 		// Handle successful upload (ObjectStore, hash tracking, cache marking)
-		m.handleUploadSuccess(ctx, payloadID, chunkIdx, blockIdx, hash, uint32(len(data)))
+		m.handleUploadSuccess(ctx, payloadID, chunkIdx, blockIdx, hash, uint32(len(data)), gen)
 
 		logger.Debug("Eager upload complete",
 			"payloadID", payloadID,
@@ -207,20 +224,13 @@ func (m *Offloader) uploadRemainingBlocks(ctx context.Context, payloadID string)
 	// Get upload state for deduplication
 	state := m.getUploadState(payloadID)
 
-	// Filter out blocks already uploaded by eager upload
+	// Filter out blocks already uploaded by eager upload.
 	var blocksToUpload []cache.PendingBlock
 	for _, blk := range pending {
-		// Check if already uploaded by eager upload
-		if state != nil {
-			key := blockKey{chunkIdx: blk.ChunkIndex, blockIdx: blk.BlockIndex}
-			state.blocksMu.Lock()
-			alreadyUploaded := state.uploaded[key]
-			state.blocksMu.Unlock()
-			if alreadyUploaded {
-				// Mark as uploaded in cache since eager upload succeeded
-				m.cache.MarkBlockUploaded(ctx, payloadID, blk.ChunkIndex, blk.BlockIndex)
-				continue
-			}
+		if state != nil && state.isUploaded(blockKey{chunkIdx: blk.ChunkIndex, blockIdx: blk.BlockIndex}) {
+			// Mark as uploaded in cache since eager upload succeeded.
+			m.cache.MarkBlockUploaded(ctx, payloadID, blk.ChunkIndex, blk.BlockIndex, blk.Generation)
+			continue
 		}
 		blocksToUpload = append(blocksToUpload, blk)
 	}
@@ -263,9 +273,10 @@ func (m *Offloader) uploadRemainingBlocks(ctx context.Context, payloadID string)
 		if m.objectStore != nil {
 			existing, err := m.objectStore.FindBlockByHash(ctx, hash)
 			if err == nil && existing != nil && existing.IsUploaded() {
-				// Block already exists - increment RefCount and skip upload
+				// Block already exists - increment RefCount and skip upload.
+				// Use generation from the pending block snapshot.
 				_, _ = m.objectStore.IncrementBlockRefCount(ctx, hash)
-				m.cache.MarkBlockUploaded(ctx, payloadID, chunkIdx, blockIdx)
+				m.cache.MarkBlockUploaded(ctx, payloadID, chunkIdx, blockIdx, blk.Generation)
 
 				logger.Debug("Flush dedup: block already exists, skipping upload",
 					"payloadID", payloadID,
@@ -286,7 +297,8 @@ func (m *Offloader) uploadRemainingBlocks(ctx context.Context, payloadID string)
 		// data from cache. Subsequent writes re-allocate the block buffer with
 		// a fresh coverage bitmap, losing the previously-written data. Reads then
 		// return zeros for the lost region instead of the actual data.
-		if !m.cache.MarkBlockUploading(ctx, payloadID, chunkIdx, blockIdx) {
+		uploadGen, ok := m.cache.MarkBlockUploading(ctx, payloadID, chunkIdx, blockIdx)
+		if !ok {
 			logger.Debug("Flush: block already being uploaded or not found, skipping",
 				"payloadID", payloadID,
 				"chunkIdx", chunkIdx,
@@ -306,10 +318,7 @@ func (m *Offloader) uploadRemainingBlocks(ctx context.Context, payloadID string)
 
 		// Also mark in state.uploaded to prevent future flushes from trying
 		if state != nil {
-			key := blockKey{chunkIdx: chunkIdx, blockIdx: blockIdx}
-			state.blocksMu.Lock()
-			state.uploaded[key] = true
-			state.blocksMu.Unlock()
+			state.markUploaded(blockKey{chunkIdx: chunkIdx, blockIdx: blockIdx})
 		}
 
 		wg.Add(1)
@@ -317,7 +326,7 @@ func (m *Offloader) uploadRemainingBlocks(ctx context.Context, payloadID string)
 		// Acquire semaphore slot (blocking for flush)
 		m.uploadSem <- struct{}{}
 
-		go func(uploadData []byte, dataSize, chunkIdx, blockIdx uint32, hash [32]byte) {
+		go func(uploadData []byte, dataSize, chunkIdx, blockIdx uint32, hash [32]byte, gen uint64) {
 			defer func() {
 				<-m.uploadSem // Release semaphore slot
 				wg.Done()
@@ -342,17 +351,15 @@ func (m *Offloader) uploadRemainingBlocks(ctx context.Context, payloadID string)
 				// Revert block to Pending so it can be retried
 				m.cache.MarkBlockPending(ctx, payloadID, chunkIdx, blockIdx)
 				if state != nil {
-					key := blockKey{chunkIdx: chunkIdx, blockIdx: blockIdx}
-					state.blocksMu.Lock()
-					state.uploaded[key] = false
-					state.blocksMu.Unlock()
+					state.revertUploaded(blockKey{chunkIdx: chunkIdx, blockIdx: blockIdx})
 				}
 				return
 			}
 
-			// Handle successful upload (ObjectStore, hash tracking, cache marking)
+			// Handle successful upload (ObjectStore, hash tracking, cache marking).
 			// Data stays in cache for reads, evictable by LRU when marked Uploaded.
-			m.handleUploadSuccess(ctx, payloadID, chunkIdx, blockIdx, hash, dataSize)
+			// If generation is stale, handleUploadSuccess reverts state.uploaded.
+			m.handleUploadSuccess(ctx, payloadID, chunkIdx, blockIdx, hash, dataSize, gen)
 
 			logger.Info("Flush upload complete",
 				"payloadID", payloadID,
@@ -360,7 +367,7 @@ func (m *Offloader) uploadRemainingBlocks(ctx context.Context, payloadID string)
 				"hash", hashB64(hash),
 				"duration", time.Since(startTime),
 				"size", dataSize)
-		}(uploadData, dataSize, chunkIdx, blockIdx, hash)
+		}(uploadData, dataSize, chunkIdx, blockIdx, hash, uploadGen)
 	}
 
 	wg.Wait()
