@@ -11,8 +11,8 @@ import (
 // SIGNING_CAPABILITIES negotiate context.
 //
 // GMAC = AES-GCM with empty plaintext, message as AAD.
-// Nonce is derived from the MessageId field (bytes 28-35 of SMB2 header),
-// zero-padded to 12 bytes.
+// Nonce is derived from the MessageId field (bytes 24-31 of SMB2 header)
+// plus server/cancel flag bits in byte 8.
 type GMACSigner struct {
 	key [KeySize]byte
 	gcm cipher.AEAD

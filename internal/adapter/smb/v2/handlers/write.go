@@ -71,8 +71,8 @@ type WriteResponse struct {
 // DecodeWriteRequest parses an SMB2 WRITE request from wire format [MS-SMB2] 2.2.21.
 // It extracts all fields including the variable-length data buffer, whose
 // location is determined by DataOffset (relative to SMB2 header).
-// The fixed structure is 48 bytes. StructureSize is 49 per spec (includes 1 byte
-// of Buffer), but zero-length writes may omit the Buffer byte.
+// The fixed structure is 48 bytes (StructureSize=49 includes 1-byte Buffer placeholder).
+// Returns an error if the body is less than 48 bytes.
 func DecodeWriteRequest(body []byte) (*WriteRequest, error) {
 	if len(body) < 48 {
 		return nil, fmt.Errorf("WRITE request too short: %d bytes", len(body))
@@ -116,7 +116,7 @@ func DecodeWriteRequest(body []byte) (*WriteRequest, error) {
 			// Fallback: data might be right after the 48-byte fixed structure
 			req.Data = body[48 : 48+int(req.Length)]
 		} else {
-			return nil, fmt.Errorf("WRITE request body too short for Length=%d: have %d bytes after fixed structure", req.Length, len(body)-48)
+			return nil, fmt.Errorf("write request body too short: need %d bytes, have %d", req.Length, len(body)-48)
 		}
 	}
 
@@ -268,11 +268,11 @@ func (h *Handler) Write(ctx *SMBHandlerContext, req *WriteRequest) (*WriteRespon
 	}
 
 	// ========================================================================
-	// Step 6: Get metadata and content services
+	// Step 6: Get metadata service and block store
 	// ========================================================================
 
 	metaSvc := h.Registry.GetMetadataService()
-	payloadSvc := h.Registry.GetBlockService()
+	blockStore := h.Registry.GetBlockStore()
 
 	// ========================================================================
 	// Step 7: Build AuthContext
@@ -305,7 +305,13 @@ func (h *Handler) Write(ctx *SMBHandlerContext, req *WriteRequest) (*WriteRespon
 	// Step 9: Prepare write operation
 	// ========================================================================
 
-	newSize := req.Offset + uint64(len(req.Data))
+	// Validate offset + length doesn't overflow
+	writeLen := uint64(len(req.Data))
+	newSize := req.Offset + writeLen
+	if newSize < req.Offset {
+		// Overflow - invalid parameter, not a disk space issue
+		return &WriteResponse{SMBResponseBase: SMBResponseBase{Status: types.StatusInvalidParameter}}, nil
+	}
 	writeOp, err := metaSvc.PrepareWrite(authCtx, openFile.MetadataHandle, newSize)
 	if err != nil {
 		logger.Debug("WRITE: prepare failed", "path", openFile.Path, "error", err)
@@ -313,12 +319,12 @@ func (h *Handler) Write(ctx *SMBHandlerContext, req *WriteRequest) (*WriteRespon
 	}
 
 	// ========================================================================
-	// Step 10: Write data to ContentService (uses Cache internally)
+	// Step 10: Write data to BlockStore (uses local cache internally)
 	// ========================================================================
 
 	bytesWritten := len(req.Data)
 
-	err = payloadSvc.WriteAt(authCtx.Context, writeOp.PayloadID, req.Data, req.Offset)
+	err = blockStore.WriteAt(authCtx.Context, string(writeOp.PayloadID), req.Data, req.Offset)
 	if err != nil {
 		logger.Warn("WRITE: content write failed", "path", openFile.Path, "error", err)
 		return &WriteResponse{SMBResponseBase: SMBResponseBase{Status: ContentErrorToSMBStatus(err)}}, nil

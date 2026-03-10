@@ -533,13 +533,17 @@ func (s *MetadataService) PrewarmWriteCache(handle FileHandle, file *File) {
 // The method does NOT perform actual data reading. The protocol handler
 // coordinates between metadata and content stores.
 func (s *MetadataService) PrepareRead(ctx *AuthContext, handle FileHandle) (*ReadMetadata, error) {
+	_, err := s.storeForHandle(handle)
+	if err != nil {
+		return nil, err
+	}
+
 	// Check context
 	if err := ctx.Context.Err(); err != nil {
 		return nil, err
 	}
 
-	// Get file entry via MetadataService.GetFile which merges pending write
-	// state (size, mtime, PayloadID) for same-handle deferred commits.
+	// Get file entry (use MetadataService.GetFile to merge pending write state)
 	file, err := s.GetFile(ctx.Context, handle)
 	if err != nil {
 		return nil, err

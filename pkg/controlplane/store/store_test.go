@@ -929,13 +929,17 @@ func TestPostgresDSN(t *testing.T) {
 		t.Error("expected non-empty DSN")
 	}
 	// Check that all parts are present
-	if !strings.Contains(dsn, "host=localhost") {
+	if !contains(dsn, "host=localhost") {
 		t.Error("DSN should contain host")
 	}
-	if !strings.Contains(dsn, "port=5432") {
+	if !contains(dsn, "port=5432") {
 		t.Error("DSN should contain port")
 	}
-	if !strings.Contains(dsn, "sslmode=require") {
+	if !contains(dsn, "sslmode=require") {
 		t.Error("DSN should contain sslmode")
 	}
+}
+
+func contains(s, substr string) bool {
+	return strings.Contains(s, substr)
 }

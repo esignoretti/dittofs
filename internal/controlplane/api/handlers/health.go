@@ -169,11 +169,11 @@ func (h *HealthHandler) Stores(w http.ResponseWriter, r *http.Request) {
 		response.MetadataStores = append(response.MetadataStores, health)
 	}
 
-	// Check block store (via payload service)
-	payloadSvc := h.registry.GetBlockService()
-	if payloadSvc != nil {
+	// Check block store health
+	blockStore := h.registry.GetBlockStore()
+	if blockStore != nil {
 		start := time.Now()
-		err := payloadSvc.HealthCheck(ctx)
+		err := blockStore.HealthCheck(ctx)
 		latency := time.Since(start)
 
 		blockHealth := &StoreHealth{
