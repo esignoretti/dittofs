@@ -122,7 +122,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 45: Package Restructure** - Create pkg/blockstore/ hierarchy absorbing cache, payload, offloader, gc (completed 2026-03-09)
 - [x] **Phase 46: Per-Share Block Store Wiring** - Runtime manages per-share BlockStore instances replacing global PayloadService (completed 2026-03-10)
 - [x] **Phase 47: L1 Read Cache and Prefetch** - Read-through LRU cache with sequential prefetch for hot blocks (completed 2026-03-10)
-- [ ] **Phase 48: Auto-Deduced Configuration** - Derive buffer/cache sizes and concurrency from CPU/memory
+- [x] **Phase 48: Auto-Deduced Configuration** - Derive buffer/cache sizes and concurrency from CPU/memory (completed 2026-03-10)
 - [ ] **Phase 49: Testing and Documentation** - E2E tests for new CLI, multi-share isolation, updated documentation
 
 ### v4.1 NFSv4.2 Extensions
@@ -287,8 +287,8 @@ Plans:
 **Verification**: `go test ./pkg/blockstore/...` && sequential read benchmark
 **Plans**: 2 plans
 Plans:
-- [ ] 47-01-PLAN.md — ReadCache LRU type + Prefetcher sequential detector in pkg/blockstore/readcache/
-- [ ] 47-02-PLAN.md — Engine integration, config plumbing, auto-promote on flush
+- [x] 47-01-PLAN.md — ReadCache LRU type + Prefetcher sequential detector in pkg/blockstore/readcache/
+- [x] 47-02-PLAN.md — Engine integration, config plumbing, auto-promote on flush
 
 ### Phase 48: Auto-Deduced Configuration
 **Goal**: Derive buffer/cache sizes and concurrency from system resources
@@ -297,11 +297,14 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. WriteBufferMemory defaults to 25% of available memory if not configured
   2. ReadCacheMemory defaults to 12.5% of available memory if not configured
-  3. ParallelUploads defaults to max(4, runtime.NumCPU()) if not configured
-  4. ParallelDownloads defaults to max(8, runtime.NumCPU()*2) if not configured
+  3. ParallelUploads defaults to max(4, runtime.GOMAXPROCS(0)) if not configured
+  4. ParallelDownloads defaults to max(8, runtime.GOMAXPROCS(0)*2) if not configured
   5. User-provided config values override auto-deduced defaults
 **Verification**: `go test ./pkg/config/...` && config validation test
-**Plans**: TBD
+**Plans**: 2 plans
+Plans:
+- [x] 48-01-PLAN.md — System resource detection (internal/sysinfo/) and deduction functions (pkg/blockstore/defaults.go)
+- [x] 48-02-PLAN.md — Config cleanup (remove CacheConfig/OffloaderConfig), start.go wiring, config show --deduced
 
 ### Phase 49: Testing and Documentation
 **Goal**: Update E2E tests and documentation for new block store architecture
@@ -566,8 +569,8 @@ v3.8 (33-40.5) -> v4.0 (41-49) -> v4.1 (50-56) -> v4.2 (57-62)
 | 44. Data Model and API/CLI | v4.0 | 3/3 | Complete | 2026-03-09 |
 | 45. Package Restructure | v4.0 | 4/4 | Complete | 2026-03-09 |
 | 46. Per-Share Block Store Wiring | v4.0 | 3/3 | Complete | 2026-03-10 |
-| 47. L1 Read Cache and Prefetch | 2/2 | Complete    | 2026-03-10 | - |
-| 48. Auto-Deduced Configuration | v4.0 | 0/? | Not started | - |
+| 47. L1 Read Cache and Prefetch | v4.0 | 2/2 | Complete | 2026-03-10 |
+| 48. Auto-Deduced Configuration | v4.0 | 2/2 | Complete | 2026-03-10 |
 | 49. Testing and Documentation | v4.0 | 0/? | Not started | - |
 | 50. Server-Side Copy | v4.1 | 0/? | Not started | - |
 | 51. Clone/Reflinks | v4.1 | 0/? | Not started | - |

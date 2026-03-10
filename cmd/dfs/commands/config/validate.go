@@ -16,10 +16,10 @@ Checks for syntax errors, missing required fields, and invalid values.
 
 Examples:
   # Validate default config
-  dittofs config validate
+  dfs config validate
 
   # Validate specific config file
-  dittofs config validate --config /etc/dittofs/config.yaml`,
+  dfs config validate --config /etc/dittofs/config.yaml`,
 	RunE: runConfigValidate,
 }
 
@@ -45,11 +45,6 @@ func runConfigValidate(cmd *cobra.Command, args []string) error {
 	// Check JWT secret is configured
 	if !cfg.ControlPlane.HasJWTSecret() {
 		warnings = append(warnings, "JWT secret not configured - API authentication will fail")
-	}
-
-	// Check cache path is set
-	if cfg.Cache.Path == "" {
-		warnings = append(warnings, "Cache path not configured")
 	}
 
 	// Print results
