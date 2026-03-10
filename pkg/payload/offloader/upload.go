@@ -3,8 +3,10 @@ package offloader
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,15 @@ import (
 // 1 block (~8MB) is in heap at a time.
 const maxUploadBatch = 4
 
+// revertToLocal reverts a FileBlock to Local state so the periodic syncer retries it.
+func (m *Offloader) revertToLocal(ctx context.Context, fb *metadata.FileBlock) {
+	fb.State = metadata.BlockStateLocal
+	if err := m.fileBlockStore.PutFileBlock(ctx, fb); err != nil {
+		logger.Error("revertToLocal: failed to revert block state, block may be stuck in Syncing",
+			"blockID", fb.ID, "error", err)
+	}
+}
+
 // uploadPendingBlocks scans FileBlockStore for local blocks not yet synced
 // to remote, and uploads them sequentially. Called by the periodic syncer.
 //
@@ -26,6 +37,10 @@ const maxUploadBatch = 4
 // The periodic syncer guards against overlapping ticks, so at most one
 // instance of this function runs at a time.
 func (m *Offloader) uploadPendingBlocks(ctx context.Context) {
+	if m.blockStore == nil {
+		return
+	}
+
 	pending, err := m.fileBlockStore.ListLocalBlocks(ctx, m.config.UploadDelay, maxUploadBatch)
 	if err != nil {
 		logger.Warn("Periodic sync: failed to list local blocks", "error", err)
@@ -64,9 +79,7 @@ func (m *Offloader) uploadFileBlock(ctx context.Context, fb *metadata.FileBlock)
 	if err != nil {
 		logger.Warn("Sync: failed to read cache file",
 			"blockID", fb.ID, "cachePath", fb.CachePath, "error", err)
-		// Revert to Local so it can be retried
-		fb.State = metadata.BlockStateLocal
-		_ = m.fileBlockStore.PutFileBlock(ctx, fb)
+		m.revertToLocal(ctx, fb)
 		return
 	}
 
@@ -86,20 +99,17 @@ func (m *Offloader) uploadFileBlock(ctx context.Context, fb *metadata.FileBlock)
 
 	lastSlash := strings.LastIndex(fb.ID, "/")
 	payloadID := fb.ID[:lastSlash]
-	var blockIdx uint64
-	if _, err := fmt.Sscanf(fb.ID[lastSlash+1:], "%d", &blockIdx); err != nil {
+	blockIdx, err := strconv.ParseUint(fb.ID[lastSlash+1:], 10, 64)
+	if err != nil {
 		logger.Warn("Sync: failed to parse block index", "blockID", fb.ID, "error", err)
-		fb.State = metadata.BlockStateLocal
-		_ = m.fileBlockStore.PutFileBlock(ctx, fb)
+		m.revertToLocal(ctx, fb)
 		return
 	}
 	storeKey := cache.FormatStoreKey(payloadID, blockIdx)
 
 	if err := m.blockStore.WriteBlock(ctx, storeKey, data); err != nil {
 		logger.Error("Sync: upload to remote failed", "blockID", fb.ID, "error", err)
-		// Revert to Local so it can be retried
-		fb.State = metadata.BlockStateLocal
-		_ = m.fileBlockStore.PutFileBlock(ctx, fb)
+		m.revertToLocal(ctx, fb)
 		return
 	}
 
@@ -116,13 +126,16 @@ func (m *Offloader) uploadFileBlock(ctx context.Context, fb *metadata.FileBlock)
 // uploadBlock uploads a single block from cache to block store.
 // Called by queue workers for block-level upload requests.
 func (m *Offloader) uploadBlock(ctx context.Context, payloadID string, blockIdx uint64) error {
-	if !m.canProcess(ctx) {
-		return fmt.Errorf("offloader is closed")
+	if err := m.checkReady(ctx); err != nil {
+		return err
+	}
+	if m.blockStore == nil {
+		return errors.New("no remote store configured")
 	}
 
 	data, _, err := m.cache.GetBlockData(ctx, payloadID, blockIdx)
 	if err != nil {
-		return fmt.Errorf("block not in cache: blockIdx=%d", blockIdx)
+		return fmt.Errorf("block not in cache (blockIdx=%d): %w", blockIdx, err)
 	}
 
 	storeKey := cache.FormatStoreKey(payloadID, blockIdx)

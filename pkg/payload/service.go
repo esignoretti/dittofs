@@ -2,6 +2,7 @@ package payload
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/marmos91/dittofs/internal/logger"
@@ -20,10 +21,10 @@ type PayloadService struct {
 // New creates a new PayloadService. Both cache and offloader are required.
 func New(c *cache.BlockCache, tm *offloader.Offloader) (*PayloadService, error) {
 	if c == nil {
-		return nil, fmt.Errorf("cache is required")
+		return nil, errors.New("cache is required")
 	}
 	if tm == nil {
-		return nil, fmt.Errorf("offloader is required")
+		return nil, errors.New("offloader is required")
 	}
 
 	return &PayloadService{
@@ -51,7 +52,6 @@ func (s *PayloadService) readAtInternal(ctx context.Context, id metadata.Payload
 	}
 
 	payloadID := string(id)
-	hasCOWSource := cowSource != ""
 
 	// Try primary cache first
 	found, err := s.cache.ReadAt(ctx, payloadID, data, offset)
@@ -62,7 +62,7 @@ func (s *PayloadService) readAtInternal(ctx context.Context, id metadata.Payload
 		return len(data), nil
 	}
 
-	if hasCOWSource {
+	if cowSource != "" {
 		if err := s.readFromCOWSource(ctx, payloadID, string(cowSource), data, offset); err != nil {
 			return 0, err
 		}
@@ -141,11 +141,9 @@ func (s *PayloadService) WriteAt(ctx context.Context, id metadata.PayloadID, dat
 	if len(data) == 0 {
 		return nil
 	}
-
 	if err := s.cache.WriteAt(ctx, string(id), data, offset); err != nil {
 		return fmt.Errorf("cache write failed: %w", err)
 	}
-
 	return nil
 }
 
@@ -158,11 +156,11 @@ func (s *PayloadService) Truncate(ctx context.Context, id metadata.PayloadID, ne
 	return s.offloader.Truncate(ctx, payloadID, newSize)
 }
 
-// Delete removes payload from both cache and block store.
+// Delete removes payload from cache (memory + disk) and block store.
 func (s *PayloadService) Delete(ctx context.Context, id metadata.PayloadID) error {
 	payloadID := string(id)
-	if err := s.cache.Remove(ctx, payloadID); err != nil {
-		return fmt.Errorf("cache remove failed: %w", err)
+	if err := s.cache.DeleteAllBlockFiles(ctx, payloadID); err != nil {
+		return fmt.Errorf("cache delete failed: %w", err)
 	}
 	return s.offloader.Delete(ctx, payloadID)
 }
@@ -187,12 +185,7 @@ func (s *PayloadService) Exists(ctx context.Context, id metadata.PayloadID) (boo
 
 // Flush enqueues remaining dirty data for background upload (non-blocking).
 func (s *PayloadService) Flush(ctx context.Context, id metadata.PayloadID) (*FlushResult, error) {
-	result, err := s.offloader.Flush(ctx, string(id))
-	if err != nil {
-		return nil, fmt.Errorf("flush failed: %w", err)
-	}
-
-	return result, nil
+	return s.offloader.Flush(ctx, string(id))
 }
 
 // DrainAllUploads waits for all in-flight uploads across all files to complete.

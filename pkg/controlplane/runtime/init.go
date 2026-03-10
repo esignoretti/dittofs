@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,7 +72,7 @@ func CreateMetadataStoreFromConfig(ctx context.Context, storeType string, cfg in
 		if !ok || dbPath == "" {
 			dbPath, ok = config["db_path"].(string) // accept legacy key
 			if !ok || dbPath == "" {
-				return nil, fmt.Errorf("badger metadata store requires path as string")
+				return nil, errors.New("badger metadata store requires path as string")
 			}
 		}
 		return badger.NewBadgerMetadataStoreWithDefaults(ctx, dbPath)
@@ -82,7 +83,7 @@ func CreateMetadataStoreFromConfig(ctx context.Context, storeType string, cfg in
 		if host, ok := config["host"].(string); ok {
 			pgCfg.Host = host
 		} else {
-			return nil, fmt.Errorf("postgres metadata store requires host")
+			return nil, errors.New("postgres metadata store requires host")
 		}
 		if port, ok := config["port"].(float64); ok {
 			pgCfg.Port = int(port)
@@ -96,17 +97,17 @@ func CreateMetadataStoreFromConfig(ctx context.Context, storeType string, cfg in
 		} else if dbname, ok := config["dbname"].(string); ok {
 			pgCfg.Database = dbname
 		} else {
-			return nil, fmt.Errorf("postgres metadata store requires database")
+			return nil, errors.New("postgres metadata store requires database")
 		}
 		if user, ok := config["user"].(string); ok {
 			pgCfg.User = user
 		} else {
-			return nil, fmt.Errorf("postgres metadata store requires user")
+			return nil, errors.New("postgres metadata store requires user")
 		}
 		if password, ok := config["password"].(string); ok {
 			pgCfg.Password = password
 		} else {
-			return nil, fmt.Errorf("postgres metadata store requires password")
+			return nil, errors.New("postgres metadata store requires password")
 		}
 		if sslmode, ok := config["sslmode"].(string); ok {
 			pgCfg.SSLMode = sslmode
@@ -158,16 +159,12 @@ func (rt *Runtime) EnsurePayloadService(ctx context.Context) error {
 	rt.mu.Unlock()
 
 	if cacheConfig == nil {
-		return fmt.Errorf("cache configuration not set - call SetCacheConfig first")
+		return errors.New("cache configuration not set - call SetCacheConfig first")
 	}
 
 	payloadStores, err := rt.store.ListPayloadStores(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list payload stores: %w", err)
-	}
-
-	if len(payloadStores) == 0 {
-		return fmt.Errorf("no payload stores configured - add a payload store first")
 	}
 
 	cacheDir := filepath.Join(cacheConfig.Path, "blocks")
@@ -178,7 +175,7 @@ func (rt *Runtime) EnsurePayloadService(ctx context.Context) error {
 	// Use the first metadata store as FileBlockStore (it embeds the interface).
 	metaStoreNames := rt.ListMetadataStores()
 	if len(metaStoreNames) == 0 {
-		return fmt.Errorf("no metadata stores registered - add a metadata store first")
+		return errors.New("no metadata stores registered - add a metadata store first")
 	}
 	fileBlockStore, err := rt.GetMetadataStore(metaStoreNames[0])
 	if err != nil {
@@ -199,45 +196,30 @@ func (rt *Runtime) EnsurePayloadService(ctx context.Context) error {
 
 	logger.Info("BlockCache initialized", "path", cacheDir, "max_size", cacheConfig.Size)
 
-	payloadStoreCfg := payloadStores[0]
-	blockStore, err := CreateBlockStoreFromConfig(ctx, payloadStoreCfg.Type, payloadStoreCfg)
-	if err != nil {
-		return fmt.Errorf("failed to create block store: %w", err)
+	// Create block store from config if payload stores are configured.
+	// When no payload stores exist, blockStore stays nil (local-only mode).
+	var blockStore blockstore.BlockStore // nil for local-only mode
+	if len(payloadStores) > 0 {
+		payloadStoreCfg := payloadStores[0]
+		blockStore, err = CreateBlockStoreFromConfig(ctx, payloadStoreCfg.Type, payloadStoreCfg)
+		if err != nil {
+			return fmt.Errorf("failed to create block store: %w", err)
+		}
+		logger.Info("Loaded payload store", "name", payloadStoreCfg.Name, "type", payloadStoreCfg.Type)
 	}
 
-	logger.Info("Loaded payload store", "name", payloadStoreCfg.Name, "type", payloadStoreCfg.Type)
+	localOnly := blockStore == nil
 
-	// Skip fsync on COMMIT path. The cache .blk files are staging buffers for the
-	// backend block store. For S3, durability comes from remote sync, and losing
-	// cache files on power failure means re-downloading, not data loss. For memory
-	// stores, data is inherently ephemeral so fsync provides no benefit either.
-	bc.SetSkipFsync(true)
+	// When a remote store is configured, skip fsync — data durability comes from
+	// remote sync (e.g. S3), not local disk. The cache .blk files are staging
+	// buffers; losing them on power failure means re-downloading, not data loss.
+	// When local-only (no remote store), disk IS the final store, so fsync matters.
+	bc.SetSkipFsync(!localOnly)
 
-	offloaderCfg := offloader.DefaultConfig()
-	rt.mu.RLock()
-	oCfg := rt.offloaderConfig
-	rt.mu.RUnlock()
-	if oCfg != nil {
-		if oCfg.ParallelUploads > 0 {
-			offloaderCfg.ParallelUploads = oCfg.ParallelUploads
-		}
-		if oCfg.ParallelDownloads > 0 {
-			offloaderCfg.ParallelDownloads = oCfg.ParallelDownloads
-		}
-		if oCfg.PrefetchBlocks > 0 {
-			offloaderCfg.PrefetchBlocks = oCfg.PrefetchBlocks
-		}
-		if oCfg.SmallFileThreshold != 0 {
-			offloaderCfg.SmallFileThreshold = oCfg.SmallFileThreshold
-		}
-		if oCfg.UploadInterval > 0 {
-			offloaderCfg.UploadInterval = oCfg.UploadInterval
-		}
-		if oCfg.UploadDelay > 0 {
-			offloaderCfg.UploadDelay = oCfg.UploadDelay
-		}
-	}
+	// When local-only, disable eviction since blocks cannot be re-fetched from remote.
+	bc.SetEvictionEnabled(!localOnly)
 
+	offloaderCfg := rt.buildOffloaderConfig()
 	offloaderInstance := offloader.New(bc, blockStore, fileBlockStore, offloaderCfg)
 
 	payloadSvc, err := payload.New(bc, offloaderInstance)
@@ -252,11 +234,14 @@ func (rt *Runtime) EnsurePayloadService(ctx context.Context) error {
 	rt.payloadService = payloadSvc
 	rt.mu.Unlock()
 
+	mode := "remote-backed"
+	if localOnly {
+		mode = "local-only"
+	}
 	logger.Info("PayloadService initialized",
-		"payload_store", payloadStoreCfg.Name,
+		"mode", mode,
 		"parallel_uploads", offloaderCfg.ParallelUploads,
-		"parallel_downloads", offloaderCfg.ParallelDownloads,
-		"small_file_threshold", offloaderCfg.SmallFileThreshold)
+		"parallel_downloads", offloaderCfg.ParallelDownloads)
 
 	return nil
 }
@@ -275,12 +260,12 @@ func CreateBlockStoreFromConfig(ctx context.Context, storeType string, cfg inter
 		return blockmemory.New(), nil
 
 	case "filesystem":
-		return nil, fmt.Errorf("payload store type 'filesystem' removed in v4.0 -- use 'memory' or 's3'")
+		return nil, errors.New("payload store type 'filesystem' removed in v4.0 -- use 'memory' or 's3'")
 
 	case "s3":
 		bucket, ok := config["bucket"].(string)
 		if !ok || bucket == "" {
-			return nil, fmt.Errorf("s3 payload store requires bucket")
+			return nil, errors.New("s3 payload store requires bucket")
 		}
 
 		region := "us-east-1"
@@ -307,6 +292,40 @@ func CreateBlockStoreFromConfig(ctx context.Context, storeType string, cfg inter
 	default:
 		return nil, fmt.Errorf("unsupported payload store type: %s", storeType)
 	}
+}
+
+// buildOffloaderConfig merges user-supplied overrides into the default offloader config.
+func (rt *Runtime) buildOffloaderConfig() offloader.Config {
+	cfg := offloader.DefaultConfig()
+
+	rt.mu.RLock()
+	oCfg := rt.offloaderConfig
+	rt.mu.RUnlock()
+
+	if oCfg == nil {
+		return cfg
+	}
+
+	if oCfg.ParallelUploads > 0 {
+		cfg.ParallelUploads = oCfg.ParallelUploads
+	}
+	if oCfg.ParallelDownloads > 0 {
+		cfg.ParallelDownloads = oCfg.ParallelDownloads
+	}
+	if oCfg.PrefetchBlocks > 0 {
+		cfg.PrefetchBlocks = oCfg.PrefetchBlocks
+	}
+	if oCfg.SmallFileThreshold != 0 {
+		cfg.SmallFileThreshold = oCfg.SmallFileThreshold
+	}
+	if oCfg.UploadInterval > 0 {
+		cfg.UploadInterval = oCfg.UploadInterval
+	}
+	if oCfg.UploadDelay > 0 {
+		cfg.UploadDelay = oCfg.UploadDelay
+	}
+
+	return cfg
 }
 
 // LoadSharesFromStore loads shares from the database into the runtime.
