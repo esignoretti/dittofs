@@ -11,6 +11,16 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# Stop handler: called by run-all.sh cleanup as "bash script.sh stop"
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "stop" ]; then
+    systemctl stop nfs-ganesha 2>/dev/null || true
+    systemctl disable nfs-ganesha 2>/dev/null || true
+    rm -rf /export/*
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Configuration (override via environment)
 # ---------------------------------------------------------------------------
 EXPORT_DIR="${EXPORT_DIR:-/export}"

@@ -341,7 +341,7 @@ install_competitor() {
         return 0
     fi
 
-    ssh_server "DITTOFS_BRANCH=${DITTOFS_BRANCH:-main} \
+    ssh_server "DITTOFS_BRANCH=${DITTOFS_BRANCH:-develop} \
         S3_BUCKET=${S3_BUCKET:-} S3_REGION=${S3_REGION:-} \
         S3_ENDPOINT=${S3_ENDPOINT:-} \
         AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-} \
