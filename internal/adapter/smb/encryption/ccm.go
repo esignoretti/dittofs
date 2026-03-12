@@ -183,7 +183,7 @@ func (c *ccmAEAD) cbcMACAdditionalData(mac, additionalData []byte) {
 	case aLen < 0xFF00:
 		lenBuf = make([]byte, 2)
 		binary.BigEndian.PutUint16(lenBuf, uint16(aLen))
-	case aLen <= math.MaxUint32:
+	case uint64(aLen) <= math.MaxUint32:
 		lenBuf = make([]byte, 6)
 		lenBuf[0] = 0xFF
 		lenBuf[1] = 0xFE
