@@ -120,9 +120,28 @@ else
 fi
 
 log "Creating benchmark directories..."
-mkdir -p "${EXPORT_DIR}"
 mkdir -p "${DATA_DIR}"
 mkdir -p "${BENCH_MOUNT}"
+
+# Place /export on the block volume so competitor file servers (kernel-nfs,
+# ganesha, samba, rclone) have enough space for benchmark data (4×1GiB files).
+# The root filesystem is only ~8GB on PLAY2-MICRO instances.
+if mountpoint -q "${DATA_DIR}" 2>/dev/null; then
+    log "Placing ${EXPORT_DIR} on block volume at ${DATA_DIR}/export..."
+    mkdir -p "${DATA_DIR}/export"
+    chmod 777 "${DATA_DIR}/export"
+    # Remove any existing /export dir on root fs, then bind mount.
+    rm -rf "${EXPORT_DIR}" 2>/dev/null || true
+    mkdir -p "${EXPORT_DIR}"
+    mount --bind "${DATA_DIR}/export" "${EXPORT_DIR}"
+    # Persist across reboots.
+    if ! grep -q "${EXPORT_DIR}" /etc/fstab 2>/dev/null || ! grep -q "bind" /etc/fstab 2>/dev/null; then
+        echo "${DATA_DIR}/export ${EXPORT_DIR} none bind 0 0" >> /etc/fstab
+    fi
+else
+    log "WARN: Block volume not at ${DATA_DIR}, using root filesystem for ${EXPORT_DIR}"
+    mkdir -p "${EXPORT_DIR}"
+fi
 
 # Set permissions — world-writable for benchmark use.
 chmod 777 "${EXPORT_DIR}"
