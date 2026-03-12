@@ -370,12 +370,16 @@ cleanup_competitor() {
         bash ${SCRIPTS_DIR}/${script} stop" 2>/dev/null || true
 
     # Belt-and-suspenders: kill anything still on common service ports.
+    # NOTE: Do NOT unmount /export — it may be a bind mount to /data/export
+    # (block volume). FUSE unmounts are handled by stop handlers instead.
     ssh_server "fuser -k 2049/tcp 2>/dev/null; \
         systemctl stop nfs-kernel-server 2>/dev/null; \
+        systemctl stop nfs-ganesha 2>/dev/null; \
         systemctl stop rclone-nfs 2>/dev/null; \
+        systemctl stop smbd 2>/dev/null; \
         systemctl stop juicefs-mount 2>/dev/null; \
-        umount.s3ql /export 2>/dev/null; \
-        umount /export 2>/dev/null; \
+        rm -rf /export/* 2>/dev/null; \
+        rm -rf /tmp/rclone* 2>/dev/null; \
         true" 2>/dev/null || true
 }
 
