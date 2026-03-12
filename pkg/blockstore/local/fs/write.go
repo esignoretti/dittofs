@@ -58,10 +58,10 @@ func (bc *FSStore) WriteAt(ctx context.Context, payloadID string, data []byte, o
 			}
 		}
 
-		// Hard backpressure: if memory far exceeds budget, flush blocks
+		// Hard backpressure: if memory exceeds 1.5x budget, flush blocks
 		// synchronously before allocating more. Prevents OOM during write
 		// storms where NFS clients send hundreds of concurrent writes.
-		for bc.memUsed.Load() > bc.maxMemory*2 {
+		for bc.memUsed.Load() > bc.maxMemory*3/2 {
 			if !bc.flushOldestDirtyBlock(ctx) {
 				break // No flushable blocks available
 			}

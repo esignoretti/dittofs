@@ -94,11 +94,12 @@ func NewFromConfig(ctx context.Context, config Config) (*Store, error) {
 		))
 	}
 
-	// Configure HTTP client optimized for high-throughput parallel uploads.
+	// Configure HTTP client for parallel uploads. Pool size kept moderate
+	// to limit memory overhead (~50 conns x 512KB buffers = ~25MB).
 	httpTransport := &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 200,
-		MaxConnsPerHost:     200,
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 50,
+		MaxConnsPerHost:     50,
 		IdleConnTimeout:     90 * time.Second,
 		ForceAttemptHTTP2:   false,
 		TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),

@@ -160,41 +160,49 @@ func (m *Syncer) inlineFetchOrWait(ctx context.Context, payloadID string, blockI
 	m.inFlight[key] = result
 	m.inFlightMu.Unlock()
 
+	// Guarantee inFlight cleanup on all exit paths (including panics).
+	// The deferred completeInFlight uses completionErr which is set by
+	// each exit path before returning.
+	var completionErr error
+	completed := false
+	defer func() {
+		if !completed {
+			m.completeInFlight(key, result, completionErr)
+		}
+	}()
+
 	storeKey, err := m.resolveStoreKey(ctx, payloadID, blockIdx)
 	if err != nil {
-		m.completeInFlight(key, result, err)
+		completionErr = err
 		return nil, false, err
 	}
 	if storeKey == "" {
-		m.completeInFlight(key, result, nil)
 		return nil, true, nil
 	}
 
 	if m.remoteStore == nil {
-		m.completeInFlight(key, result, nil)
 		return nil, true, nil // No remote store -- treat as sparse
 	}
 
 	data, err := m.remoteStore.ReadBlock(ctx, storeKey)
 	if err != nil {
 		if errors.Is(err, blockstore.ErrBlockNotFound) {
-			m.completeInFlight(key, result, nil)
 			return nil, true, nil
 		}
-		m.completeInFlight(key, result, err)
+		completionErr = err
 		return nil, false, fmt.Errorf("download block %s: %w", storeKey, err)
 	}
 
-	// Cache write in background; piggybacked waiters are signaled after completion.
+	// Cache write synchronously; data is already downloaded so there's no
+	// reason to hold it in a background goroutine. Under high concurrency,
+	// background goroutines each holding 8MB data caused OOM.
 	blockOffset := blockIdx * uint64(BlockSize)
-	go func() {
-		bgCtx := context.Background()
-		if cacheErr := m.cache.WriteFromRemote(bgCtx, payloadID, data, blockOffset); cacheErr != nil {
-			logger.Warn("inline download: cache write failed",
-				"block", key, "error", cacheErr)
-		}
-		m.completeInFlight(key, result, nil)
-	}()
+	if cacheErr := m.cache.WriteFromRemote(ctx, payloadID, data, blockOffset); cacheErr != nil {
+		logger.Warn("inline download: cache write failed",
+			"block", key, "error", cacheErr)
+	}
+	completed = true
+	m.completeInFlight(key, result, nil)
 
 	return data, true, nil
 }
@@ -331,9 +339,21 @@ func (m *Syncer) enqueueDownload(payloadID string, blockIdx uint64) chan error {
 	req.Done = make(chan error, 1)
 
 	go func() {
-		err := <-req.Done
+		// Wait for either download completion or syncer shutdown.
+		// Without the stopCh case, this goroutine leaks if the queue
+		// is stopped before processing the request (req.Done never signaled).
+		var err error
+		select {
+		case err = <-req.Done:
+		case <-m.stopCh:
+			err = ErrClosed
+		}
 		m.completeInFlight(key, result, err)
-		callerDone <- err
+		// Non-blocking send: if caller abandoned (ctx cancelled), don't block.
+		select {
+		case callerDone <- err:
+		default:
+		}
 	}()
 
 	if !m.queue.EnqueueDownload(req) {

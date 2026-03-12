@@ -13,14 +13,14 @@ import (
 // to madvise(MADV_DONTNEED) the 8MB pages back to the OS, then re-fault them
 // on the next allocation. This was measured at 55% of CPU time in pprof.
 //
-// The channel pool holds up to 64 buffers (512MB max). Buffers survive GC
+// The channel pool holds up to 32 buffers (256MB max). Buffers survive GC
 // because they're referenced by the channel. When the pool is empty, a new
 // buffer is allocated. When the pool is full, returned buffers are dropped
 // (GC will collect them naturally without madvise churn).
 //
 // Buffers may contain stale data but that's safe -- dataSize tracks the valid
 // extent and all writes overwrite the relevant range before reading it.
-var blockBufPool = make(chan []byte, 64)
+var blockBufPool = make(chan []byte, 32)
 
 func getBlockBuf() []byte {
 	select {
