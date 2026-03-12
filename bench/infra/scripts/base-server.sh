@@ -19,7 +19,7 @@ EXPORT_DIR="${EXPORT_DIR:-/export}"
 DATA_DIR="${DATA_DIR:-/data}"
 BENCH_MOUNT="${BENCH_MOUNT:-/mnt/bench}"
 DITTOFS_REPO="${DITTOFS_REPO:-https://github.com/marmos91/dittofs.git}"
-DITTOFS_BRANCH="${DITTOFS_BRANCH:-main}"
+DITTOFS_BRANCH="${DITTOFS_BRANCH:-develop}"
 
 # ---------------------------------------------------------------------------
 # Helpers

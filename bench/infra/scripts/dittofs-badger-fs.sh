@@ -10,6 +10,16 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# Stop handler: called by run-all.sh cleanup as "bash script.sh stop"
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "stop" ]; then
+    systemctl stop dfs.service 2>/dev/null || true
+    pkill -9 dfs 2>/dev/null || true
+    rm -rf /data/metadata /data/cache /.config/dittofs /root/.config/dittofs /etc/dfs
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Configuration (override via environment)
 # ---------------------------------------------------------------------------
 EXPORT_DIR="${EXPORT_DIR:-/export}"
