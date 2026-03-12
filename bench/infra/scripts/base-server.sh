@@ -84,8 +84,41 @@ log "Installing fio..."
 apt-get install -y -qq fio
 
 # ---------------------------------------------------------------------------
-# 4. Create benchmark directories
+# 4. Mount block volume and create benchmark directories
 # ---------------------------------------------------------------------------
+log "Setting up block storage volume..."
+
+# The 150 GB block volume is attached as the first additional disk.
+# Scaleway exposes it as /dev/sdb or /dev/vdb depending on the instance type.
+DATA_DISK=""
+for dev in /dev/sdb /dev/vdb /dev/xvdb; do
+    if [ -b "$dev" ]; then
+        DATA_DISK="$dev"
+        break
+    fi
+done
+
+if [ -n "$DATA_DISK" ]; then
+    # Format only if not already formatted.
+    if ! blkid "$DATA_DISK" &>/dev/null; then
+        log "Formatting ${DATA_DISK} as ext4..."
+        mkfs.ext4 -q "$DATA_DISK"
+    fi
+    mkdir -p "${DATA_DIR}"
+    if ! mountpoint -q "${DATA_DIR}" 2>/dev/null; then
+        log "Mounting ${DATA_DISK} at ${DATA_DIR}..."
+        mount "$DATA_DISK" "${DATA_DIR}"
+        # Persist across reboots.
+        if ! grep -q "${DATA_DIR}" /etc/fstab; then
+            echo "${DATA_DISK} ${DATA_DIR} ext4 defaults,nofail 0 2" >> /etc/fstab
+        fi
+    fi
+    log "Block volume mounted: $(df -h ${DATA_DIR} | tail -1)"
+else
+    log "WARN: No block volume found, using root filesystem for ${DATA_DIR}"
+    mkdir -p "${DATA_DIR}"
+fi
+
 log "Creating benchmark directories..."
 mkdir -p "${EXPORT_DIR}"
 mkdir -p "${DATA_DIR}"

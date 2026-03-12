@@ -8,10 +8,8 @@ import (
 	scaleway "github.com/pulumiverse/pulumi-scaleway/sdk/go/scaleway"
 )
 
-// deployBench provisions an ephemeral server VM and exports its install
-// script and connection details. The orchestrator calls
-// `pulumi up --stack bench` once per competitor, then `pulumi destroy`
-// before moving to the next.
+// deployBench provisions an ephemeral server VM with a 150 GB block storage
+// volume and exports its install script and connection details.
 func deployBench(ctx *pulumi.Context) error {
 	stackCfg := config.New(ctx, "dittofs-bench")
 	cfg := loadConfig(stackCfg)
@@ -26,6 +24,16 @@ func deployBench(ctx *pulumi.Context) error {
 	// Private network ID from the base stack.
 	privateNetworkID := stackCfg.Require("privateNetworkID")
 
+	// 150 GB block storage volume for benchmark data (/data, /export).
+	dataVolume, err := scaleway.NewBlockVolume(ctx, "data-volume", &scaleway.BlockVolumeArgs{
+		SizeInGb: pulumi.Int(150),
+		Iops:     pulumi.Int(5000),
+		Tags:     pulumi.StringArray{pulumi.String("dittofs-bench"), pulumi.String(systemName)},
+	})
+	if err != nil {
+		return err
+	}
+
 	// Flexible IP for server VM — SSH access.
 	serverIP, err := scaleway.NewInstanceIp(ctx, "server-ip", &scaleway.InstanceIpArgs{
 		Tags: pulumi.StringArray{pulumi.String("dittofs-bench"), pulumi.String(systemName)},
@@ -34,13 +42,16 @@ func deployBench(ctx *pulumi.Context) error {
 		return err
 	}
 
-	// Ephemeral server VM from standard image.
+	// Ephemeral server VM from standard image with block volume attached.
 	server, err := scaleway.NewInstanceServer(ctx, "bench-server", &scaleway.InstanceServerArgs{
 		Name:  pulumi.Sprintf("bench-%s", systemName),
 		Type:  pulumi.String(cfg.VMType),
 		Image: pulumi.String(cfg.Image),
 		IpId:  serverIP.ID(),
 		Tags:  pulumi.StringArray{pulumi.String("dittofs-bench"), pulumi.String(systemName)},
+		AdditionalVolumeIds: pulumi.StringArray{
+			dataVolume.ID(),
+		},
 	})
 	if err != nil {
 		return err
