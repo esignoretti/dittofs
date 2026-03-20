@@ -15,7 +15,7 @@ DittoFS evolves from NFSv3 to full NFSv4.2 support across fifteen milestones. v1
 - [x] **v4.0 BlockStore Unification Refactor** - Phases 41-49 (shipped 2026-03-11) — [archive](milestones/v4.0-ROADMAP.md)
 - [x] **v4.2 Benchmarking & Performance** - Phases 57-62 (shipped 2026-03-04)
 - [x] **v4.3 Protocol Gap Fixes** - Phases 49.1-49.3 (shipped 2026-03-13)
-- [ ] **v4.7 Offline/Edge Resilience** - Phases 63-66 (in progress)
+- [x] **v4.7 Offline/Edge Resilience** - Phases 63-68 (shipped 2026-03-20) — [archive](milestones/v4.7-ROADMAP.md)
 - [ ] **v4.5 BlockStore Security** - Phases 49.4-49.5 (planned)
 - [ ] **v4.6 Production Hardening** - Phases 67-71 (planned)
 - [ ] **v4.8 DX/UX Improvements** - Phases 72-74 (planned)
@@ -143,12 +143,16 @@ Full phase details archived to [milestones/v4.3-ROADMAP.md](milestones/v4.3-ROAD
 
 </details>
 
-### v4.7 Offline/Edge Resilience (In Progress)
+<details>
+<summary>[x] v4.7 Offline/Edge Resilience (Phases 63-68) — SHIPPED 2026-03-20</summary>
 
 - [x] **Phase 63: Cache Retention Model and Eviction Policy** - Per-share cache retention config (pin/ttl/lru), control plane API/CLI, eviction policy enforcement (completed 2026-03-13)
 - [x] **Phase 64: S3 Health Check and Syncer Resilience** - Periodic connectivity detection, syncer backoff during outages, auto-resume and ordered drain on reconnect (completed 2026-03-16)
-- [ ] **Phase 65: Offline Read/Write Paths** - Graceful degradation serving cached blocks offline, local write acceptance when S3 unreachable
-- [ ] **Phase 66: Edge Test Infrastructure** - Pulumi Scaleway deployment, persistence verification, offline simulation via iptables, auto-sync validation
+- [x] **Phase 65: Offline Read/Write Paths** - Graceful degradation serving cached blocks offline, local write acceptance when S3 unreachable (completed 2026-03-16)
+- [x] **Phase 66: Edge Test Infrastructure** - Pulumi Scaleway deployment, persistence verification, offline simulation via iptables, auto-sync validation (delivered via PR #286)
+- [x] **Phase 68: Protocol Correctness and Hot-Reload** - NTLM flag cleanup and share hot-reload integration tests (completed 2026-03-20)
+
+</details>
 
 ### v4.5 BlockStore Security
 
@@ -234,70 +238,14 @@ Full phase details archived to [milestones/v4.3-ROADMAP.md](milestones/v4.3-ROAD
 
 ---
 
-## v4.7 Offline/Edge Resilience
+<details>
+<summary>v4.7 Offline/Edge Resilience (Phases 63-68) — SHIPPED 2026-03-20</summary>
 
-### Phase 63: Cache Retention Model and Eviction Policy
-**Goal**: Operators can configure per-share cache retention policies that control how local blocks are evicted
-**Depends on**: Phase 62 (v4.2 complete) / Phase 49.3 (v4.3 complete)
-**Requirements**: CACHE-01, CACHE-02, CACHE-03, CACHE-04, CACHE-05, CACHE-06
-**Success Criteria** (what must be TRUE):
-  1. Running `dfsctl share create --name /edge-data --retention pin` creates a share whose local blocks are never evicted, even under disk pressure
-  2. Running `dfsctl share update --name /logs --retention ttl --retention-ttl 72h` configures time-based eviction where blocks become eviction-eligible only after 72 hours since last access
-  3. Existing shares without explicit retention config behave identically to before (LRU eviction, backward compatible)
-  4. `dfsctl share show /edge-data` displays the configured retention policy and TTL (if applicable) in the output
-  5. Eviction cycle skips pinned blocks and respects TTL thresholds before marking blocks as eviction candidates
-**Plans**: 3 plans
+Full phase details archived to [milestones/v4.7-ROADMAP.md](milestones/v4.7-ROADMAP.md).
 
-Plans:
-- [x] 63-01-PLAN.md — RetentionPolicy type, Share model fields, runtime config threading
-- [x] 63-02-PLAN.md — REST API retention fields, CLI --retention/--retention-ttl flags
-- [x] 63-03-PLAN.md — Eviction policy enforcement (pin skip, TTL threshold, LRU ordering)
+4 phases, 10 plans: cache retention policies (pin/ttl/lru), S3 health monitoring with circuit breaker, offline read/write paths, NTLM flag cleanup, share hot-reload tests.
 
-### Phase 64: S3 Health Check and Syncer Resilience
-**Goal**: The syncer detects S3 connectivity loss, stops wasting resources on failed uploads, and automatically resumes when connectivity returns
-**Depends on**: Phase 63
-**Requirements**: RESIL-04, RESIL-05, RESIL-06, RESIL-07, RESIL-08
-**Success Criteria** (what must be TRUE):
-  1. A periodic health check (configurable interval, default 30s) probes the remote store and transitions between healthy/unhealthy states
-  2. When health check reports unhealthy, the GC eviction cycle is suspended (blocks that cannot be re-downloaded from S3 are not evicted)
-  3. When health check reports unhealthy, the syncer stops attempting uploads and enters exponential backoff (no wasted network/CPU on doomed requests)
-  4. When health check transitions from unhealthy to healthy, the syncer automatically resumes and drains queued blocks in upload order (oldest first)
-  5. Health state transitions are logged and observable via existing metrics/status endpoints
-**Plans**: 3 plans
-
-Plans:
-- [x] 64-01-PLAN.md — HealthMonitor type with periodic probe, state machine, configurable thresholds
-- [x] 64-02-PLAN.md — Syncer circuit breaker, eviction suspension callback, CacheStats health fields
-- [x] 64-03-PLAN.md — Integration tests for circuit breaker, recovery drain, and eviction suspension
-
-### Phase 65: Offline Read/Write Paths
-**Goal**: NFS/SMB clients can continue reading cached files and writing new data when S3 is unreachable
-**Depends on**: Phase 64
-**Requirements**: RESIL-01, RESIL-02, RESIL-03
-**Success Criteria** (what must be TRUE):
-  1. READ operations for blocks present in local cache succeed normally when the remote store is unreachable
-  2. READ operations for blocks only in S3 (not cached locally) return a clear, descriptive error indicating remote unavailability (not a generic I/O error)
-  3. WRITE operations succeed by storing data in the local block store when the remote store is unreachable, with blocks queued for sync on reconnect
-**Plans**: 2 plans
-
-Plans:
-- [ ] 65-01-PLAN.md — ErrRemoteUnavailable sentinel, health-gated read path, protocol error mapping, integration tests
-- [ ] 65-02-PLAN.md — Health endpoint degraded status, per-share health in dfs/dfsctl status
-
-### Phase 66: Edge Test Infrastructure
-**Goal**: Reproducible edge deployment and offline scenario testing on real infrastructure
-**Depends on**: Phase 65
-**Requirements**: INFRA-01, INFRA-02, INFRA-03, INFRA-04
-**Success Criteria** (what must be TRUE):
-  1. Running `pulumi up` deploys a Scaleway VM with DittoFS configured for BadgerDB metadata + local FS cache + S3 remote, ready for NFS mount
-  2. A test script uploads files via NFS mount, waits a configurable delay, then verifies all files are still readable (cache retention works, no vanishing blocks)
-  3. A test script blocks S3 connectivity via iptables, then verifies cached files are still readable and new writes are accepted locally
-  4. A test script restores S3 connectivity and verifies that locally-written blocks are automatically uploaded to S3 within a bounded time
-**Plans**: TBD
-
-Plans:
-- [ ] 66-01: Pulumi stack and VM provisioning (Scaleway, DittoFS config, NFS mount)
-- [ ] 66-02: Edge test scripts (persistence, offline simulation, auto-sync verification)
+</details>
 
 ---
 
@@ -351,13 +299,8 @@ Plans:
 **Depends on**: Phase 67
 **Requirements**: PROTO-02, RUNTIME-01
 **Reference**: GitHub #215, #235
-**Success Criteria** (what must be TRUE):
-  1. NTLM CHALLENGE_MESSAGE no longer advertises NTLMSSP_NEGOTIATE_SEAL or NTLMSSP_NEGOTIATE_128/56 flags when encryption is not implemented
-  2. Strict NTLM clients (e.g., smbclient with require signing) negotiate sessions without capability mismatch errors
-  3. Running `dfsctl share create --name /new-share ...` while the server is running makes the share immediately accessible via NFS mount and SMB tree connect without restarting dfs
-  4. Both NFS EXPORT/MNT and SMB tree connect enumerate the newly created share within seconds of creation
-**Verification**: `go build ./...` && `go test ./...` && runtime share creation test
-**Plans**: TBD
+**Note**: Executed as part of v4.7 milestone (completed 2026-03-20)
+**Plans**: 2/2 complete
 
 ### Phase 69: Storage Observability and Quotas
 **Goal**: Operators can see real storage usage, and per-share quotas enforce size limits reported accurately via NFS and SMB
@@ -617,14 +560,11 @@ v3.8 (33-40.5) -> v4.2 (57-62) -> v4.0 (41-49) -> v4.3 (49.1-49.3) -> v4.7 (63-6
 | 57-62 | v4.2 | Complete | Complete | 2026-03-04 |
 | 41-49 | v4.0 | 24/24 | Complete | 2026-03-11 |
 | 49.1-49.3 | v4.3 | 1/1 | Complete | 2026-03-13 |
-| 63. Cache Retention Model | 3/3 | Complete    | 2026-03-13 | - |
-| 64. S3 Health Check + Syncer Resilience | 3/3 | Complete    | 2026-03-16 | - |
-| 65. Offline Read/Write Paths | 2/2 | Complete    | 2026-03-16 | - |
-| 66. Edge Test Infrastructure | v4.7 | 0/2 | Not started | - |
+| 63-68 | v4.7 | 10/10 | Complete | 2026-03-20 |
 | 49.4 Block-Level Compression | v4.5 | 0/? | Not started | - |
 | 49.5 Client-Side Encryption | v4.5 | 0/? | Not started | - |
 | 67. SMB3 Signing Fix | v4.6 | 0/? | Not started | - |
-| 68. Protocol Correctness and Hot-Reload | v4.6 | 0/? | Not started | - |
+| 68. Protocol Correctness and Hot-Reload | v4.7 | 2/2 | Complete | 2026-03-20 |
 | 69. Storage Observability and Quotas | v4.6 | 0/? | Not started | - |
 | 70. Unified Client Tracking | v4.6 | 0/? | Not started | - |
 | 71. Trash and Soft-Delete | v4.6 | 0/? | Not started | - |
@@ -650,3 +590,4 @@ v3.8 (33-40.5) -> v4.2 (57-62) -> v4.0 (41-49) -> v4.3 (49.1-49.3) -> v4.7 (63-6
 *v4.0 shipped: 2026-03-11*
 *v4.3 shipped: 2026-03-13*
 *v4.7 roadmap created: 2026-03-13*
+*v4.7 shipped: 2026-03-20*

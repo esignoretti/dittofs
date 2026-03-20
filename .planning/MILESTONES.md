@@ -1,5 +1,38 @@
 # Project Milestones: DittoFS NFS Protocol Evolution
 
+## v4.7 Offline/Edge Resilience (Shipped: 2026-03-20)
+
+**Delivered:** Offline/edge resilience for DittoFS — per-share cache retention policies, S3 health monitoring with circuit breaker, offline read/write paths, and protocol correctness fixes.
+
+**Phases completed:** 63-68 (4 phases, 10 plans)
+
+**Key accomplishments:**
+
+- Per-share cache retention policies (pin/ttl/lru) with REST API and CLI support
+- S3 health monitor with 3-failure threshold, exponential backoff, and automatic recovery
+- Syncer circuit breaker — pauses uploads during outage, resumes oldest-first on recovery
+- Offline read path — serves locally cached blocks when S3 unreachable, clear errors for remote-only blocks
+- Offline write path — accepts writes to local store during S3 outage, queues for sync on reconnect
+- Health observability via `/health` endpoint, `dfs status`, and `dfsctl status` with per-share health
+- NTLM challenge flag cleanup — removed unimplemented Flag128/Flag56/FlagSeal capabilities
+- Share hot-reload integration tests — OnShareChange callback lifecycle verification
+
+**Stats:**
+
+- 4 phases, 10 plans
+- 9 PRs merged (#278-#287)
+- 289,608 LOC Go
+- Mar 15 - Mar 20, 2026 (6 days)
+
+**Known gaps:**
+
+- INFRA-01 through INFRA-04: delivered via PR #286 outside GSD — no formal VERIFICATION.md
+- Nyquist validation not performed for any phase
+
+**Archive:** [v4.7-ROADMAP.md](milestones/v4.7-ROADMAP.md) | [v4.7-REQUIREMENTS.md](milestones/v4.7-REQUIREMENTS.md) | [v4.7-MILESTONE-AUDIT.md](milestones/v4.7-MILESTONE-AUDIT.md)
+
+---
+
 ## v4.3 Protocol Gap Fixes (Shipped: 2026-03-13)
 
 **Delivered:** Closed protocol gaps identified during v4.0 development — NFSv4 READDIR cookie verifier, READDIRPLUS performance, and LSA named pipe for Windows SID resolution. Two of three issues were already resolved in earlier milestones.
@@ -135,7 +168,6 @@
 
 ---
 
-
 ## v3.0 NFSv4.1 Sessions (Shipped: 2026-02-25)
 
 **Delivered:** NFSv4.1 session infrastructure with exactly-once semantics, backchannel multiplexing, directory delegations, trunking, and SMB Kerberos authentication.
@@ -173,7 +205,6 @@
 
 ---
 
-
 ## v3.5 Adapter + Core Refactoring (Shipped: 2026-02-26)
 
 **Delivered:** Clean separation of protocol-specific code from generic layers, unified lock model, restructured NFS/SMB adapters with shared infrastructure, and decomposed core objects for maintainability.
@@ -205,7 +236,6 @@
 
 ---
 
-
 ## v3.8 SMB3 Protocol Upgrade (Shipped: 2026-03-04)
 
 **Delivered:** Full SMB3.0/3.0.2/3.1.1 protocol support with enterprise security (AES encryption, signing, Kerberos), leases, durable handles, cross-protocol integration, and conformance testing.
@@ -236,4 +266,3 @@
 **Archive:** [v3.8-ROADMAP.md](milestones/v3.8-ROADMAP.md) | [v3.8-REQUIREMENTS.md](milestones/v3.8-REQUIREMENTS.md)
 
 ---
-

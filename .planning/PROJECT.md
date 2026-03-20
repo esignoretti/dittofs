@@ -2,21 +2,9 @@
 
 ## What This Is
 
-A comprehensive multi-protocol virtual filesystem with NFSv3/NFSv4.0/NFSv4.1 and SMB3.1.1 support, Kerberos authentication, unified cross-protocol locking, and advanced features like delegations, leases, durable handles, and encryption. v1.0 through v4.3 shipped. Next: Offline/Edge Resilience (v4.7) — fix cache eviction for edge deployments and enable disconnected operation with local-first reads/writes and auto-sync on reconnect.
+A comprehensive multi-protocol virtual filesystem with NFSv3/NFSv4.0/NFSv4.1 and SMB3.1.1 support, Kerberos authentication, unified cross-protocol locking, and advanced features like delegations, leases, durable handles, encryption, and offline/edge resilience. v1.0 through v4.7 shipped. Next: BlockStore Security (v4.5) or Production Hardening (v4.6).
 
 Target: Cloud-native enterprise NAS with feature parity exceeding JuiceFS and Hammerspace, particularly in security (Kerberos + AES encryption), session reliability (EOS), cross-protocol consistency, Windows SMB3.1.1 compatibility, and edge/offline resilience.
-
-## Current Milestone: v4.7 Offline/Edge Resilience
-
-**Goal:** Fix cache eviction for edge deployments and enable disconnected operation with local-first reads/writes and auto-sync on reconnect.
-
-**Target features:**
-- Diagnose & fix local block eviction (movies vanish after 3 days on edge nodes)
-- Per-share retention policy (pin mode + configurable TTL) in control plane share config
-- Offline read resilience — serve from local cache when S3 is unreachable
-- Offline write support — accept writes locally, queue for S3 sync on reconnect
-- Connectivity detection & auto-sync on reconnect
-- Test infrastructure — Scaleway VMs via Pulumi, edge scenario reproduction, offline simulation via S3 endpoint block
 
 ## Upcoming Milestones
 
@@ -114,16 +102,17 @@ Enable enterprise-grade multi-protocol file access (NFSv3, NFSv4.x, SMB3) with u
 - ✓ NFSv4 READDIR cookie verifier (mtime-based, advisory validation) — v4.3
 - ✓ READDIRPLUS performance (DirEntry.Attr in all stores) — v4.0 (verified v4.3)
 - ✓ LSA named pipe (lsarpc with SID-to-name identity resolution) — v3.6/v3.8 (verified v4.3)
+- ✓ Per-share cache retention policies (pin/ttl/lru) with REST API and CLI — v4.7
+- ✓ S3 health monitoring with circuit breaker, exponential backoff, auto-resume — v4.7
+- ✓ Offline read resilience — serve cached blocks when S3 unreachable — v4.7
+- ✓ Offline write support — accept writes locally, queue for sync on reconnect — v4.7
+- ✓ Connectivity detection & auto-sync on reconnect — v4.7
+- ✓ Health observability via REST API and CLI — v4.7
+- ✓ NTLM challenge flag cleanup (removed unimplemented capabilities) — v4.7
+- ✓ Share hot-reload callback lifecycle tested — v4.7
+- ✓ Edge test infrastructure (Pulumi + Scaleway VMs + offline simulation) — v4.7 (PR #286)
 
 ### Active
-
-#### v4.7 — Offline/Edge Resilience
-- [ ] Cache eviction diagnosis — identify why local blocks vanish after 3 days on edge deployments
-- [ ] Per-share retention policy — pin mode (default) + configurable TTL in share config
-- [ ] Offline read resilience — serve from local cache when S3 is unreachable
-- [ ] Offline write support — write locally, queue for S3 sync on reconnect
-- [ ] Connectivity detection & auto-sync — detect S3 availability, resume sync automatically
-- [ ] Edge test infrastructure — Scaleway VMs via Pulumi, offline simulation via S3 endpoint block
 
 #### v4.6 — Production Hardening
 - [ ] SMB 3.1.1 signing on macOS — fix preauth integrity hash mismatch (#252)
@@ -160,16 +149,22 @@ Enable enterprise-grade multi-protocol file access (NFSv3, NFSv4.x, SMB3) with u
 
 ## Context
 
-**Current State (post-v4.3):**
-- ~283,700 LOC Go
+**Current State (post-v4.7):**
+- ~289,600 LOC Go (167K source + 122K test)
 - NFSv3 + NFSv4.0 + NFSv4.1 + NLM + SMB3.1.1 fully implemented
 - SMB3 security: AES encryption (128/256 GCM/CCM), AES signing (CMAC/GMAC), preauth integrity
 - SMB3 features: Lease V2 with directory leasing, durable handles V1/V2, VALIDATE_NEGOTIATE_INFO
 - SPNEGO/Kerberos authentication with automatic NTLM fallback and guest session support
+- NTLM challenge cleaned: unimplemented encryption flags (Flag128/Flag56/FlagSeal) removed
+- Share hot-reload callback lifecycle fully tested (OnShareChange coverage)
 - Cross-protocol coordination: SMB3 leases <-> NFS delegations bidirectional breaks
 - Conformance testing: smbtorture baselines, WPTS BVT, go-smb2 E2E, multi-OS CI
 - Windows 11 ARM64 verified: 10/10 manual verification tests passed over SMB 3.1.1
 - K8s operator with portmapper support
+- Per-share cache retention policies (pin/ttl/lru) with eviction enforcement
+- S3 health monitor with circuit breaker and auto-recovery
+- Offline read/write paths — local-first operation with queued sync on reconnect
+- Edge test infrastructure: Pulumi + Scaleway VMs + iptables-based offline simulation
 
 **Known tech debt:**
 - ACL enforcement in CheckAccess deferred (POSIX permissions enforced instead)
@@ -266,6 +261,13 @@ Enable enterprise-grade multi-protocol file access (NFSv3, NFSv4.x, SMB3) with u
 | Per-adapter connection pools | Isolation between NFS and SMB, simpler limits | ✓ Good — Phase 01 |
 | Mtime-based NFSv4 READDIR cookie verifier | Matches NFSv3 pattern, advisory-only mismatch validation | ✓ Good — Phase 49.1 |
 | Advisory verifier (never NFS4ERR_NOT_SAME) | Lenient approach avoids breaking clients on directory changes | ✓ Good — Phase 49.1 |
+| RetentionPolicy as string type | GORM/JSON compatibility, empty defaults to LRU (CACHE-06) | ✓ Good — Phase 63 |
+| Per-file access tracking for eviction | Enables LRU/TTL eviction decisions; pin mode short-circuits ensureSpace | ✓ Good — Phase 63 |
+| Atomic bool/int for lock-free health state | Avoids mutex contention on health check hot path | ✓ Good — Phase 64 |
+| Circuit breaker at periodicUploader level | Clean integration point, EvictionSuspended derived not stored | ✓ Good — Phase 64 |
+| Health gate at syncer level for GetSize/Exists | Single check point for all remote access during offline mode | ✓ Good — Phase 65 |
+| Health endpoint returns 200 (not 503) for degraded | Edge nodes expected to operate offline without K8s restarts | ✓ Good — Phase 65 |
+| NTLM sealing never implemented | SMB3 AES transport encryption is the only confidentiality path | ✓ Good — Phase 68 |
 
 ---
-*Last updated: 2026-03-13 after v4.7 Offline/Edge Resilience milestone started*
+*Last updated: 2026-03-20 after v4.7 milestone*
