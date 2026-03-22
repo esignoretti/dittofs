@@ -88,6 +88,12 @@ func (s *MetadataService) PrepareWrite(ctx *AuthContext, handle FileHandle, newS
 		return nil, err
 	}
 
+	// Resolve the store once for use throughout this method.
+	store, err := s.storeForHandle(handle)
+	if err != nil {
+		return nil, err
+	}
+
 	// Fast path: check if we have cached file metadata from a previous write
 	// This avoids store.GetFile for sequential writes to the same file
 	var file *File
@@ -95,11 +101,6 @@ func (s *MetadataService) PrepareWrite(ctx *AuthContext, handle FileHandle, newS
 		file = cachedFile
 	} else {
 		// Slow path: fetch from store
-		store, err := s.storeForHandle(handle)
-		if err != nil {
-			return nil, err
-		}
-
 		fetchedFile, err := store.GetFile(ctx.Context, handle)
 		if err != nil {
 			return nil, err
@@ -125,6 +126,27 @@ func (s *MetadataService) PrepareWrite(ctx *AuthContext, handle FileHandle, newS
 			Code:    ErrInvalidArgument,
 			Message: "cannot write to non-regular file",
 			Path:    file.Path,
+		}
+	}
+
+	// Quota enforcement: best-effort check before allowing the write.
+	// This is a soft quota (standard NFS/SMB behavior): under high concurrency,
+	// multiple writes may pass the check simultaneously and slightly exceed the
+	// quota until the next check catches up. Hard atomic enforcement would require
+	// kernel-level integration which is impractical for userspace NFS/SMB servers.
+	// Truncate (shrink) and zero-byte writes are always allowed.
+	shareName := shareNameForHandle(handle)
+	quotaBytes := s.GetQuotaForShare(shareName)
+	if quotaBytes > 0 && newSize > file.Size {
+		currentUsed := store.GetUsedBytes()
+		// Safe unsigned subtraction first (we know newSize > file.Size from guard),
+		// then cast to int64. This avoids overflow when either value exceeds MaxInt64.
+		delta := int64(newSize - file.Size)
+		if currentUsed+delta > quotaBytes {
+			return nil, &StoreError{
+				Code:    ErrNoSpace,
+				Message: "share quota exceeded",
+			}
 		}
 	}
 
