@@ -250,8 +250,9 @@ func (lm *Manager) requestLeaseImpl(ctx context.Context, fileHandle FileHandle, 
 			// the second opener's response is not sent before the first
 			// client receives the OPLOCK_BREAK_NOTIFICATION.
 			breakCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
-			defer cancel()
-			if err := lm.WaitForBreakCompletion(breakCtx, handleKey); err != nil {
+			err := lm.WaitForBreakCompletion(breakCtx, handleKey)
+			cancel() // cancel immediately, not deferred — avoid context leak
+			if err != nil {
 				logger.Debug("RequestLease: break wait completed with error",
 					"fileHandle", handleKey,
 					"error", err)

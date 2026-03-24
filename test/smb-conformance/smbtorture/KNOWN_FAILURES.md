@@ -1,6 +1,6 @@
 # smbtorture Known Failures
 
-Last updated: 2026-03-19 (added 15 newly reachable tests from compound, ADS, and oplock improvements)
+Last updated: 2026-03-24 (Phase 73: ChangeNotify, session re-auth, anonymous encryption, DH/lease, timestamp freeze-thaw fixes)
 
 Tests listed here are expected to fail and will NOT cause CI to report failure.
 Only NEW failures (not in this list) will cause CI to fail.
@@ -145,36 +145,20 @@ share modes pass due to the stub implementation.
 | smb2.streams.zero-byte | Streams | ADS zero-byte handling not implemented | - |
 | smb2.create_no_streams.no_stream | Streams | No-streams create context not implemented | - |
 
-### Change Notify (Not Fully Implemented)
+### Change Notify (Remaining)
 
-Async change notification requires background notification infrastructure.
-Only basic file-level notify works.
+Phase 73 Plan 03 completed async ChangeNotify infrastructure: basedir, close,
+dir, double, mask, mask-change, rec, rmdir1-4, tree, logoff, tdis,
+tdis1, tcp, tcon now pass. Remaining tests require features not yet implemented.
 
 | Test Name | Category | Reason | Issue |
 |-----------|----------|--------|-------|
-| smb2.notify.basedir | Change Notify | Async directory notify not implemented | - |
-| smb2.notify.close | Change Notify | Notify on close not implemented | - |
-| smb2.notify.dir | Change Notify | Directory notify not implemented | - |
-| smb2.notify.double | Change Notify | Double notify not implemented | - |
-| smb2.notify.handle-permissions | Change Notify | Notify permission checks not implemented | - |
-| smb2.notify.invalid-reauth | Change Notify | Notify reauth handling not implemented | - |
-| smb2.notify.logoff | Change Notify | Notify on logoff not implemented | - |
-| smb2.notify.mask | Change Notify | Notify mask filtering not implemented | - |
-| smb2.notify.mask-change | Change Notify | Notify mask change not implemented | - |
-| smb2.notify.overflow | Change Notify | Notify buffer overflow not implemented | - |
-| smb2.notify.rec | Change Notify | Recursive notify not implemented | - |
-| smb2.notify.rmdir1 | Change Notify | Notify on rmdir not implemented | - |
-| smb2.notify.rmdir2 | Change Notify | Notify on rmdir not implemented | - |
-| smb2.notify.rmdir3 | Change Notify | Notify on rmdir not implemented | - |
-| smb2.notify.rmdir4 | Change Notify | Notify on rmdir not implemented | - |
-| smb2.notify.session-reconnect | Change Notify | Notify session reconnect not implemented | - |
-| smb2.notify.tcon | Change Notify | Notify on tree connect not implemented | - |
-| smb2.notify.tcp | Change Notify | Notify over TCP not implemented | - |
-| smb2.notify.tdis | Change Notify | Notify on tree disconnect not implemented | - |
-| smb2.notify.tdis1 | Change Notify | Notify on tree disconnect not implemented | - |
-| smb2.notify.tree | Change Notify | Tree-level notify not implemented | - |
-| smb2.notify.valid-req | Change Notify | Notify valid request checks not implemented | - |
-| smb2.change_notify_disabled.notfiy_disabled | Change Notify | Change notify disabled test not implemented | - |
+| smb2.notify.handle-permissions | Change Notify | Notify per-handle permission enforcement not tested | - |
+| smb2.notify.invalid-reauth | Change Notify | Notify re-auth interaction edge case | - |
+| smb2.notify.overflow | Change Notify | Notify buffer overflow edge case | - |
+| smb2.notify.session-reconnect | Change Notify | Depends on session reconnect (not re-auth) | - |
+| smb2.notify.valid-req | Change Notify | CompletionFilter validation rejects previously-accepted requests | - |
+| smb2.change_notify_disabled.notfiy_disabled | Change Notify | Change notify disabled mode test | - |
 
 ### Oplocks (Multi-Client Coordination Not Implemented)
 
@@ -670,20 +654,16 @@ share mode enforcement during rename.
 | smb2.rename.no_share_delete_no_delete_access | Rename | Rename share mode enforcement not working | - |
 | smb2.rename.rename_dir_openfile | Rename | Rename directory with open file not working | - |
 
-### Sessions (Fix Candidate)
+### Sessions (Remaining)
 
-Session management partially implemented but tests fail due to incomplete
-session reconnect and re-authentication logic.
+Phase 73 Plan 03 implemented session re-authentication with key re-derivation
+per MS-SMB2 3.3.5.5.3. reauth2-6 now pass. Remaining tests need session
+reconnect or multi-channel binding.
 
 | Test Name | Category | Reason | Issue |
 |-----------|----------|--------|-------|
 | smb2.session.reconnect1 | Sessions | Session reconnect not fully working | - |
 | smb2.session.reconnect2 | Sessions | Session reconnect not fully working | - |
-| smb2.session.reauth2 | Sessions | Session re-authentication not fully working | - |
-| smb2.session.reauth3 | Sessions | Session re-authentication not fully working | - |
-| smb2.session.reauth4 | Sessions | Session re-authentication not fully working | - |
-| smb2.session.reauth5 | Sessions | Session re-authentication not fully working | - |
-| smb2.session.reauth6 | Sessions | Session re-authentication not fully working | - |
 | smb2.session.bind_negative_smb202 | Sessions | Session binding validation not fully working | - |
 | smb2.session.bind_negative_smb210s | Sessions | Session binding validation not fully working | - |
 | smb2.session.bind_negative_smb210d | Sessions | Session binding validation not fully working | - |
@@ -757,16 +737,13 @@ Newly reachable after GMAC signing fix.
 | smb2.session.encryption-aes-256-ccm | Session encryption | AES-256-CCM encryption test not fully passing | - |
 | smb2.session.encryption-aes-256-gcm | Session encryption | AES-256-GCM encryption test not fully passing | - |
 
-### Anonymous Session (Signing/Encryption Tests)
+### Anonymous Session (Remaining)
 
-Anonymous session tests for signing and encryption edge cases.
-Newly reachable after GMAC signing fix.
+Phase 73 Plan 03 implemented anonymous session encryption bypass per MS-SMB2
+3.3.5.2.9. anon-encryption1-3 now pass. Remaining signing tests need further work.
 
 | Test Name | Category | Reason | Issue |
 |-----------|----------|--------|-------|
-| smb2.session.anon-encryption1 | Anonymous session | Anonymous session encryption not fully passing | - |
-| smb2.session.anon-encryption2 | Anonymous session | Anonymous session encryption not fully passing | - |
-| smb2.session.anon-encryption3 | Anonymous session | Anonymous session encryption not fully passing | - |
 | smb2.session.anon-signing1 | Anonymous session | Anonymous session signing not fully passing | - |
 | smb2.session.anon-signing2 | Anonymous session | Anonymous session signing not fully passing | - |
 
@@ -827,7 +804,7 @@ incomplete delayed-write and timestamp freeze/unfreeze logic.
 | smb2.timestamps.delayed-write-vs-flush | Timestamps | Delayed write vs flush timestamp not working | - |
 | smb2.timestamps.delayed-write-vs-setbasic | Timestamps | Delayed write vs setbasic timestamp not working | - |
 | smb2.timestamps.delayed-write-vs-seteof | Timestamps | Delayed write vs seteof timestamp not working | - |
-| smb2.timestamps.freeze-thaw | Timestamps | CreationTime drifts during freeze — metadata auto-update source needs investigation | - |
+| smb2.timestamps.freeze-thaw | Timestamps | CreationTime freeze/unfreeze not fully working | - |
 
 ### Scan (Full Operation Enumeration)
 
@@ -838,6 +815,14 @@ iterates all QUERY_DIRECTORY information classes. Both hit unimplemented classes
 | Test Name | Category | Reason | Issue |
 |-----------|----------|--------|-------|
 | smb2.scan.scan | Scan | Full operation scan hits unimplemented info classes | - |
+
+## Changelog
+
+### Phase 73 (2026-03-24)
+Removed ~24 tests (ChangeNotify, session re-auth, anonymous encryption).
+Re-added ~28 tests that were prematurely removed (durable handles, leases,
+notify valid-req, freeze-thaw). Fixed rw.invalid and kernel_oplocks5 regressions.
+Reverted post-conflict lease granting (caused kernel_oplocks5 regression).
 
 ## Notes
 
