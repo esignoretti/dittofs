@@ -58,6 +58,7 @@ type Handler struct {
 
 	// Change notification management
 	NotifyRegistry *NotifyRegistry
+	nextAsyncId    atomic.Uint64
 
 	// Configuration
 	MaxTransactSize uint32
@@ -490,8 +491,17 @@ func (h *Handler) closeFilesWithFilter(
 		return true
 	})
 
-	// Second pass: delete collected file handles
+	// Second pass: delete collected file handles and clean up associated state
 	for _, fileID := range toDelete {
+		// Unregister any pending CHANGE_NOTIFY watchers for this handle.
+		// The CLOSE handler (close.go) does this for explicit closes, but
+		// closeFilesWithFilter bypasses the CLOSE handler. Without this,
+		// stale watchers persist in the NotifyRegistry after connection
+		// cleanup and can fire during subsequent tests, sending async
+		// responses on dead connections with partially-destroyed sessions.
+		if h.NotifyRegistry != nil {
+			h.NotifyRegistry.Unregister(fileID)
+		}
 		h.DeleteOpenFile(fileID)
 	}
 
@@ -668,6 +678,12 @@ func (h *Handler) GenerateSessionID() uint64 {
 // GenerateTreeID generates a new unique tree ID
 func (h *Handler) GenerateTreeID() uint32 {
 	return h.nextTreeID.Add(1)
+}
+
+// generateAsyncId generates a new unique async ID for CHANGE_NOTIFY interim responses.
+// AsyncIds must be unique within a connection and non-zero.
+func (h *Handler) generateAsyncId() uint64 {
+	return h.nextAsyncId.Add(1)
 }
 
 // GenerateFileID generates a new unique file ID
