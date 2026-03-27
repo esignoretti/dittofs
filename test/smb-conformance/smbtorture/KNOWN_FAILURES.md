@@ -1,6 +1,6 @@
 # smbtorture Known Failures
 
-Last updated: 2026-03-24 (Phase 73: ChangeNotify, session re-auth, anonymous encryption, DH/lease, timestamp freeze-thaw fixes)
+Last updated: 2026-03-26 (Compression state persistence, dup_extents cleanup, stale known failures removal)
 
 Tests listed here are expected to fail and will NOT cause CI to report failure.
 Only NEW failures (not in this list) will cause CI to fail.
@@ -58,17 +58,31 @@ descriptors, and owner rights are not implemented.
 
 ### IOCTL/FSCTL Operations (Not Implemented)
 
-Server-side copy (SRV_COPYCHUNK), sparse file operations, compression, and most
-FSCTL operations are not implemented. Only shadow_copy enumeration and
-sparse_file_attr query work.
+Server-side copy (SRV_COPYCHUNK), sparse file operations, and most FSCTL operations
+are not implemented. Compression state tracking (FSCTL_GET/SET_COMPRESSION) and
+FILE_ATTRIBUTE_COMPRESSED are supported. Duplicate extents (block refcounting) tests
+skip automatically because FILE_SUPPORTS_BLOCK_REFCOUNTING is not advertised.
 
 | Test Name | Category | Reason | Issue |
 |-----------|----------|--------|-------|
 | smb2.ioctl.bug14769 | IOCTL | IOCTL edge case not implemented | - |
-| smb2.ioctl.compress_create_with_attr | IOCTL | Compression not implemented | - |
-| smb2.ioctl.compress_notsup_get | IOCTL | Compression not implemented | - |
-| smb2.ioctl.compress_notsup_set | IOCTL | Compression not implemented | - |
-| smb2.ioctl.compress_perms | IOCTL | Compression not implemented | - |
+| smb2.ioctl.compress_dir_inherit | IOCTL | Compression inheritance to child files not fully implemented | - |
+| smb2.ioctl.compress_inherit_disable | IOCTL | Compression inheritance disable not fully implemented | - |
+| smb2.ioctl.compress_perms | IOCTL | Compression attribute + ACL permission check not implemented | - |
+| smb2.ioctl.dup_extents_simple | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_len_beyond_dest | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_len_beyond_src | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_len_zero | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_compressed_src | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_sparse_dest | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_sparse_src | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_bad_handle | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_sparse_both | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_src_is_dest | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_src_is_dest_overlap | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_compressed_dest | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_src_lock | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
+| smb2.ioctl.dup_extents_dest_lock | IOCTL | Duplicate extents not implemented (may state-poison in CI) | - |
 | smb2.ioctl.copy_chunk_across_shares | IOCTL | Server-side copy not implemented | - |
 | smb2.ioctl.copy_chunk_across_shares2 | IOCTL | Server-side copy not implemented | - |
 | smb2.ioctl.copy_chunk_across_shares3 | IOCTL | Server-side copy not implemented | - |
@@ -92,12 +106,6 @@ sparse_file_attr query work.
 | smb2.ioctl.copy_chunk_write_access | IOCTL | Server-side copy not implemented | - |
 | smb2.ioctl.copy_chunk_zero_length | IOCTL | Server-side copy not implemented | - |
 | smb2.ioctl.copy-chunk | IOCTL | Server-side copy not implemented | - |
-| smb2.ioctl.dup_extents_simple | IOCTL | Duplicate extents not implemented | - |
-| smb2.ioctl.dup_extents_len_beyond_dest | IOCTL | Duplicate extents not implemented | - |
-| smb2.ioctl.dup_extents_len_zero | IOCTL | Duplicate extents not implemented | - |
-| smb2.ioctl.dup_extents_compressed_src | IOCTL | Duplicate extents not implemented | - |
-| smb2.ioctl.dup_extents_sparse_dest | IOCTL | Duplicate extents not implemented | - |
-| smb2.ioctl.dup_extents_sparse_src | IOCTL | Duplicate extents not implemented | - |
 | smb2.ioctl.bug14788.NETWORK_INTERFACE | IOCTL | Network interface enumeration not implemented | - |
 | smb2.ioctl.req_resume_key | IOCTL | Resume key for server-side copy not implemented | - |
 | smb2.ioctl.req_two_resume_keys | IOCTL | Resume key for server-side copy not implemented | - |
@@ -288,6 +296,7 @@ files, create blobs) are not implemented. Basic create operations pass.
 |-----------|----------|--------|-------|
 | smb2.create.acldir | Create | ACL-based directory create not implemented | - |
 | smb2.create.multi | Create | Multi-create fails under full suite (leftover file state) | - |
+| smb2.create.mkdir-dup | Create | Full-suite state poisoning (passes individually) | - |
 | smb2.create.aclfile | Create | ACL-based file create not implemented | - |
 | smb2.create.bench-path-contention-shared | Create | Path contention benchmark not implemented | - |
 | smb2.create.blob | Create | Create context blobs not fully implemented | - |
@@ -544,6 +553,7 @@ still fail due to incomplete reconnect, lease coordination, and persistence.
 | smb2.durable-v2-open.persistent-open-oplock | Durable handles V2 | Persistent handles not implemented | - |
 | smb2.durable-v2-open.persistent-open-lease | Durable handles V2 | Persistent handles not implemented | - |
 | smb2.durable-v2-delay.durable_v2_reconnect_delay | Durable handles V2 | DH2 reconnect delay not fully working | - |
+| smb2.durable-v2-delay.durable_v2_reconnect_delay_msec | Durable handles V2 | DH2 reconnect delay (millisecond variant) not fully working | - |
 
 ### Leases (Fix Candidate)
 
