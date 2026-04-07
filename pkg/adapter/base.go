@@ -130,6 +130,13 @@ type BaseAdapter struct {
 	// Used by tests to synchronize with server startup.
 	ListenerReady chan struct{}
 
+	// started flips to true once ServeWithFactory has bound the listener
+	// successfully. Used by [BaseAdapter.Healthcheck] to distinguish a
+	// configured-but-not-yet-started adapter (StatusUnknown) from a
+	// running one. Reset is not required: the BaseAdapter is created
+	// fresh per Serve call.
+	started atomic.Bool
+
 	// listenerMu protects access to the listener field.
 	listenerMu sync.RWMutex
 
@@ -206,10 +213,19 @@ func (b *BaseAdapter) ServeWithFactory(
 		return fmt.Errorf("failed to create %s listener on port %d: %w", b.protocolName, b.Config.Port, err)
 	}
 
-	// Store listener with mutex protection and signal readiness
+	// Store listener with mutex protection and signal readiness.
+	//
+	// Ordering invariant: started must be flipped BEFORE closing
+	// ListenerReady. Tests (and the API layer's /status routes) treat
+	// "ListenerReady has fired" as proof that the listener is bound,
+	// so any concurrent Healthcheck observing a ready listener must
+	// also see started=true. Inverting these two lines would create a
+	// window where a probe sees a ready listener but reports
+	// StatusUnknown.
 	b.listenerMu.Lock()
 	b.listener = listener
 	b.listenerMu.Unlock()
+	b.started.Store(true)
 	close(b.ListenerReady)
 
 	logger.Info(b.protocolName+" server listening", "port", b.Config.Port)

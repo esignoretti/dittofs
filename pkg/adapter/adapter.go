@@ -5,6 +5,7 @@ import (
 
 	"github.com/marmos91/dittofs/pkg/auth"
 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
+	"github.com/marmos91/dittofs/pkg/health"
 	"github.com/marmos91/dittofs/pkg/metadata/lock"
 )
 
@@ -98,6 +99,37 @@ type Adapter interface {
 	//
 	// Returns nil if the error cannot be mapped to a protocol-specific error.
 	MapError(err error) ProtocolError
+
+	// Healthcheck returns the adapter's current health as a structured
+	// [health.Report] and satisfies [health.Checker]. The API layer
+	// (phase U-E) wraps this in a [health.CachedChecker] and serves it
+	// from /adapter/{name}/status.
+	//
+	// Implementations should derive status from cheap, already-tracked
+	// signals — never run a fresh probe per call. Mapping:
+	//
+	//   - [health.StatusDisabled] when the adapter is configured off
+	//     (config.Enabled == false). Operators turned it off; nothing
+	//     to probe.
+	//   - [health.StatusUnknown] when the adapter exists but has not
+	//     yet established a known running state — most commonly the
+	//     pre-Serve startup window, but also any state the
+	//     implementation cannot positively classify (canceled probe
+	//     context, BaseAdapter without failed-start tracking, etc.).
+	//   - [health.StatusUnhealthy] when the implementation explicitly
+	//     tracks a failed lifecycle state — for example a stopped or
+	//     crashed adapter, or one whose listener died after running.
+	//     Phase U-C does not introduce that tracking, so the default
+	//     [BaseAdapter] never returns Unhealthy from "configured-on
+	//     but not started"; a future phase can add a serveAttempted /
+	//     lastServeErr field and lift that limitation.
+	//   - [health.StatusDegraded] when running but reporting recent
+	//     errors above whatever per-protocol threshold the
+	//     implementation tracks. Phase U-C does not introduce that
+	//     instrumentation either; only adapters that already had a
+	//     degraded-detection mechanism can return this today.
+	//   - [health.StatusHealthy] when running with no recent issues.
+	Healthcheck(ctx context.Context) health.Report
 }
 
 // OplockBreakerProviderKey is the Runtime adapter provider key for the OplockBreaker.
