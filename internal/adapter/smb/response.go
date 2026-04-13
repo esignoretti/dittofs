@@ -193,6 +193,13 @@ func prepareDispatch(ctx context.Context, reqHeader *header.SMB2Header, connInfo
 		if !ok || sess.LoggedOff.Load() {
 			return nil, nil, types.StatusUserSessionDeleted
 		}
+		if sess.IsExpired() {
+			logger.Debug("Kerberos ticket expired",
+				"sessionID", reqHeader.SessionID,
+				"username", sess.Username,
+				"expiresAt", sess.ExpiresAt)
+			return nil, nil, types.StatusNetworkSessionExpired
+		}
 		handlerCtx.IsGuest = sess.IsGuest
 		handlerCtx.Username = sess.Username
 	}
