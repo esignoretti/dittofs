@@ -457,7 +457,7 @@ func TestBuildSessionSetupResponse(t *testing.T) {
 func TestExtractNTLMToken(t *testing.T) {
 	t.Run("PassesThroughRawNTLM", func(t *testing.T) {
 		ntlmMsg := validNTLMNegotiateMessage()
-		result, isWrapped := extractNTLMToken(ntlmMsg)
+		result, isWrapped, mechList := extractNTLMToken(ntlmMsg)
 
 		if !auth.IsValid(result) {
 			t.Error("Should pass through raw NTLM unchanged")
@@ -465,25 +465,31 @@ func TestExtractNTLMToken(t *testing.T) {
 		if isWrapped {
 			t.Error("Raw NTLM should not be marked as wrapped")
 		}
+		if mechList != nil {
+			t.Error("Raw NTLM should yield nil mechListBytes")
+		}
 	})
 
 	t.Run("ExtractsFromSPNEGO", func(t *testing.T) {
 		ntlmMsg := validNTLMNegotiateMessage()
 		spnegoMsg := wrapInSPNEGO(ntlmMsg)
-		result, _ := extractNTLMToken(spnegoMsg)
+		result, _, mechList := extractNTLMToken(spnegoMsg)
 
 		if !auth.IsValid(result) {
 			t.Error("Should extract NTLM from SPNEGO")
 		}
+		if len(mechList) == 0 {
+			t.Error("SPNEGO NegTokenInit should yield non-empty mechListBytes")
+		}
 	})
 
 	t.Run("ReturnsEmptyForEmpty", func(t *testing.T) {
-		result, _ := extractNTLMToken(nil)
+		result, _, _ := extractNTLMToken(nil)
 		if len(result) != 0 {
 			t.Error("Should return empty for nil input")
 		}
 
-		result, _ = extractNTLMToken([]byte{})
+		result, _, _ = extractNTLMToken([]byte{})
 		if len(result) != 0 {
 			t.Error("Should return empty for empty input")
 		}
@@ -1036,6 +1042,129 @@ func TestSessionSetupConstants(t *testing.T) {
 	t.Run("SMB2HeaderSize", func(t *testing.T) {
 		if smb2HeaderSize != 64 {
 			t.Errorf("SMB2 header size = %d, expected 64", smb2HeaderSize)
+		}
+	})
+}
+
+// =============================================================================
+// buildAuthenticatedResponse MIC emission tests
+// =============================================================================
+
+// extractSecurityBuffer pulls the security buffer out of a SESSION_SETUP
+// response body written by buildSessionSetupResponse. Layout per MS-SMB2 2.2.6.
+func extractSecurityBuffer(t *testing.T, data []byte) []byte {
+	t.Helper()
+	if len(data) < 8 {
+		t.Fatalf("response body too short: %d bytes", len(data))
+	}
+	secBufLen := binary.LittleEndian.Uint16(data[6:8])
+	if secBufLen == 0 {
+		return nil
+	}
+	if len(data) < 8+int(secBufLen) {
+		t.Fatalf("truncated security buffer: need %d, have %d", 8+secBufLen, len(data))
+	}
+	return data[8 : 8+secBufLen]
+}
+
+// TestBuildAuthenticatedResponse_MICEmission asserts that when the client
+// used SPNEGO and we have the mechList + ExportedSessionKey, the final
+// accept-completed NegTokenResp includes a valid 16-byte mechListMIC and
+// omits the superfluous SupportedMech field (RFC 4178 §4.2.2 + MS-NLMP
+// 2.2.2.9.1). Guards the wiring added for #371.
+func TestBuildAuthenticatedResponse_MICEmission(t *testing.T) {
+	mechListBytes := []byte{
+		0x30, 0x0c, 0x06, 0x0a,
+		0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+	}
+	exportedSessionKey := []byte{
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+		0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+	}
+
+	t.Run("EmitsMICAndOmitsSupportedMech", func(t *testing.T) {
+		h := NewHandler()
+		pending := &PendingAuth{
+			SessionID:     1,
+			UsedSPNEGO:    true,
+			MechListBytes: mechListBytes,
+		}
+
+		result := h.buildAuthenticatedResponse(pending, exportedSessionKey, auth.FlagNTLM|auth.FlagKeyExch, false)
+
+		if result.Status != types.StatusSuccess {
+			t.Fatalf("Status = 0x%x, want STATUS_SUCCESS", result.Status)
+		}
+
+		secBuf := extractSecurityBuffer(t, result.Data)
+		if len(secBuf) == 0 {
+			t.Fatal("response carries no security buffer")
+		}
+
+		var resp gokrbspnego.NegTokenResp
+		if err := resp.Unmarshal(secBuf); err != nil {
+			t.Fatalf("unmarshal NegTokenResp: %v", err)
+		}
+
+		if resp.NegState != asn1.Enumerated(auth.NegStateAcceptCompleted) {
+			t.Errorf("NegState = %d, want accept-completed (0)", resp.NegState)
+		}
+		if len(resp.MechListMIC) != 16 {
+			t.Errorf("MechListMIC length = %d, want 16", len(resp.MechListMIC))
+		}
+		if resp.MechListMIC[0] != 0x01 {
+			t.Errorf("MechListMIC Version[0] = 0x%x, want 0x01 (NTLMSSP_SIGN_VERSION)", resp.MechListMIC[0])
+		}
+		// SeqNum field (bytes 12-15) must be zero for SPNEGO MIC.
+		for i := 12; i < 16; i++ {
+			if resp.MechListMIC[i] != 0 {
+				t.Errorf("MechListMIC SeqNum[%d] = 0x%x, want 0", i-12, resp.MechListMIC[i])
+			}
+		}
+		// RFC 4178 §4.2.2: SupportedMech is only valid in the first server
+		// reply. accept-completed is the final reply — must be absent.
+		if len(resp.SupportedMech) != 0 {
+			t.Errorf("SupportedMech should be absent, got %v", resp.SupportedMech)
+		}
+	})
+
+	t.Run("NoMICWhenKeyAbsent", func(t *testing.T) {
+		h := NewHandler()
+		pending := &PendingAuth{
+			SessionID:     2,
+			UsedSPNEGO:    true,
+			MechListBytes: mechListBytes,
+		}
+
+		// No-NT-hash path: caller passes nil exportedSessionKey.
+		result := h.buildAuthenticatedResponse(pending, nil, auth.FlagNTLM|auth.FlagKeyExch, false)
+
+		secBuf := extractSecurityBuffer(t, result.Data)
+		var resp gokrbspnego.NegTokenResp
+		if err := resp.Unmarshal(secBuf); err != nil {
+			t.Fatalf("unmarshal NegTokenResp: %v", err)
+		}
+		if len(resp.MechListMIC) != 0 {
+			t.Errorf("MechListMIC should be empty when key is nil, got %d bytes", len(resp.MechListMIC))
+		}
+		if resp.NegState != asn1.Enumerated(auth.NegStateAcceptCompleted) {
+			t.Errorf("NegState = %d, want accept-completed (0)", resp.NegState)
+		}
+	})
+
+	t.Run("NoSPNEGOEnvelopeWhenRawNTLM", func(t *testing.T) {
+		h := NewHandler()
+		pending := &PendingAuth{
+			SessionID:     3,
+			UsedSPNEGO:    false,
+			MechListBytes: mechListBytes,
+		}
+
+		result := h.buildAuthenticatedResponse(pending, exportedSessionKey, auth.FlagNTLM|auth.FlagKeyExch, false)
+
+		secBuf := extractSecurityBuffer(t, result.Data)
+		if len(secBuf) != 0 {
+			t.Errorf("raw-NTLM session should carry empty security buffer, got %d bytes", len(secBuf))
 		}
 	})
 }
