@@ -55,15 +55,11 @@ type smbResponse interface {
 //   - Response encoding with error handling
 //   - Error response generation on failures
 //
-// **Flow:**
-//
-//  1. Decode the request body using the provided decode function
-//  2. If decode fails: return error response with errorStatus
-//  3. Call the handler with the decoded request
-//  4. If handler returns error: return error response with errorStatus
-//  5. Encode the response using the Encode() method
-//  6. If encode fails: return error response with errorStatus
-//  7. Return successful HandlerResult with encoded data and status
+// Error responses (decode/handle/encode failures, or any handler-returned error
+// status) return a nil body alongside the error status. The outer
+// buildResponseHeaderAndBody layer substitutes MakeErrorBody() per
+// [MS-SMB2] 2.2.2 before the response hits the wire, so we avoid encoding a
+// command-specific body that would then be discarded.
 //
 // **Type Parameters:**
 //   - Req: The request type (must satisfy smbRequest constraint)
@@ -73,82 +69,50 @@ type smbResponse interface {
 //   - body: Raw request body bytes (after SMB2 header)
 //   - decode: Function to parse body into typed request
 //   - handle: Function to process request and return response
-//   - errorStatus: NT_STATUS code to use for error responses
-//   - makeErrorResp: Function to create an error response with given status
+//   - errorStatus: NT_STATUS code to use when decode/handle fails
+//   - makeErrorResp: retained for signature compatibility with existing
+//     callers; unused since the outer layer substitutes the ERROR body.
 //
 // **Returns:**
 //   - *HandlerResult: Contains encoded response data and status code
 //   - error: Non-nil only for system-level failures; protocol errors use status codes
-//
-// **Example:**
-//
-//	return handleRequest(
-//	    body,
-//	    handlers.DecodeReadRequest,
-//	    func(req *handlers.ReadRequest) (*handlers.ReadResponse, error) {
-//	        return h.Read(ctx, req)
-//	    },
-//	    types.StatusInvalidParameter,
-//	    func(status types.Status) *handlers.ReadResponse {
-//	        return &handlers.ReadResponse{SMBResponseBase: handlers.SMBResponseBase{Status: status}}
-//	    },
-//	)
 func handleRequest[Req smbRequest, Resp smbResponse](
 	body []byte,
 	decode func([]byte) (Req, error),
 	handle func(Req) (Resp, error),
 	errorStatus types.Status,
-	makeErrorResp func(types.Status) Resp,
+	_ func(types.Status) Resp,
 ) (*HandlerResult, error) {
-	// ========================================================================
-	// Step 1: Decode request
-	// ========================================================================
-
 	req, err := decode(body)
 	if err != nil {
 		logger.Debug("SMB: error decoding request", "error", err)
-		errorResp := makeErrorResp(errorStatus)
-		encoded, encErr := errorResp.Encode()
-		if encErr != nil {
-			return &HandlerResult{Data: nil, Status: errorStatus}, encErr
-		}
-		return &HandlerResult{Data: encoded, Status: errorStatus}, nil
+		return &HandlerResult{Status: errorStatus}, nil
 	}
-
-	// ========================================================================
-	// Step 2: Call handler
-	// ========================================================================
 
 	resp, err := handle(req)
 	if err != nil {
 		logger.Debug("SMB: handler error", "error", err)
-		errorResp := makeErrorResp(errorStatus)
-		encoded, encErr := errorResp.Encode()
-		if encErr != nil {
-			return &HandlerResult{Data: nil, Status: errorStatus}, encErr
-		}
-		return &HandlerResult{Data: encoded, Status: errorStatus}, nil
+		return &HandlerResult{Status: errorStatus}, nil
 	}
-
-	// ========================================================================
-	// Step 3: Extract status before encoding
-	// ========================================================================
 
 	status := resp.GetStatus()
 
-	// ========================================================================
-	// Step 4: Encode response
-	// ========================================================================
+	// Skip encoding whenever buildResponseHeaderAndBody will substitute
+	// MakeErrorBody() on the way out — that is, for every error status and
+	// for warning statuses other than StatusBufferOverflow. Only
+	// StatusBufferOverflow (the buffer-truncation signal carried in
+	// QUERY_INFO responses) preserves its command-specific body downstream;
+	// everything else, including StatusNoMoreFiles at end-of-enumeration,
+	// has its encoded body discarded and replaced with the 9-byte ERROR
+	// structure per [MS-SMB2] 2.2.2.
+	if status.IsError() || (status.IsWarning() && status != types.StatusBufferOverflow) {
+		return &HandlerResult{Status: status}, nil
+	}
 
 	encoded, err := resp.Encode()
 	if err != nil {
 		logger.Debug("SMB: error encoding response", "error", err)
-		errorResp := makeErrorResp(errorStatus)
-		encodedErr, encErr := errorResp.Encode()
-		if encErr != nil {
-			return &HandlerResult{Data: nil, Status: errorStatus}, encErr
-		}
-		return &HandlerResult{Data: encodedErr, Status: types.StatusInternalError}, nil
+		return &HandlerResult{Status: types.StatusInternalError}, nil
 	}
 
 	return &HandlerResult{Data: encoded, Status: status}, nil

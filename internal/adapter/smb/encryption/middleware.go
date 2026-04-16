@@ -159,6 +159,7 @@ func (m *sessionEncryptionMiddleware) EncryptResponse(sessionID uint64, smb2Mess
 	// Copy auth tag into header Signature and build wire format
 	copy(th.Signature[:], tag)
 	headerBytes := th.Encode()
+
 	return append(headerBytes, ciphertext...), nil
 }
 
