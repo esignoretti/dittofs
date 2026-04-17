@@ -10,7 +10,9 @@ import (
 //
 // This handles:
 //   - Input validation
-//   - Permission checking (write on parent)
+//   - Permission checking via checkDeletePermission: ctx.HasDeleteAccess
+//     (Windows DELETE semantics — authorized upstream, MS-FSA 2.1.5.4) or
+//     WRITE on parent (POSIX unlink(2))
 //   - Sticky bit enforcement
 //   - Hard link management (decrement or set nlink=0)
 //   - Parent timestamp updates
@@ -48,11 +50,6 @@ func (s *MetadataService) RemoveFile(ctx *AuthContext, parentHandle FileHandle, 
 		}
 	}
 
-	// Check write permission on parent
-	if err := s.checkWritePermission(ctx, parentHandle); err != nil {
-		return nil, err
-	}
-
 	// Get child handle
 	fileHandle, err := store.GetChild(ctx.Context, parentHandle, name)
 	if err != nil {
@@ -72,6 +69,11 @@ func (s *MetadataService) RemoveFile(ctx *AuthContext, parentHandle FileHandle, 
 			Message: "cannot remove directory with RemoveFile, use RemoveDirectory",
 			Path:    name,
 		}
+	}
+
+	// Check delete permission: WRITE on parent (POSIX) or owner-of-file (Windows DELETE).
+	if err := s.checkDeletePermission(ctx, parentHandle, file); err != nil {
+		return nil, err
 	}
 
 	// Check sticky bit restriction

@@ -129,8 +129,10 @@ func (resp *CloseResponse) Encode() ([]byte, error) {
 // conversion (SMB-to-NFS symlink interop), handles delete-on-close, releases
 // byte-range locks and oplocks, and unregisters any pending CHANGE_NOTIFY watches.
 //
-// Flush and delete errors are logged but do not fail the CLOSE -- the handle
-// is always released to prevent resource leaks.
+// Flush errors are logged but do not fail the CLOSE. Delete-on-close unlink
+// failures are surfaced to the client per MS-SMB2 3.3.5.10 / MS-FSA 2.1.5.4
+// (#388) — the client must know the file was not removed. The handle itself
+// is always released regardless, to prevent resource leaks.
 func (h *Handler) Close(ctx *SMBHandlerContext, req *CloseRequest) (*CloseResponse, error) {
 	logger.Debug("CLOSE request",
 		"fileID", fmt.Sprintf("%x", req.FileID),
@@ -277,6 +279,12 @@ func (h *Handler) Close(ctx *SMBHandlerContext, req *CloseRequest) (*CloseRespon
 		if err != nil {
 			logger.Warn("CLOSE: failed to build auth context for delete", "error", err)
 		} else {
+			// DELETE access was verified upstream before DeletePending was set:
+			// either by CREATE honoring FILE_DELETE_ON_CLOSE (create.go:913) or
+			// by SET_INFO FileDispositionInformation (set_info.go:752). Signal
+			// that to the metadata layer so the owner-of-target delete rule
+			// applies without loosening POSIX unlink(2) for NFS callers.
+			authCtx.HasDeleteAccess = true
 			metaSvc := h.Registry.GetMetadataService()
 			var deleteErr error
 			if openFile.IsDirectory {
@@ -286,7 +294,18 @@ func (h *Handler) Close(ctx *SMBHandlerContext, req *CloseRequest) (*CloseRespon
 			}
 
 			if deleteErr != nil {
-				logger.Debug("CLOSE: failed to delete", "path", openFile.Path, "isDir", openFile.IsDirectory, "error", deleteErr)
+				// Per MS-SMB2 3.3.5.10 and MS-FSA 2.1.5.4, a CLOSE that cannot
+				// honor DELETE_ON_CLOSE must surface the failure to the client.
+				// Returning STATUS_SUCCESS while the underlying unlink failed
+				// causes the client to believe the file is gone and reissue
+				// CREATE/CLOSE in a tight loop (smbtorture smb2.session.reauth5,
+				// issue #388).
+				resp.Status = MetadataErrorToSMBStatus(deleteErr)
+				logger.Debug("CLOSE: failed to delete",
+					"path", openFile.Path,
+					"isDir", openFile.IsDirectory,
+					"status", resp.Status,
+					"error", deleteErr)
 			} else {
 				logger.Debug("CLOSE: deleted", "path", openFile.Path, "isDir", openFile.IsDirectory)
 

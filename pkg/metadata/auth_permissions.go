@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 
 	"github.com/marmos91/dittofs/pkg/metadata/acl"
 )
@@ -431,6 +432,47 @@ func (s *MetadataService) checkPermission(ctx *AuthContext, handle FileHandle, p
 // checkWritePermission checks write permission on a file.
 func (s *MetadataService) checkWritePermission(ctx *AuthContext, handle FileHandle) error {
 	return s.checkPermission(ctx, handle, PermissionWrite, "write permission denied")
+}
+
+// checkDeletePermission checks permission to unlink an entry from a parent directory.
+//
+// Two rules, in order:
+//
+//  1. If the protocol handler set ctx.HasDeleteAccess, DELETE access was
+//     already authorized upstream (e.g. SMB CREATE with
+//     FILE_DELETE_ON_CLOSE + desiredAccess=DELETE or SET_INFO
+//     FileDispositionInformation, both of which verify the caller's grant
+//     at open time). Per MS-FSA 2.1.5.4, DELETE_ON_CLOSE honors the handle's
+//     frozen authorization regardless of the current identity — critical for
+//     SMB reauth flows where the session's UID/GID may shift between open
+//     and close for the same Kerberos principal (issue #388). Read-only
+//     shares still block this path as defense in depth.
+//  2. Otherwise, fall back to POSIX unlink(2): require WRITE on the parent
+//     directory. Keeps NFS strict.
+//
+// Sticky-bit semantics are enforced separately by CheckStickyBitRestriction,
+// which the caller must invoke after this check on the resolved file entry.
+// The `file` parameter is currently unused but reserved for future rule
+// extensions (e.g. explicit DELETE ACE evaluation) and kept for signature
+// stability across call sites.
+func (s *MetadataService) checkDeletePermission(ctx *AuthContext, parentHandle FileHandle, _ *File) error {
+	// Rule 1: upstream DELETE-access grant.
+	if ctx.HasDeleteAccess && !ctx.ShareReadOnly {
+		return nil
+	}
+
+	// Rule 2: POSIX WRITE on parent.
+	if err := s.checkWritePermission(ctx, parentHandle); err != nil {
+		var storeErr *StoreError
+		if errors.As(err, &storeErr) && storeErr.Code == ErrAccessDenied {
+			return &StoreError{
+				Code:    ErrAccessDenied,
+				Message: "delete permission denied",
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // checkReadPermission checks read permission on a file.

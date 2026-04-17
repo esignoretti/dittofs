@@ -83,6 +83,15 @@ func (f *testFixture) userContext() *metadata.AuthContext {
 	return f.authContext(1000, 1000)
 }
 
+// smbDeleteContext returns an AuthContext with HasDeleteAccess=true, simulating
+// the SMB handler path where DELETE access was verified at CREATE time before
+// reaching a delete-on-close unlink.
+func (f *testFixture) smbDeleteContext(uid, gid uint32) *metadata.AuthContext {
+	ctx := f.authContext(uid, gid)
+	ctx.HasDeleteAccess = true
+	return ctx
+}
+
 // ============================================================================
 // Service Registration Tests
 // ============================================================================
@@ -494,6 +503,255 @@ func TestMetadataService_RemoveDirectory(t *testing.T) {
 		var storeErr *metadata.StoreError
 		require.ErrorAs(t, err, &storeErr)
 		assert.Equal(t, metadata.ErrNotDirectory, storeErr.Code)
+	})
+}
+
+// ============================================================================
+// Delete permission model tests (issue #388)
+// ============================================================================
+//
+// These verify that RemoveFile/RemoveDirectory honor MS-FSA 2.1.5.1.2.1 delete
+// semantics: the caller must hold WRITE on parent OR own the target. Without the
+// owner-path rule, SMB DELETE_ON_CLOSE loops forever when the file's creator
+// asks the server to clean up its own temp file with DELETE-only access.
+
+// prepareDeletePermTest creates a parent dir owned by `dirOwner` with the given
+// mode, and a file inside owned by `fileOwner`. Setup runs as root so we can
+// arrange any ownership/mode combination regardless of whether the file owner
+// could have actually created the file. Returns the parent handle and the file
+// name so the calling test can exercise the delete permission check directly.
+func prepareDeletePermTest(t *testing.T, fx *testFixture, dirMode uint32, dirOwner, fileOwner uint32) (metadata.FileHandle, string) {
+	t.Helper()
+
+	// 1) Create parent as root with mode 0777 so we can then create children in
+	//    it regardless of the final dirOwner/dirMode we're configuring.
+	_, err := fx.service.CreateDirectory(fx.rootContext(), fx.rootHandle, "parent", &metadata.FileAttr{
+		Mode: 0777,
+	})
+	require.NoError(t, err)
+
+	parentHandle, err := fx.store.GetChild(t.Context(), fx.rootHandle, "parent")
+	require.NoError(t, err)
+
+	// 2) Create the file as root so we don't need write on parent for fileOwner.
+	_, err = fx.service.CreateFile(fx.rootContext(), parentHandle, "target.txt", &metadata.FileAttr{
+		Mode: 0644,
+	})
+	require.NoError(t, err)
+
+	fileHandle, err := fx.store.GetChild(t.Context(), parentHandle, "target.txt")
+	require.NoError(t, err)
+
+	// 3) Chown the file to its intended owner.
+	err = fx.service.SetFileAttributes(fx.rootContext(), fileHandle, &metadata.SetAttrs{
+		UID: metadata.Uint32Ptr(fileOwner),
+		GID: metadata.Uint32Ptr(fileOwner),
+	})
+	require.NoError(t, err)
+
+	// 4) Apply the desired parent ownership/mode last so the mode isn't masked
+	//    by earlier operations.
+	err = fx.service.SetFileAttributes(fx.rootContext(), parentHandle, &metadata.SetAttrs{
+		Mode: metadata.Uint32Ptr(dirMode),
+		UID:  metadata.Uint32Ptr(dirOwner),
+		GID:  metadata.Uint32Ptr(dirOwner),
+	})
+	require.NoError(t, err)
+
+	return parentHandle, "target.txt"
+}
+
+func TestMetadataService_RemoveFile_DeletePermission(t *testing.T) {
+	t.Parallel()
+
+	// Rule 1 (existing POSIX): WRITE on parent + non-owner → allow.
+	t.Run("WRITE-on-parent non-owner allowed", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		// Parent owned by 1000 with mode 0777 (world writable). File owned by 2000.
+		parentHandle, name := prepareDeletePermTest(t, fx, 0777, 1000, 2000)
+
+		// Caller 3000 has neither ownership nor anything special — only world WRITE.
+		_, err := fx.service.RemoveFile(fx.authContext(3000, 3000), parentHandle, name)
+		require.NoError(t, err)
+	})
+
+	// Rule 1 (SMB-gated): HasDeleteAccess bypasses parent-WRITE check
+	// regardless of current caller identity (MS-FSA 2.1.5.4 —
+	// authorization was frozen at CREATE, survives reauth identity drift).
+	t.Run("HasDeleteAccess bypasses parent-WRITE", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		// Parent owned by 1000 with mode 0755 (no world write). File owned by 2000.
+		parentHandle, name := prepareDeletePermTest(t, fx, 0755, 1000, 2000)
+
+		// Caller 3000 is neither owner nor has parent-WRITE. The SMB CREATE
+		// handler already verified DELETE access at open, so HasDeleteAccess
+		// is sufficient — this is the reauth5 scenario.
+		_, err := fx.service.RemoveFile(fx.smbDeleteContext(3000, 3000), parentHandle, name)
+		require.NoError(t, err)
+	})
+
+	// NFS POSIX: without HasDeleteAccess, owner still needs parent-WRITE.
+	// Preserves unlink(2) / pjdfstest behavior.
+	t.Run("no-WRITE-on-parent owner NFS-style denied", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		parentHandle, name := prepareDeletePermTest(t, fx, 0755, 1000, 2000)
+
+		// Caller 2000 owns the file but HasDeleteAccess is not set (NFS path).
+		_, err := fx.service.RemoveFile(fx.authContext(2000, 2000), parentHandle, name)
+		require.Error(t, err)
+		var storeErr *metadata.StoreError
+		require.ErrorAs(t, err, &storeErr)
+		assert.Equal(t, metadata.ErrAccessDenied, storeErr.Code)
+	})
+
+	// Read-only share: HasDeleteAccess must not bypass share-level read-only.
+	t.Run("read-only-share SMB-delete denied", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		parentHandle, name := prepareDeletePermTest(t, fx, 0755, 1000, 2000)
+
+		ctx := fx.smbDeleteContext(2000, 2000)
+		ctx.ShareReadOnly = true
+
+		_, err := fx.service.RemoveFile(ctx, parentHandle, name)
+		require.Error(t, err)
+		var storeErr *metadata.StoreError
+		require.ErrorAs(t, err, &storeErr)
+		assert.Equal(t, metadata.ErrAccessDenied, storeErr.Code)
+	})
+
+	// Sticky bit: caller has WRITE on parent but is neither the file owner
+	// nor the directory owner → sticky bit blocks the delete.
+	t.Run("sticky-bit non-owner denied", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		// Parent owned by 1000, sticky+world-writable (1777). File owned by 2000.
+		parentHandle, name := prepareDeletePermTest(t, fx, 01777, 1000, 2000)
+
+		// Caller 3000 has WRITE via world bit, but sticky restricts to
+		// root / file-owner / dir-owner.
+		_, err := fx.service.RemoveFile(fx.authContext(3000, 3000), parentHandle, name)
+		require.Error(t, err)
+		var storeErr *metadata.StoreError
+		require.ErrorAs(t, err, &storeErr)
+		assert.Equal(t, metadata.ErrAccessDenied, storeErr.Code)
+	})
+
+	// Sticky bit + caller owns file → allow (caller also has WRITE via
+	// world bit, so rule 1 grants; sticky then permits owner-of-file).
+	t.Run("sticky-bit owner-of-file allowed", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		// Parent owned by 1000, sticky+world-writable (1777). File owned by 2000.
+		parentHandle, name := prepareDeletePermTest(t, fx, 01777, 1000, 2000)
+
+		// Caller owns the file; sticky rule explicitly permits this.
+		_, err := fx.service.RemoveFile(fx.authContext(2000, 2000), parentHandle, name)
+		require.NoError(t, err)
+	})
+}
+
+// prepareDeletePermDirTest mirrors prepareDeletePermTest for empty directory
+// targets. Returns the parent handle and the name of an empty directory inside
+// it owned by `dirTargetOwner`.
+func prepareDeletePermDirTest(t *testing.T, fx *testFixture, parentMode uint32, parentOwner, dirTargetOwner uint32) (metadata.FileHandle, string) {
+	t.Helper()
+
+	_, err := fx.service.CreateDirectory(fx.rootContext(), fx.rootHandle, "parent", &metadata.FileAttr{
+		Mode: 0777,
+	})
+	require.NoError(t, err)
+
+	parentHandle, err := fx.store.GetChild(t.Context(), fx.rootHandle, "parent")
+	require.NoError(t, err)
+
+	_, err = fx.service.CreateDirectory(fx.rootContext(), parentHandle, "target", &metadata.FileAttr{
+		Mode: 0755,
+	})
+	require.NoError(t, err)
+
+	targetHandle, err := fx.store.GetChild(t.Context(), parentHandle, "target")
+	require.NoError(t, err)
+
+	err = fx.service.SetFileAttributes(fx.rootContext(), targetHandle, &metadata.SetAttrs{
+		UID: metadata.Uint32Ptr(dirTargetOwner),
+		GID: metadata.Uint32Ptr(dirTargetOwner),
+	})
+	require.NoError(t, err)
+
+	err = fx.service.SetFileAttributes(fx.rootContext(), parentHandle, &metadata.SetAttrs{
+		Mode: metadata.Uint32Ptr(parentMode),
+		UID:  metadata.Uint32Ptr(parentOwner),
+		GID:  metadata.Uint32Ptr(parentOwner),
+	})
+	require.NoError(t, err)
+
+	return parentHandle, "target"
+}
+
+func TestMetadataService_RemoveDirectory_DeletePermission(t *testing.T) {
+	t.Parallel()
+
+	// Rule 1 (POSIX): WRITE on parent + non-owner → allow.
+	t.Run("WRITE-on-parent non-owner allowed", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		parentHandle, name := prepareDeletePermDirTest(t, fx, 0777, 1000, 2000)
+
+		err := fx.service.RemoveDirectory(fx.authContext(3000, 3000), parentHandle, name)
+		require.NoError(t, err)
+	})
+
+	// SMB-gated: HasDeleteAccess bypasses parent-WRITE regardless of identity.
+	t.Run("HasDeleteAccess bypasses parent-WRITE", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		parentHandle, name := prepareDeletePermDirTest(t, fx, 0755, 1000, 2000)
+
+		err := fx.service.RemoveDirectory(fx.smbDeleteContext(3000, 3000), parentHandle, name)
+		require.NoError(t, err)
+	})
+
+	// NFS POSIX: no HasDeleteAccess + no parent-WRITE → denied.
+	t.Run("no-WRITE-on-parent NFS-style denied", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		parentHandle, name := prepareDeletePermDirTest(t, fx, 0755, 1000, 2000)
+
+		err := fx.service.RemoveDirectory(fx.authContext(2000, 2000), parentHandle, name)
+		require.Error(t, err)
+		var storeErr *metadata.StoreError
+		require.ErrorAs(t, err, &storeErr)
+		assert.Equal(t, metadata.ErrAccessDenied, storeErr.Code)
+	})
+
+	// Read-only share blocks rule 1 even with HasDeleteAccess.
+	t.Run("read-only-share SMB-delete denied", func(t *testing.T) {
+		t.Parallel()
+		fx := newTestFixture(t)
+
+		parentHandle, name := prepareDeletePermDirTest(t, fx, 0755, 1000, 2000)
+
+		ctx := fx.smbDeleteContext(2000, 2000)
+		ctx.ShareReadOnly = true
+
+		err := fx.service.RemoveDirectory(ctx, parentHandle, name)
+		require.Error(t, err)
+		var storeErr *metadata.StoreError
+		require.ErrorAs(t, err, &storeErr)
+		assert.Equal(t, metadata.ErrAccessDenied, storeErr.Code)
 	})
 }
 
