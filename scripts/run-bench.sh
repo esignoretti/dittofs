@@ -20,8 +20,11 @@
 
 set -euo pipefail
 
-SERVER=51.15.211.189
-CLIENT=51.15.199.235
+# Infra targets — override via env vars for different bench clusters.
+BENCH_SERVER="${BENCH_SERVER:-51.15.211.189}"
+BENCH_CLIENT="${BENCH_CLIENT:-51.15.199.235}"
+SERVER="$BENCH_SERVER"
+CLIENT="$BENCH_CLIENT"
 SSH="ssh -o IdentityAgent=none -i ~/.ssh/id_rsa"
 SCP="scp -o IdentityAgent=none -i ~/.ssh/id_rsa"
 
@@ -33,12 +36,17 @@ THREADS=4
 FILE_SIZE=1GiB
 BLOCK_SIZE=4KiB
 
+# DittoFS auth — override in shared envs; defaults are fine for ephemeral bench VMs.
+DITTOFS_ADMIN_PASSWORD="${DITTOFS_ADMIN_PASSWORD:-benchadmin123}"
+DITTOFS_SECRET="${DITTOFS_SECRET:-dittofs-bench-secret-key-for-jwt-1234567890}"
+
+# S3 config — credentials are required; bucket/region/endpoint have bench defaults.
 S3_REGION="${S3_REGION:-fr-par}"
 S3_BUCKET="${S3_BUCKET:-dittofs-bench-blocks}"
 S3_ENDPOINT="${S3_ENDPOINT:-https://s3.fr-par.scw.cloud}"
-S3_ACCESS_KEY="${S3_ACCESS_KEY:?S3_ACCESS_KEY must be set}"
-S3_SECRET_KEY="${S3_SECRET_KEY:?S3_SECRET_KEY must be set}"
-S3_CONFIG="{\"region\":\"${S3_REGION}\",\"bucket\":\"${S3_BUCKET}\",\"endpoint\":\"${S3_ENDPOINT}\",\"access_key_id\":\"${S3_ACCESS_KEY}\",\"secret_access_key\":\"${S3_SECRET_KEY}\",\"force_path_style\":true}"
+S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID must be set}"
+S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY must be set}"
+S3_CONFIG="{\"region\":\"${S3_REGION}\",\"bucket\":\"${S3_BUCKET}\",\"endpoint\":\"${S3_ENDPOINT}\",\"access_key_id\":\"${S3_ACCESS_KEY_ID}\",\"secret_access_key\":\"${S3_SECRET_ACCESS_KEY}\",\"force_path_style\":true}"
 
 echo "=== DittoFS Benchmark Suite ==="
 echo "Round: $ROUND"
@@ -52,12 +60,12 @@ $SSH root@$SERVER 'killall -9 dfs 2>/dev/null; sleep 1; rm -rf /root/.config/dit
 
 # 2. Start DFS
 echo "[2/7] Starting DFS..."
-$SSH root@$SERVER 'DITTOFS_CONTROLPLANE_SECRET="dittofs-bench-secret-key-for-jwt-1234567890" DITTOFS_ADMIN_INITIAL_PASSWORD="benchadmin123" nohup /usr/local/bin/dfs start --foreground > /tmp/dfs.log 2>&1 &'
+$SSH root@$SERVER "DITTOFS_CONTROLPLANE_SECRET=\"${DITTOFS_SECRET}\" DITTOFS_ADMIN_INITIAL_PASSWORD=\"${DITTOFS_ADMIN_PASSWORD}\" nohup /usr/local/bin/dfs start --foreground > /tmp/dfs.log 2>&1 &"
 sleep 4
 
 # 3. Configure stores and shares
 echo "[3/7] Configuring stores and shares..."
-$SSH root@$SERVER "dfsctl login --server http://localhost:8080 --username admin --password benchadmin123 && \
+$SSH root@$SERVER "dfsctl login --server http://localhost:8080 --username admin --password ${DITTOFS_ADMIN_PASSWORD} && \
   dfsctl store metadata add --name badger-meta --type badger --db-path /data/metadata/badger && \
   dfsctl store block local add --name fs-local --type fs --path /data/blocks && \
   dfsctl store block remote add --name s3-remote --type s3 --config '$S3_CONFIG' && \

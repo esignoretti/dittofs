@@ -16,8 +16,11 @@
 
 set -euo pipefail
 
-SERVER=51.15.211.189
-CLIENT=51.15.199.235
+# Infra targets — override via env vars for different bench clusters.
+BENCH_SERVER="${BENCH_SERVER:-51.15.211.189}"
+BENCH_CLIENT="${BENCH_CLIENT:-51.15.199.235}"
+SERVER="$BENCH_SERVER"
+CLIENT="$BENCH_CLIENT"
 SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 SCP="scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
@@ -39,10 +42,17 @@ META_FILES=1000
 SMALL_FILE_COUNT=10000
 MOUNT_POINT=/mnt/bench
 
-# DittoFS config
-DITTOFS_ADMIN_PASSWORD="benchadmin123"
-DITTOFS_SECRET="dittofs-bench-secret-key-for-jwt-1234567890"
-S3_CONFIG='{"region":"fr-par","bucket":"dittofs-bench-payload","endpoint":"https://s3.fr-par.scw.cloud","access_key_id":"SCW8SK6RJTJEHPJXNC36","secret_access_key":"81bf6d6c-fc05-4cd6-a84d-9336c2f5eb80","force_path_style":true}'
+# DittoFS auth — override in shared envs; defaults are fine for ephemeral bench VMs.
+DITTOFS_ADMIN_PASSWORD="${DITTOFS_ADMIN_PASSWORD:-benchadmin123}"
+DITTOFS_SECRET="${DITTOFS_SECRET:-dittofs-bench-secret-key-for-jwt-1234567890}"
+
+# S3 config — credentials are required; bucket/region/endpoint have bench defaults.
+S3_REGION="${S3_REGION:-fr-par}"
+S3_BUCKET="${S3_BUCKET:-dittofs-bench-payload}"
+S3_ENDPOINT="${S3_ENDPOINT:-https://s3.fr-par.scw.cloud}"
+S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID must be set}"
+S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY must be set}"
+S3_CONFIG="{\"region\":\"${S3_REGION}\",\"bucket\":\"${S3_BUCKET}\",\"endpoint\":\"${S3_ENDPOINT}\",\"access_key_id\":\"${S3_ACCESS_KEY_ID}\",\"secret_access_key\":\"${S3_SECRET_ACCESS_KEY}\",\"force_path_style\":true}"
 
 # ---------------------------------------------------------------------------
 # Logging
