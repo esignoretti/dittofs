@@ -310,6 +310,21 @@ func (r *Runtime) UpdateShare(name string, readOnly *bool, defaultPermission *st
 	return r.sharesSvc.UpdateShare(name, readOnly, defaultPermission, retentionPolicy, retentionTTL)
 }
 
+// DisableShare sets enabled=false on the share's DB row and runtime
+// registry, then notifies adapters so active sessions drop (Phase 5 D-02/D-03).
+// Idempotent on already-disabled shares (returns shares.ErrShareAlreadyDisabled
+// which callers typically treat as a benign no-op). Exposed for Phase 6's
+// POST /api/v1/shares/{name}/disable handler (D-27).
+func (r *Runtime) DisableShare(ctx context.Context, name string) error {
+	return r.sharesSvc.DisableShare(ctx, r.store, name)
+}
+
+// EnableShare inverts DisableShare. Idempotent on already-enabled shares
+// (no DB write). Phase 6's POST /api/v1/shares/{name}/enable handler (D-27).
+func (r *Runtime) EnableShare(ctx context.Context, name string) error {
+	return r.sharesSvc.EnableShare(ctx, r.store, name)
+}
+
 func (r *Runtime) GetShare(name string) (*Share, error) {
 	return r.sharesSvc.GetShare(name)
 }
@@ -430,11 +445,12 @@ func (r *Runtime) UpdateBackupRepo(ctx context.Context, repoID string) error {
 
 // RunBackup runs one backup attempt for repoID. Called by Phase 6's on-demand
 // POST /backups handler and shares the per-repo mutex with the cron path
-// (D-23). Returns storebackups.ErrBackupAlreadyRunning on contention (409 in
-// the API layer).
-func (r *Runtime) RunBackup(ctx context.Context, repoID string) (*models.BackupRecord, error) {
+// (D-23). Returns (rec, job, nil) on success so handlers can surface the
+// BackupJob ID for client polling. Returns storebackups.ErrBackupAlreadyRunning
+// on contention (409 in the API layer).
+func (r *Runtime) RunBackup(ctx context.Context, repoID string) (*models.BackupRecord, *models.BackupJob, error) {
 	if r.storeBackupsSvc == nil {
-		return nil, fmt.Errorf("storebackups service not initialized")
+		return nil, nil, fmt.Errorf("storebackups service not initialized")
 	}
 	return r.storeBackupsSvc.RunBackup(ctx, repoID)
 }
@@ -470,6 +486,16 @@ func (r *Runtime) DestFactoryFn() storebackups.DestinationFactoryFn {
 		return nil
 	}
 	return r.storeBackupsSvc.DestFactory()
+}
+
+// StoreBackupsService returns the storebackups sub-service so Phase 6's
+// REST handlers can reach RunBackup / RunRestore / RunRestoreDryRun /
+// CancelBackupJob / ValidateSchedule / RegisterRepo / UnregisterRepo /
+// UpdateRepo without the thin Runtime wrappers (which only expose a subset).
+// Returns nil when the runtime was constructed with a nil store (test
+// scaffolding) — callers must nil-check.
+func (r *Runtime) StoreBackupsService() *storebackups.Service {
+	return r.storeBackupsSvc
 }
 
 // --- Identity Mapping (delegated to identity.Service) ---

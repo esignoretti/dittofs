@@ -16,26 +16,30 @@ func normalizeShareNameForAPI(name string) string {
 
 // Share represents a share in the system.
 type Share struct {
-	ID                 string    `json:"id"`
-	Name               string    `json:"name"`
-	MetadataStoreID    string    `json:"metadata_store_id"`
-	LocalBlockStoreID  string    `json:"local_block_store_id"`
-	RemoteBlockStoreID *string   `json:"remote_block_store_id"`
-	ReadOnly           bool      `json:"read_only,omitempty"`
-	EncryptData        bool      `json:"encrypt_data,omitempty"`
-	DefaultPermission  string    `json:"default_permission,omitempty"`
-	Description        string    `json:"description,omitempty"`
-	BlockedOperations  []string  `json:"blocked_operations,omitempty"`
-	RetentionPolicy    string    `json:"retention_policy,omitempty"`
-	RetentionTTL       string    `json:"retention_ttl,omitempty"`
-	LocalStoreSize     string    `json:"local_store_size,omitempty"`
-	ReadBufferSize     string    `json:"read_buffer_size,omitempty"`
-	QuotaBytes         string    `json:"quota_bytes,omitempty"`
-	UsedBytes          int64     `json:"used_bytes"`
-	PhysicalBytes      int64     `json:"physical_bytes"`
-	UsagePercent       float64   `json:"usage_percent"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 string  `json:"id"`
+	Name               string  `json:"name"`
+	MetadataStoreID    string  `json:"metadata_store_id"`
+	LocalBlockStoreID  string  `json:"local_block_store_id"`
+	RemoteBlockStoreID *string `json:"remote_block_store_id"`
+	ReadOnly           bool    `json:"read_only,omitempty"`
+	// Enabled mirrors models.Share.Enabled — Phase 6 D-28. The tag is
+	// deliberately NOT omitempty: `false` is semantically meaningful
+	// ("share is disabled") whereas read_only:false is the inert default.
+	Enabled           bool      `json:"enabled"`
+	EncryptData       bool      `json:"encrypt_data,omitempty"`
+	DefaultPermission string    `json:"default_permission,omitempty"`
+	Description       string    `json:"description,omitempty"`
+	BlockedOperations []string  `json:"blocked_operations,omitempty"`
+	RetentionPolicy   string    `json:"retention_policy,omitempty"`
+	RetentionTTL      string    `json:"retention_ttl,omitempty"`
+	LocalStoreSize    string    `json:"local_store_size,omitempty"`
+	ReadBufferSize    string    `json:"read_buffer_size,omitempty"`
+	QuotaBytes        string    `json:"quota_bytes,omitempty"`
+	UsedBytes         int64     `json:"used_bytes"`
+	PhysicalBytes     int64     `json:"physical_bytes"`
+	UsagePercent      float64   `json:"usage_percent"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // CreateShareRequest is the request to create a share.
@@ -145,4 +149,25 @@ func (c *Client) SetGroupSharePermission(shareName, groupName, level string) err
 // RemoveGroupSharePermission removes a group's permission from a share.
 func (c *Client) RemoveGroupSharePermission(shareName, groupName string) error {
 	return c.delete(fmt.Sprintf("/api/v1/shares/%s/permissions/groups/%s", url.PathEscape(normalizeShareNameForAPI(shareName)), groupName), nil)
+}
+
+// DisableShare flips Enabled=false on the share. Returns the updated Share
+// (with Enabled=false). Admin-only on the server side (D-27).
+func (c *Client) DisableShare(name string) (*Share, error) {
+	var share Share
+	if err := c.post(fmt.Sprintf("/api/v1/shares/%s/disable",
+		url.PathEscape(normalizeShareNameForAPI(name))), nil, &share); err != nil {
+		return nil, err
+	}
+	return &share, nil
+}
+
+// EnableShare flips Enabled=true on the share. Idempotent server-side.
+func (c *Client) EnableShare(name string) (*Share, error) {
+	var share Share
+	if err := c.post(fmt.Sprintf("/api/v1/shares/%s/enable",
+		url.PathEscape(normalizeShareNameForAPI(name))), nil, &share); err != nil {
+		return nil, err
+	}
+	return &share, nil
 }

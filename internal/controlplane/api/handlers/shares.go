@@ -15,6 +15,7 @@ import (
 	"github.com/marmos91/dittofs/pkg/blockstore"
 	"github.com/marmos91/dittofs/pkg/controlplane/models"
 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
+	"github.com/marmos91/dittofs/pkg/controlplane/runtime/shares"
 	"github.com/marmos91/dittofs/pkg/controlplane/store"
 	"github.com/marmos91/dittofs/pkg/health"
 )
@@ -96,25 +97,29 @@ type UpdateShareRequest struct {
 
 // ShareResponse is the response body for share endpoints.
 type ShareResponse struct {
-	ID                 string    `json:"id"`
-	Name               string    `json:"name"`
-	MetadataStoreID    string    `json:"metadata_store_id"`
-	LocalBlockStoreID  string    `json:"local_block_store_id"`
-	RemoteBlockStoreID *string   `json:"remote_block_store_id"`
-	ReadOnly           bool      `json:"read_only"`
-	EncryptData        bool      `json:"encrypt_data"`
-	DefaultPermission  string    `json:"default_permission"`
-	BlockedOperations  []string  `json:"blocked_operations,omitempty"`
-	RetentionPolicy    string    `json:"retention_policy"`
-	RetentionTTL       string    `json:"retention_ttl,omitempty"`    // Human-readable duration
-	LocalStoreSize     string    `json:"local_store_size,omitempty"` // Human-readable byte size
-	ReadBufferSize     string    `json:"read_buffer_size,omitempty"` // Human-readable byte size
-	QuotaBytes         string    `json:"quota_bytes,omitempty"`      // Human-readable, e.g., "10 GiB" or empty if unlimited
-	UsedBytes          int64     `json:"used_bytes"`                 // Logical used bytes (sum of file sizes)
-	PhysicalBytes      int64     `json:"physical_bytes"`             // Block store disk usage
-	UsagePercent       float64   `json:"usage_percent"`              // 0-100, 0 if no quota
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 string  `json:"id"`
+	Name               string  `json:"name"`
+	MetadataStoreID    string  `json:"metadata_store_id"`
+	LocalBlockStoreID  string  `json:"local_block_store_id"`
+	RemoteBlockStoreID *string `json:"remote_block_store_id"`
+	ReadOnly           bool    `json:"read_only"`
+	// Enabled mirrors models.Share.Enabled. No omitempty — `false` is
+	// semantically meaningful (the share is disabled) and consumers must
+	// render that state explicitly (D-28).
+	Enabled           bool      `json:"enabled"`
+	EncryptData       bool      `json:"encrypt_data"`
+	DefaultPermission string    `json:"default_permission"`
+	BlockedOperations []string  `json:"blocked_operations,omitempty"`
+	RetentionPolicy   string    `json:"retention_policy"`
+	RetentionTTL      string    `json:"retention_ttl,omitempty"`    // Human-readable duration
+	LocalStoreSize    string    `json:"local_store_size,omitempty"` // Human-readable byte size
+	ReadBufferSize    string    `json:"read_buffer_size,omitempty"` // Human-readable byte size
+	QuotaBytes        string    `json:"quota_bytes,omitempty"`      // Human-readable, e.g., "10 GiB" or empty if unlimited
+	UsedBytes         int64     `json:"used_bytes"`                 // Logical used bytes (sum of file sizes)
+	PhysicalBytes     int64     `json:"physical_bytes"`             // Block store disk usage
+	UsagePercent      float64   `json:"usage_percent"`              // 0-100, 0 if no quota
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 
 	// Status is the worst-of health report derived from the share's
 	// metadata store and block store engine. Non-omitempty so
@@ -576,6 +581,79 @@ func (h *ShareHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	WriteNoContent(w)
 }
 
+// Disable handles POST /api/v1/shares/{name}/disable.
+// Flips Enabled=false on the share's DB row and runtime registry; adapters
+// drop any active sessions (Phase 5 D-02/D-03; Phase 6 D-27). Idempotent at
+// the runtime layer on already-disabled shares.
+func (h *ShareHandler) Disable(w http.ResponseWriter, r *http.Request) {
+	name := normalizeShareName(chi.URLParam(r, "name"))
+	if name == "/" {
+		BadRequest(w, "Share name is required")
+		return
+	}
+	if h.runtime == nil {
+		InternalServerError(w, "Runtime not available")
+		return
+	}
+	if err := h.runtime.DisableShare(r.Context(), name); err != nil {
+		if errors.Is(err, models.ErrShareNotFound) {
+			NotFound(w, "Share not found")
+			return
+		}
+		// ErrShareAlreadyDisabled is benign — fall through to re-read + 200.
+		if !errors.Is(err, shares.ErrShareAlreadyDisabled) {
+			InternalServerError(w, "Failed to disable share")
+			return
+		}
+	}
+	share, err := h.store.GetShare(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, models.ErrShareNotFound) {
+			NotFound(w, "Share not found")
+			return
+		}
+		InternalServerError(w, "Failed to reload share")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), HealthCheckTimeout)
+	defer cancel()
+	WriteJSONOK(w, h.shareToResponseWithUsage(ctx, share))
+}
+
+// Enable handles POST /api/v1/shares/{name}/enable.
+// Flips Enabled=true. Idempotent at the runtime layer (no-op on already-enabled).
+func (h *ShareHandler) Enable(w http.ResponseWriter, r *http.Request) {
+	name := normalizeShareName(chi.URLParam(r, "name"))
+	if name == "/" {
+		BadRequest(w, "Share name is required")
+		return
+	}
+	if h.runtime == nil {
+		InternalServerError(w, "Runtime not available")
+		return
+	}
+	if err := h.runtime.EnableShare(r.Context(), name); err != nil {
+		if errors.Is(err, models.ErrShareNotFound) {
+			NotFound(w, "Share not found")
+			return
+		}
+		InternalServerError(w, "Failed to enable share")
+		return
+	}
+	share, err := h.store.GetShare(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, models.ErrShareNotFound) {
+			NotFound(w, "Share not found")
+			return
+		}
+		InternalServerError(w, "Failed to reload share")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), HealthCheckTimeout)
+	defer cancel()
+	WriteJSONOK(w, h.shareToResponseWithUsage(ctx, share))
+}
+
 // SetUserPermission handles PUT /api/v1/shares/{name}/users/{username}.
 // Sets a user's permission for a share (admin only).
 func (h *ShareHandler) SetUserPermission(w http.ResponseWriter, r *http.Request) {
@@ -835,6 +913,7 @@ func shareToResponse(s *models.Share) ShareResponse {
 		LocalBlockStoreID:  s.LocalBlockStoreID,
 		RemoteBlockStoreID: s.RemoteBlockStoreID,
 		ReadOnly:           s.ReadOnly,
+		Enabled:            s.Enabled,
 		EncryptData:        s.EncryptData,
 		DefaultPermission:  s.DefaultPermission,
 		BlockedOperations:  s.GetBlockedOps(),

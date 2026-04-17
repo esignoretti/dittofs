@@ -14,7 +14,7 @@
 - [x] **Phase 3: Destination Drivers + Encryption** - Local FS + S3 destination drivers with atomic completion, SHA-256 integrity, and AES-256-GCM encryption at rest (completed 2026-04-16)
 - [ ] **Phase 4: Scheduler + Retention** - robfig/cron/v3 scheduler with overlap guard, jitter, count/age retention, pin, and separate post-upload retention pass
 - [ ] **Phase 5: Restore Orchestration + Safety Rails** - Quiesce-swap-resume restore, share-disable precondition, manifest verification, interrupted-job recovery, block-GC hold integration
-- [ ] **Phase 6: CLI & REST API Surface** - `dfsctl store metadata ... backup/restore/repo` subtree and REST API with async job semantics
+- [x] **Phase 6: CLI & REST API Surface** - `dfsctl store metadata ... backup/restore/repo` subtree and REST API with async job semantics (completed 2026-04-17)
 - [ ] **Phase 7: Testing & Hardening** - Localstack S3 E2E matrix, corruption/partial-restore coverage, cross-version tests, chaos tests
 
 ## Phase Details
@@ -127,8 +127,16 @@ Plans:
   4. `dfsctl store metadata <store> repo add|list|remove` manages repos (destination config, schedule, retention) on the attached store
   5. REST endpoints `POST /api/stores/metadata/{name}/backups`, `GET /api/stores/metadata/{name}/backups`, `POST /api/stores/metadata/{name}/restore` return 202 + job id; `GET /api/backup-jobs/{id}` polls status
   6. Async job records persist across client disconnect, so dittofs-pro UI can poll the same endpoints as `dfsctl`
-**Plans**: TBD
 **UI hint**: yes
+**Plans:** 6 plans
+
+Plans:
+- [x] 06-01-PLAN.md — BackupStore methods (ListBackupRecords/ListBackupJobsFiltered/UpdateBackupRecordPinned/UpdateBackupJobProgress) + D-50 progress instrumentation in backup/restore executors + Share.Enabled JSON tag
+- [x] 06-02-PLAN.md — REST handlers (backups, backup_jobs, backup_repos) + typed problem variants (D-13, D-29, D-46) + shares.go Disable/Enable + router wiring + apiclient typed methods
+- [x] 06-03-PLAN.md — CLI share restructure (D-35 breaking flip) + dfsctl share <name> disable|enable + ENABLED column on list/show (D-27, D-28, D-36..D-39) + CHANGELOG v0.13.0 entry
+- [x] 06-04-PLAN.md — CLI repo subtree (add/list/show/edit/remove) with interactive per-kind prompts, partial-patch edit, --purge-archives cascade (D-14..D-22)
+- [x] 06-05-PLAN.md — CLI backup subtree (run/list/show/pin/unpin + job list/show/cancel) + shared async-poll helper (D-01..D-11, D-13, D-24..D-26, D-42..D-48)
+- [x] 06-06-PLAN.md — CLI restore verb (D-29/D-30/D-31/D-33/D-40) reusing Plan 05 poll helper + metadata.go final AddCommand wiring + end-to-end human-verify checkpoint
 
 ### Phase 7: Testing & Hardening
 **Goal**: Every failure mode that silently corrupts or loses data in production backup systems is covered by an E2E or chaos test before the milestone ships.
@@ -146,10 +154,10 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundations — Models, Manifest, Capability Interface | 0/0 | Not started | - |
-| 2. Per-Engine Backup Drivers | 0/4 | Not started | - |
+| 1. Foundations — Models, Manifest, Capability Interface | 3/3 | Complete    | 2026-04-15 |
+| 2. Per-Engine Backup Drivers | 4/4 | Complete    | 2026-04-15 |
 | 3. Destination Drivers + Encryption | 6/6 | Complete    | 2026-04-16 |
-| 4. Scheduler + Retention | 0/5 | Not started | - |
-| 5. Restore Orchestration + Safety Rails | 8/10 | In Progress|  |
-| 6. CLI & REST API Surface | 0/0 | Not started | - |
+| 4. Scheduler + Retention | 5/5 | Complete    | 2026-04-16 |
+| 5. Restore Orchestration + Safety Rails | 10/10 | Complete    | 2026-04-17 |
+| 6. CLI & REST API Surface | 6/6 | Complete    | 2026-04-17 |
 | 7. Testing & Hardening | 0/0 | Not started | - |

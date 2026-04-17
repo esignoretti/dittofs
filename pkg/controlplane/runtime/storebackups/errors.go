@@ -1,9 +1,44 @@
 package storebackups
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/marmos91/dittofs/pkg/backup/restore"
 	"github.com/marmos91/dittofs/pkg/controlplane/models"
 )
+
+// restorePreconditionError carries the list of enabled shares that blocked
+// a restore so the REST handler can surface them in the 409 body. Wraps
+// ErrRestorePreconditionFailed so errors.Is continues to work.
+type restorePreconditionError struct {
+	storeName string
+	enabled   []string
+}
+
+func newRestorePreconditionError(storeName string, enabled []string) *restorePreconditionError {
+	return &restorePreconditionError{storeName: storeName, enabled: append([]string(nil), enabled...)}
+}
+
+func (e *restorePreconditionError) Error() string {
+	return fmt.Sprintf("%s: store %q has %d enabled share(s): %v",
+		ErrRestorePreconditionFailed.Error(), e.storeName, len(e.enabled), e.enabled)
+}
+
+func (e *restorePreconditionError) Unwrap() error { return ErrRestorePreconditionFailed }
+
+// EnabledShares implements the enabledSharesCarrier contract used by the
+// REST handler (extractEnabledShares) to populate the 409 response body.
+func (e *restorePreconditionError) EnabledShares() []string { return e.enabled }
+
+// ErrBackupJobNotFound — canceling / looking up a backup or restore job
+// whose run-ctx is not registered (either unknown ID or already terminal).
+// The REST handler (Phase 6 Plan 02) maps this to 200 OK + current job per
+// D-45 idempotent-on-terminal semantics; runtime itself just reports
+// absence. Distinct identity from models.ErrBackupJobNotFound: the model
+// sentinel signals "DB row missing", this one signals "no active run-ctx
+// to cancel".
+var ErrBackupJobNotFound = errors.New("backup job not found or already terminal")
 
 // Re-exports of Phase-4 sentinels for caller convenience. Callers may
 // import either the models or the storebackups package; both identities
