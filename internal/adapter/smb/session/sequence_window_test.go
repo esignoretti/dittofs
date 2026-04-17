@@ -10,7 +10,11 @@ import (
 
 func TestSequenceWindow_NewCreatesWithZeroAvailable(t *testing.T) {
 	w := NewCommandSequenceWindow(131070)
-	assert.Equal(t, uint64(1), w.Size(), "new window should have size 1 (sequence {0})")
+	// Window covers sequences {0, 1} so NEGOTIATE can arrive with either
+	// MessageID (smbtorture uses 0, MS-WPTS uses 1).
+	assert.Equal(t, uint64(2), w.Size(), "new window should cover sequences {0, 1}")
+	assert.Equal(t, uint64(1), w.Available(),
+		"available credits should be 1 (client's initial cur_credits)")
 }
 
 func TestSequenceWindow_ConsumeZeroSucceeds(t *testing.T) {
@@ -134,8 +138,13 @@ func TestSequenceWindow_MaxSizeCap(t *testing.T) {
 	// Grant way more than maxSize
 	w.Grant(200)
 
-	// Size should be capped at maxSize
-	assert.LessOrEqual(t, w.Size(), maxSize, "window size should not exceed maxSize")
+	// The available credit count — what the client's cur_credits will see
+	// after Grant — must never exceed maxSize (MS-SMB2 3.3.1.2 /
+	// Connection.MaxCredits). The raw window span is allowed to exceed
+	// maxSize briefly when the oldest bit is still in the bitmap, but
+	// Remaining() must still report 0 so further responses grant nothing.
+	assert.LessOrEqual(t, w.Available(), maxSize, "available credits should not exceed maxSize")
+	assert.Equal(t, uint64(0), w.Remaining(), "Remaining should be 0 once available == maxSize")
 }
 
 func TestSequenceWindow_GrantAfterHeavyConsumption(t *testing.T) {
@@ -207,14 +216,45 @@ func TestSequenceWindow_ConcurrentConsumeAndGrant(t *testing.T) {
 
 func TestSequenceWindow_SizeReturnsCorrectValue(t *testing.T) {
 	w := NewCommandSequenceWindow(131070)
-	assert.Equal(t, uint64(1), w.Size(), "initial window should have size 1")
+	// Initial window covers sequences {0, 1} — see NewCommandSequenceWindow.
+	assert.Equal(t, uint64(2), w.Size(), "initial window should have size 2")
 
 	w.Grant(10)
-	assert.Equal(t, uint64(11), w.Size(), "after granting 10, size should be 11")
+	assert.Equal(t, uint64(12), w.Size(), "after granting 10, size should be 12")
 
 	w.Consume(0, 1)
 	// Size reflects the full window range, not just available slots
 	// After consuming, size may reduce if low watermark advances
 	sz := w.Size()
 	assert.Greater(t, sz, uint64(0), "size should still be > 0 after consuming one")
+}
+
+// TestSequenceWindow_ReclaimDecouplesAvailableFromBitmap verifies that
+// Reclaim decrements `available` without clearing bitmap bits. The reclaimed
+// message IDs remain in-range for Consume but the client was never told
+// about them. If such a message arrives anyway (protocol violation or race),
+// Consume must saturate `available` at zero rather than underflowing.
+func TestSequenceWindow_ReclaimDecouplesAvailableFromBitmap(t *testing.T) {
+	w := NewCommandSequenceWindow(8192)
+	w.Grant(10) // high = 11, available = 11, bits 0..10 set
+	w.Consume(0, 1)
+
+	w.Reclaim(5)
+	// available should drop by 5, but the 5 reclaimed bits stay set in
+	// the bitmap — a misbehaving client that sent one of those msgIDs
+	// would still pass bit validation.
+	assert.Equal(t, uint64(5), w.Available(), "Reclaim should drop `available` by 5")
+
+	// Consume reclaimed msgIDs should saturate `available` at 0, not
+	// underflow. Messages 1..5 are still-set reclaimed bits; 6..10 are
+	// legitimately granted. Consume msgs 1..10 (all ten) — `available`
+	// starts at 5, so the last five decrements would underflow without
+	// the saturation guard.
+	for seq := uint64(1); seq <= 10; seq++ {
+		assert.True(t, w.Consume(seq, 1), "seq %d should be consumable", seq)
+	}
+	assert.Equal(t, uint64(0), w.Available(),
+		"available should saturate at 0, not underflow to a huge value")
+	assert.Equal(t, w.MaxSize(), w.Remaining(),
+		"Remaining should reflect a full empty window, not an underflow-distorted value")
 }

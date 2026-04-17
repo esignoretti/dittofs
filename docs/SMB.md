@@ -426,22 +426,134 @@ blockStore.ReadAt(ctx, contentID, buf, offset)
 
 ### Credit Flow Control
 
-SMB2 uses credits for flow control:
+SMB2 uses credits (MS-SMB2 3.3.1.2) as the protocol-level flow-control
+mechanism. Each request consumes credits equal to its `CreditCharge`; each
+response grants credits via the `CreditResponse` header field. The client
+tracks a per-connection running balance (`cur_credits`) and will refuse to
+send a request once its balance would go negative, or reject a response
+whose grant would overflow its 16-bit counter. Both outcomes look like
+`NT_STATUS_INTERNAL_ERROR` or `NT_STATUS_INVALID_NETWORK_RESPONSE` on the
+wire, so credit accounting must be byte-for-byte consistent between the
+server's window and the client's counter.
+
+#### Defaults
 
 ```go
-// Adaptive credit strategy
 type CreditConfig struct {
-    MinGrant          uint16  // Minimum credits per response (16)
+    MinGrant          uint16  // Minimum credits per response (1)
     MaxGrant          uint16  // Maximum credits per response (8192)
-    InitialGrant      uint16  // Initial session credits (256)
-    MaxSessionCredits uint32  // Maximum total credits (65535)
+    InitialGrant      uint16  // Floor when client requests 0 (1)
+    MaxSessionCredits uint32  // Per-connection window cap (8192)
 }
 ```
 
-Strategies:
-- **Fixed**: Always grant InitialGrant credits
-- **Echo**: Grant what client requests (within bounds)
-- **Adaptive**: Adjust based on server load (default)
+The defaults match Samba's server (`smb2 max credits = 8192`, initial
+grant = 1 in `source3/smbd/smb2_server.c`) and Windows Server 2008R2+.
+These are the protocol-level invariants clients expect; tuning them
+higher can break interoperability.
+
+#### Server data structure — `CommandSequenceWindow`
+
+One per connection. Tracks granted message IDs as a sliding bitmap
+(`internal/adapter/smb/session/sequence_window.go`):
+
+```
+low           high
+ │    span=high-low    │
+ ▼                     ▼
+[0111100011001110000...]  bit i = sequence (low+i) is granted-and-unconsumed
+                           set by Grant, cleared by Consume
+
+available   = the server's view of the client's cur_credits
+              (initially equal to popcount(bitmap); decoupled by Reclaim)
+```
+
+Three invariants drive correctness:
+
+1. **`available` mirrors the client's `cur_credits`.** Every `Grant(N)`
+   increments `available` by the amount the server actually extended the
+   window; every `Consume(msgId, charge)` decrements `available` by
+   `charge`. The server never grants more than `MaxSessionCredits -
+   available`, so the client's counter can never overflow.
+2. **`low` advances lazily in 64-bit blocks.** `advanceLow` reclaims
+   bitmap words once an entire 64-sequence run has been consumed. The
+   `available` counter is the authoritative credit tally; the bitmap
+   span (`high - low`) can briefly exceed `available` when the oldest
+   unconsumed bit is still in place, but stays bounded because
+   `available` gates new grants.
+3. **Credit-exempt commands still consume sequence numbers.** MS-SMB2
+   exempts `NEGOTIATE`, `CANCEL`, and the first `SESSION_SETUP`
+   (`SessionID=0`) from credit *validation*, but the client still
+   advances its msgId and decrements `cur_credits` for them. The server
+   therefore MUST call `Consume` on those messages too — otherwise
+   `available` drifts up by one per credit-exempt request, saturates at
+   `MaxSessionCredits`, and future responses carry `credits=0` until
+   the client runs out of credits (observed in issue #378).
+
+##### Reclaim — compound response zeroing
+
+MS-SMB2 3.2.4.1.4 requires middle responses in a compound to advertise
+`Credits=0`. Our response builder grants credits atomically before the
+write (see below), so after zeroing the middle headers the window would
+be over-extended relative to what the client was told. `Reclaim(n)`
+decrements `available` by `n` without touching the bitmap — the
+reclaimed message IDs remain valid on the server (a misbehaving client
+that sent one would still pass Consume), but the client was never told
+about them and will not use them under normal operation. `Consume`
+saturates `available` at zero rather than underflowing if a reclaimed
+message ID is used anyway.
+
+#### Grant path — atomic, pre-write
+
+```
+GrantCredits (per-session policy)   →  credits (requested grant)
+  └─ strategy-dependent (echo/fixed/adaptive)
+
+CommandSequenceWindow.Grant(credits) →  credits' (may be less; ≤ MaxSessionCredits - available)
+  └─ extends the window and updates `available` atomically under w.mu
+
+respHeader.Credits = credits'
+...send response...
+```
+
+The grant is recorded against the window **before** the response is
+written, and the grant function returns the actual amount extended, so
+the value advertised in `hdr.Credits` is always exactly what the window
+was extended by. This closes the TOCTOU gap that a "read `Remaining()`,
+clamp, write, then `Grant()`" pattern would leave open when pipelined
+responses run on the same connection. All response build sites funnel
+through `grantConnectionCredits` in `internal/adapter/smb/response.go`.
+
+#### Strategies
+
+- **Echo** (default): grant what the client requests, bounded by
+  `[MinGrant, MaxGrant]` and `Remaining()`. Matches Samba's
+  `smb2_set_operation_credit`: `grant = credit_charge + (requested − 1)`.
+- **Fixed**: always grant `InitialGrant`.
+- **Adaptive**: `InitialGrant` scaled by live load and client-outstanding
+  factors. More aggressive than Echo, primarily useful when throughput
+  matters more than strict Samba interop.
+
+#### Interoperability notes
+
+- **Samba client** hard-caps `cur_credits` at `uint16` max (65535) and
+  rejects any response that would overflow. Prior to #378 we advertised
+  ~384 credits per response (InitialGrant=256 × adaptive 1.5× boost),
+  which saturated the client after ~85 SESSION_SETUP iterations and
+  triggered `NT_STATUS_INVALID_NETWORK_RESPONSE`. The fix lowered defaults
+  to Samba-compatible values and enforced `Remaining()` clamping at every
+  response build site.
+- **Windows client** is more tolerant but grants are capped by the
+  negotiated `Connection.MaxCredits`; setting `MaxSessionCredits > 8192`
+  gains nothing because Windows caps at 8192 by default too.
+- **Multi-credit operations** (large READ/WRITE) consume `CreditCharge`
+  sequence numbers per request; the window handles charge > 1 natively.
+
+Reference:
+- MS-SMB2 3.3.1.2 (Server Credit Tracking)
+- Samba `source3/smbd/smb2_server.c` `smb2_set_operation_credit` and
+  surrounding bitmap bookkeeping
+- Samba client check: `libcli/smb/smbXcli_base.c:4295-4298`
 
 ## Authentication
 

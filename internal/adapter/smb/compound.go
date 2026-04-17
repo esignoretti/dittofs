@@ -73,31 +73,30 @@ func ProcessCompoundRequest(ctx context.Context, firstHeader *header.SMB2Header,
 
 	// Per MS-SMB2 3.2.4.1.4: compound-level credit accounting.
 	// The first command's CreditCharge covers the entire compound.
-	// Validate and consume from sequence window once for the first command.
-	if !session.IsCreditExempt(firstHeader.Command, firstHeader.SessionID) {
-		// Validate CreditCharge against payload size (MS-SMB2 3.3.5.2.5)
-		if connInfo.SupportsMultiCredit {
-			if err := session.ValidateCreditCharge(firstHeader.Command, firstHeader.CreditCharge, firstBody); err != nil {
-				logger.Debug("Compound credit charge validation failed",
-					"command", firstHeader.Command.String(),
-					"creditCharge", firstHeader.CreditCharge,
-					"error", err)
-				failEntireCompound(firstHeader, compoundData, types.StatusInvalidParameter, connInfo)
-				return
-			}
+	// CreditCharge size validation is skipped for exempt commands; sequence
+	// window Consume still runs for NEGOTIATE and first SESSION_SETUP but is
+	// skipped for CANCEL — see response.go for rationale (#378).
+	exempt := session.IsCreditExempt(firstHeader.Command, firstHeader.SessionID)
+	if !exempt && connInfo.SupportsMultiCredit {
+		if err := session.ValidateCreditCharge(firstHeader.Command, firstHeader.CreditCharge, firstBody); err != nil {
+			logger.Debug("Compound credit charge validation failed",
+				"command", firstHeader.Command.String(),
+				"creditCharge", firstHeader.CreditCharge,
+				"error", err)
+			failEntireCompound(firstHeader, compoundData, types.StatusInvalidParameter, connInfo)
+			return
 		}
-
-		// Consume sequence numbers for the first command
-		if connInfo.SequenceWindow != nil {
-			charge := session.EffectiveCreditCharge(firstHeader.CreditCharge)
-			if !connInfo.SequenceWindow.Consume(firstHeader.MessageID, charge) {
-				logger.Debug("Compound sequence window validation failed",
-					"command", firstHeader.Command.String(),
-					"messageID", firstHeader.MessageID,
-					"creditCharge", charge)
-				failEntireCompound(firstHeader, compoundData, types.StatusInvalidParameter, connInfo)
-				return
-			}
+	}
+	if connInfo.SequenceWindow != nil && firstHeader.Command != types.CommandCancel {
+		charge := session.EffectiveCreditCharge(firstHeader.CreditCharge)
+		if !connInfo.SequenceWindow.Consume(firstHeader.MessageID, charge) {
+			logger.Debug("Compound sequence window validation failed",
+				"command", firstHeader.Command.String(),
+				"messageID", firstHeader.MessageID,
+				"creditCharge", charge,
+				"exempt", exempt)
+			failEntireCompound(firstHeader, compoundData, types.StatusInvalidParameter, connInfo)
+			return
 		}
 	}
 
@@ -379,7 +378,7 @@ func sendCompoundResponses(responses []compoundResponse, connInfo *ConnInfo) err
 
 	// Per MS-SMB2 3.2.4.1.4: middle compound responses grant 0 credits;
 	// only the last response grants credits to the client.
-	applyCompoundCreditZeroing(responses)
+	applyCompoundCreditZeroing(responses, connInfo)
 
 	// Build compound payload: sign each command individually, then concatenate.
 	// Per Windows Server behavior (validated by smbtorture compound-padding test),
@@ -451,11 +450,10 @@ func sendCompoundResponses(responses []compoundResponse, connInfo *ConnInfo) err
 					"sessionID", sessionID,
 					"commands", len(responses))
 				writeErr := WriteNetBIOSFrame(connInfo.Conn, connInfo.WriteMu, connInfo.WriteTimeout, encrypted)
-				// Expand sequence window with credits from last response only
-				// (middle responses granted 0 credits per MS-SMB2 3.2.4.1.4)
-				if writeErr == nil {
-					expandCompoundSequenceWindow(responses, connInfo)
-				}
+				// NOTE: each sub-response's credit grant was extended on the
+				// sequence window synchronously during buildResponseHeaderAndBody;
+				// applyCompoundCreditZeroing reclaimed the now-zeroed middle
+				// responses. No post-write Grant is needed here (#378).
 				return writeErr
 			}
 		}
@@ -465,25 +463,10 @@ func sendCompoundResponses(responses []compoundResponse, connInfo *ConnInfo) err
 		"commands", len(responses),
 		"totalBytes", len(payload))
 
-	writeErr := WriteNetBIOSFrame(connInfo.Conn, connInfo.WriteMu, connInfo.WriteTimeout, payload)
-	// Expand sequence window with credits from last response only
-	// (middle responses granted 0 credits per MS-SMB2 3.2.4.1.4)
-	if writeErr == nil {
-		expandCompoundSequenceWindow(responses, connInfo)
-	}
-	return writeErr
-}
-
-// expandCompoundSequenceWindow expands the sequence window using credits from the
-// last compound response only. Middle responses have Credits=0 after zeroing.
-func expandCompoundSequenceWindow(responses []compoundResponse, connInfo *ConnInfo) {
-	if connInfo.SequenceWindow == nil || len(responses) == 0 {
-		return
-	}
-	lastCredits := responses[len(responses)-1].respHeader.Credits
-	if lastCredits > 0 {
-		connInfo.SequenceWindow.Grant(lastCredits)
-	}
+	// Each sub-response's credit grant was extended on the window during
+	// buildResponseHeaderAndBody; applyCompoundCreditZeroing reclaimed the
+	// zeroed middle responses. No post-write Grant needed (#378).
+	return WriteNetBIOSFrame(connInfo.Conn, connInfo.WriteMu, connInfo.WriteTimeout, payload)
 }
 
 // failEntireCompound generates error responses for all commands in the compound
@@ -517,13 +500,23 @@ func failEntireCompound(firstHeader *header.SMB2Header, compoundData []byte, sta
 // Per MS-SMB2 3.2.4.1.4: middle compound responses grant 0 credits; only the last
 // response grants credits. For single-response compounds (len <= 1), no zeroing
 // is applied since they go through SendMessage which handles granting normally.
-func applyCompoundCreditZeroing(responses []compoundResponse) {
+//
+// Each sub-response was built via buildResponseHeaderAndBody, which already
+// extended the connection's sequence window by that response's grant. Zeroing
+// the middle headers would leave the window over-extended relative to what
+// the client sees, so after zeroing we Reclaim each middle response's grant
+// back from the window. Per-response Reclaim (rather than summing into a
+// single call) avoids capping at uint16 if the aggregate ever exceeds 65535.
+func applyCompoundCreditZeroing(responses []compoundResponse, connInfo *ConnInfo) {
 	if len(responses) <= 1 {
 		return
 	}
-	// Set Credits=0 for all responses except the last
 	for i := 0; i < len(responses)-1; i++ {
+		credits := responses[i].respHeader.Credits
 		responses[i].respHeader.Credits = 0
+		if credits > 0 && connInfo.SequenceWindow != nil {
+			connInfo.SequenceWindow.Reclaim(credits)
+		}
 	}
 }
 
@@ -539,11 +532,7 @@ func isSessionLevelError(status types.Status) bool {
 // buildErrorResponseHeaderAndBody creates a response header and error body for
 // compound error responses (e.g., signature verification failures).
 func buildErrorResponseHeaderAndBody(reqHeader *header.SMB2Header, status types.Status, connInfo *ConnInfo) (*header.SMB2Header, []byte) {
-	credits := connInfo.SessionManager.GrantCredits(
-		reqHeader.SessionID,
-		reqHeader.Credits,
-		reqHeader.CreditCharge,
-	)
+	credits := grantConnectionCredits(connInfo, reqHeader.SessionID, reqHeader.Credits, reqHeader.CreditCharge)
 	respHeader := header.NewResponseHeaderWithCredits(reqHeader, status, credits)
 	return respHeader, MakeErrorBody()
 }
@@ -699,7 +688,7 @@ func buildCompoundParseErrorResponse(data []byte, connInfo *ConnInfo) (*header.S
 		messageID = binary.LittleEndian.Uint64(data[24:32])
 	}
 
-	credits := connInfo.SessionManager.GrantCredits(0, 1, 0)
+	credits := grantConnectionCredits(connInfo, 0, 1, 0)
 	respHeader := &header.SMB2Header{
 		ProtocolID:    [4]byte{0xFE, 'S', 'M', 'B'},
 		StructureSize: header.HeaderSize,

@@ -39,6 +39,27 @@ func TestCreditValidationLogic_ExemptCommands(t *testing.T) {
 	}
 }
 
+// TestCreditValidationLogic_CancelReusesTargetMessageID verifies the dispatcher
+// invariant that CANCEL does NOT double-consume its target's sequence slot.
+// Per MS-SMB2 3.3.5.16, CANCEL reuses the pending request's MessageID. The
+// original request already consumed that slot; a second Consume would fail
+// and the dispatcher would reply STATUS_INVALID_PARAMETER — a spurious CANCEL
+// response that clients treat as a protocol violation (WPTS
+// BVT_SMB2Basic_CancelRegisteredChangeNotify, smbtorture notify.mask/tdis,
+// replay.replay7).
+func TestCreditValidationLogic_CancelReusesTargetMessageID(t *testing.T) {
+	sw := session.NewCommandSequenceWindow(8192)
+	sw.Grant(10)
+
+	// Client sends CHANGE_NOTIFY MessageID=5; server consumes slot 5.
+	require.True(t, sw.Consume(5, 1), "initial CHANGE_NOTIFY consume should succeed")
+
+	// Client then sends CANCEL MessageID=5 targeting the pending CHANGE_NOTIFY.
+	// The dispatcher MUST NOT call Consume again — slot 5 is already cleared.
+	assert.False(t, sw.Consume(5, 1),
+		"second Consume on same MessageID must fail (proves double-consume would reject CANCEL)")
+}
+
 // TestCreditValidationLogic_NonExemptConsumption verifies that non-exempt commands
 // consume from the sequence window.
 func TestCreditValidationLogic_NonExemptConsumption(t *testing.T) {
@@ -126,7 +147,7 @@ func TestConnInfo_SequenceWindowField(t *testing.T) {
 
 	assert.NotNil(t, ci.SequenceWindow, "SequenceWindow field should be accessible")
 	assert.True(t, ci.SupportsMultiCredit, "SupportsMultiCredit field should be accessible")
-	assert.Equal(t, uint64(1), ci.SequenceWindow.Size(), "initial window should have size 1")
+	assert.Equal(t, uint64(2), ci.SequenceWindow.Size(), "initial window covers sequences {0, 1}")
 }
 
 // TestSendMessage_SequenceWindowExpansion verifies the sequence window expansion
@@ -302,7 +323,7 @@ func TestCompound_MiddleResponsesGrantZeroCredits(t *testing.T) {
 	}
 
 	// Apply compound credit zeroing: middle responses grant 0
-	applyCompoundCreditZeroing(responses)
+	applyCompoundCreditZeroing(responses, &ConnInfo{})
 
 	assert.Equal(t, uint16(0), responses[0].respHeader.Credits,
 		"first (middle) response should have Credits=0")
@@ -310,6 +331,38 @@ func TestCompound_MiddleResponsesGrantZeroCredits(t *testing.T) {
 		"second (middle) response should have Credits=0")
 	assert.Equal(t, uint16(10), responses[2].respHeader.Credits,
 		"last response should retain its credits")
+}
+
+// TestCompound_ReclaimRollsBackMiddleGrants verifies that when middle compound
+// responses are zeroed, the connection sequence window reclaims those credits
+// so `available` stays in sync with what was advertised to the client (#378).
+func TestCompound_ReclaimRollsBackMiddleGrants(t *testing.T) {
+	sw := session.NewCommandSequenceWindow(8192)
+	// Simulate each sub-response's pre-zero grant by extending the window.
+	// Three sub-responses of 10 credits each => available = 31 (1 initial + 30).
+	sw.Grant(10)
+	sw.Grant(10)
+	sw.Grant(10)
+	preZeroAvail := sw.Available()
+
+	responses := []compoundResponse{
+		{respHeader: &header.SMB2Header{Credits: 10}},
+		{respHeader: &header.SMB2Header{Credits: 10}},
+		{respHeader: &header.SMB2Header{Credits: 10}},
+	}
+
+	applyCompoundCreditZeroing(responses, &ConnInfo{SequenceWindow: sw})
+
+	// Middle responses should be zeroed; last retains its credits.
+	assert.Equal(t, uint16(0), responses[0].respHeader.Credits)
+	assert.Equal(t, uint16(0), responses[1].respHeader.Credits)
+	assert.Equal(t, uint16(10), responses[2].respHeader.Credits)
+
+	// Available must have dropped by the reclaimed middle-response credits
+	// (10 + 10 = 20) so it mirrors what the client sees (last response's 10
+	// + whatever was there before the three grants).
+	assert.Equal(t, preZeroAvail-20, sw.Available(),
+		"Reclaim should roll back middle-response grants from `available`")
 }
 
 // TestCompound_SequenceWindowExpandedByLastResponse verifies that the sequence
@@ -329,7 +382,7 @@ func TestCompound_SequenceWindowExpandedByLastResponse(t *testing.T) {
 	}
 
 	// Apply compound credit zeroing
-	applyCompoundCreditZeroing(responses)
+	applyCompoundCreditZeroing(responses, &ConnInfo{})
 
 	// Only the last response should expand the window
 	lastCredits := responses[len(responses)-1].respHeader.Credits
@@ -359,7 +412,7 @@ func TestCompound_SingleResponseNoZeroing(t *testing.T) {
 
 	// For single response, no zeroing should be applied
 	// (sendCompoundResponses delegates to SendMessage for len==1)
-	applyCompoundCreditZeroing(responses)
+	applyCompoundCreditZeroing(responses, &ConnInfo{})
 
 	// Single response should NOT be zeroed
 	assert.Equal(t, uint16(10), responses[0].respHeader.Credits,
