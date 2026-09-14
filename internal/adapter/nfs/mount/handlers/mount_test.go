@@ -216,3 +216,105 @@ func TestMount_UnverifiedGSSDeniedOnUnrestrictedShare(t *testing.T) {
 		t.Fatalf("Status = %d, want MountErrAccess (%d)", resp.Status, MountErrAccess)
 	}
 }
+
+// newKerberosMountCtx is newGSSMountCtx with KerberosEnabled set, matching a
+// server that has a GSS processor configured.
+func newKerberosMountCtx(reqCtx context.Context, service uint32) *MountHandlerContext {
+	ctx := newGSSMountCtx(reqCtx, service)
+	ctx.KerberosEnabled = true
+	return ctx
+}
+
+// TestMount_AuthFlavors_OmitsAuthSysWhenShareForbidsIt pins the MNT reply's
+// flavor list against the share's own policy.
+//
+// RFC 1813 App I makes fhstatus3.auth_flavors the list of flavors this export
+// accepts, and mount.nfs and automounters negotiate sec= from it. The handler
+// denies an AUTH_SYS mount on a RequireKerberos share a few lines earlier, so
+// advertising AUTH_UNIX there points the client at a mount that cannot succeed.
+func TestMount_AuthFlavors_OmitsAuthSysWhenShareForbidsIt(t *testing.T) {
+	h, ctx := newTestMountHandler(t, "/export", true)
+	// allowAuthSys stays true; RequireKerberos is what refuses AUTH_SYS here.
+	if err := h.Registry.(*runtime.Runtime).SetExportAuthPolicyForTesting("/export", true, true); err != nil {
+		t.Fatalf("SetExportAuthPolicyForTesting: %v", err)
+	}
+
+	resp, err := h.Mount(newKerberosMountCtx(ctx, gss.RPCGSSSvcPrivacy), &MountRequest{DirPath: "/export"})
+	if err != nil {
+		t.Fatalf("Mount returned unexpected error: %v", err)
+	}
+	if resp.Status != MountOK {
+		t.Fatalf("Status = %d, want MountOK (%d)", resp.Status, MountOK)
+	}
+	for _, f := range resp.AuthFlavors {
+		if f == 1 {
+			t.Fatalf("AuthFlavors = %v, must not offer AUTH_UNIX on a RequireKerberos share", resp.AuthFlavors)
+		}
+	}
+	if len(resp.AuthFlavors) == 0 {
+		t.Fatal("AuthFlavors is empty; the Kerberos pseudoflavors should still be offered")
+	}
+}
+
+// TestMount_AuthFlavors_OmitsPseudoflavorsBelowFloor is the same agreement on
+// the Kerberos side: a krb5p export denies a krb5 or krb5i mount, so it must
+// not advertise them.
+func TestMount_AuthFlavors_OmitsPseudoflavorsBelowFloor(t *testing.T) {
+	h, ctx := newTestMountHandler(t, "/export", true)
+	if err := h.Registry.(*runtime.Runtime).SetMinKerberosLevelForTesting("/export", models.KerberosLevelKrb5p); err != nil {
+		t.Fatalf("SetMinKerberosLevelForTesting: %v", err)
+	}
+
+	resp, err := h.Mount(newKerberosMountCtx(ctx, gss.RPCGSSSvcPrivacy), &MountRequest{DirPath: "/export"})
+	if err != nil {
+		t.Fatalf("Mount returned unexpected error: %v", err)
+	}
+	if resp.Status != MountOK {
+		t.Fatalf("Status = %d, want MountOK (%d)", resp.Status, MountOK)
+	}
+	for _, f := range resp.AuthFlavors {
+		if f == int32(gss.PseudoFlavorKrb5) || f == int32(gss.PseudoFlavorKrb5i) {
+			t.Fatalf("AuthFlavors = %v, must not offer a pseudoflavor below the krb5p floor", resp.AuthFlavors)
+		}
+	}
+	var hasKrb5p bool
+	for _, f := range resp.AuthFlavors {
+		if f == int32(gss.PseudoFlavorKrb5p) {
+			hasKrb5p = true
+		}
+	}
+	if !hasKrb5p {
+		t.Fatalf("AuthFlavors = %v, want krb5p offered on a krb5p share", resp.AuthFlavors)
+	}
+}
+
+// TestMount_AuthNoneDeniedWhenShareForbidsAuthSys covers the flavor the
+// AllowAuthSys gate used to miss.
+//
+// The gate named AUTH_UNIX specifically, so an AUTH_NONE caller — carrying no
+// credential at all — passed it on a share configured to refuse AUTH_SYS and
+// received a root handle, gated only by the share's default_permission. A share
+// that refuses AUTH_SYS refuses a weaker flavor too.
+func TestMount_AuthNoneDeniedWhenShareForbidsAuthSys(t *testing.T) {
+	h, ctx := newTestMountHandler(t, "/export", true)
+	if err := h.Registry.(*runtime.Runtime).SetExportAuthPolicyForTesting("/export", false, false); err != nil {
+		t.Fatalf("SetExportAuthPolicyForTesting: %v", err)
+	}
+
+	c := newMountCtx(ctx)
+	c.AuthFlavor = 0 // AUTH_NONE
+	c.UID, c.GID, c.GIDs = nil, nil, nil
+
+	resp, err := h.Mount(c, &MountRequest{DirPath: "/export"})
+	if err != nil {
+		t.Fatalf("Mount returned unexpected error: %v", err)
+	}
+	if resp.Status != MountErrAccess {
+		t.Fatalf("Status = %d, want MountErrAccess (%d): an AUTH_NONE caller must not mount a share that refuses AUTH_SYS",
+			resp.Status, MountErrAccess)
+	}
+	if len(resp.FileHandle) != 0 {
+		t.Fatalf("FileHandle = %x (%d bytes), want empty — a denied mount must not return a root handle",
+			resp.FileHandle, len(resp.FileHandle))
+	}
+}
