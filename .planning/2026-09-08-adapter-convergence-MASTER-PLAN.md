@@ -1014,3 +1014,213 @@ static `op` set from the dispatch table. Any new label must follow it.
 
 A test that passes against both the broken and the fixed build means the fix is redundant, not that
 the test is weak.
+
+---
+
+## Wave 9 — Converge the duplicate-request caches (goals 2 + 3) — DONE
+
+Both adapters cache a reply so a repeated request returns the original result, and neither knew the
+other existed. NFS calls it a duplicate-request cache (`pkg/adapter/nfs/drc.go`,
+`duplicateRequestCache`, verbs `lookup`/`record`/`abort`, wrapped by `withDRC`). SMB calls it a
+replay cache (`internal/adapter/smb/pending/replay_cache.go`, `CreateReplayCache[R,O]` +
+`LockReplayCache`). Same concept, disjoint vocabulary.
+
+**Do NOT merge them into one generic cache.** Refuted on five counts, recorded here so it is not
+re-proposed: the trigger differs (NFS *infers* a retransmit from the XID; SMB is *told* via
+`SMB2_FLAGS_REPLAY_OPERATION`), the key differs (`(clientAddr, XID, body)` vs `(sessionID,
+CreateGuid)` vs `(FileID, index, number)`), the payload differs (raw reply bytes vs a typed response
+*plus* the live `OpenFile`, which is why the SMB type is generic over `[R any, O any]` — compound
+chains read the FileID back out), eviction differs (per-connection slot bound vs a 600s TTL
+mirroring Samba plus `ForgetSession`/`ForgetFile` hooks NFS has no analogue for), and the commit rule
+differs four ways (v3 caches any reply; v4.0 only `err == nil` + recordable type; SMB CREATE only on
+success; SMB LOCK caches a bare status). Decisively, **ownership differs**: `withDRC` works because
+one `defer` owns the abort, whereas SMB's CREATE reservation *transfers* to the async-park resume
+goroutine (`create_post_break.go:710`), so a blanket defer there would release a slot another
+goroutine owns. Unifying means parameterising over key, payload, eligibility, commit rule, eviction
+and ownership transfer — six knobs to share a ~40-line state machine. Converge the *vocabulary*, not
+the code.
+
+### Task 9.1 — Close the reservation leak on the inline CREATE path
+
+`create.go` reserves at the `Reserve` call and releases ~20 lines later with **no `defer`**, running
+`completeCreateAfterBreak` in between. `handleRequestPanic` (`pkg/adapter/smb/connection.go:661`)
+recovers per-request, logs, and does **not** re-panic or tear the session down — so a panic there
+leaves the reservation set. `pruneLocked` prunes only `entries`; it never touches `reserved`, and
+reservations carry no timestamp, so there is no TTL to heal it. The only other exit is
+`ForgetSession` at session teardown. Net effect: every replayed CREATE for that CreateGuid resolves
+to `STATUS_FILE_NOT_AVAILABLE` for the remaining life of the session.
+
+Pre-existing; the `pending` package move did not introduce it. Second-order — it needs a panic to
+trigger — which is why it earns a guard, not a redesign.
+
+**Files:**
+- Modify: `internal/adapter/smb/handlers/create.go` (the `reservedReplay` block)
+- Test: `internal/adapter/smb/handlers/create_replay_panic_test.go` (create)
+
+The guard must cover **only** the inline path. The park path (`asyncId != 0`) returns before the
+release and hands ownership to the resume goroutine; a `defer` placed above the park branch would
+release a reservation that goroutine still owns and reintroduce the sharing-violation-on-replay bug
+the reservation exists to prevent.
+
+- [x] **Step 1: Write the failing test** — drive the real `Create`, not a mock of the
+      guard. `Handler.Registry` is the `smbRuntime` interface, so wrap it and panic from
+      `GetMetadataService` **only while the reservation is held** — that pins the injection
+      to the window even if the CREATE path is reordered. `completeCreateAfterBreak` calls
+      it, so the panic lands inside. Two traps cost a cycle each and are worth writing down:
+      the fixture needs `e.h.CreateSessionWithID(...)` or `Create` returns
+      `STATUS_USER_SESSION_DELETED` (0xC0000203) long before the reserve, and the test must
+      assert that the injection *fired* — without that check it passes whenever the panic
+      stops being reached.
+
+- [x] **Step 2: Run it and watch it fail** — for the right reason: *"reservation survived
+      the panic"*, not a compile error.
+
+- [x] **Step 3: Defer the release, and hand ownership off on the park branch**
+
+No helper is needed — the existing `reservedReplay` flag already carries the
+ownership decision, so the defer reads it and the park branch clears it:
+
+```go
+defer func() {
+	if reservedReplay {
+		h.CreateReplayCache.Release(ctx.SessionID, replayGuid)
+	}
+}()
+
+if asyncId := h.breakAndMaybeParkCreate(ctx, draft); asyncId != 0 {
+	// Ownership of the release moves to the resume goroutine.
+	reservedReplay = false
+	return &CreateResponse{...}, nil
+}
+return h.completeCreateAfterBreak(ctx, draft), nil
+```
+
+- [x] **Step 4: Run the test, then the package** — `go test ./internal/adapter/smb/handlers/`
+- [x] **Step 5: Commit** — `fix(smb): release the CREATE replay reservation when the completion panics`
+
+### Task 9.2 — Rename SMB onto the NFS vocabulary
+
+Per the Naming section's existing rule, `store` collides with the metadata-store noun
+(`storeCreateReplayIfApplicable`→`cacheCreateReplay` was already booked for this reason). The NFS
+verbs win because they are protocol-neutral; MS-SMB2 §3.3.5.2.5 references stay in the doc comments
+so the protocol grounding is not lost.
+
+| SMB today | Becomes | Why |
+| --- | --- | --- |
+| `CreateReplayCache[R,O]` | `CreateDRC[R,O]` | `DRC` is already this codebase's abbreviation (`withDRC`) |
+| `LockReplayCache` | `LockDRC` | same |
+| `Store` | `Record` | matches NFS `record`; frees the banned `store` verb |
+| `LookupEntry` | `Lookup` | matches NFS `lookup` |
+| `Release` | *(unchanged)* | **Do not rename to `Abort`.** `Store` does not clear `reserved`, so NFS `record` = SMB `Record`+`Release` and NFS `abort` = `Release` alone. `Release` runs on the success path too; calling it `Abort` there would be false. |
+| `Reserve` / `IsReserved` | *(unchanged)* | NFS folds reservation into `lookup`'s result; SMB needs it explicit because of ownership transfer |
+
+Rename the file `replay_cache.go` → `drc.go` and `replay_cache_test.go` → `drc_test.go` to match
+`pkg/adapter/nfs/drc.go`.
+
+- [x] **Step 1: Rename with `gopls rename`, never sed** — the plan's standing rule; dispatch entries
+      and tests must move atomically. One symbol per invocation, `go build ./...` between each.
+- [x] **Step 2: `git diff -M --color-moved` shows zero body edits** beyond the renamed identifiers.
+- [x] **Step 3: Full package suite green** — `go test ./internal/adapter/smb/... ./pkg/adapter/smb/...`
+- [x] **Step 4: Commit** — `refactor(smb): name the replay caches after the duplicate-request cache they are`
+
+### Task 9.3 — Benchmark both caches on the contended path
+
+NFS has `BenchmarkDRC_Contended` (`pkg/adapter/nfs/drc_test.go:281`). **SMB has 15 tests and zero
+benchmarks.** Both sit on the per-request hot path behind a single `sync.Mutex`, and the SMB CREATE
+cache calls `pruneLocked` on **every** `Record` — an O(n) map walk plus, once at cap, a second O(n)
+scan for the oldest entry. That is the first thing to measure, because it is the one that scales
+with cache occupancy rather than with request count.
+
+**Files:**
+- Create: `internal/adapter/smb/pending/drc_bench_test.go`
+
+- [x] **Step 1: Write the benchmarks** — parallel, because uncontended numbers hide the mutex.
+
+```go
+func BenchmarkCreateDRC_Contended(b *testing.B) {
+	c := NewCreateDRC[int, int]()
+	var ctr atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			var g [16]byte
+			binary.LittleEndian.PutUint64(g[:], ctr.Add(1))
+			c.Record(1, g, 0, 0)
+			c.Lookup(1, g)
+		}
+	})
+}
+
+// Record at cap: pruneLocked walks every entry, then scans again for the
+// oldest. This is the O(n)-per-Record path, so it is measured on its own.
+func BenchmarkCreateDRC_RecordAtCap(b *testing.B) {
+	c := NewCreateDRC[int, int]()
+	for i := 0; i < maxCreateReplayEntries; i++ {
+		var g [16]byte
+		binary.LittleEndian.PutUint64(g[:], uint64(i))
+		c.Record(1, g, 0, 0)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var g [16]byte
+		binary.LittleEndian.PutUint64(g[:], uint64(maxCreateReplayEntries+i))
+		c.Record(1, g, 0, 0)
+	}
+}
+
+func BenchmarkLockDRC_Contended(b *testing.B) {
+	c := NewLockDRC()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := uint32(0)
+		for pb.Next() {
+			i++
+			c.Record([16]byte{1}, i%64, uint8(i), types.StatusSuccess)
+			c.Lookup([16]byte{1}, i%64, uint8(i))
+		}
+	})
+}
+```
+
+- [x] **Step 2: Record the baseline** — `go test ./internal/adapter/smb/pending/ -run '^$' -bench . -benchmem -count=10 > /tmp/drc-base.txt`.
+      Go sizes `b.N` from the timed region only, so keep setup above `ResetTimer`.
+- [x] **Step 3: Compare against the NFS side** — run `BenchmarkDRC_Contended` the same way. The two
+      numbers are the cross-adapter claim; a 10x gap is a finding, not noise.
+- [x] **Step 4: Judge `pruneLocked` on evidence.** Measured on an M1 Max. A fourth benchmark
+      had to be added first: the original `Contended` never forgets an entry, so it measures a
+      permanently saturated cache, which is the pathological end rather than the shape a server
+      makes. `OpenCloseCycle` (record → lookup → forget) is the realistic one.
+
+      | | before | after |
+      | --- | --- | --- |
+      | `OpenCloseCycle` | 823 ns | **596 ns** |
+      | `Contended` (saturated) | 62.8 µs | 56.0 µs |
+      | `RecordAtCap` | 84.9 µs | 84.4 µs |
+
+      The at-cap row is the same code in both columns by construction: the early return added
+      to `pruneLocked` is a `len < cap` check, which is false at the cap, so the spread there is
+      run-to-run noise rather than an effect. Its first numbers (89.0 / 87.6 µs) were taken with
+      a setup that filled 4095 entries, not 4096 — `Record` drops the all-zero guid, so a loop
+      from 0 silently lost its first insert and the first timed call took the under-cap fast
+      path. Re-measured after starting the keys at 1; the benchmark now asserts its own
+      occupancy before timing, so an under-filled setup fails instead of quietly measuring the
+      wrong thing.
+
+      `Record` called `pruneLocked` unconditionally, so every insert walked the whole cache —
+      and took a `time.Now()` — to reclaim nothing. Under the cap there is nothing to reclaim:
+      the cap bounds memory, and `Lookup` drops an expired entry when it reads one, so a dead
+      entry lingering costs only bytes. Returning early is the whole fix.
+
+      **The cap case is unchanged and stays that way**, marked `ponytail:` with the measurement
+      and the upgrade path (an intrusive LRU list, or batch eviction per pass). Reaching it
+      needs thousands of durable opens held open simultaneously, since a clean close forgets
+      its entry.
+
+      Against `BenchmarkDRC_Contended` on the NFS side (66 ns/op), the realistic SMB path is
+      ~9x, not the ~950x the saturated benchmark first suggested. **Quote the cycle number,
+      not the saturated one** — the saturated figure describes a cache nothing is closing.
+
+- [x] **Step 5: Commit** — `perf(smb): skip the CREATE cache prune below the cap`
+
+**Gate:** no optimisation lands in this wave without a before/after benchmark in the PR body. Per the
+perf ledger, an unmeasured optimisation is a guess with a diff attached.
