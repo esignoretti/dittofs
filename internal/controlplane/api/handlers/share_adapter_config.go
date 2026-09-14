@@ -3,11 +3,13 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/controlplane/models"
 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
+	"github.com/marmos91/dittofs/pkg/controlplane/runtime/shares"
 	"github.com/marmos91/dittofs/pkg/controlplane/store"
 )
 
@@ -27,6 +29,14 @@ type ShareNFSConfigHandlerStore interface {
 type ShareNFSConfigHandler struct {
 	store   ShareNFSConfigHandlerStore
 	runtime *runtime.Runtime
+
+	// patchMu serializes the load/merge/persist/push sequence in Patch. Each
+	// request persists a full options snapshot built from its own read, so two
+	// concurrent PATCHes would otherwise interleave into a lost update — and,
+	// because the live push applies only the fields the request named, leave the
+	// stored config and the running share disagreeing about different fields.
+	// The server is single-node, so one mutex covers every writer.
+	patchMu sync.Mutex
 }
 
 // NewShareNFSConfigHandler creates a new ShareNFSConfigHandler.
@@ -84,6 +94,9 @@ func (h *ShareNFSConfigHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 // Patch handles PATCH /api/v1/shares/{name}/adapters/nfs/config.
 func (h *ShareNFSConfigHandler) Patch(w http.ResponseWriter, r *http.Request) {
+	h.patchMu.Lock()
+	defer h.patchMu.Unlock()
+
 	share, ok := h.lookupShare(w, r)
 	if !ok {
 		return
@@ -170,7 +183,7 @@ func (h *ShareNFSConfigHandler) Patch(w http.ResponseWriter, r *http.Request) {
 
 	// Push the netgroup association into the running share so it takes effect
 	// immediately (CheckNetgroupAccess reads NetgroupName from the runtime
-	// registry). Other NFS export fields apply on adapter restart.
+	// registry).
 	if req.Netgroup != nil && h.runtime != nil {
 		if err := h.runtime.SetShareNetgroup(share.Name, netgroupName); err != nil {
 			logger.Warn("NFS config persisted but failed to update runtime netgroup",
@@ -190,6 +203,26 @@ func (h *ShareNFSConfigHandler) Patch(w http.ResponseWriter, r *http.Request) {
 					"share", share.Name, "squash", opts.Squash, "error", err)
 			}
 		}
+
+		// The export auth-flavor fields and the READDIRPLUS toggle are read from
+		// the running share on the request path, so persisting them alone leaves
+		// the adapter enforcing the previous values until a restart. For
+		// AllowAuthSys and RequireKerberos that means a tightened export keeps
+		// accepting the flavor it now forbids, while this call reports success.
+		if req.AllowAuthSys != nil || req.RequireKerberos != nil ||
+			req.MinKerberosLevel != nil || req.DisableReaddirplus != nil {
+			update := shares.NFSExportPolicyUpdate{
+				AllowAuthSys:       req.AllowAuthSys,
+				RequireKerberos:    req.RequireKerberos,
+				MinKerberosLevel:   req.MinKerberosLevel,
+				DisableReaddirplus: req.DisableReaddirplus,
+			}
+			if err := h.runtime.SetNFSExportPolicy(share.Name, update); err != nil {
+				logger.Warn("NFS config persisted but failed to update runtime export policy",
+					"share", share.Name, "error", err)
+			}
+		}
+
 		h.runtime.InvalidateAuthCache()
 	}
 
