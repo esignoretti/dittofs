@@ -55,6 +55,8 @@ dfsctl store block local edit <share> --config '{"durability": "remote"}'
   (~5700 ops/s) additionally needs the journal async-commit half — see
   [Remaining work](#remaining-work-1758). Use it for create/write-heavy workloads
   that tolerate losing the last ~100 ms of *metadata* on a hard crash.
+  **It also turns off per-read warm-read verification** — see
+  [Read integrity](#read-integrity-per-read-verification--self-heal) before choosing it.
 - **`remote`** — makes `CLOSE`/`COMMIT` block until the data is durable in the
   remote (S3) store, so an acknowledged write survives losing the whole node. Slow
   by design.
@@ -196,7 +198,7 @@ startup-recovery CRC and the remote cold-fetch BLAKE3 don't cover on their own.
 slices out the requested sub-range. For large sequential reads that is free (you
 would read the record anyway); for **small random reads** it adds read
 amplification (a whole record fetched to return a few KiB) plus the CRC32 CPU.
-That is exactly why it is **off on the fast `writeback` default** and on for the
+That is exactly why it is **off on the fast `writeback` tier** and on for the
 durability-sensitive tiers.
 
 ### Why opt-in-on-durable-tiers (not always-on, not never)
