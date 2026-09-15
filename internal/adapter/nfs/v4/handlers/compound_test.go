@@ -2000,7 +2000,7 @@ func TestCompound_BindConnToSession_Rebind(t *testing.T) {
 }
 
 func TestCompound_BindConnToSession_LimitExceeded(t *testing.T) {
-	// Create max_connections bindings, attempt one more, verify NFS4ERR_RESOURCE.
+	// Create max_connections bindings, attempt one more, verify NFS4ERR_DELAY.
 	h, sessionID := createTestSessionWithConnectionID(t, 8020)
 
 	// Set max connections per session to 3 (conn 8020 auto-bound = 1 already)
@@ -2016,7 +2016,7 @@ func TestCompound_BindConnToSession_LimitExceeded(t *testing.T) {
 		t.Fatalf("expected 3 bindings at limit, got %d", len(bindings))
 	}
 
-	// Attempt one more -- should fail with NFS4ERR_RESOURCE
+	// Attempt one more -- should fail with NFS4ERR_DELAY
 	ctx := newTestCompoundContext()
 	ctx.ConnectionID = 8023
 
@@ -2034,8 +2034,87 @@ func TestCompound_BindConnToSession_LimitExceeded(t *testing.T) {
 		t.Fatalf("decode response error: %v", err)
 	}
 
-	if decoded.Status != types.NFS4ERR_RESOURCE {
-		t.Errorf("status = %d, want NFS4ERR_RESOURCE (%d)", decoded.Status, types.NFS4ERR_RESOURCE)
+	// NFS4ERR_RESOURCE (10018) is an NFSv4.0 error that RFC 8881 does not define
+	// and that BIND_CONN_TO_SESSION's valid-error list in Section 15.2 omits.
+	if decoded.Status != types.NFS4ERR_DELAY {
+		t.Errorf("status = %d, want NFS4ERR_DELAY (%d)", decoded.Status, types.NFS4ERR_DELAY)
+	}
+}
+
+func TestCompound_SequenceBindConnToSession_LimitExceeded(t *testing.T) {
+	// The connection limit is also reachable with BIND_CONN_TO_SESSION following
+	// SEQUENCE, which this dispatcher accepts. The status must be NFS4ERR_DELAY
+	// there too -- NFS4ERR_RESOURCE is not an NFSv4.1 error in any COMPOUND shape.
+	//
+	// RFC 8881 Section 15.1.1.3 puts the retry obligation on the client for a
+	// NFS4ERR_DELAY raised by an operation other than the first in the request:
+	// the retry MUST carry a different slot ID or sequence value, so the server
+	// is explicitly excused from suppressing a cached DELAY on this path.
+	h, sessionID := createTestSessionWithConnectionID(t, 8040)
+	h.StateManager.SetMaxConnectionsPerSession(2)
+	bindConnection(t, h, sessionID, 8041, types.CDFC4_FORE)
+
+	if got := len(h.StateManager.GetConnectionBindings(sessionID)); got != 2 {
+		t.Fatalf("expected 2 bindings at limit, got %d", got)
+	}
+
+	ctx := newTestCompoundContext()
+	ctx.ConnectionID = 8042
+
+	ops := []compoundOp{
+		{opCode: types.OP_SEQUENCE, data: encodeSequenceArgs(sessionID, 0, 1, 0, false)},
+		{opCode: types.OP_BIND_CONN_TO_SESSION, data: encodeBindConnToSessionArgs(sessionID, types.CDFC4_FORE, false)},
+	}
+	data := buildCompoundArgsWithOps([]byte("seqbind"), 1, ops)
+
+	resp, err := h.ProcessCompound(ctx, data)
+	if err != nil {
+		t.Fatalf("ProcessCompound error: %v", err)
+	}
+
+	decoded, err := decodeCompoundResponse(resp)
+	if err != nil {
+		t.Fatalf("decode response error: %v", err)
+	}
+
+	// The COMPOUND status is the status of the last operation executed, so the
+	// BIND failure surfaces here. (decodeCompoundResponse reads opcode+status
+	// per result and cannot walk SEQUENCE's full result body, so the per-op
+	// results are not inspected.)
+	if decoded.Status != types.NFS4ERR_DELAY {
+		t.Errorf("compound status = %d, want NFS4ERR_DELAY (%d)", decoded.Status, types.NFS4ERR_DELAY)
+	}
+
+	if got := len(h.StateManager.GetConnectionBindings(sessionID)); got != 2 {
+		t.Errorf("bindings after refused bind = %d, want 2", got)
+	}
+
+	// The DELAY is genuinely retryable rather than pinned by the reply cache:
+	// freeing a connection and re-sending with the next sequence ID re-executes
+	// the bind. ValidateSequence treats seqid == slot.SeqID+1 as a new request,
+	// so only a retry reusing the original slot+seqid would replay the cached
+	// reply -- and Section 15.1.1.3 requires the client to vary them here.
+	h.StateManager.UnbindConnection(8041)
+
+	retryCtx := newTestCompoundContext()
+	retryCtx.ConnectionID = 8042
+	retryOps := []compoundOp{
+		{opCode: types.OP_SEQUENCE, data: encodeSequenceArgs(sessionID, 0, 2, 0, false)},
+		{opCode: types.OP_BIND_CONN_TO_SESSION, data: encodeBindConnToSessionArgs(sessionID, types.CDFC4_FORE, false)},
+	}
+	retryResp, err := h.ProcessCompound(retryCtx, buildCompoundArgsWithOps([]byte("seqbind"), 1, retryOps))
+	if err != nil {
+		t.Fatalf("retry ProcessCompound error: %v", err)
+	}
+	retryDecoded, err := decodeCompoundResponse(retryResp)
+	if err != nil {
+		t.Fatalf("decode retry response error: %v", err)
+	}
+	if retryDecoded.Status != types.NFS4_OK {
+		t.Errorf("retry compound status = %d, want NFS4_OK", retryDecoded.Status)
+	}
+	if got := len(h.StateManager.GetConnectionBindings(sessionID)); got != 2 {
+		t.Errorf("bindings after successful retry = %d, want 2", got)
 	}
 }
 
