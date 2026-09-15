@@ -783,6 +783,36 @@ func (h *Handler) releaseSessionLeasesAndNotifies(ctx context.Context, sessionID
 // blocked LOCKs for a session. Used by both CleanupSession and
 // PreviousSessionID teardown.
 
+// cancelPendingLocksForTree completes every blocking LOCK parked on a tree with
+// STATUS_RANGE_NOT_LOCKED and drops its wait-graph edge. A parked LOCK outlives
+// the opens the tree held — closing files does not wake it — so without this the
+// dispatch goroutine waits for a lock no client will ever release.
+//
+// Per MS-SMB2 §3.3.5.14 and smbtorture smb2.lock.cancel-tdis this is what
+// TREE_DISCONNECT owes a tree it takes down; any other path that removes a tree
+// owes it the same, which is why it is here rather than inline in one handler.
+func (h *Handler) cancelPendingLocksForTree(treeID uint32) {
+	if h.PendingLockRegistry == nil {
+		return
+	}
+	for _, parked := range h.PendingLockRegistry.UnregisterAllForTree(treeID) {
+		if parked.Callback != nil {
+			// Synchronous like the CLOSE and LOGOFF siblings: the callback
+			// writes the LOCK-cancel response through the connection's write
+			// mutex, so a fire-and-forget goroutine would only add unowned
+			// concurrency (no join on teardown), and the count of parked locks
+			// is bounded by the tree's clients.
+			if err := parked.Callback(parked.SessionID, parked.MessageID, parked.AsyncId, types.StatusRangeNotLocked, nil); err != nil {
+				logger.Debug("tree teardown: failed to cancel pending LOCK",
+					"treeID", treeID, "asyncId", parked.AsyncId, "messageID", parked.MessageID, "error", err)
+			}
+		}
+		if h.LockWaitGraph != nil && parked.OwnerID != "" {
+			h.LockWaitGraph.RemoveWaiter(parked.OwnerID)
+		}
+	}
+}
+
 func (h *Handler) cancelAsyncOpsForSession(sessionID uint64) {
 	if h.PipeReadRegistry != nil {
 		for _, parked := range h.PipeReadRegistry.UnregisterAllForSession(sessionID) {
@@ -987,6 +1017,14 @@ func (h *Handler) CreateSessionWithUserAndExpiry(sessionID uint64, clientAddr st
 
 func (h *Handler) StoreTree(tree *TreeConnection) {
 	h.trees.Store(tree.TreeID, tree)
+}
+
+// ReplaceTree swaps one tree connection for another under its ID and reports
+// whether the swap happened. It fails when the tree is no longer the one the
+// caller read, which is how a republish tells a tree that merely changed from
+// one that was torn down: a plain store would put a disconnected tree back.
+func (h *Handler) ReplaceTree(old, updated *TreeConnection) bool {
+	return h.trees.CompareAndSwap(old.TreeID, old, updated)
 }
 
 // StoreOpenFile stores an open file

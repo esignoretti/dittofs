@@ -140,15 +140,7 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 		"user", user,
 		"permission", permission)
 
-	// Apply share-level read_only override
-	// If share is configured as read_only, cap permission to Read
-	if share.ReadOnly && permission != models.PermissionNone {
-		if permission == models.PermissionReadWrite || permission == models.PermissionAdmin {
-			logger.Debug("Share is read-only, capping permission to read",
-				"shareName", shareName, "originalPermission", permission)
-			permission = models.PermissionRead
-		}
-	}
+	permission = capReadOnlyShare(share, permission)
 
 	// Encryption enforcement: in required mode, reject unencrypted sessions
 	// connecting to encrypted shares.
@@ -175,7 +167,35 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 		ContinuousAvailability: share.ContinuousAvailability,
 		AllowMFsymlink:         share.AllowMFsymlink,
 	}
+	// Re-check the revocation between resolving access and publishing the tree.
+	// The dispatch gate ran before this handler did, so a re-check sweep that
+	// revoked the session and removed its trees in the meantime would otherwise
+	// find this one published behind it — and a later re-authentication, which
+	// clears the revocation, would leave it standing on the permission resolved
+	// for the user that was retired.
+	if sess != nil && sess.IsExpiredOrRevoked() {
+		logger.Warn("SMB TREE_CONNECT refused: session was revoked while access was being resolved",
+			"share", shareName, "sessionID", ctx.SessionID)
+		return NewErrorResult(types.StatusNetworkSessionExpired), nil
+	}
 	h.StoreTree(tree)
+
+	// Published first, then checked again, because a teardown races this in the
+	// one direction the check above cannot see. LOGOFF marks the session before
+	// it removes the trees, so a teardown that had already started when the
+	// check ran removes every tree except this one — it is not in the map yet —
+	// and the client is handed a tree ID on a session that no longer exists.
+	// Storing before the second look inverts that: either the teardown's sweep
+	// finds this tree and takes it, or this check sees the mark and withdraws it.
+	if sess != nil && (sess.LoggedOff.Load() || sess.IsExpiredOrRevoked()) {
+		h.DeleteTree(treeID)
+		logger.Warn("SMB TREE_CONNECT refused: session torn down while access was being resolved",
+			"share", shareName, "sessionID", ctx.SessionID)
+		if sess.LoggedOff.Load() {
+			return NewErrorResult(types.StatusUserSessionDeleted), nil
+		}
+		return NewErrorResult(types.StatusNetworkSessionExpired), nil
+	}
 
 	ctx.TreeID = treeID
 	ctx.ShareName = shareName
@@ -281,6 +301,15 @@ func (h *Handler) handleIPCShare(ctx *SMBHandlerContext) (*HandlerResult, error)
 		return NewErrorResult(types.StatusUserSessionDeleted), nil
 	}
 
+	// The dispatch gate refused this command only if the session had already
+	// lost authorization when it arrived. A sweep that revokes in between would
+	// otherwise leave this tree behind, and a later re-authentication clears the
+	// revocation while the tree survives it.
+	if sess.IsExpiredOrRevoked() {
+		logger.Debug("IPC$ access denied: session authorization revoked", "sessionID", ctx.SessionID)
+		return NewErrorResult(types.StatusNetworkSessionExpired), nil
+	}
+
 	// Create tree connection for IPC$ with PIPE share type
 	treeID := h.GenerateTreeID()
 	tree := &TreeConnection{
@@ -371,6 +400,20 @@ type sidSharePermissionResolver interface {
 //  4. Default permission if no explicit permission found
 //
 // This mirrors the NFS behavior where root users get automatic admin access based on squash settings.
+// capReadOnlyShare caps a resolved permission to read when the share itself is
+// configured read-only, so no resolution hands back write access the share
+// forbids. Every path that resolves a share permission goes through it —
+// TREE_CONNECT and the authorization re-check alike — because a second copy of
+// this rule is a copy that can drift.
+func capReadOnlyShare(share *runtime.Share, permission models.SharePermission) models.SharePermission {
+	if !share.ReadOnly || (permission != models.PermissionReadWrite && permission != models.PermissionAdmin) {
+		return permission
+	}
+	logger.Debug("Share is read-only, capping permission to read",
+		"shareName", share.Name, "originalPermission", permission)
+	return models.PermissionRead
+}
+
 func resolveSharePermission(
 	ctx *SMBHandlerContext,
 	sess *session.Session,
@@ -378,38 +421,86 @@ func resolveSharePermission(
 	defaultPerm models.SharePermission,
 	userStore models.UserStore,
 ) (models.SharePermission, string) {
+	var snap session.AuthzIdentity
+	if sess != nil {
+		// Through the locked accessor: SESSION_SETUP re-authentication replaces
+		// these fields under the session mutex, so reading them directly races a
+		// concurrent re-auth and can resolve access from a half-published
+		// identity.
+		snap = sess.AuthzIdentity()
+	}
+	perm, identifier, _ := resolveSharePermissionForIdentity(ctx, sess, snap, share, defaultPerm, userStore)
+	return perm, identifier
+}
+
+// resolveSharePermissionForIdentity resolves against a supplied identity rather
+// than reading the session again. An authorization re-check substitutes the
+// record it has just read from the store into the snapshot, so the grants and
+// group memberships consulted below are current ones rather than those captured
+// when the session authenticated, while every other identity field still comes
+// from the one read that produced the generation the re-check is pinned to.
+func resolveSharePermissionForIdentity(
+	ctx *SMBHandlerContext,
+	sess *session.Session,
+	snap session.AuthzIdentity,
+	share *runtime.Share,
+	defaultPerm models.SharePermission,
+	userStore models.UserStore,
+) (models.SharePermission, string, bool) {
+	user := snap.User
 	// No session at all — deny (the caller maps PermissionNone to
 	// STATUS_ACCESS_DENIED).
 	if sess == nil {
-		return models.PermissionNone, ""
+		return models.PermissionNone, "", true
+	}
+
+	// A disabled user keeps no access on any protocol. Every path that installs
+	// a user on a session already requires Enabled, so this does not currently
+	// refuse a request the earlier checks let through — it is the backstop that
+	// keeps that true, and the one place a re-check can pass a record read after
+	// the session was established. Ahead of the root bypass below because a
+	// disabled root is still disabled. Mirrors the NFS resolver.
+	if user != nil && !user.Enabled {
+		logger.Debug("Share access denied (user disabled)",
+			"shareName", share.Name, "user", user.Username)
+		return models.PermissionNone, user.Username, true
 	}
 
 	// 1. Root user bypass: UID 0 with a squash mode that allows root access gets
 	// admin regardless of grants. Mirrors resolveNFSSharePermission.
-	if sess.User != nil && isRootUser(sess.User) && rootHasAdminAccess(share) {
+	if user != nil && isRootUser(user) && rootHasAdminAccess(share) {
 		logger.Debug("Root user granted admin access via squash mode",
-			"shareName", share.Name, "user", sess.User.Username, "squash", share.Squash)
-		return models.PermissionAdmin, sess.User.Username
+			"shareName", share.Name, "user", user.Username, "squash", share.Squash)
+		return models.PermissionAdmin, user.Username, true
 	}
 
 	// 2. Local user/group resolution.
+
 	localPerm := defaultPerm
-	identifier := sess.Username
+	identifier := snap.Username
+	// resolved reports whether the permission below is a decision the store
+	// actually made — across both lookups, the local one here and the SID grant
+	// further down. A failed lookup falls back to the share default, which is a
+	// grant a caller must not mistake for a resolved one: TREE_CONNECT may hand
+	// out the default on a fresh connect, but a re-check that writes the result
+	// back would promote an explicitly restricted tree to it.
+	resolved := true
 	switch {
-	case sess.User != nil:
-		identifier = sess.User.Username
+	case user != nil:
+		identifier = user.Username
 		if userStore != nil {
-			if perm, err := userStore.ResolveSharePermission(ctx.Context, sess.User, share.Name); err != nil {
+			if perm, err := userStore.ResolveSharePermission(ctx.Context, user, share.Name); err != nil {
 				logger.Debug("Permission resolution failed, using default",
-					"shareName", share.Name, "user", sess.User.Username, "error", err, "default", defaultPerm)
+					"shareName", share.Name, "user", user.Username, "error", err, "default", defaultPerm)
+				resolved = false
 			} else {
 				localPerm = perm
 			}
 		} else {
 			logger.Debug("No userStore available, using default permission",
-				"shareName", share.Name, "user", sess.User.Username, "default", defaultPerm)
+				"shareName", share.Name, "user", user.Username, "default", defaultPerm)
 		}
-	case sess.IsGuest:
+	case snap.IsGuest:
 		identifier = "guest"
 	}
 
@@ -421,19 +512,23 @@ func resolveSharePermission(
 	// be overridden, mirroring the local resolver's "user-explicit wins" rule.
 	effective := localPerm
 	userExplicit := false
-	if sess.User != nil {
-		_, userExplicit = sess.User.GetExplicitSharePermission(share.Name)
+	if user != nil {
+		_, userExplicit = user.GetExplicitSharePermission(share.Name)
 	}
 	if r, ok := userStore.(sidSharePermissionResolver); ok && !userExplicit {
-		groupSIDs, userSID := sess.PACIdentity()
-		sids := groupSIDs
-		if userSID != "" {
-			sids = append(sids, userSID)
+		sids := snap.GroupSIDs
+		if snap.UserSID != "" {
+			sids = append(sids, snap.UserSID)
 		}
 		if len(sids) > 0 {
 			if sidPerm, err := r.ResolveSharePermissionForSIDs(ctx.Context, sids, share.Name); err != nil {
 				logger.Debug("SID permission resolution failed, ignoring",
 					"shareName", share.Name, "error", err)
+				// Unresolved for the same reason the local lookup is: an AD
+				// principal can hold its whole grant here, so a failure leaves
+				// the permission below resting on the share default rather than
+				// on anything the store said.
+				resolved = false
 			} else if sidPerm.Level() > effective.Level() {
 				logger.Debug("Direct AD/SID grant elevates share permission",
 					"shareName", share.Name, "user", identifier, "from", effective, "to", sidPerm)
@@ -442,7 +537,7 @@ func resolveSharePermission(
 		}
 	}
 
-	return effective, identifier
+	return effective, identifier, resolved
 }
 
 // isRootUser checks if the user has UID 0 (root).
