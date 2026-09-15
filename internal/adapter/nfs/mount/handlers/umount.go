@@ -39,9 +39,9 @@ type UmountResponse struct {
 }
 
 // Umnt handles MOUNT UMNT (RFC 1813 Appendix I, Mount procedure 3).
-// Removes a client's mount record for a previously mounted filesystem.
-// Delegates to Runtime.RemoveMount to clear mount tracking state.
-// Removes mount session record (not the share itself); idempotent.
+// Removes the calling client's NFS mount record for the requested export only:
+// other exports it still has mounted, and its mounts over other protocols, stay.
+// Removes the mount session record (not the share itself); idempotent.
 // Errors: none (UMNT always succeeds per RFC 1813, returns void).
 func (h *Handler) Umnt(
 	ctx *MountHandlerContext,
@@ -62,19 +62,18 @@ func (h *Handler) Umnt(
 
 	logger.Info("Unmount request", "path", req.DirPath, "client_ip", clientIP)
 
-	// Remove the mount record from the registry
-	// Note: We remove the mount SESSION, NOT the share itself! The share persists.
-	// UMNT always succeeds per RFC 1813, even if no mount record exists
-	removed := h.Registry.RemoveMount(clientIP)
+	// Remove the mount SESSION, not the share itself — the share persists. The
+	// dirpath is the same string MNT recorded the mount under, so it scopes the
+	// removal to the one export the client asked to unmount.
+	removed := h.Registry.RemoveMount(clientIP, req.DirPath)
 	if removed {
 		logger.Info("Unmount successful", "path", req.DirPath, "client_ip", clientIP)
 	} else {
 		logger.Debug("Unmount acknowledged (no active mount)", "path", req.DirPath, "client_ip", clientIP)
 	}
 
-	// UMNT always returns void/success per RFC 1813
-	// Even if RemoveMount failed or was cancelled, we return success
-	// because the client-side unmount has already occurred
+	// UMNT returns void/success per RFC 1813 even when nothing matched: the
+	// client-side unmount has already occurred.
 	return &UmountResponse{MountResponseBase: MountResponseBase{Status: MountOK}}, nil
 }
 
