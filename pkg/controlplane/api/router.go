@@ -131,7 +131,7 @@ func NewRouter(rt *runtime.Runtime, jwtService *auth.JWTService, cpStore store.S
 
 	// API handlers - use cpStore directly since API handlers have request context
 	authHandler := handlers.NewAuthHandler(cpStore, jwtService)
-	userHandler, err := handlers.NewUserHandler(cpStore, jwtService)
+	userHandler, err := handlers.NewUserHandler(cpStore, jwtService, rt.InvalidateAuthCache)
 	if err != nil {
 		// This is a programming error - jwtService should always be provided
 		panic("failed to create user handler: " + err.Error())
@@ -185,7 +185,7 @@ func NewRouter(rt *runtime.Runtime, jwtService *auth.JWTService, cpStore store.S
 			r.Route("/groups", func(r chi.Router) {
 				r.Use(apiMiddleware.RequireAdmin())
 
-				groupHandler := handlers.NewGroupHandler(cpStore)
+				groupHandler := handlers.NewGroupHandler(cpStore, rt.InvalidateAuthCache)
 				r.Post("/", groupHandler.Create)
 				r.Get("/", groupHandler.List)
 				r.Get("/{name}", groupHandler.Get)
