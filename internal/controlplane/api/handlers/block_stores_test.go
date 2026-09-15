@@ -642,3 +642,202 @@ func TestBlockStoreHandler_Update_RenameTargetResolvingByIDIsNotAConflict(t *tes
 		t.Fatalf("status = %d, want %d, body = %s", w.Code, http.StatusOK, w.Body.String())
 	}
 }
+
+// The checker cache is keyed by the store's name, but the route may address
+// the store by its ID. A rename issued through the ID route must still evict
+// the entry cached under the name it had, or that name keeps answering with
+// the store's last known health for a whole TTL window after nothing carries
+// it any more.
+func TestBlockStoreHandler_Update_RenameByIDEvictsTheCheckerCachedUnderTheName(t *testing.T) {
+	cpStore, handler := setupBlockStoreTestWithRuntime(t)
+	ctx := context.Background()
+
+	id := uuid.New().String()
+	if _, err := cpStore.CreateBlockStore(ctx, &models.BlockStoreConfig{
+		ID: id, Name: "cached", Type: "memory", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateBlockStore: %v", err)
+	}
+
+	// Warm the cache under the name, which is the only key the checker uses.
+	if got := handler.runtime.BlockStoreChecker("cached").Healthcheck(ctx).Status; got != health.StatusHealthy {
+		t.Fatalf("warm-up status = %v, want healthy", got)
+	}
+
+	renamed := "moved"
+	body, _ := json.Marshal(UpdateBlockStoreRequest{Name: &renamed})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/store/block/"+id, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = withBlockStoreName(req, id)
+	w := httptest.NewRecorder()
+
+	handler.Update(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Update(rename by ID) = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	if got := handler.runtime.BlockStoreChecker("cached").Healthcheck(ctx).Status; got == health.StatusHealthy {
+		t.Error("the old name still reports healthy: the checker cached under it survived the rename")
+	}
+}
+
+// Delete resolves its target by name or ID, but the checker is cached under
+// the name alone. A DELETE addressed by ID must still evict that entry, or a
+// store recreated under the same name inherits the dead one's health for the
+// rest of the TTL window.
+func TestBlockStoreHandler_Remove_ByIDEvictsTheCheckerCachedUnderTheName(t *testing.T) {
+	cpStore, handler := setupBlockStoreTestWithRuntime(t)
+	ctx := context.Background()
+
+	id := uuid.New().String()
+	if _, err := cpStore.CreateBlockStore(ctx, &models.BlockStoreConfig{
+		ID: id, Name: "doomed", Type: "memory", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateBlockStore: %v", err)
+	}
+
+	if got := handler.runtime.BlockStoreChecker("doomed").Healthcheck(ctx).Status; got != health.StatusHealthy {
+		t.Fatalf("warm-up status = %v, want healthy", got)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/store/block/"+id, nil)
+	req = withBlockStoreName(req, id)
+	w := httptest.NewRecorder()
+
+	handler.Remove(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Remove(by ID) = %d, want %d; body=%s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+
+	if got := handler.runtime.BlockStoreChecker("doomed").Healthcheck(ctx).Status; got == health.StatusHealthy {
+		t.Error("the deleted store's name still reports healthy: its checker survived the delete")
+	}
+}
+
+// A mutation cannot name every checker it invalidates: the route may address
+// a store by ID, and a concurrent rename can move a name between the lookup
+// and the write, so the request alone does not identify which probes went
+// stale. Eviction therefore covers every block-store checker, not the keys
+// this request happens to know about.
+func TestBlockStoreHandler_Update_EvictsCheckersItCannotName(t *testing.T) {
+	cpStore, handler := setupBlockStoreTestWithRuntime(t)
+	ctx := context.Background()
+
+	id := uuid.New().String()
+	for _, n := range []struct{ id, name string }{{id, "edited"}, {uuid.New().String(), "bystander"}} {
+		if _, err := cpStore.CreateBlockStore(ctx, &models.BlockStoreConfig{
+			ID: n.id, Name: n.name, Type: "memory", CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("CreateBlockStore(%s): %v", n.name, err)
+		}
+	}
+
+	// Warm both, then delete the bystander's row behind the cache's back so a
+	// surviving entry is distinguishable from a re-probed one.
+	for _, n := range []string{"edited", "bystander"} {
+		if got := handler.runtime.BlockStoreChecker(n).Healthcheck(ctx).Status; got != health.StatusHealthy {
+			t.Fatalf("warm-up %s = %v, want healthy", n, got)
+		}
+	}
+	if err := cpStore.DeleteBlockStore(ctx, "bystander"); err != nil {
+		t.Fatalf("DeleteBlockStore(bystander): %v", err)
+	}
+
+	renamed := "edited-again"
+	body, _ := json.Marshal(UpdateBlockStoreRequest{Name: &renamed})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/store/block/"+id, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = withBlockStoreName(req, id)
+	w := httptest.NewRecorder()
+
+	handler.Update(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Update = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	if got := handler.runtime.BlockStoreChecker("bystander").Healthcheck(ctx).Status; got == health.StatusHealthy {
+		t.Error("a checker the request never named survived: eviction is still keyed by the names this handler knows")
+	}
+}
+
+// A name probed before its store exists caches a "not found" verdict. Creating
+// the store changes that name's health, so a create invalidates checkers for
+// the same reason an update or a delete does.
+func TestBlockStoreHandler_Create_EvictsTheCheckerCachedWhileTheNameWasAbsent(t *testing.T) {
+	cpStore, handler := setupBlockStoreTestWithRuntime(t)
+	ctx := context.Background()
+
+	if got := handler.runtime.BlockStoreChecker("arriving").Healthcheck(ctx).Status; got == health.StatusHealthy {
+		t.Fatalf("a name with no store must not probe healthy, got %v", got)
+	}
+
+	body, _ := json.Marshal(CreateBlockStoreRequest{Name: "arriving", Type: "memory"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/store/block", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.Create(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("Create = %d, want %d; body=%s", w.Code, http.StatusCreated, w.Body.String())
+	}
+	if _, err := cpStore.GetBlockStore(ctx, "arriving"); err != nil {
+		t.Fatalf("GetBlockStore(arriving): %v", err)
+	}
+
+	if got := handler.runtime.BlockStoreChecker("arriving").Healthcheck(ctx).Status; got != health.StatusHealthy {
+		t.Errorf("status = %v, want healthy: the not-found verdict cached before the create survived it", got)
+	}
+}
+
+// renameFailingStore fails only RenameBlockStore, standing in for a rename
+// that loses a race after the preflight cleared it.
+type renameFailingStore struct {
+	store.Store
+}
+
+func (s renameFailingStore) RenameBlockStore(context.Context, string, string) (*models.BlockStoreConfig, error) {
+	return nil, models.ErrStoreNotFound
+}
+
+// The config write lands before the rename is attempted, so a rename that
+// fails leaves the store mutated under its original name. That is still a
+// mutation, and the probes cached for it are still stale.
+//
+// The assertion is on the cache entry rather than on a report: the store
+// survives a failed rename, so a memory store probes healthy either way and
+// only the identity of the cached checker says whether it was rebuilt.
+func TestBlockStoreHandler_Update_EvictsWhenTheRenameFailsAfterTheConfigLanded(t *testing.T) {
+	cpStore, _ := setupBlockStoreTestWithRuntime(t)
+	ctx := context.Background()
+
+	if _, err := cpStore.CreateBlockStore(ctx, &models.BlockStoreConfig{
+		ID: uuid.New().String(), Name: "doomed-rename", Type: "memory",
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateBlockStore: %v", err)
+	}
+
+	rt := runtime.New(cpStore)
+	handler := NewBlockStoreHandler(renameFailingStore{cpStore}, rt)
+
+	before := rt.BlockStoreChecker("doomed-rename")
+	if got := before.Healthcheck(ctx).Status; got != health.StatusHealthy {
+		t.Fatalf("warm-up status = %v, want healthy", got)
+	}
+
+	renamed := "never-lands"
+	body, _ := json.Marshal(UpdateBlockStoreRequest{Name: &renamed})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/store/block/doomed-rename", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = withBlockStoreName(req, "doomed-rename")
+	w := httptest.NewRecorder()
+
+	handler.Update(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("Update(rename that fails) = %d, want %d; body=%s", w.Code, http.StatusNotFound, w.Body.String())
+	}
+
+	if rt.BlockStoreChecker("doomed-rename") == before {
+		t.Error("the failed rename returned without evicting: the checker cached before the config write is still the one being served")
+	}
+}

@@ -111,6 +111,13 @@ func (h *BlockStoreHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A name that was probed before it existed is cached as "not found", so a
+	// create invalidates checkers for the same reason an update or a delete
+	// does: the name's health just changed.
+	if h.runtime != nil {
+		h.runtime.InvalidateBlockStoreCheckers()
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), HealthCheckTimeout)
 	defer cancel()
 
@@ -272,6 +279,17 @@ func (h *BlockStoreHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The config has landed, so two separate windows need clearing. Evicting
+	// now drops the probes cached before the write, which a concurrent status
+	// read would otherwise be served for the rest of the TTL. Evicting again
+	// on the way out drops anything cached during the work below — those
+	// probes read a store the rename had not moved yet — and covers the rename
+	// failure paths, which return with the store mutated under its old name.
+	if h.runtime != nil {
+		h.runtime.InvalidateBlockStoreCheckers()
+		defer h.runtime.InvalidateBlockStoreCheckers()
+	}
+
 	// A share's binding normally holds the store's UUID, but the older update
 	// path persisted the name instead. Those shares would resolve nothing once
 	// the name moves, so repoint them — onto the UUID, which cannot go stale
@@ -290,16 +308,6 @@ func (h *BlockStoreHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		bs = renamed
-	}
-
-	// Evict the cached checker so the post-update response does not
-	// observe a stale probe from before the config change landed. A rename
-	// leaves an entry under the old name too.
-	if h.runtime != nil {
-		h.runtime.InvalidateBlockStoreChecker(name)
-		if renameTo != "" {
-			h.runtime.InvalidateBlockStoreChecker(renameTo)
-		}
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), HealthCheckTimeout)
@@ -331,10 +339,10 @@ func (h *BlockStoreHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Evict any cached health checker so a subsequently-recreated
-	// store with the same name does not inherit a stale probe.
+	// Evict the cached checkers so a subsequently-recreated store with the
+	// same name does not inherit a stale probe.
 	if h.runtime != nil {
-		h.runtime.InvalidateBlockStoreChecker(name)
+		h.runtime.InvalidateBlockStoreCheckers()
 	}
 
 	WriteNoContent(w)
