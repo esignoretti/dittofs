@@ -111,13 +111,14 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-
+      # No Nix cache here: .#build is the Go toolchain alone, all of it
+      # substituted from cache.nixos.org, so this job realizes nothing locally
+      # and has nothing worth pushing back. Entering .#ci instead would build
+      # pynfs and pjdfstest from source just to run `go build`.
       - name: Build DittoFS
         run: |
-          nix develop .#ci --command sh -c "CGO_ENABLED=0 go build -o dfs cmd/dfs/main.go"
-          nix develop .#ci --command sh -c "CGO_ENABLED=0 go build -o dfsctl cmd/dfsctl/main.go"
+          nix develop .#build --command sh -c "CGO_ENABLED=0 go build -o dfs cmd/dfs/main.go"
+          nix develop .#build --command sh -c "CGO_ENABLED=0 go build -o dfsctl cmd/dfsctl/main.go"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v7
