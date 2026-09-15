@@ -365,18 +365,11 @@ func buildShareConfig(ctx context.Context, s store.Store, share *models.Share) (
 		BlockedOperations:                share.GetBlockedOps(),
 		RetentionPolicy:                  share.GetRetentionPolicy(),
 		RetentionTTL:                     share.GetRetentionTTL(),
-		LocalStoreSize:                   share.LocalStoreSize,
+		JournalSize:                      share.JournalSize,
 		ReadBufferSize:                   share.ReadBufferSize,
 		QuotaBytes:                       share.QuotaBytes,
-		LocalBlockStoreID:                share.LocalBlockStoreID,
-		RemoteBlockStoreID:               derefString(share.RemoteBlockStoreID),
+		BlockStoreID:                     share.BlockStoreID,
+		CommitAck:                        share.CommitAck,
+		RelaxedMetadataCommit:            share.RelaxedMetadataCommit,
 	}, nil
-}
-
-// derefString safely dereferences a *string, returning "" if nil.
-func derefString(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }

@@ -19,7 +19,6 @@ type MetadataStore struct {
 type BlockStore struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
-	Kind      string          `json:"kind"`
 	Type      string          `json:"type"`
 	Config    json.RawMessage `json:"config,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
@@ -41,12 +40,15 @@ type createStoreAPIRequest struct {
 
 // UpdateStoreRequest is the request to update a store.
 type UpdateStoreRequest struct {
+	// Name renames the store. A rename onto a name already in use is refused.
+	Name   *string `json:"name,omitempty"`
 	Type   *string `json:"type,omitempty"`
 	Config any     `json:"-"` // Config is serialized separately as a JSON string
 }
 
 // updateStoreAPIRequest is the actual API request format.
 type updateStoreAPIRequest struct {
+	Name   *string `json:"name,omitempty"`
 	Type   *string `json:"type,omitempty"`
 	Config *string `json:"config,omitempty"`
 }
@@ -122,33 +124,33 @@ func (c *Client) MetadataStoreHealth(name string) (*MetadataStoreHealthResult, e
 	return getResource[MetadataStoreHealthResult](c, fmt.Sprintf("/api/v1/store/metadata/%s/health", name))
 }
 
-// ListBlockStores returns all block stores of a given kind.
-func (c *Client) ListBlockStores(kind string) ([]BlockStore, error) {
-	return listResources[BlockStore](c, fmt.Sprintf("/api/v1/store/block/%s", kind))
+// ListBlockStores returns all block stores.
+func (c *Client) ListBlockStores() ([]BlockStore, error) {
+	return listResources[BlockStore](c, "/api/v1/store/block")
 }
 
-// GetBlockStore returns a block store by name and kind.
-func (c *Client) GetBlockStore(kind, name string) (*BlockStore, error) {
-	return getResource[BlockStore](c, fmt.Sprintf("/api/v1/store/block/%s/%s", kind, name))
+// GetBlockStore returns a block store by name.
+func (c *Client) GetBlockStore(name string) (*BlockStore, error) {
+	return getResource[BlockStore](c, fmt.Sprintf("/api/v1/store/block/%s", name))
 }
 
 // CreateBlockStore creates a new block store.
-func (c *Client) CreateBlockStore(kind string, req *CreateStoreRequest) (*BlockStore, error) {
+func (c *Client) CreateBlockStore(req *CreateStoreRequest) (*BlockStore, error) {
 	configStr, err := serializeConfig(req.Config)
 	if err != nil {
 		return nil, err
 	}
 	apiReq := createStoreAPIRequest{Name: req.Name, Type: req.Type, Config: configStr}
 	var store BlockStore
-	if err := c.post(fmt.Sprintf("/api/v1/store/block/%s", kind), apiReq, &store); err != nil {
+	if err := c.post("/api/v1/store/block", apiReq, &store); err != nil {
 		return nil, err
 	}
 	return &store, nil
 }
 
 // UpdateBlockStore updates an existing block store.
-func (c *Client) UpdateBlockStore(kind, name string, req *UpdateStoreRequest) (*BlockStore, error) {
-	apiReq := updateStoreAPIRequest{Type: req.Type}
+func (c *Client) UpdateBlockStore(name string, req *UpdateStoreRequest) (*BlockStore, error) {
+	apiReq := updateStoreAPIRequest{Name: req.Name, Type: req.Type}
 	if req.Config != nil {
 		configStr, err := serializeConfig(req.Config)
 		if err != nil {
@@ -157,15 +159,15 @@ func (c *Client) UpdateBlockStore(kind, name string, req *UpdateStoreRequest) (*
 		apiReq.Config = &configStr
 	}
 	var store BlockStore
-	if err := c.put(fmt.Sprintf("/api/v1/store/block/%s/%s", kind, name), apiReq, &store); err != nil {
+	if err := c.put(fmt.Sprintf("/api/v1/store/block/%s", name), apiReq, &store); err != nil {
 		return nil, err
 	}
 	return &store, nil
 }
 
 // RemoveBlockStore deletes a block store.
-func (c *Client) RemoveBlockStore(kind, name string) error {
-	return deleteResource(c, fmt.Sprintf("/api/v1/store/block/%s/%s", kind, name))
+func (c *Client) RemoveBlockStore(name string) error {
+	return deleteResource(c, fmt.Sprintf("/api/v1/store/block/%s", name))
 }
 
 // BlockStoreHealthResult holds the result of a block store health check.
@@ -178,6 +180,6 @@ type BlockStoreHealthResult struct {
 
 // BlockStoreHealth performs a health check on a block store.
 // The server always returns 200 with the health status in the response body.
-func (c *Client) BlockStoreHealth(kind, name string) (*BlockStoreHealthResult, error) {
-	return getResource[BlockStoreHealthResult](c, fmt.Sprintf("/api/v1/store/block/%s/%s/health", kind, name))
+func (c *Client) BlockStoreHealth(name string) (*BlockStoreHealthResult, error) {
+	return getResource[BlockStoreHealthResult](c, fmt.Sprintf("/api/v1/store/block/%s/health", name))
 }

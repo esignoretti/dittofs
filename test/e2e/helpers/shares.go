@@ -13,13 +13,12 @@ import (
 
 // Share represents a share returned from the API.
 type Share struct {
-	Name               string  `json:"name"`
-	MetadataStoreID    string  `json:"metadata_store_id"`
-	LocalBlockStoreID  string  `json:"local_block_store_id"`
-	RemoteBlockStoreID *string `json:"remote_block_store_id,omitempty"`
-	ReadOnly           bool    `json:"read_only"`
-	DefaultPermission  string  `json:"default_permission"`
-	Description        string  `json:"description,omitempty"`
+	Name              string `json:"name"`
+	MetadataStoreID   string `json:"metadata_store_id"`
+	BlockStoreID      string `json:"block_store_id"`
+	ReadOnly          bool   `json:"read_only"`
+	DefaultPermission string `json:"default_permission"`
+	Description       string `json:"description,omitempty"`
 }
 
 // ShareOption is a functional option for share operations.
@@ -29,7 +28,6 @@ type shareOptions struct {
 	readOnly          *bool
 	defaultPermission string
 	description       string
-	remoteBlockStore  string
 	trashEnabled      *bool
 }
 
@@ -64,14 +62,6 @@ func WithShareTrashEnabled() ShareOption {
 	}
 }
 
-// WithShareRemote sets the remote block store name for the share.
-// This enables tiered storage (local + remote durable storage).
-func WithShareRemote(remoteName string) ShareOption {
-	return func(o *shareOptions) {
-		o.remoteBlockStore = remoteName
-	}
-}
-
 // =============================================================================
 // Share CRUD Methods
 // =============================================================================
@@ -79,17 +69,14 @@ func WithShareRemote(remoteName string) ShareOption {
 // CreateShare creates a new share via the CLI.
 // Returns the created share or an error with CLI output on failure.
 // Share names MUST have a leading slash (e.g., "/myshare").
-func (r *CLIRunner) CreateShare(name, metadataStore, localBlockStore string, opts ...ShareOption) (*Share, error) {
+func (r *CLIRunner) CreateShare(name, metadataStore, blockStore string, opts ...ShareOption) (*Share, error) {
 	options := &shareOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
 
-	args := []string{"share", "create", "--name", name, "--metadata", metadataStore, "--local", localBlockStore}
+	args := []string{"share", "create", "--name", name, "--metadata", metadataStore, "--block-store", blockStore}
 
-	if options.remoteBlockStore != "" {
-		args = append(args, "--remote", options.remoteBlockStore)
-	}
 	if options.readOnly != nil {
 		args = append(args, "--read-only", fmt.Sprintf("%t", *options.readOnly))
 	}

@@ -288,8 +288,9 @@ ls: cannot access 'file.txt': Stale file handle
    ```bash
    ./dfsctl store metadata add --name persistent --type badger \
      --config '{"path":"/var/lib/dittofs/metadata"}'
-   ./dfsctl store block local add --name default --type memory
-   ./dfsctl share create --name /export --metadata persistent --local default
+   ./dfsctl store block add --name persistent-blocks --type memory
+   ./dfsctl share create --name /export --metadata persistent \
+     --block-store persistent-blocks
    ```
 
 3. **Clear client NFS cache (Linux):**
@@ -322,15 +323,14 @@ tail -f ~/.local/state/dittofs/dittofs.log | grep -i "slow\|timeout"
          max_write_size: 1048576  # 1MB
    ```
 
-2. **Use memory stores for development:**
+2. **Use a memory metadata store for development:**
    ```bash
    ./dfsctl store metadata add --name fast --type memory
-   ./dfsctl store block local add --name fast --type memory
    ```
 
 3. **For S3, verify configuration:**
    ```bash
-   ./dfsctl store block remote add --name s3-store --type s3 \
+   ./dfsctl store block add --name s3-store --type s3 \
      --config '{"region":"us-east-1","bucket":"my-bucket"}'
    ```
 
@@ -605,12 +605,12 @@ shares:
 
 **Solution:** Ensure stores exist before creating the share:
 ```bash
-# Create the stores first
+# Create the stores first — a share needs both
 ./dfsctl store metadata add --name my-store --type memory
-./dfsctl store block local add --name my-blocks --type memory
+./dfsctl store block add --name my-blocks --type memory
 
 # Then create the share referencing them
-./dfsctl share create --name /export --metadata my-store --local my-blocks
+./dfsctl share create --name /export --metadata my-store --block-store my-blocks
 ```
 
 ### NFSv4 Session Issues

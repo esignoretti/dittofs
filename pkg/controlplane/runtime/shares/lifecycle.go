@@ -36,8 +36,16 @@ func (s *Service) AddShare(
 		return err
 	}
 
-	if config.LocalBlockStoreID != "" && blockStoreProvider == nil {
-		return fmt.Errorf("block store provider is required when LocalBlockStoreID is set for share %q", config.Name)
+	// A share's durable tier is its block store: the journal holds bytes only
+	// until they are synced out, and eviction reclaims journal space on the
+	// promise that a durable copy exists elsewhere. A share without a block
+	// store has no such copy, so eviction could drop the only one. Refuse the
+	// share instead of building one that can lose data.
+	if config.BlockStoreID == "" {
+		return fmt.Errorf("share %q has no block store: every share must reference one", config.Name)
+	}
+	if blockStoreProvider == nil {
+		return fmt.Errorf("block store provider is required to resolve the block store for share %q", config.Name)
 	}
 
 	if metadataSvc == nil {
@@ -77,11 +85,10 @@ func (s *Service) AddShare(
 		return err
 	}
 
-	// Phase 2: Create per-share BlockStore if local block store config is provided.
-	if config.LocalBlockStoreID != "" {
-		if err := s.createBlockStoreForShare(ctx, share, config, blockStoreProvider, metadataStore, localStoreDefaults, syncerDefaults); err != nil {
-			return fmt.Errorf("failed to create block store for share %q: %w", config.Name, err)
-		}
+	// Phase 2: Create the per-share BlockStore. Every share has a journal, so
+	// this is unconditional — there is no longer a share without local storage.
+	if err := s.createBlockStoreForShare(ctx, share, config, blockStoreProvider, metadataStore, localStoreDefaults, syncerDefaults); err != nil {
+		return fmt.Errorf("failed to create block store for share %q: %w", config.Name, err)
 	}
 
 	// cleanupShare releases resources for a share that failed to fully initialize.
@@ -101,7 +108,7 @@ func (s *Service) AddShare(
 	// data actually made durable in the journal. This grows metadata.Size up to the
 	// journal size (max-only, never shrinks) BEFORE the share is registered and any
 	// protocol handler can read it, so ACK'd bytes are never truncated.
-	if config.LocalBlockStoreID != "" && share.BlockStore != nil {
+	if share.BlockStore != nil {
 		if err := reconcileMetadataSizeFromJournal(ctx, metadataStore, share.BlockStore); err != nil {
 			cleanupShare()
 			return fmt.Errorf("failed to reconcile metadata sizes for share %q: %w", config.Name, err)
@@ -117,10 +124,10 @@ func (s *Service) AddShare(
 		return fmt.Errorf("failed to configure metadata for share: %w", err)
 	}
 
-	// Apply the per-share metadata writeback tier (#1757) parsed from the local
-	// store config in createBlockStoreForShare. Set explicitly (true or false) so
-	// a re-add that toggles writeback off is honored. Only the concrete
-	// *metadata.Service implements the setter.
+	// Apply the share's relaxed metadata commit tier, stashed by
+	// createBlockStoreForShare. Set explicitly (true or false) so a re-add that
+	// toggles it off is honored. Only the concrete *metadata.Service implements
+	// the setter.
 	if wb, ok := metadataSvc.(MetadataWritebackSetter); ok {
 		wb.SetShareWriteback(config.Name, share.writeback)
 	}
@@ -553,6 +560,38 @@ func (s *Service) RemoveShare(name string) error {
 // cannot block the rest of shutdown. Drains run outside the registry lock (a
 // drain can block up to its grace window). The block stores stay OPEN; their
 // full teardown still happens in RemoveShare.
+// CloseBlockStores closes every registered share's block store.
+//
+// Shutdown fenced the rollup workers and closed the metadata stores but left
+// the journals open, so each share held its append log and index open for the
+// rest of the process's life. Nothing on a Unix filesystem reports that — an
+// open file can still be unlinked — but the handles are real, and a platform
+// that refuses to remove a file while it is open surfaces the leak as a
+// directory that cannot be cleaned up.
+//
+// Runs before the metadata stores close, for the reason StopRollups already
+// runs there: closing drains in-flight work that writes manifests through the
+// metadata store, which has to still be open to receive them.
+//
+// Close is idempotent, so a share removed afterwards closes harmlessly again.
+// The registry is left intact: this is resource teardown, not removal.
+func (s *Service) CloseBlockStores() {
+	s.mu.RLock()
+	stores := make(map[string]*engine.Store, len(s.registry))
+	for name, share := range s.registry {
+		if share.BlockStore != nil {
+			stores[name] = share.BlockStore
+		}
+	}
+	s.mu.RUnlock()
+
+	for name, bs := range stores {
+		if err := bs.Close(); err != nil {
+			logger.Warn("Shutdown: failed to close block store for share", "share", name, "error", err)
+		}
+	}
+}
+
 func (s *Service) StopRollups(ctx context.Context) {
 	type namedStore struct {
 		name string

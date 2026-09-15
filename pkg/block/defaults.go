@@ -17,9 +17,8 @@ type SystemDetector interface {
 
 // Minimum floor values for deduced defaults.
 const (
-	MinLocalStoreSize      uint64 = 256 << 20 // 256 MiB
-	MinReadBufferSize      int64  = 64 << 20  // 64 MiB
-	MinMaxLogBytes         uint64 = 1 << 30   // 1 GiB
+	MinReadBufferSize      int64  = 64 << 20 // 64 MiB
+	MinMaxLogBytes         uint64 = 1 << 30  // 1 GiB
 	MinParallelFetches            = 8
 	DefaultPrefetchWorkers        = 4
 
@@ -39,7 +38,6 @@ const (
 
 // DeducedDefaults holds block store sizing values derived from system resources.
 type DeducedDefaults struct {
-	LocalStoreSize  uint64 // 25% of memory, floor 256 MiB
 	ReadBufferSize  int64  // 12.5% of memory, floor 64 MiB
 	MaxLogBytes     uint64 // 25% of memory, floor 1 GiB (append-log pressure budget)
 	ParallelSyncs   int    // upload concurrency: 0 = adaptive auto-tune (default), >0 = pinned — #1407
@@ -47,7 +45,6 @@ type DeducedDefaults struct {
 	PrefetchWorkers int    // fixed at DefaultPrefetchWorkers
 
 	// Internal: track whether clamping actually occurred.
-	localStoreClamped      bool
 	readBufferClamped      bool
 	maxLogBytesClamped     bool
 	parallelFetchesClamped bool
@@ -57,12 +54,6 @@ type DeducedDefaults struct {
 func DeduceDefaults(d SystemDetector) *DeducedDefaults {
 	mem := d.AvailableMemory()
 	cpus := d.AvailableCPUs()
-
-	localStoreSize := mem / 4
-	localStoreClamped := localStoreSize < MinLocalStoreSize
-	if localStoreClamped {
-		localStoreSize = MinLocalStoreSize
-	}
 
 	readBufferSize := ClampToInt64(mem / 8)
 	readBufferClamped := readBufferSize < MinReadBufferSize
@@ -76,7 +67,7 @@ func DeduceDefaults(d SystemDetector) *DeducedDefaults {
 	// logBytesTotal exceeds this budget. Because the log is disk-backed
 	// pre-flush write data whose in-flight working set is bounded by how fast
 	// the host can absorb writes, we size it relative to available memory —
-	// 25% of RAM, the same fraction used for the local store — with a 1 GiB
+	// 25% of RAM, the same fraction used for the journal — with a 1 GiB
 	// floor so the budget never drops below the historical fixed default on
 	// small machines. Reporters on large-RAM hosts get a proportionally larger
 	// budget instead of a hardcoded 1 GiB ceiling.
@@ -100,13 +91,11 @@ func DeduceDefaults(d SystemDetector) *DeducedDefaults {
 	}
 
 	return &DeducedDefaults{
-		LocalStoreSize:         localStoreSize,
 		ReadBufferSize:         readBufferSize,
 		MaxLogBytes:            maxLogBytes,
 		ParallelSyncs:          parallelSyncs,
 		ParallelFetches:        parallelFetches,
 		PrefetchWorkers:        DefaultPrefetchWorkers,
-		localStoreClamped:      localStoreClamped,
 		readBufferClamped:      readBufferClamped,
 		maxLogBytesClamped:     maxLogBytesClamped,
 		parallelFetchesClamped: parallelFetchesClamped,
@@ -119,9 +108,6 @@ func DeduceDefaults(d SystemDetector) *DeducedDefaults {
 // that naturally computed to the minimum).
 func (d *DeducedDefaults) HitFloors() []string {
 	var floors []string
-	if d.localStoreClamped {
-		floors = append(floors, fmt.Sprintf("local_store_size floored at %s", FormatBytes(MinLocalStoreSize)))
-	}
 	if d.readBufferClamped {
 		floors = append(floors, fmt.Sprintf("read_buffer_size floored at %s", FormatBytes(uint64(MinReadBufferSize))))
 	}
@@ -142,8 +128,7 @@ func (d *DeducedDefaults) String() string {
 		parallelSyncs = "adaptive"
 	}
 	return fmt.Sprintf(
-		"LocalStoreSize=%s, ReadBufferSize=%s, ParallelSyncs=%s, ParallelFetches=%d, MaxLogBytes=%s, PrefetchWorkers=%d",
-		FormatBytes(d.LocalStoreSize),
+		"ReadBufferSize=%s, ParallelSyncs=%s, ParallelFetches=%d, MaxLogBytes=%s, PrefetchWorkers=%d",
 		FormatBytes(uint64(d.ReadBufferSize)),
 		parallelSyncs,
 		d.ParallelFetches,

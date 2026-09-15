@@ -70,17 +70,13 @@ func (sd ShareDetail) Rows() [][]string {
 		retPolicy = "lru"
 	}
 
-	remoteStore := "-"
-	if s.RemoteBlockStoreID != nil && *s.RemoteBlockStoreID != "" {
-		remoteStore = resolveStoreName(sd.blockStoreNames, *s.RemoteBlockStoreID)
-	}
-
 	rows := [][]string{
 		{"Name", s.Name},
 		{"ID", s.ID},
 		{"Metadata Store", resolveStoreName(sd.metaStoreNames, s.MetadataStoreID)},
-		{"Local Block Store", resolveStoreName(sd.blockStoreNames, s.LocalBlockStoreID)},
-		{"Remote Block Store", remoteStore},
+		{"Block Store", resolveStoreName(sd.blockStoreNames, s.BlockStoreID)},
+		{"Commit Ack", commitAckString(s.CommitAck)},
+		{"Relaxed Metadata Commit", relaxedMetadataCommitString(s.RelaxedMetadataCommit)},
 		{"Read Only", fmt.Sprintf("%v", s.ReadOnly)},
 		{"Enabled", shareEnabledString(s.Enabled)},
 		{"Default Permission", s.DefaultPermission},
@@ -112,8 +108,8 @@ func (sd ShareDetail) Rows() [][]string {
 	}
 
 	// Only show cache size overrides when set
-	if s.LocalStoreSize != "" {
-		rows = append(rows, []string{"Local Store Size", s.LocalStoreSize})
+	if s.JournalSize != "" {
+		rows = append(rows, []string{"Journal Size", s.JournalSize})
 	}
 	if s.ReadBufferSize != "" {
 		rows = append(rows, []string{"Read Buffer Size", s.ReadBufferSize})
@@ -244,4 +240,27 @@ func offlineRows(o *health.OfflineStatus) [][]string {
 	}
 	return [][]string{{"Offline Safe", fmt.Sprintf("no (%s remote-only across %d ranges)",
 		bytesize.ByteSize(o.RemoteOnlyBytes), o.RemoteOnlyRanges)}}
+}
+
+// relaxedMetadataCommitString renders the second durability axis, saying what
+// the setting costs rather than echoing a bare bool: the two axes are
+// independent, so a reader of one row must not have to infer the other.
+func relaxedMetadataCommitString(relaxed bool) string {
+	if relaxed {
+		return "true (metadata fsync deferred; warm-read verification off)"
+	}
+	return "false (metadata fsync paid inline)"
+}
+
+// commitAckString renders what a COMMIT waits for, spelling out what each
+// setting survives so the durability promise is readable without the guide.
+func commitAckString(ack string) string {
+	switch ack {
+	case "block-store":
+		return "block-store (survives device loss)"
+	case "journal", "":
+		return "journal (survives host crash)"
+	default:
+		return ack
+	}
 }

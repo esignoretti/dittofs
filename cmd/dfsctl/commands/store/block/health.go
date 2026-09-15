@@ -15,27 +15,20 @@ var healthCmd = &cobra.Command{
 	Short: "Check block store health",
 	Long: `Perform a health check on a block store configuration.
 
-For local filesystem stores, checks if the path exists and is writable.
-For local memory stores, always reports healthy.
-For remote S3 stores, performs a HeadBucket call to verify connectivity.
-For remote memory stores, always reports healthy.
+For S3 stores, performs a HeadBucket call to verify connectivity.
+For memory stores, always reports healthy.
 
 Examples:
-  # Check health of a local block store
-  dfsctl store block health --kind local --name fs-cache
-
-  # Check health of a remote block store
-  dfsctl store block health --kind remote --name s3-store
+  # Check health of a block store
+  dfsctl store block health --name s3-store
 
   # Output as JSON
-  dfsctl store block health --kind remote --name s3-store -o json`,
+  dfsctl store block health --name s3-store -o json`,
 	RunE: runBlockStoreHealth,
 }
 
 func init() {
-	healthCmd.Flags().String("kind", "", "Block store kind: local or remote (required)")
 	healthCmd.Flags().String("name", "", "Block store name (required)")
-	_ = healthCmd.MarkFlagRequired("kind")
 	_ = healthCmd.MarkFlagRequired("name")
 }
 
@@ -45,14 +38,9 @@ func runBlockStoreHealth(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	kind, _ := cmd.Flags().GetString("kind")
 	name, _ := cmd.Flags().GetString("name")
 
-	if kind != "local" && kind != "remote" {
-		return fmt.Errorf("invalid kind %q: must be 'local' or 'remote'", kind)
-	}
-
-	resp, err := client.BlockStoreHealth(kind, name)
+	resp, err := client.BlockStoreHealth(name)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}

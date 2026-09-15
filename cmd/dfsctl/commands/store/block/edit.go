@@ -1,4 +1,4 @@
-package remote
+package block
 
 import (
 	"encoding/json"
@@ -12,6 +12,7 @@ import (
 )
 
 var (
+	editName   string
 	editType   string
 	editConfig string
 	// S3 specific
@@ -25,26 +26,30 @@ var (
 
 var editCmd = &cobra.Command{
 	Use:   "edit <name>",
-	Short: "Edit a remote block store",
-	Long: `Edit an existing remote block store configuration.
+	Short: "Edit a block store",
+	Long: `Edit an existing block store configuration.
 
 When run without flags, opens an interactive editor to modify store properties.
 When flags are provided, only the specified fields are updated.
 
 Examples:
   # Edit interactively
-  dfsctl store block remote edit s3-store
+  dfsctl store block edit s3-store
 
   # Update config with JSON
-  dfsctl store block remote edit s3-store --config '{"bucket":"new-bucket"}'
+  dfsctl store block edit s3-store --config '{"bucket":"new-bucket"}'
 
   # Update S3 settings
-  dfsctl store block remote edit s3-store --bucket new-bucket --region us-west-2`,
+  dfsctl store block edit s3-store --bucket new-bucket --region us-west-2
+
+  # Rename a store
+  dfsctl store block edit s3-store --name archive-blocks`,
 	Args: cobra.ExactArgs(1),
 	RunE: runEdit,
 }
 
 func init() {
+	editCmd.Flags().StringVar(&editName, "name", "", "Rename the block store (names must be unique)")
 	editCmd.Flags().StringVar(&editType, "type", "", "Store type: s3, memory")
 	editCmd.Flags().StringVar(&editConfig, "config", "", "Store configuration as JSON")
 	editCmd.Flags().StringVar(&editBucket, "bucket", "", "S3 bucket name (for s3)")
@@ -63,12 +68,12 @@ func runEdit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	current, err := client.GetBlockStore("remote", name)
+	current, err := client.GetBlockStore(name)
 	if err != nil {
-		return fmt.Errorf("failed to get remote block store: %w", err)
+		return fmt.Errorf("failed to get block store: %w", err)
 	}
 
-	hasFlags := cmd.Flags().Changed("type") || cmd.Flags().Changed("config") ||
+	hasFlags := cmd.Flags().Changed("name") || cmd.Flags().Changed("type") || cmd.Flags().Changed("config") ||
 		cmd.Flags().Changed("bucket") || cmd.Flags().Changed("region") || cmd.Flags().Changed("endpoint") ||
 		cmd.Flags().Changed("access-key") || cmd.Flags().Changed("secret-key") ||
 		cmd.Flags().Changed("parallel-uploads")
@@ -125,6 +130,11 @@ func runEdit(cmd *cobra.Command, args []string) error {
 		hasUpdate = true
 	}
 
+	if editName != "" {
+		req.Name = &editName
+		hasUpdate = true
+	}
+
 	if editType != "" {
 		req.Type = &editType
 		hasUpdate = true
@@ -134,16 +144,16 @@ func runEdit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no update fields specified. Use --type, --config, --bucket, --region, --endpoint, --access-key, --secret-key, or --parallel-uploads")
 	}
 
-	store, err := client.UpdateBlockStore("remote", name, req)
+	store, err := client.UpdateBlockStore(name, req)
 	if err != nil {
-		return fmt.Errorf("failed to update remote block store: %w", err)
+		return fmt.Errorf("failed to update block store: %w", err)
 	}
 
-	return cmdutil.PrintResourceWithSuccess(os.Stdout, store, fmt.Sprintf("Remote block store '%s' updated successfully", store.Name))
+	return cmdutil.PrintResourceWithSuccess(os.Stdout, store, fmt.Sprintf("Block store '%s' updated successfully", store.Name))
 }
 
 func runEditInteractive(client *apiclient.Client, name string, current *apiclient.BlockStore) error {
-	fmt.Printf("Editing remote block store: %s (type: %s)\n", current.Name, current.Type)
+	fmt.Printf("Editing block store: %s (type: %s)\n", current.Name, current.Type)
 	fmt.Println("Press Ctrl+C to abort.")
 	fmt.Println()
 
@@ -234,10 +244,10 @@ func runEditInteractive(client *apiclient.Client, name string, current *apiclien
 		return nil
 	}
 
-	store, err := client.UpdateBlockStore("remote", name, req)
+	store, err := client.UpdateBlockStore(name, req)
 	if err != nil {
-		return fmt.Errorf("failed to update remote block store: %w", err)
+		return fmt.Errorf("failed to update block store: %w", err)
 	}
 
-	return cmdutil.PrintResourceWithSuccess(os.Stdout, store, fmt.Sprintf("Remote block store '%s' updated successfully", store.Name))
+	return cmdutil.PrintResourceWithSuccess(os.Stdout, store, fmt.Sprintf("Block store '%s' updated successfully", store.Name))
 }

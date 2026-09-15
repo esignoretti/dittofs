@@ -10,10 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/glebarez/sqlite"
-	"github.com/google/uuid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -113,6 +111,13 @@ type Config struct {
 	Type     DatabaseType   `mapstructure:"type" yaml:"type"`
 	SQLite   SQLiteConfig   `mapstructure:"sqlite" yaml:"sqlite"`
 	Postgres PostgresConfig `mapstructure:"postgres" yaml:"postgres"`
+
+	// JournalRoot carries the server's blockstore.journal.path in so the
+	// upgrade can compare it against where each share's data was recorded
+	// before a share stopped referencing its own block store. It is derived
+	// from that key rather than set under `database`, and empty means the
+	// comparison has nothing to compare against and is skipped.
+	JournalRoot string `mapstructure:"-" yaml:"-" json:"-"`
 }
 
 // ApplyDefaults fills in missing configuration with default values.
@@ -260,6 +265,21 @@ func New(config *Config) (*GORMStore, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	// Every path below can refuse the database — a renamed config key, a
+	// half-migrated column pair, a share left without a block store. Those
+	// returns hand back no store, so nothing else can ever close this handle;
+	// release it here instead of leaving the file open for the life of the
+	// process. Cleared once the store takes ownership.
+	opened := true
+	defer func() {
+		if !opened {
+			return
+		}
+		if sqlDB, derr := db.DB(); derr == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+
 	// Configure the connection pool.
 	switch config.Type {
 	case DatabaseTypePostgres:
@@ -314,6 +334,12 @@ func New(config *Config) (*GORMStore, error) {
 		}
 	}
 
+	// Pre-migration: the (name, kind) uniqueness becomes (name), so two rows
+	// that legitimately shared a name must be resolved by the operator first.
+	if err := checkBlockStoreNameCollisions(db); err != nil {
+		return nil, err
+	}
+
 	// Pre-migration: drop legacy single-column unique index on block_store_configs.name.
 	// AutoMigrate creates the new composite index idx_block_store_name_kind on (name, kind)
 	// but does not drop pre-existing ones, which would prevent having a local and remote
@@ -334,15 +360,89 @@ func New(config *Config) (*GORMStore, error) {
 	}
 
 	// Pre-migration: rename read_cache_size column to read_buffer_size if it exists.
-	if db.Migrator().HasColumn(&models.Share{}, "read_cache_size") {
+	if hasColumn(db, &models.Share{}, "read_cache_size") {
 		if err := db.Migrator().RenameColumn(&models.Share{}, "read_cache_size", "read_buffer_size"); err != nil {
 			return nil, fmt.Errorf("failed to rename read_cache_size column: %w", err)
+		}
+	}
+
+	// Pre-migration: rename local_store_size to journal_size if it exists.
+	// Must run before AutoMigrate: AutoMigrate adds any column the model
+	// declares but the table lacks, so renaming afterwards would leave the
+	// operator's configured ceiling in the old column with a fresh empty one
+	// beside it, reading back as "never set".
+	if hasColumn(db, &models.Share{}, "local_store_size") {
+		if hasColumn(db, &models.Share{}, "journal_size") {
+			// Both columns present means an earlier upgrade added the new one
+			// without moving the values across. Which one is authoritative is
+			// not recoverable from the schema, and choosing wrong silently
+			// changes every share's size ceiling.
+			return nil, fmt.Errorf("shares table has both local_store_size and journal_size; " +
+				"copy the intended values into journal_size, drop local_store_size, and restart")
+		}
+		if err := db.Migrator().RenameColumn(&models.Share{}, "local_store_size", "journal_size"); err != nil {
+			return nil, fmt.Errorf("failed to rename local_store_size column: %w", err)
+		}
+	}
+
+	// Pre-migration: rename remote_block_store_id to block_store_id. Must
+	// precede AutoMigrate for the same reason as journal_size — otherwise the
+	// new column arrives empty and every share loses its store reference.
+	if hasColumn(db, &models.Share{}, "remote_block_store_id") {
+		if hasColumn(db, &models.Share{}, "block_store_id") {
+			return nil, fmt.Errorf("shares table has both remote_block_store_id and block_store_id; " +
+				"copy the intended values into block_store_id, drop the old column, and restart")
+		}
+		if err := db.Migrator().RenameColumn(&models.Share{}, "remote_block_store_id", "block_store_id"); err != nil {
+			return nil, fmt.Errorf("failed to rename remote_block_store_id column: %w", err)
+		}
+	}
+
+	// Pre-migration: refuse an upgrade that would lose where a share's data is,
+	// before any of it happens.
+	//
+	// Both checks read local_block_store_id, which the post-migration step
+	// below drops. They run here rather than beside that drop because
+	// AutoMigrate adds the foreign key on the share's block store and
+	// validates it against the existing rows: a share holding an empty
+	// reference fails that constraint first, and the operator gets the
+	// database's message about it instead of the one naming the share and the
+	// fix. Running first also means a refusal leaves the schema untouched
+	// rather than partly upgraded.
+	if hasColumn(db, &models.Share{}, "local_block_store_id") {
+		// A local-only share's only binding lives in that column; refuse
+		// rather than drop it out from under them.
+		if err := checkLocalOnlyShares(db); err != nil {
+			return nil, err
+		}
+		// The column is also the only surviving record of where a share's
+		// bytes sit. A journal root that names somewhere else would open an
+		// empty journal beside them and read back zeros, so compare while the
+		// comparison is still possible.
+		if err := checkShareJournalRoots(db, config.JournalRoot); err != nil {
+			return nil, err
 		}
 	}
 
 	// Run auto-migration
 	if err := db.AutoMigrate(models.AllModels()...); err != nil {
 		return nil, fmt.Errorf("failed to run database migration: %w", err)
+	}
+
+	// Post-migration: drop the kind column and the indexes it anchored. The
+	// collision check above guarantees names are already unique. The column
+	// cannot merely be left unread: it is NOT NULL with no default, so the
+	// first insert that stops naming it would be rejected. Its own index has
+	// to go first, because SQLite refuses to drop an indexed column.
+	for _, idx := range []string{"idx_block_store_name_kind", "idx_block_store_configs_kind"} {
+		if err := db.Exec("DROP INDEX IF EXISTS " + idx).Error; err != nil {
+			return nil, fmt.Errorf("failed to drop %s: %w", idx, err)
+		}
+	}
+	if hasColumn(db, &models.BlockStoreConfig{}, "kind") {
+		if err := db.Migrator().DropColumn(&models.BlockStoreConfig{}, "kind"); err != nil {
+			return nil, fmt.Errorf("failed to drop block_store_configs.kind: %w", err)
+		}
 	}
 
 	// Post-migration: backfill shares.enabled for rows that predate the
@@ -355,6 +455,34 @@ func New(config *Config) (*GORMStore, error) {
 		true,
 	).Error; err != nil {
 		return nil, fmt.Errorf("failed to backfill shares.enabled: %w", err)
+	}
+
+	// Post-migration: carry a configured durability tier off the local block
+	// store config and onto the share, before the blanket backfill below
+	// claims every unset row for the default.
+	if err := migrateShareDurability(db); err != nil {
+		return nil, err
+	}
+
+	// Post-migration: backfill commit_ack for rows that predate the column.
+	// A share acknowledging on nothing is not a weaker promise, it is an
+	// unreadable one, and SQLite may leave NULL on ALTER TABLE ADD COLUMN even
+	// with a DEFAULT.
+	if err := db.Exec(
+		"UPDATE shares SET commit_ack = ? WHERE commit_ack IS NULL OR commit_ack = ''",
+		string(models.CommitAckJournal),
+	).Error; err != nil {
+		return nil, fmt.Errorf("failed to backfill commit_ack: %w", err)
+	}
+
+	// Post-migration: the journal is provisioned under the server-level root, so
+	// a share no longer references a local block store. Dropped only after
+	// migrateShareDurability above, which reads that store's config through it.
+	// The refusals that gate this drop ran before AutoMigrate.
+	if hasColumn(db, &models.Share{}, "local_block_store_id") {
+		if err := db.Migrator().DropColumn(&models.Share{}, "local_block_store_id"); err != nil {
+			return nil, fmt.Errorf("failed to drop local_block_store_id column: %w", err)
+		}
 	}
 
 	// Refs #532: backfill shares.access_based_enumeration for rows that predate
@@ -403,42 +531,16 @@ func New(config *Config) (*GORMStore, error) {
 		return nil, fmt.Errorf("failed to backfill shares.allow_mfsymlink: %w", err)
 	}
 
-	// --- Post-AutoMigrate migrations ---
-	// Step 2: Migrate legacy Share payload_store_id column to local/remote block store IDs.
-	postMigrator := db.Migrator()
-	if postMigrator.HasColumn(&models.Share{}, "payload_store_id") {
-		// Create default-local block store for existing shares
-		defaultLocalID := uuid.New().String()
-		if err := db.Exec(
-			"INSERT INTO block_store_configs (id, name, kind, type, config, created_at) VALUES (?, 'default-local', 'local', 'fs', '{}', ?)",
-			defaultLocalID, time.Now(),
-		).Error; err != nil {
-			return nil, fmt.Errorf("failed to create default-local block store: %w", err)
-		}
-		// Populate new columns from legacy payload_store_id column
-		if err := db.Exec("UPDATE shares SET local_block_store_id = ?", defaultLocalID).Error; err != nil {
-			return nil, fmt.Errorf("failed to populate local_block_store_id: %w", err)
-		}
-		if err := db.Exec("UPDATE shares SET remote_block_store_id = payload_store_id WHERE payload_store_id IS NOT NULL AND payload_store_id != ''").Error; err != nil {
-			return nil, fmt.Errorf("failed to populate remote_block_store_id: %w", err)
-		}
-		// Drop old column
-		if err := postMigrator.DropColumn(&models.Share{}, "payload_store_id"); err != nil {
-			return nil, fmt.Errorf("failed to drop payload_store_id column: %w", err)
-		}
-	}
-
 	// Post-migration: drop protocol-specific columns from shares table.
 	// These have been moved to share_adapter_configs.
-	migrator := db.Migrator()
 	for _, col := range []string{"squash", "anonymous_uid", "anonymous_gid", "allow_auth_sys", "require_kerberos", "min_kerberos_level", "netgroup_id", "disable_readdirplus"} {
-		if migrator.HasColumn(&models.Share{}, col) {
-			_ = migrator.DropColumn(&models.Share{}, col)
+		if hasColumn(db, &models.Share{}, col) {
+			_ = db.Migrator().DropColumn(&models.Share{}, col)
 		}
 	}
 	for _, col := range []string{"guest_enabled", "guest_uid", "guest_gid"} {
-		if migrator.HasColumn(&models.Share{}, col) {
-			_ = migrator.DropColumn(&models.Share{}, col)
+		if hasColumn(db, &models.Share{}, col) {
+			_ = db.Migrator().DropColumn(&models.Share{}, col)
 		}
 	}
 
@@ -479,6 +581,7 @@ func New(config *Config) (*GORMStore, error) {
 		return nil, fmt.Errorf("failed to apply portmapper defaults: %w", err)
 	}
 
+	opened = false
 	return store, nil
 }
 

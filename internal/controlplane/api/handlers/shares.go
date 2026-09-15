@@ -66,61 +66,72 @@ func NewShareHandler(s ShareHandlerStore, rt *runtime.Runtime) *ShareHandler {
 	return &ShareHandler{store: s, runtime: rt}
 }
 
-// errWrongBlockStoreKind is returned by resolveBlockStoreRef when a reference
-// resolves to a store of an unexpected kind. It is a client error (a bad
-// reference), distinct from a missing store or an operational failure.
-var errWrongBlockStoreKind = errors.New("block store has unexpected kind")
-
 // resolveBlockStoreRef resolves a block-store reference — a name or a canonical
-// UUID — to its config, scoped to the expected kind. It tries the kind-scoped
-// name lookup first, then a UUID lookup, rejecting a UUID that resolves to the
-// wrong kind. This mirrors the runtime's resolveBlockStoreConfig so the API
-// never persists an id the share can't load at startup (#1312): a remote-store
-// UUID handed to local_block_store_id (or vice versa) is refused up front
-// instead of silently breaking the share on the next restart.
+// UUID — to its config. It tries the name lookup first, then a UUID lookup, so
+// the API never persists a reference the share cannot load at startup.
 //
 // Only a genuine not-found on the name lookup falls through to the UUID lookup;
 // an operational error (DB/context) is returned as-is so callers can surface it
 // as a 500 rather than masking it as an unknown reference.
-func (h *ShareHandler) resolveBlockStoreRef(ctx context.Context, ref string, kind models.BlockStoreKind) (*models.BlockStoreConfig, error) {
-	cfg, err := h.store.GetBlockStore(ctx, ref, kind)
-	if err == nil {
-		return cfg, nil
-	}
-	if !errors.Is(err, models.ErrStoreNotFound) {
-		return nil, err
-	}
-	cfg, err = h.store.GetBlockStoreByID(ctx, ref)
+func (h *ShareHandler) resolveBlockStoreRef(ctx context.Context, ref string) (*models.BlockStoreConfig, error) {
+	cfg, err := h.store.GetBlockStore(ctx, ref)
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, models.ErrStoreNotFound) {
+			return nil, err
+		}
+		if cfg, err = h.store.GetBlockStoreByID(ctx, ref); err != nil {
+			return nil, err
+		}
 	}
-	if cfg.Kind != kind {
-		return nil, fmt.Errorf("%w: %q is %q, expected %q", errWrongBlockStoreKind, ref, cfg.Kind, kind)
+	// A store whose type the runtime cannot build is refused here rather than
+	// at the rebind below it: binding persists first, so a type that fails to
+	// build leaves the share holding a reference that fails at every startup,
+	// where the share is skipped with a warning and the server reports healthy
+	// without it. Creation already refuses these types, so a row carrying one
+	// predates the single-block-store model.
+	if !validateBlockStoreType(cfg.Type) {
+		return nil, fmt.Errorf("%w: %s", errUnsupportedBlockStoreType, cfg.Type)
 	}
 	return cfg, nil
 }
 
-// writeBlockStoreRefError maps a resolveBlockStoreRef failure to an HTTP
-// response: a missing or wrong-kind reference is the client's fault (400),
-// anything else is an operational failure (500). tier is "Local" or "Remote".
-func writeBlockStoreRefError(w http.ResponseWriter, tier, ref string, err error) {
-	switch {
-	case errors.Is(err, models.ErrStoreNotFound):
-		BadRequest(w, tier+" block store not found: "+ref)
-	case errors.Is(err, errWrongBlockStoreKind):
-		BadRequest(w, tier+" block store has the wrong kind: "+ref)
-	default:
-		InternalServerError(w, "Failed to resolve "+tier+" block store "+ref+": "+err.Error())
+// errUnsupportedBlockStoreType reports a reference that resolved to a store of
+// a type no share can be bound to.
+var errUnsupportedBlockStoreType = errors.New("unsupported block store type")
+
+// parseCommitAck maps a request value to what a COMMIT waits for. Anything
+// unrecognised is refused rather than silently resolved to the default, which
+// would turn a typo into a quieter durability promise than the one asked for.
+func parseCommitAck(v string) (models.CommitAck, bool) {
+	switch models.CommitAck(v) {
+	case models.CommitAckJournal, models.CommitAckBlockStore:
+		return models.CommitAck(v), true
 	}
+	return "", false
+}
+
+// writeBlockStoreRefError maps a resolveBlockStoreRef failure to an HTTP
+// response: a missing reference is the client's fault (400), anything else is
+// an operational failure (500).
+func writeBlockStoreRefError(w http.ResponseWriter, ref string, err error) {
+	if errors.Is(err, models.ErrStoreNotFound) {
+		BadRequest(w, "Block store not found: "+ref)
+		return
+	}
+	if errors.Is(err, errUnsupportedBlockStoreType) {
+		BadRequest(w, "Block store "+ref+" cannot back a share: "+err.Error()+
+			". Create an s3 or memory block store and bind the share to that instead.")
+		return
+	}
+	InternalServerError(w, "Failed to resolve block store "+ref+": "+err.Error())
 }
 
 // CreateShareRequest is the request body for POST /api/v1/shares.
 type CreateShareRequest struct {
-	Name             string  `json:"name"`
-	MetadataStoreID  string  `json:"metadata_store_id"`
-	LocalBlockStore  string  `json:"local_block_store"`
-	RemoteBlockStore *string `json:"remote_block_store,omitempty"`
-	ReadOnly         bool    `json:"read_only,omitempty"`
+	Name            string `json:"name"`
+	MetadataStoreID string `json:"metadata_store_id"`
+	BlockStore      string `json:"block_store"`
+	ReadOnly        bool   `json:"read_only,omitempty"`
 	// Owner is the username whose UID/GID owns the share's root directory.
 	// Empty leaves the root owned by root (UID/GID 0). Share permission grants
 	// gate access to the export; the owner governs who can write at the root
@@ -131,9 +142,14 @@ type CreateShareRequest struct {
 	BlockedOperations *[]string `json:"blocked_operations,omitempty"`
 	RetentionPolicy   string    `json:"retention_policy,omitempty"`
 	RetentionTTL      string    `json:"retention_ttl,omitempty"` // Duration string like "72h"
-	LocalStoreSize    string    `json:"local_store_size,omitempty"`
+	JournalSize       string    `json:"journal_size,omitempty"`
 	ReadBufferSize    string    `json:"read_buffer_size,omitempty"`
-	QuotaBytes        string    `json:"quota_bytes,omitempty"` // Human-readable, e.g., "10GiB" (0 = unlimited)
+	// CommitAck names what a COMMIT waits for ("journal" or "block-store").
+	// Empty keeps the model default. RelaxedMetadataCommit is the independent
+	// second axis, a pointer so nil keeps the default rather than clearing it.
+	CommitAck             string `json:"commit_ack,omitempty"`
+	RelaxedMetadataCommit *bool  `json:"relaxed_metadata_commit,omitempty"`
+	QuotaBytes            string `json:"quota_bytes,omitempty"` // Human-readable, e.g., "10GiB" (0 = unlimited)
 	// AclFlagInheritedCanonicalization — Refs #514. Pointer so the handler
 	// can distinguish "unset → use default true" from "explicit false".
 	AclFlagInheritedCanonicalization *bool `json:"acl_flag_inherited_canonicalization,omitempty"`
@@ -164,22 +180,23 @@ type CreateShareRequest struct {
 
 // UpdateShareRequest is the request body for PUT /api/v1/shares/{name}.
 type UpdateShareRequest struct {
-	MetadataStoreID    *string   `json:"metadata_store_id,omitempty"`
-	LocalBlockStoreID  *string   `json:"local_block_store_id,omitempty"`
-	RemoteBlockStoreID *string   `json:"remote_block_store_id,omitempty"`
-	ReadOnly           *bool     `json:"read_only,omitempty"`
-	EncryptData        *bool     `json:"encrypt_data,omitempty"`
-	DefaultPermission  *string   `json:"default_permission,omitempty"`
-	BlockedOperations  *[]string `json:"blocked_operations,omitempty"`
-	RetentionPolicy    *string   `json:"retention_policy,omitempty"`
-	RetentionTTL       *string   `json:"retention_ttl,omitempty"` // Duration string like "72h"
-	LocalStoreSize     *string   `json:"local_store_size,omitempty"`
-	ReadBufferSize     *string   `json:"read_buffer_size,omitempty"`
-	QuotaBytes         *string   `json:"quota_bytes,omitempty"` // Human-readable, nil = no change, "0" = remove quota
+	MetadataStoreID       *string   `json:"metadata_store_id,omitempty"`
+	BlockStoreID          *string   `json:"block_store_id,omitempty"`
+	CommitAck             *string   `json:"commit_ack,omitempty"`
+	RelaxedMetadataCommit *bool     `json:"relaxed_metadata_commit,omitempty"`
+	ReadOnly              *bool     `json:"read_only,omitempty"`
+	EncryptData           *bool     `json:"encrypt_data,omitempty"`
+	DefaultPermission     *string   `json:"default_permission,omitempty"`
+	BlockedOperations     *[]string `json:"blocked_operations,omitempty"`
+	RetentionPolicy       *string   `json:"retention_policy,omitempty"`
+	RetentionTTL          *string   `json:"retention_ttl,omitempty"` // Duration string like "72h"
+	JournalSize           *string   `json:"journal_size,omitempty"`
+	ReadBufferSize        *string   `json:"read_buffer_size,omitempty"`
+	QuotaBytes            *string   `json:"quota_bytes,omitempty"` // Human-readable, nil = no change, "0" = remove quota
 	// AclFlagInheritedCanonicalization — Refs #514. nil = no change;
 	// non-nil = explicit set. Persisted on UpdateShare; runtime hot-reload
 	// is not required (takes effect on adapter restart, matching
-	// LocalStoreSize/ReadBufferSize semantics).
+	// JournalSize/ReadBufferSize semantics).
 	AclFlagInheritedCanonicalization *bool `json:"acl_flag_inherited_canonicalization,omitempty"`
 	// AccessBasedEnumeration — Refs #532. nil = no change; non-nil = explicit
 	// set. Persisted on UpdateShare; takes effect on adapter restart.
@@ -209,12 +226,13 @@ type UpdateShareRequest struct {
 
 // ShareResponse is the response body for share endpoints.
 type ShareResponse struct {
-	ID                 string  `json:"id"`
-	Name               string  `json:"name"`
-	MetadataStoreID    string  `json:"metadata_store_id"`
-	LocalBlockStoreID  string  `json:"local_block_store_id"`
-	RemoteBlockStoreID *string `json:"remote_block_store_id"`
-	ReadOnly           bool    `json:"read_only"`
+	ID                    string           `json:"id"`
+	Name                  string           `json:"name"`
+	MetadataStoreID       string           `json:"metadata_store_id"`
+	BlockStoreID          string           `json:"block_store_id"`
+	CommitAck             models.CommitAck `json:"commit_ack"`
+	RelaxedMetadataCommit bool             `json:"relaxed_metadata_commit"`
+	ReadOnly              bool             `json:"read_only"`
 	// Enabled mirrors models.Share.Enabled. No omitempty — `false` is
 	// semantically meaningful (the share is disabled) and consumers must
 	// render that state explicitly.
@@ -228,7 +246,7 @@ type ShareResponse struct {
 	BlockedOperations []string `json:"blocked_operations,omitempty"`
 	RetentionPolicy   string   `json:"retention_policy"`
 	RetentionTTL      string   `json:"retention_ttl,omitempty"`    // Human-readable duration
-	LocalStoreSize    string   `json:"local_store_size,omitempty"` // Human-readable byte size
+	JournalSize       string   `json:"journal_size,omitempty"`     // Human-readable byte size
 	ReadBufferSize    string   `json:"read_buffer_size,omitempty"` // Human-readable byte size
 	QuotaBytes        string   `json:"quota_bytes,omitempty"`      // Human-readable, e.g., "10 GiB" or empty if unlimited
 	UsedBytes         int64    `json:"used_bytes"`                 // Logical used bytes (sum of file sizes)
@@ -304,8 +322,8 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "Metadata store ID is required")
 		return
 	}
-	if req.LocalBlockStore == "" {
-		BadRequest(w, "Local block store is required")
+	if req.BlockStore == "" {
+		BadRequest(w, "Block store is required")
 		return
 	}
 
@@ -319,22 +337,11 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate that local block store exists (accepts a name or a UUID).
-	localBlockStore, err := h.resolveBlockStoreRef(r.Context(), req.LocalBlockStore, models.BlockStoreKindLocal)
+	// Validate that the block store exists (accepts a name or a UUID).
+	blockStore, err := h.resolveBlockStoreRef(r.Context(), req.BlockStore)
 	if err != nil {
-		writeBlockStoreRefError(w, "Local", req.LocalBlockStore, err)
+		writeBlockStoreRefError(w, req.BlockStore, err)
 		return
-	}
-
-	// Validate optional remote block store
-	var remoteBlockStoreID *string
-	if req.RemoteBlockStore != nil && *req.RemoteBlockStore != "" {
-		remoteStore, remoteErr := h.resolveBlockStoreRef(r.Context(), *req.RemoteBlockStore, models.BlockStoreKindRemote)
-		if remoteErr != nil {
-			writeBlockStoreRefError(w, "Remote", *req.RemoteBlockStore, remoteErr)
-			return
-		}
-		remoteBlockStoreID = &remoteStore.ID
 	}
 
 	// Set default permission if not provided.
@@ -383,14 +390,14 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse optional per-share size overrides
-	var localStoreSize, readBufferSize, quotaBytes int64
-	if req.LocalStoreSize != "" {
-		bs, parseErr := bytesize.ParseByteSize(req.LocalStoreSize)
+	var journalSize, readBufferSize, quotaBytes int64
+	if req.JournalSize != "" {
+		bs, parseErr := bytesize.ParseByteSize(req.JournalSize)
 		if parseErr != nil {
-			BadRequest(w, "Invalid local_store_size: "+parseErr.Error())
+			BadRequest(w, "Invalid journal_size: "+parseErr.Error())
 			return
 		}
-		localStoreSize = bs.Int64()
+		journalSize = bs.Int64()
 	}
 	if req.ReadBufferSize != "" {
 		bs, parseErr := bytesize.ParseByteSize(req.ReadBufferSize)
@@ -503,20 +510,32 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 		rootAttr = &metadata.FileAttr{UID: *owner.UID, GID: gid}
 	}
 
+	commitAck := models.CommitAckJournal
+	if req.CommitAck != "" {
+		parsed, ok := parseCommitAck(req.CommitAck)
+		if !ok {
+			BadRequest(w, "Invalid commit_ack "+req.CommitAck+": expected \"journal\" or \"block-store\"")
+			return
+		}
+		commitAck = parsed
+	}
+	relaxedMetadataCommit := req.RelaxedMetadataCommit != nil && *req.RelaxedMetadataCommit
+
 	now := time.Now()
 	share := &models.Share{
 		ID:                               uuid.New().String(),
 		Name:                             req.Name,
-		MetadataStoreID:                  metaStore.ID,       // Use actual store ID (UUID), not name
-		LocalBlockStoreID:                localBlockStore.ID, // Use actual store ID (UUID), not name
-		RemoteBlockStoreID:               remoteBlockStoreID, // Nullable
+		MetadataStoreID:                  metaStore.ID,  // Use actual store ID (UUID), not name
+		BlockStoreID:                     blockStore.ID, // Use the actual store ID (UUID), not the name
 		ReadOnly:                         req.ReadOnly,
 		EncryptData:                      req.EncryptData,
 		DefaultPermission:                defaultPerm,
 		RetentionPolicy:                  string(retPolicy),
 		RetentionTTL:                     int64(retTTL.Seconds()),
-		LocalStoreSize:                   localStoreSize,
+		JournalSize:                      journalSize,
 		ReadBufferSize:                   readBufferSize,
+		CommitAck:                        commitAck,
+		RelaxedMetadataCommit:            relaxedMetadataCommit,
 		QuotaBytes:                       quotaBytes,
 		Enabled:                          true, // REST-02: new shares are enabled by default.
 		AclFlagInheritedCanonicalization: aclCanon,
@@ -608,15 +627,12 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 			RequireKerberos:                  nfsOpts.RequireKerberos,
 			MinKerberosLevel:                 nfsOpts.MinKerberosLevel,
 			BlockedOperations:                share.GetBlockedOps(),
-			LocalStoreSize:                   localStoreSize,
+			JournalSize:                      journalSize,
 			ReadBufferSize:                   readBufferSize,
 			QuotaBytes:                       quotaBytes,
-			LocalBlockStoreID:                localBlockStore.ID,
+			BlockStoreID:                     blockStore.ID,
 			RetentionPolicy:                  retPolicy,
 			RetentionTTL:                     retTTL,
-		}
-		if remoteBlockStoreID != nil {
-			shareConfig.RemoteBlockStoreID = *remoteBlockStoreID
 		}
 
 		if err := h.runtime.AddShare(r.Context(), shareConfig); err != nil {
@@ -709,51 +725,40 @@ func (h *ShareHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// share-load and is NOT hot-reloaded on a binding change (see #1532), so
 	// changing it here silently has no effect on mirroring until a full server
 	// restart. We detect the change below and warn the operator.
-	prevLocalBlockStoreID := share.LocalBlockStoreID
-	prevRemoteBlockStoreID := ""
-	if share.RemoteBlockStoreID != nil {
-		prevRemoteBlockStoreID = *share.RemoteBlockStoreID
-	}
+	prevBlockStoreID := share.BlockStoreID
+	prevCommitAck, prevRelaxed := share.CommitAck, share.RelaxedMetadataCommit
 
 	// Apply updates
 	if req.MetadataStoreID != nil {
 		share.MetadataStoreID = *req.MetadataStoreID
 	}
-	if req.LocalBlockStoreID != nil {
+	if req.BlockStoreID != nil {
 		// Resolve to the canonical UUID, accepting either a name or a UUID
-		// (mirrors CreateShare). Persisting a raw name here was the root cause
-		// of #1312: on restart GetBlockStoreByID(name) failed and the share
-		// never loaded.
-		localBlockStore, err := h.resolveBlockStoreRef(r.Context(), *req.LocalBlockStoreID, models.BlockStoreKindLocal)
+		// (mirrors CreateShare). Persisting a raw name here leaves a share that
+		// never loads: on restart GetBlockStoreByID(name) finds nothing.
+		blockStore, err := h.resolveBlockStoreRef(r.Context(), *req.BlockStoreID)
 		if err != nil {
-			writeBlockStoreRefError(w, "Local", *req.LocalBlockStoreID, err)
+			writeBlockStoreRefError(w, *req.BlockStoreID, err)
 			return
 		}
-		share.LocalBlockStoreID = localBlockStore.ID
+		share.BlockStoreID = blockStore.ID
 	}
-	if req.RemoteBlockStoreID != nil {
-		if *req.RemoteBlockStoreID == "" {
-			// Explicit clear of the remote tier.
-			share.RemoteBlockStoreID = nil
-		} else {
-			remoteBlockStore, err := h.resolveBlockStoreRef(r.Context(), *req.RemoteBlockStoreID, models.BlockStoreKindRemote)
-			if err != nil {
-				writeBlockStoreRefError(w, "Remote", *req.RemoteBlockStoreID, err)
-				return
-			}
-			share.RemoteBlockStoreID = &remoteBlockStore.ID
+
+	// Detect an effective block-store binding change. Compared against the
+	// canonical resolved IDs so a no-op re-submit does not warn.
+	blockStoreBindingChanged := share.BlockStoreID != prevBlockStoreID
+
+	if req.CommitAck != nil {
+		parsed, ok := parseCommitAck(*req.CommitAck)
+		if !ok {
+			BadRequest(w, "Invalid commit_ack "+*req.CommitAck+": expected \"journal\" or \"block-store\"")
+			return
 		}
+		share.CommitAck = parsed
 	}
-
-	// Detect an effective block-store binding change (see #1532). Compared
-	// against the canonical resolved IDs so a no-op re-submit does not warn.
-	newRemoteBlockStoreID := ""
-	if share.RemoteBlockStoreID != nil {
-		newRemoteBlockStoreID = *share.RemoteBlockStoreID
+	if req.RelaxedMetadataCommit != nil {
+		share.RelaxedMetadataCommit = *req.RelaxedMetadataCommit
 	}
-	blockStoreBindingChanged := share.LocalBlockStoreID != prevLocalBlockStoreID ||
-		newRemoteBlockStoreID != prevRemoteBlockStoreID
-
 	if req.ReadOnly != nil {
 		share.ReadOnly = *req.ReadOnly
 	}
@@ -762,7 +767,7 @@ func (h *ShareHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AclFlagInheritedCanonicalization != nil {
 		// Refs #514. Persisted to DB; takes effect on adapter restart
-		// (matches LocalStoreSize/ReadBufferSize semantics — no runtime
+		// (matches JournalSize/ReadBufferSize semantics — no runtime
 		// hot-reload).
 		share.AclFlagInheritedCanonicalization = *req.AclFlagInheritedCanonicalization
 	}
@@ -878,13 +883,13 @@ func (h *ShareHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	// Handle per-share size overrides (saved to DB, take effect on restart)
 	sizeChanged := false
-	if req.LocalStoreSize != nil {
-		bs, parseErr := bytesize.ParseByteSize(*req.LocalStoreSize)
+	if req.JournalSize != nil {
+		bs, parseErr := bytesize.ParseByteSize(*req.JournalSize)
 		if parseErr != nil {
-			BadRequest(w, "Invalid local_store_size: "+parseErr.Error())
+			BadRequest(w, "Invalid journal_size: "+parseErr.Error())
 			return
 		}
-		share.LocalStoreSize = bs.Int64()
+		share.JournalSize = bs.Int64()
 		sizeChanged = true
 	}
 	if req.ReadBufferSize != nil {
@@ -921,7 +926,7 @@ func (h *ShareHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	if sizeChanged {
 		logger.Info("Store size override updated for share (takes effect on restart)", "share", share.Name,
-			"local_store_size", share.LocalStoreSize, "read_buffer_size", share.ReadBufferSize)
+			"journal_size", share.JournalSize, "read_buffer_size", share.ReadBufferSize)
 	}
 
 	// A block-store binding change is not picked up by the running syncer until
@@ -930,7 +935,7 @@ func (h *ShareHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// change is never a silent no-op for mirroring.
 	var updateWarnings []string
 	if blockStoreBindingChanged && h.runtime != nil {
-		if err := h.runtime.RebindShareBlockStore(r.Context(), share.Name, prevLocalBlockStoreID, prevRemoteBlockStoreID); err != nil {
+		if err := h.runtime.RebindShareBlockStore(r.Context(), share.Name, prevBlockStoreID); err != nil {
 			logger.Error("Failed to hot-reload share block store after binding change; a restart is required",
 				"share", share.Name, "error", err)
 			updateWarnings = append(updateWarnings,
@@ -938,8 +943,26 @@ func (h *ShareHandler) Update(w http.ResponseWriter, r *http.Request) {
 		} else {
 			logger.Info("Share block store rebound live after binding change",
 				"share", share.Name,
-				"local_block_store_id", share.LocalBlockStoreID,
-				"remote_block_store_id", newRemoteBlockStoreID)
+				"block_store_id", share.BlockStoreID)
+		}
+	}
+
+	// Both durability axes apply LIVE: they decide what a COMMIT waits for, and
+	// an operator who tightens the promise must not be told it succeeded while
+	// acknowledgement carries on under the old terms. A failure to apply is the
+	// one case that needs the restart warning.
+	if (share.CommitAck != prevCommitAck || share.RelaxedMetadataCommit != prevRelaxed) && h.runtime != nil {
+		if err := h.runtime.ApplyShareDurability(share.Name,
+			share.CommitAck == models.CommitAckBlockStore, share.RelaxedMetadataCommit); err != nil {
+			logger.Error("Failed to apply the durability change to the running share; a restart is required",
+				"share", share.Name, "error", err)
+			updateWarnings = append(updateWarnings,
+				"durability settings changed but could not be applied to the running share; a server restart is required for the change to take effect")
+		} else {
+			logger.Info("Share durability applied live",
+				"share", share.Name,
+				"commit_ack", share.CommitAck,
+				"relaxed_metadata_commit", share.RelaxedMetadataCommit)
 		}
 	}
 
@@ -1581,9 +1604,9 @@ func shareToResponse(s *models.Share) ShareResponse {
 	if s.RetentionTTL > 0 {
 		retTTL = s.GetRetentionTTL().String()
 	}
-	var localStoreSizeStr, readBufferSizeStr string
-	if s.LocalStoreSize > 0 {
-		localStoreSizeStr = bytesize.ByteSize(s.LocalStoreSize).String()
+	var journalSizeStr, readBufferSizeStr string
+	if s.JournalSize > 0 {
+		journalSizeStr = bytesize.ByteSize(s.JournalSize).String()
 	}
 	if s.ReadBufferSize > 0 {
 		readBufferSizeStr = bytesize.ByteSize(s.ReadBufferSize).String()
@@ -1596,8 +1619,9 @@ func shareToResponse(s *models.Share) ShareResponse {
 		ID:                               s.ID,
 		Name:                             s.Name,
 		MetadataStoreID:                  s.MetadataStoreID,
-		LocalBlockStoreID:                s.LocalBlockStoreID,
-		RemoteBlockStoreID:               s.RemoteBlockStoreID,
+		BlockStoreID:                     s.BlockStoreID,
+		CommitAck:                        s.CommitAck,
+		RelaxedMetadataCommit:            s.RelaxedMetadataCommit,
 		ReadOnly:                         s.ReadOnly,
 		Enabled:                          s.Enabled,
 		EncryptData:                      s.EncryptData,
@@ -1607,7 +1631,7 @@ func shareToResponse(s *models.Share) ShareResponse {
 		BlockedOperations:                s.GetBlockedOps(),
 		RetentionPolicy:                  string(s.GetRetentionPolicy()),
 		RetentionTTL:                     retTTL,
-		LocalStoreSize:                   localStoreSizeStr,
+		JournalSize:                      journalSizeStr,
 		ReadBufferSize:                   readBufferSizeStr,
 		QuotaBytes:                       quotaBytesStr,
 		AclFlagInheritedCanonicalization: s.AclFlagInheritedCanonicalization,

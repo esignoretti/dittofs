@@ -55,7 +55,7 @@ func seedShare(t *testing.T, cpStore store.Store, name string) string {
 	}
 
 	blockStore := &models.BlockStoreConfig{
-		ID: uuid.New().String(), Name: "b-" + name, Kind: models.BlockStoreKindLocal, Type: "memory",
+		ID: uuid.New().String(), Name: "b-" + name, Type: "memory",
 		CreatedAt: time.Now(),
 	}
 	if _, err := cpStore.CreateBlockStore(ctx, blockStore); err != nil {
@@ -66,7 +66,7 @@ func seedShare(t *testing.T, cpStore store.Store, name string) string {
 		ID:                uuid.New().String(),
 		Name:              "/" + name,
 		MetadataStoreID:   metaStore.ID,
-		LocalBlockStoreID: blockStore.ID,
+		BlockStoreID:      blockStore.ID,
 		DefaultPermission: "read-write",
 		CreatedAt:         time.Now(),
 		UpdatedAt:         time.Now(),
@@ -285,21 +285,15 @@ func TestShareHandler_Update_ResolvesBlockStoreNameToID(t *testing.T) {
 	seedShare(t, cpStore, "s-bsname")
 	ctx := context.Background()
 
-	// Create a new local + remote block store referenced by NAME below.
-	newLocal := &models.BlockStoreConfig{
-		ID: uuid.New().String(), Name: "fresh-local", Kind: models.BlockStoreKindLocal, Type: "memory", CreatedAt: time.Now(),
+	// Create a new block store referenced by NAME below.
+	fresh := &models.BlockStoreConfig{
+		ID: uuid.New().String(), Name: "fresh-store", Type: "memory", CreatedAt: time.Now(),
 	}
-	if _, err := cpStore.CreateBlockStore(ctx, newLocal); err != nil {
-		t.Fatalf("CreateBlockStore(local): %v", err)
-	}
-	newRemote := &models.BlockStoreConfig{
-		ID: uuid.New().String(), Name: "fresh-remote", Kind: models.BlockStoreKindRemote, Type: "memory", CreatedAt: time.Now(),
-	}
-	if _, err := cpStore.CreateBlockStore(ctx, newRemote); err != nil {
-		t.Fatalf("CreateBlockStore(remote): %v", err)
+	if _, err := cpStore.CreateBlockStore(ctx, fresh); err != nil {
+		t.Fatalf("CreateBlockStore: %v", err)
 	}
 
-	body := []byte(`{"local_block_store_id":"fresh-local","remote_block_store_id":"fresh-remote"}`)
+	body := []byte(`{"block_store_id":"fresh-store"}`)
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/shares/s-bsname", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req = withShareName(req, "s-bsname")
@@ -314,11 +308,8 @@ func TestShareHandler_Update_ResolvesBlockStoreNameToID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetShare: %v", err)
 	}
-	if got.LocalBlockStoreID != newLocal.ID {
-		t.Errorf("LocalBlockStoreID = %q, want canonical UUID %q (not the name)", got.LocalBlockStoreID, newLocal.ID)
-	}
-	if got.RemoteBlockStoreID == nil || *got.RemoteBlockStoreID != newRemote.ID {
-		t.Errorf("RemoteBlockStoreID = %v, want canonical UUID %q (not the name)", got.RemoteBlockStoreID, newRemote.ID)
+	if got.BlockStoreID != fresh.ID {
+		t.Errorf("BlockStoreID = %q, want canonical UUID %q (not the name)", got.BlockStoreID, fresh.ID)
 	}
 }
 
@@ -328,7 +319,7 @@ func TestShareHandler_Update_RejectsUnknownBlockStore(t *testing.T) {
 	cpStore, _, handler := setupShareTestWithRuntime(t)
 	seedShare(t, cpStore, "s-bsunknown")
 
-	body := []byte(`{"local_block_store_id":"does-not-exist"}`)
+	body := []byte(`{"block_store_id":"does-not-exist"}`)
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/shares/s-bsunknown", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req = withShareName(req, "s-bsunknown")
@@ -337,35 +328,6 @@ func TestShareHandler_Update_RejectsUnknownBlockStore(t *testing.T) {
 	handler.Update(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("Update(unknown block store) = %d, want 400; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// TestShareHandler_Update_RejectsWrongKindBlockStore verifies a UUID that
-// resolves to the wrong kind (a remote store handed to local_block_store_id) is
-// rejected with 400 rather than persisted — otherwise the share would fail to
-// load at the next restart (#1312).
-func TestShareHandler_Update_RejectsWrongKindBlockStore(t *testing.T) {
-	cpStore, _, handler := setupShareTestWithRuntime(t)
-	seedShare(t, cpStore, "s-bskind")
-	ctx := context.Background()
-
-	remote := &models.BlockStoreConfig{
-		ID: uuid.New().String(), Name: "kind-remote", Kind: models.BlockStoreKindRemote, Type: "memory", CreatedAt: time.Now(),
-	}
-	if _, err := cpStore.CreateBlockStore(ctx, remote); err != nil {
-		t.Fatalf("CreateBlockStore(remote): %v", err)
-	}
-
-	// Hand the remote store's UUID to the local tier — must be refused.
-	body := []byte(`{"local_block_store_id":"` + remote.ID + `"}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/shares/s-bskind", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req = withShareName(req, "s-bskind")
-	w := httptest.NewRecorder()
-
-	handler.Update(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("Update(wrong-kind block store) = %d, want 400; body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -384,7 +346,7 @@ func seedStores(t *testing.T, cpStore store.Store, name string) (metaName, block
 		t.Fatalf("CreateMetadataStore: %v", err)
 	}
 	blockStore := &models.BlockStoreConfig{
-		ID: uuid.New().String(), Name: "b-" + name, Kind: models.BlockStoreKindLocal, Type: "memory", CreatedAt: time.Now(),
+		ID: uuid.New().String(), Name: "b-" + name, Type: "memory", CreatedAt: time.Now(),
 	}
 	if _, err := cpStore.CreateBlockStore(ctx, blockStore); err != nil {
 		t.Fatalf("CreateBlockStore: %v", err)
@@ -404,7 +366,7 @@ func TestShareHandler_Create_RejectsInvalidDefaultPermission(t *testing.T) {
 	body, _ := json.Marshal(CreateShareRequest{
 		Name:              "/perm-bad",
 		MetadataStoreID:   metaName,
-		LocalBlockStore:   blockName,
+		BlockStore:        blockName,
 		DefaultPermission: "read_write", // underscore — the valid token is "read-write"
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/shares", bytes.NewReader(body))
@@ -446,13 +408,13 @@ func TestShareHandler_Update_WarnsWhenLiveReloadFails(t *testing.T) {
 	ctx := context.Background()
 
 	remote := &models.BlockStoreConfig{
-		ID: uuid.New().String(), Name: "warn-remote", Kind: models.BlockStoreKindRemote, Type: "memory", CreatedAt: time.Now(),
+		ID: uuid.New().String(), Name: "warn-remote", Type: "memory", CreatedAt: time.Now(),
 	}
 	if _, err := cpStore.CreateBlockStore(ctx, remote); err != nil {
 		t.Fatalf("CreateBlockStore(remote): %v", err)
 	}
 
-	body := []byte(`{"remote_block_store_id":"warn-remote"}`)
+	body := []byte(`{"block_store_id":"warn-remote"}`)
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/shares/s-bswarn", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req = withShareName(req, "s-bswarn")
@@ -495,5 +457,91 @@ func TestShareHandler_Update_NoWarnWithoutBindingChange(t *testing.T) {
 	}
 	if len(resp.Warnings) != 0 {
 		t.Errorf("expected no warnings for a non-binding update, got %v", resp.Warnings)
+	}
+}
+
+// TestShareHandler_Create_SetsDurabilityAxes proves the two axes are settable
+// at create — before this they had no interface at all and every share took the
+// default whatever the operator asked for.
+func TestShareHandler_Create_SetsDurabilityAxes(t *testing.T) {
+	cpStore, _, handler := setupShareTestWithRuntime(t)
+	metaName, blockName := seedStores(t, cpStore, "durable")
+	ctx := context.Background()
+
+	body, _ := json.Marshal(map[string]any{
+		"name":                    "acked",
+		"metadata_store_id":       metaName,
+		"block_store":             blockName,
+		"commit_ack":              "block-store",
+		"relaxed_metadata_commit": true,
+		"default_permission":      "read-write",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/shares", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.Create(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("Create = %d, want 201, body=%s", w.Code, w.Body.String())
+	}
+
+	got, err := cpStore.GetShare(ctx, "/acked")
+	if err != nil {
+		t.Fatalf("GetShare: %v", err)
+	}
+	if got.CommitAck != models.CommitAckBlockStore {
+		t.Errorf("CommitAck = %q, want %q", got.CommitAck, models.CommitAckBlockStore)
+	}
+	if !got.RelaxedMetadataCommit {
+		t.Error("RelaxedMetadataCommit = false, want true: the axes are independent and both were asked for")
+	}
+}
+
+// TestShareHandler_Create_RejectsUnknownCommitAck pins the refusal: resolving a
+// typo to the default would hand the operator a weaker durability promise
+// than the one they wrote, with nothing to reveal it.
+func TestShareHandler_Create_RejectsUnknownCommitAck(t *testing.T) {
+	cpStore, _, handler := setupShareTestWithRuntime(t)
+	metaName, blockName := seedStores(t, cpStore, "badack")
+
+	body, _ := json.Marshal(map[string]any{
+		"name":               "bad",
+		"metadata_store_id":  metaName,
+		"block_store":        blockName,
+		"commit_ack":         "remote",
+		"default_permission": "read-write",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/shares", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.Create(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Create(commit_ack=remote) = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestShareHandler_Update_SetsDurabilityAxes covers the edit path, including
+// that an omitted axis is left alone rather than reset.
+func TestShareHandler_Update_SetsDurabilityAxes(t *testing.T) {
+	cpStore, _, handler := setupShareTestWithRuntime(t)
+	seedShare(t, cpStore, "s-ack")
+	ctx := context.Background()
+
+	body := []byte(`{"commit_ack":"block-store"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/shares/s-ack", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = withShareName(req, "s-ack")
+	w := httptest.NewRecorder()
+	handler.Update(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Update = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	got, err := cpStore.GetShare(ctx, "/s-ack")
+	if err != nil {
+		t.Fatalf("GetShare: %v", err)
+	}
+	if got.CommitAck != models.CommitAckBlockStore {
+		t.Errorf("CommitAck = %q, want %q", got.CommitAck, models.CommitAckBlockStore)
+	}
+	if got.RelaxedMetadataCommit {
+		t.Error("RelaxedMetadataCommit was flipped by an update that never named it")
 	}
 }

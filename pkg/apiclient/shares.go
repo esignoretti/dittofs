@@ -18,12 +18,13 @@ func normalizeShareNameForAPI(name string) string {
 
 // Share represents a share in the system.
 type Share struct {
-	ID                 string  `json:"id"`
-	Name               string  `json:"name"`
-	MetadataStoreID    string  `json:"metadata_store_id"`
-	LocalBlockStoreID  string  `json:"local_block_store_id"`
-	RemoteBlockStoreID *string `json:"remote_block_store_id"`
-	ReadOnly           bool    `json:"read_only,omitempty"`
+	ID                    string `json:"id"`
+	Name                  string `json:"name"`
+	MetadataStoreID       string `json:"metadata_store_id"`
+	BlockStoreID          string `json:"block_store_id"`
+	CommitAck             string `json:"commit_ack"`
+	RelaxedMetadataCommit bool   `json:"relaxed_metadata_commit"`
+	ReadOnly              bool   `json:"read_only,omitempty"`
 	// Enabled mirrors models.Share.Enabled. The tag is deliberately NOT
 	// omitempty: `false` is semantically meaningful ("share is
 	// disabled") whereas read_only:false is the inert default.
@@ -34,7 +35,7 @@ type Share struct {
 	BlockedOperations []string `json:"blocked_operations,omitempty"`
 	RetentionPolicy   string   `json:"retention_policy,omitempty"`
 	RetentionTTL      string   `json:"retention_ttl,omitempty"`
-	LocalStoreSize    string   `json:"local_store_size,omitempty"`
+	JournalSize       string   `json:"journal_size,omitempty"`
 	ReadBufferSize    string   `json:"read_buffer_size,omitempty"`
 	QuotaBytes        string   `json:"quota_bytes,omitempty"`
 	UsedBytes         int64    `json:"used_bytes"`
@@ -89,22 +90,26 @@ type Share struct {
 
 // CreateShareRequest is the request to create a share.
 type CreateShareRequest struct {
-	Name              string  `json:"name"`
-	MetadataStoreID   string  `json:"metadata_store_id"`
-	LocalBlockStore   string  `json:"local_block_store"`
-	RemoteBlockStore  *string `json:"remote_block_store,omitempty"`
-	ReadOnly          bool    `json:"read_only,omitempty"`
-	EncryptData       bool    `json:"encrypt_data,omitempty"`
-	DefaultPermission string  `json:"default_permission,omitempty"`
+	Name              string `json:"name"`
+	MetadataStoreID   string `json:"metadata_store_id"`
+	BlockStore        string `json:"block_store"`
+	ReadOnly          bool   `json:"read_only,omitempty"`
+	EncryptData       bool   `json:"encrypt_data,omitempty"`
+	DefaultPermission string `json:"default_permission,omitempty"`
 	// Owner is the username whose UID/GID owns the share's root directory.
 	Owner             string    `json:"owner,omitempty"`
 	Description       string    `json:"description,omitempty"`
 	BlockedOperations *[]string `json:"blocked_operations,omitempty"`
 	RetentionPolicy   string    `json:"retention_policy,omitempty"`
 	RetentionTTL      string    `json:"retention_ttl,omitempty"`
-	LocalStoreSize    string    `json:"local_store_size,omitempty"`
+	JournalSize       string    `json:"journal_size,omitempty"`
 	ReadBufferSize    string    `json:"read_buffer_size,omitempty"`
 	QuotaBytes        string    `json:"quota_bytes,omitempty"`
+	// CommitAck is what a COMMIT waits for: "journal" or "block-store".
+	// Empty leaves the server default. RelaxedMetadataCommit is the
+	// independent second axis; nil leaves the default.
+	CommitAck             string `json:"commit_ack,omitempty"`
+	RelaxedMetadataCommit *bool  `json:"relaxed_metadata_commit,omitempty"`
 	// AclFlagInheritedCanonicalization — Refs #514. Pointer so callers can
 	// distinguish "unset → server default (true)" from "explicit false".
 	AclFlagInheritedCanonicalization *bool `json:"acl_flag_inherited_canonicalization,omitempty"`
@@ -134,18 +139,20 @@ type CreateShareRequest struct {
 
 // UpdateShareRequest is the request to update a share.
 type UpdateShareRequest struct {
-	LocalBlockStoreID  *string   `json:"local_block_store_id,omitempty"`
-	RemoteBlockStoreID *string   `json:"remote_block_store_id,omitempty"`
-	ReadOnly           *bool     `json:"read_only,omitempty"`
-	EncryptData        *bool     `json:"encrypt_data,omitempty"`
-	DefaultPermission  *string   `json:"default_permission,omitempty"`
-	Description        *string   `json:"description,omitempty"`
-	BlockedOperations  *[]string `json:"blocked_operations,omitempty"`
-	RetentionPolicy    *string   `json:"retention_policy,omitempty"`
-	RetentionTTL       *string   `json:"retention_ttl,omitempty"`
-	LocalStoreSize     *string   `json:"local_store_size,omitempty"`
-	ReadBufferSize     *string   `json:"read_buffer_size,omitempty"`
-	QuotaBytes         *string   `json:"quota_bytes,omitempty"`
+	BlockStoreID      *string   `json:"block_store_id,omitempty"`
+	ReadOnly          *bool     `json:"read_only,omitempty"`
+	EncryptData       *bool     `json:"encrypt_data,omitempty"`
+	DefaultPermission *string   `json:"default_permission,omitempty"`
+	Description       *string   `json:"description,omitempty"`
+	BlockedOperations *[]string `json:"blocked_operations,omitempty"`
+	RetentionPolicy   *string   `json:"retention_policy,omitempty"`
+	RetentionTTL      *string   `json:"retention_ttl,omitempty"`
+	JournalSize       *string   `json:"journal_size,omitempty"`
+	ReadBufferSize    *string   `json:"read_buffer_size,omitempty"`
+	QuotaBytes        *string   `json:"quota_bytes,omitempty"`
+	// CommitAck / RelaxedMetadataCommit — nil = no change.
+	CommitAck             *string `json:"commit_ack,omitempty"`
+	RelaxedMetadataCommit *bool   `json:"relaxed_metadata_commit,omitempty"`
 	// AclFlagInheritedCanonicalization — Refs #514. nil = no change;
 	// non-nil = explicit set. Takes effect on adapter restart.
 	AclFlagInheritedCanonicalization *bool `json:"acl_flag_inherited_canonicalization,omitempty"`

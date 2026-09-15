@@ -215,15 +215,23 @@ type ShareConfig struct {
 	RetentionTTL    time.Duration
 
 	// Per-share block store size overrides (0 = use system default).
-	LocalStoreSize int64
+	JournalSize    int64
 	ReadBufferSize int64
 
 	// Per-share byte quota (0 = unlimited).
 	QuotaBytes int64
 
-	// Block store config IDs resolved from the DB share model.
-	LocalBlockStoreID  string // Required: references a local BlockStoreConfig
-	RemoteBlockStoreID string // Optional: references a remote BlockStoreConfig (empty = local-only)
+	// BlockStoreID references the BlockStoreConfig this share offloads to,
+	// resolved from the DB share model. The journal is provisioned under the
+	// server-level root and is not configured here.
+	BlockStoreID string
+
+	// CommitAck selects what an NFS COMMIT or SMB Flush waits for.
+	CommitAck models.CommitAck
+
+	// RelaxedMetadataCommit lets an operation that promised stable metadata
+	// return before that metadata's fsync completes.
+	RelaxedMetadataCommit bool
 }
 
 // LegacyMountInfo is the legacy NFS mount record format.
@@ -251,9 +259,9 @@ type MetadataServiceDeregistrar interface {
 	RemoveStoreForShare(shareName string)
 }
 
-// MetadataWritebackSetter opts a share into the metadata writeback tier (#1757).
+// MetadataWritebackSetter opts a share into the relaxed metadata commit tier.
 // The concrete *metadata.Service satisfies it. AddShare calls it after
-// registering the store when the share's local config sets "writeback": true.
+// registering the store, from the share's RelaxedMetadataCommit.
 type MetadataWritebackSetter interface {
 	SetShareWriteback(shareName string, writeback bool)
 }
@@ -354,7 +362,16 @@ func modeLabel(hasRemote bool) string {
 // share names can produce the same directory name).
 func sanitizeShareName(name string) string {
 	name = strings.TrimPrefix(name, "/")
-	return url.PathEscape(name)
+	escaped := url.PathEscape(name)
+	// Escaping neutralizes separators but leaves dots, so a name that is
+	// nothing but them still addresses a parent once joined — "/.." would put
+	// a share's journal on the root itself, outside the directory that keeps
+	// shares apart. Escaping the dots keeps it an ordinary single name.
+	switch escaped {
+	case ".", "..":
+		return strings.ReplaceAll(escaped, ".", "%2E")
+	}
+	return escaped
 }
 func (s *Service) GetShare(name string) (*Share, error) {
 	s.mu.RLock()

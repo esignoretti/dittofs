@@ -64,8 +64,7 @@ func newShareJSONBodyServer(t *testing.T) *shareJSONBodyServer {
 func resetCreateFlags() {
 	createName = ""
 	createMetadata = ""
-	createLocal = ""
-	createRemote = ""
+	createBlockStore = ""
 	createReadOnly = false
 	createEncryptData = false
 	createDefaultPermission = "read-write"
@@ -73,7 +72,7 @@ func resetCreateFlags() {
 	createDescription = ""
 	createRetention = ""
 	createRetentionTTL = ""
-	createLocalStoreSize = ""
+	createJournalSize = ""
 	createReadBufferSize = ""
 	createQuotaBytes = ""
 	createAclCanonicalize = true
@@ -87,15 +86,14 @@ func resetCreateFlags() {
 
 // resetEditFlags clears editCmd state for tests.
 func resetEditFlags() {
-	editLocal = ""
-	editRemote = ""
+	editBlockStore = ""
 	editReadOnly = ""
 	editEncryptData = ""
 	editDefaultPermission = ""
 	editDescription = ""
 	editRetention = ""
 	editRetentionTTL = ""
-	editLocalStoreSize = ""
+	editJournalSize = ""
 	editReadBufferSize = ""
 	editQuotaBytes = ""
 	editAclCanonicalize = ""
@@ -118,7 +116,7 @@ func TestCreateCmd_AclCanonicalizeInherited_ExplicitFalse(t *testing.T) {
 	resetCreateFlags()
 	createName = "/x"
 	createMetadata = "meta"
-	createLocal = "bs"
+	createBlockStore = "bs"
 	createAclCanonicalize = false
 	if err := createCmd.Flags().Set("acl-canonicalize-inherited", "false"); err != nil {
 		t.Fatalf("Flags.Set: %v", err)
@@ -152,7 +150,7 @@ func TestCreateCmd_AclCanonicalizeInherited_UnsetOmitsField(t *testing.T) {
 	resetCreateFlags()
 	createName = "/x"
 	createMetadata = "meta"
-	createLocal = "bs"
+	createBlockStore = "bs"
 
 	_ = captureStdout(t, func() {
 		if err := runCreate(createCmd, nil); err != nil {

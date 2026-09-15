@@ -208,7 +208,6 @@ func runStart(cmd *cobra.Command, args []string) error {
 		"cpus", detector.AvailableCPUs(),
 	)
 	logger.Info("Auto-deduced block store defaults",
-		"local_store_size", block.FormatBytes(deduced.LocalStoreSize),
 		"read_buffer_size", block.FormatBytes(uint64(deduced.ReadBufferSize)),
 		"max_log_bytes", block.FormatBytes(deduced.MaxLogBytes),
 		"parallel_syncs", deduced.ParallelSyncs,
@@ -225,21 +224,22 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Resolve the effective append-log pressure budget default: the global
-	// config blockstore.local.max_log_bytes wins when set, otherwise the
-	// system-deduced default. A per-share block store config max_log_bytes
-	// still overrides this inside CreateLocalStoreFromConfig.
+	// config blockstore.journal.max_log_bytes wins when set, otherwise the
+	// system-deduced default.
 	effectiveMaxLogBytes := deduced.MaxLogBytes
-	if cfg.Blockstore.Local.MaxLogBytes > 0 {
-		effectiveMaxLogBytes = cfg.Blockstore.Local.MaxLogBytes
+	if cfg.Blockstore.Journal.MaxLogBytes > 0 {
+		effectiveMaxLogBytes = cfg.Blockstore.Journal.MaxLogBytes
 	}
 
 	// Set per-share defaults BEFORE loading shares (AddShare creates BlockStores).
 	rt.SetLocalStoreDefaults(&shares.LocalStoreDefaults{
-		MaxSize:                deduced.LocalStoreSize,
-		ReadBufferBytes:        deduced.ReadBufferSize,
-		MaxLogBytes:            block.ClampToInt64(effectiveMaxLogBytes),
-		DefaultRemoteCacheSize: cfg.Blockstore.Local.DefaultRemoteCacheSize,
-		BackpressureMaxWait:    cfg.Blockstore.Local.BackpressureMaxWait,
+		ReadBufferBytes:     deduced.ReadBufferSize,
+		MaxLogBytes:         block.ClampToInt64(effectiveMaxLogBytes),
+		JournalRoot:         cfg.Blockstore.Journal.Path,
+		ChunkSize:           cfg.Blockstore.Journal.ChunkSize,
+		ChunkMax:            cfg.Blockstore.Journal.ChunkMax,
+		DirtyExpire:         cfg.Blockstore.Journal.DirtyExpire,
+		BackpressureMaxWait: cfg.Blockstore.Journal.BackpressureMaxWait,
 	})
 	rt.SetSyncerDefaults(&shares.SyncerDefaults{
 		ParallelDownloads: deduced.ParallelFetches,

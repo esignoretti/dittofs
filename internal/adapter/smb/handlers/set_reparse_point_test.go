@@ -34,7 +34,7 @@ func setupReparseShare(t *testing.T) (*Handler, *SMBHandlerContext, metadata.Fil
 	if err != nil {
 		t.Fatalf("cpstore.New: %v", err)
 	}
-	rt := runtime.New(cps)
+	rt := newTestRuntime(t, cps)
 
 	if _, err := cps.CreateMetadataStore(ctx, &models.MetadataStoreConfig{Name: "rpmeta", Type: "memory"}); err != nil {
 		t.Fatalf("CreateMetadataStore: %v", err)
@@ -45,7 +45,7 @@ func setupReparseShare(t *testing.T) (*Handler, *SMBHandlerContext, metadata.Fil
 	}
 
 	localBSID, err := cps.CreateBlockStore(ctx, &models.BlockStoreConfig{
-		Name: "rpbs", Kind: models.BlockStoreKindLocal, Type: "memory",
+		Name: "rpbs", Type: "memory",
 	})
 	if err != nil {
 		t.Fatalf("CreateBlockStore: %v", err)
@@ -53,10 +53,10 @@ func setupReparseShare(t *testing.T) (*Handler, *SMBHandlerContext, metadata.Fil
 
 	const shareName = "/rp"
 	if err := rt.AddShare(ctx, &runtime.ShareConfig{
-		Name:              shareName,
-		MetadataStore:     "rpmeta",
-		Enabled:           true,
-		LocalBlockStoreID: localBSID,
+		Name:          shareName,
+		MetadataStore: "rpmeta",
+		Enabled:       true,
+		BlockStoreID:  localBSID,
 		RootAttr: &metadata.FileAttr{
 			Type: metadata.FileTypeDirectory,
 			Mode: 0o777,

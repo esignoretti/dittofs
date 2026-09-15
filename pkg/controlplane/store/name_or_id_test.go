@@ -23,7 +23,7 @@ func TestStoreAndShareNameOrIDResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create metadata store: %v", err)
 	}
-	localID, err := store.CreateBlockStore(ctx, &models.BlockStoreConfig{Name: "local", Kind: models.BlockStoreKindLocal, Type: "fs"})
+	localID, err := store.CreateBlockStore(ctx, &models.BlockStoreConfig{Name: "local", Type: "fs"})
 	if err != nil {
 		t.Fatalf("create block store: %v", err)
 	}
@@ -39,21 +39,21 @@ func TestStoreAndShareNameOrIDResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("block store by id is kind-scoped", func(t *testing.T) {
-		byID, err := store.GetBlockStore(ctx, localID, models.BlockStoreKindLocal)
-		if err != nil || byID.Name != "local" {
-			t.Fatalf("by id (local): got %+v err %v", byID, err)
+	t.Run("block store by name and by id", func(t *testing.T) {
+		byName, err := store.GetBlockStore(ctx, "local")
+		if err != nil || byName.ID != localID {
+			t.Fatalf("by name: got %+v err %v", byName, err)
 		}
-		// The same ID under the wrong kind must not resolve.
-		if _, err := store.GetBlockStore(ctx, localID, models.BlockStoreKindRemote); !errors.Is(err, models.ErrStoreNotFound) {
-			t.Fatalf("by id (remote): expected ErrStoreNotFound, got %v", err)
+		byID, err := store.GetBlockStore(ctx, localID)
+		if err != nil || byID.Name != "local" {
+			t.Fatalf("by id: got %+v err %v", byID, err)
 		}
 	})
 
 	shareID, err := store.CreateShare(ctx, &models.Share{
-		Name:              "/share",
-		MetadataStoreID:   metaID,
-		LocalBlockStoreID: localID,
+		Name:            "/share",
+		MetadataStoreID: metaID,
+		BlockStoreID:    localID,
 	})
 	if err != nil {
 		t.Fatalf("create share: %v", err)

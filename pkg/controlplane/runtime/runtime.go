@@ -371,6 +371,8 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	// the DB is still open or it races the close. Bounded by the caller's ctx
 	// (an overall deadline across shares) so shutdown stays predictable.
 	r.sharesSvc.StopRollups(ctx)
+	// Release the journals before the metadata stores they write through.
+	r.sharesSvc.CloseBlockStores()
 	r.CloseMetadataStores()
 	return nil
 }
@@ -615,12 +617,19 @@ func (r *Runtime) AddShare(ctx context.Context, config *ShareConfig) error {
 	return nil
 }
 
+// ApplyShareDurability puts a share's durability choice into effect on the
+// running share, so an edit does not wait for a restart to change what a COMMIT
+// acknowledges.
+func (r *Runtime) ApplyShareDurability(name string, requireDurableCommit, relaxedMetadataCommit bool) error {
+	return r.sharesSvc.ApplyDurability(name, requireDurableCommit, relaxedMetadataCommit, r.GetMetadataService())
+}
+
 // RebindShareBlockStore hot-reloads a running share's per-share BlockStore after
 // its local/remote block-store binding changed, so the change takes effect
 // without a server restart (#1532). It rebuilds the new ShareConfig from the
 // (already-persisted) DB row and passes the previous block-store IDs so the
 // share service can restore the old binding if the new one fails to build.
-func (r *Runtime) RebindShareBlockStore(ctx context.Context, name, oldLocalBlockStoreID, oldRemoteBlockStoreID string) error {
+func (r *Runtime) RebindShareBlockStore(ctx context.Context, name, oldBlockStoreID string) error {
 	shareModel, err := r.store.GetShare(ctx, name)
 	if err != nil {
 		return fmt.Errorf("rebind: failed to load share %q: %w", name, err)
@@ -636,8 +645,7 @@ func (r *Runtime) RebindShareBlockStore(ctx context.Context, name, oldLocalBlock
 	// oldConfig is the same row with the previous block-store binding — used only
 	// for recovery if the new store fails to build.
 	oldCfg := *newCfg
-	oldCfg.LocalBlockStoreID = oldLocalBlockStoreID
-	oldCfg.RemoteBlockStoreID = oldRemoteBlockStoreID
+	oldCfg.BlockStoreID = oldBlockStoreID
 
 	r.mu.RLock()
 	localDefaults := r.localStoreDefaults

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/marmos91/dittofs/internal/adapter/common"
+	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/block/engine"
+	"github.com/marmos91/dittofs/pkg/block/remote"
 	"github.com/marmos91/dittofs/pkg/controlplane/models"
 	"github.com/marmos91/dittofs/pkg/controlplane/runtime/shares"
 	cpstore "github.com/marmos91/dittofs/pkg/controlplane/store"
@@ -35,7 +37,10 @@ type byteVerifyFixture struct {
 	localStoreDir string
 
 	// Captured so simulateRestart can rebuild the Runtime over the SAME
-	// control-plane store and re-register the reopened metadata store.
+	// control-plane store and re-register the reopened metadata store. The
+	// journal root is captured for the same reason: a fresh one would come up
+	// empty, so a restart would silently lose every byte the journal holds.
+	journalRoot   string
 	metaStoreName string
 	localID       string
 	remoteID      string
@@ -44,8 +49,10 @@ type byteVerifyFixture struct {
 // newByteVerifyFixture builds the fixture for the given metadata store. The
 // metaType is the engine label recorded in the cpstore ("memory" | "badger" |
 // "postgres") — it drives snapshot/restore's per-engine Restoreable dispatch.
+// Every share carries a block store, so the default fixture gets a plaintext
+// memory one rather than standing up a share with a journal alone.
 func newByteVerifyFixture(t *testing.T, meta metadata.Store, metaType string) *byteVerifyFixture {
-	return newByteVerifyFixtureOpts(t, meta, metaType, nil)
+	return newByteVerifyFixtureOpts(t, meta, metaType, plaintextRemoteCfg())
 }
 
 // newByteVerifyFixtureOpts is newByteVerifyFixture with an optional remote
@@ -66,7 +73,8 @@ func newByteVerifyFixtureOpts(t *testing.T, meta metadata.Store, metaType string
 	t.Cleanup(func() { _ = cp.Close() })
 
 	rt := New(cp)
-	rt.SetLocalStoreDefaults(&shares.LocalStoreDefaults{MaxSize: 0})
+	journalRoot := t.TempDir()
+	rt.SetLocalStoreDefaults(&shares.LocalStoreDefaults{JournalRoot: journalRoot, MaxSize: 0})
 
 	const metaStoreName = "bv-meta"
 	metaID, err := cp.CreateMetadataStore(context.Background(), &models.MetadataStoreConfig{
@@ -86,7 +94,6 @@ func newByteVerifyFixtureOpts(t *testing.T, meta metadata.Store, metaType string
 	fsDir := t.TempDir()
 	localCfg := &models.BlockStoreConfig{
 		Name: "bv-local",
-		Kind: models.BlockStoreKindLocal,
 		Type: "fs",
 	}
 	// SetConfig serializes into the persisted JSON blob; GetBlockStoreByID
@@ -116,23 +123,22 @@ func newByteVerifyFixtureOpts(t *testing.T, meta metadata.Store, metaType string
 	// shares.enabled in the DB) resolves it. AddShare only populates the
 	// runtime registry, not this row.
 	cpShare := &models.Share{
-		Name:              shareName,
-		MetadataStoreID:   metaID,
-		LocalBlockStoreID: localID,
-		Enabled:           true,
+		Name:            shareName,
+		MetadataStoreID: metaID,
+		BlockStoreID:    localID,
+		Enabled:         true,
 	}
 	if remoteID != "" {
-		cpShare.RemoteBlockStoreID = &remoteID
+		cpShare.BlockStoreID = remoteID
 	}
 	if _, err := cp.CreateShare(context.Background(), cpShare); err != nil {
 		t.Fatalf("cpstore CreateShare: %v", err)
 	}
 	if err := rt.AddShare(context.Background(), &shares.ShareConfig{
-		Name:               shareName,
-		MetadataStore:      metaStoreName,
-		LocalBlockStoreID:  localID,
-		RemoteBlockStoreID: remoteID,
-		Enabled:            true,
+		Name:          shareName,
+		MetadataStore: metaStoreName,
+		BlockStoreID:  remoteID,
+		Enabled:       true,
 	}); err != nil {
 		t.Fatalf("AddShare: %v", err)
 	}
@@ -158,6 +164,7 @@ func newByteVerifyFixtureOpts(t *testing.T, meta metadata.Store, metaType string
 		bs:            share.BlockStore,
 		shareName:     shareName,
 		localStoreDir: localStoreDir,
+		journalRoot:   journalRoot,
 		metaStoreName: metaStoreName,
 		localID:       localID,
 		remoteID:      remoteID,
@@ -176,6 +183,14 @@ func (f *byteVerifyFixture) simulateRestart(reopen func(*testing.T) metadata.Sto
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = f.rt.Shutdown(ctx)
 	cancel()
+
+	// A real remote outlives a restart; the in-memory one does not, so carry its
+	// objects over to the store the restarted runtime will build. Without this
+	// every snapshot looks non-durable after the restart.
+	var priorRemote remote.RemoteStore
+	if f.bs != nil {
+		priorRemote = f.bs.RemoteStore()
+	}
 
 	// Release the outgoing block store's log-blob fd. Runtime.Shutdown closes
 	// metadata stores but NOT block stores, so without this the pre-restart
@@ -198,16 +213,15 @@ func (f *byteVerifyFixture) simulateRestart(reopen func(*testing.T) metadata.Sto
 	meta := reopen(f.t)
 
 	rt := New(f.store)
-	rt.SetLocalStoreDefaults(&shares.LocalStoreDefaults{MaxSize: 0})
+	rt.SetLocalStoreDefaults(&shares.LocalStoreDefaults{JournalRoot: f.journalRoot, MaxSize: 0})
 	if err := rt.RegisterMetadataStore(f.metaStoreName, meta); err != nil {
 		f.t.Fatalf("simulateRestart RegisterMetadataStore: %v", err)
 	}
 	if err := rt.AddShare(context.Background(), &shares.ShareConfig{
-		Name:               f.shareName,
-		MetadataStore:      f.metaStoreName,
-		LocalBlockStoreID:  f.localID,
-		RemoteBlockStoreID: f.remoteID,
-		Enabled:            false, // restore requires the share disabled
+		Name:          f.shareName,
+		MetadataStore: f.metaStoreName,
+		BlockStoreID:  f.remoteID,
+		Enabled:       false, // restore requires the share disabled
 	}); err != nil {
 		f.t.Fatalf("simulateRestart AddShare: %v", err)
 	}
@@ -218,6 +232,7 @@ func (f *byteVerifyFixture) simulateRestart(reopen func(*testing.T) metadata.Sto
 	f.rt = rt
 	f.meta = meta
 	f.bs = share.BlockStore
+	copyRemoteBlocks(f.t, priorRemote, f.bs.RemoteStore())
 
 	// The freshly-opened block store holds a new log-blob fd on the SAME fsDir.
 	// f.rt.Shutdown (via the deferred fixture close) does not close block stores,
@@ -231,8 +246,35 @@ func (f *byteVerifyFixture) simulateRestart(reopen func(*testing.T) metadata.Sto
 	})
 }
 
+// copyRemoteBlocks replays every block object from src into dst, standing in
+// for the durability a process-external remote would have on its own.
+func copyRemoteBlocks(t *testing.T, src, dst remote.RemoteStore) {
+	t.Helper()
+	from, ok := src.(remote.RemoteBlockStore)
+	if !ok || dst == nil {
+		return
+	}
+	to, ok := dst.(remote.RemoteBlockStore)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	if err := from.WalkBlocks(ctx, func(blockID string, _ block.Meta) error {
+		data, err := from.GetBlock(ctx, blockID)
+		if err != nil {
+			return err
+		}
+		return to.PutBlock(ctx, blockID, bytes.NewReader(data))
+	}); err != nil {
+		t.Fatalf("copy remote blocks: %v", err)
+	}
+}
+
 func (f *byteVerifyFixture) close() {
 	f.t.Helper()
+	// Drop the share first so its block store stops before Shutdown closes the
+	// metadata stores underneath the syncer's in-flight fetches.
+	_ = f.rt.RemoveShare(f.shareName)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := f.rt.Shutdown(ctx); err != nil {
@@ -550,7 +592,6 @@ func TestSnapshotByteVerify_Matrix(t *testing.T) {
 func plaintextRemoteCfg() *models.BlockStoreConfig {
 	return &models.BlockStoreConfig{
 		Name: "bv-plain-remote",
-		Kind: models.BlockStoreKindRemote,
 		Type: "memory",
 	}
 }

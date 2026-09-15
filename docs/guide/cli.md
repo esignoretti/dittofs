@@ -700,23 +700,17 @@ Global flags:
   - [`dfsctl status`](#dfsctl-status) — Show server status
   - [`dfsctl store`](#dfsctl-store) — Store management
     - [`dfsctl store block`](#dfsctl-store-block) — Block store management
+      - [`dfsctl store block add`](#dfsctl-store-block-add) — Add a block store
       - [`dfsctl store block audit-refcounts`](#dfsctl-store-block-audit-refcounts) — Verify every manifest block reference has a backing FileChunk row
+      - [`dfsctl store block edit`](#dfsctl-store-block-edit) — Edit a block store
       - [`dfsctl store block evict`](#dfsctl-store-block-evict) — Evict block store data
       - [`dfsctl store block gc`](#dfsctl-store-block-gc) — Run garbage collection for a block store share
       - [`dfsctl store block gc-status`](#dfsctl-store-block-gc-status) — Show the last block-store GC run summary for a share
       - [`dfsctl store block health`](#dfsctl-store-block-health) — Check block store health
-      - [`dfsctl store block local`](#dfsctl-store-block-local) — Local block store management
-        - [`dfsctl store block local add`](#dfsctl-store-block-local-add) — Add a local block store
-        - [`dfsctl store block local edit`](#dfsctl-store-block-local-edit) — Edit a local block store
-        - [`dfsctl store block local list`](#dfsctl-store-block-local-list) — List local block stores
-        - [`dfsctl store block local remove`](#dfsctl-store-block-local-remove) — Remove a local block store
+      - [`dfsctl store block list`](#dfsctl-store-block-list) — List block stores
       - [`dfsctl store block reclaim`](#dfsctl-store-block-reclaim) — Reclaim orphaned block storage (deletes; use --dry-run to preview)
       - [`dfsctl store block reconcile`](#dfsctl-store-block-reconcile) — Report orphaned block storage (read-only; no deletes)
-      - [`dfsctl store block remote`](#dfsctl-store-block-remote) — Remote block store management
-        - [`dfsctl store block remote add`](#dfsctl-store-block-remote-add) — Add a remote block store
-        - [`dfsctl store block remote edit`](#dfsctl-store-block-remote-edit) — Edit a remote block store
-        - [`dfsctl store block remote list`](#dfsctl-store-block-remote-list) — List remote block stores
-        - [`dfsctl store block remote remove`](#dfsctl-store-block-remote-remove) — Remove a remote block store
+      - [`dfsctl store block remove`](#dfsctl-store-block-remove) — Remove a block store
       - [`dfsctl store block stats`](#dfsctl-store-block-stats) — Show block store statistics
     - [`dfsctl store check`](#dfsctl-store-check) — Scan manifests for ranges no chunk covers
     - [`dfsctl store metadata`](#dfsctl-store-metadata) — Manage metadata stores
@@ -3811,7 +3805,7 @@ argument. These operations require admin privileges.
 dfsctl share list
 
 # Create a new share
-dfsctl share create --name /archive --metadata default --local fs-cache --remote s3-store
+dfsctl share create --name /archive --metadata default --block-store s3-store
 
 # Show share details
 dfsctl share show /archive
@@ -3855,8 +3849,8 @@ Create a new share
 
 Create a new share on the DittoFS server.
 
-A share requires a metadata store and a local block store. A remote block store
-is optional and enables tiered storage (local cache + remote durable storage).
+A share requires a metadata store and a block store. The block store holds the
+durable copy of the data; each share also keeps a local journal on disk.
 
 ```
 dfsctl share create [flags]
@@ -3865,35 +3859,32 @@ dfsctl share create [flags]
 **Examples:**
 
 ```bash
-# Create a share with local block store only
-dfsctl share create --name /data --metadata default --local fs-cache
-
-# Create a share with local and remote block stores
-dfsctl share create --name /archive --metadata default --local fs-cache --remote s3-store
+# Create a share
+dfsctl share create --name /data --metadata default --block-store s3-store
 
 # Create a read-only share
-dfsctl share create --name /readonly --metadata default --local fs-cache --read-only
+dfsctl share create --name /readonly --metadata default --block-store s3-store --read-only
 
 # Create with default permission allowing all users read-write access
-dfsctl share create --name /shared --metadata default --local fs-cache --remote s3-store --default-permission read-write
+dfsctl share create --name /shared --metadata default --block-store s3-store --default-permission read-write
 
 # Create with description
-dfsctl share create --name /docs --metadata default --local fs-cache --description "Documentation files"
+dfsctl share create --name /docs --metadata default --block-store s3-store --description "Documentation files"
 
 # Create a pinned share (blocks never evicted)
-dfsctl share create --name /edge-data --metadata default --local fs-cache --retention pin
+dfsctl share create --name /edge-data --metadata default --block-store s3-store --retention pin
 
 # Create with TTL retention (evict after 72 hours of no access)
-dfsctl share create --name /logs --metadata default --local fs-cache --retention ttl --retention-ttl 72h
+dfsctl share create --name /logs --metadata default --block-store s3-store --retention ttl --retention-ttl 72h
 
 # Create with per-share cache size overrides
-dfsctl share create --name /bigdata --metadata default --local fs-cache --local-store-size 10GiB --read-buffer-size 2GiB
+dfsctl share create --name /bigdata --metadata default --block-store s3-store --journal-size 10GiB --read-buffer-size 2GiB
 
 # Create with per-share quota
-dfsctl share create --name /limited --metadata default --local fs-cache --quota-bytes 10GiB
+dfsctl share create --name /limited --metadata default --block-store s3-store --quota-bytes 10GiB
 
 # Create an export that does not squash root (e.g. for root-mounted/benchmark clients)
-dfsctl share create --name /export --metadata default --local fs-cache --squash none
+dfsctl share create --name /export --metadata default --block-store s3-store --squash none
 ```
 
 Flags:
@@ -3902,21 +3893,22 @@ Flags:
       --access-based-enumeration        Enable Windows access-based enumeration (SHI1005_FLAGS_ACCESS_BASED_DIRECTORY_ENUM). When true, SMB clients only see directory entries they can read.
       --acl-canonicalize-inherited      When false, preserves the SE_DACL_AUTO_INHERITED control bit verbatim on SET_INFO Security instead of applying MS-DTYP §2.5.3.4.2 canonicalization (Samba "acl flag inherited canonicalization = no"). Default true matches Windows. (default true)
       --allow-mfsymlink                 Convert 1067-byte XSym (Minshall+French) symlink files written by macOS/Windows SMB clients into real symlinks on CLOSE. Off by default (XSym files are stored as regular files).
+      --block-store string              Block store name (required)
       --change-notify-disabled          Reject SMB2 CHANGE_NOTIFY with STATUS_NOT_IMPLEMENTED on this share (mirrors Samba 'kernel change notify = no').
+      --commit-ack string               What a COMMIT waits for: journal (survives host crash) or block-store (survives device loss)
       --continuous-availability         Advertise SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY and allow SMB3 persistent durable handles on this share.
       --default-permission string       Default permission for unmapped UIDs (none|read|read-write|admin) (default "none")
       --description string              Share description
       --enable-trash                    Enable the per-share recycle bin so deletes move to #recycle instead of being permanent.
       --encrypt-data                    Require SMB3 encryption for this share
-      --local string                    Local block store name (required)
-      --local-store-size string         Per-share disk cache size override (e.g., 10GiB, 500MiB)
+      --journal-size string             Per-share journal size override (e.g., 10GiB, 500MiB)
       --metadata string                 Metadata store name (required)
       --name string                     Share name/path (required)
       --owner string                    Username that owns the share's root directory (defaults to root). The owner can write at the share root; other principals are governed by POSIX mode plus their share permission grant.
       --quota-bytes string              Per-share byte quota (e.g., '10GiB', '500MiB'). 0 = unlimited (default)
       --read-buffer-size string         Per-share read buffer size override (e.g., 2GiB, 256MiB)
       --read-only                       Make share read-only
-      --remote string                   Remote block store name (optional)
+      --relaxed-metadata-commit         Let an operation that promised stable metadata return before the metadata fsync
       --retention string                Retention policy (pin|ttl|lru)
       --retention-ttl string            Retention TTL duration (e.g., 72h, 24h)
       --squash string                   NFS export squash mode (none|root_to_admin|root_to_guest|all_to_admin|all_to_guest). Default root_to_guest (root_squash); use none or root_to_admin so a root-mounted client is not squashed to guest.
@@ -4003,11 +3995,8 @@ dfsctl share edit <name> [flags]
 # Edit share interactively
 dfsctl share edit /archive
 
-# Update local block store reference
-dfsctl share edit /archive --local new-fs-cache
-
-# Update remote block store reference
-dfsctl share edit /archive --remote new-s3-store
+# Update the block store reference
+dfsctl share edit /archive --block-store new-s3-store
 
 # Make share read-only
 dfsctl share edit /archive --read-only true
@@ -4027,8 +4016,8 @@ dfsctl share edit /archive --retention pin
 # Change retention policy to TTL with 72-hour window
 dfsctl share edit /archive --retention ttl --retention-ttl 72h
 
-# Override per-share disk cache size
-dfsctl share edit /archive --local-store-size 10GiB
+# Override the per-share journal size
+dfsctl share edit /archive --journal-size 10GiB
 
 # Override per-share read buffer size
 dfsctl share edit /archive --read-buffer-size 2GiB
@@ -4045,16 +4034,17 @@ Flags:
 ```
       --access-based-enumeration string        Enable/disable Windows access-based enumeration (true|false). Takes effect on adapter restart.
       --acl-canonicalize-inherited string      When false, preserves the SE_DACL_AUTO_INHERITED control bit verbatim on SET_INFO Security instead of applying MS-DTYP §2.5.3.4.2 canonicalization (Samba "acl flag inherited canonicalization = no"). Default true matches Windows. Takes effect on adapter restart.
+      --block-store string                     Block store name
+      --commit-ack string                      What a COMMIT waits for: journal (survives host crash) or block-store (survives device loss)
       --default-permission string              Default permission (none|read|read-write|admin)
       --description string                     Share description
       --enable-trash string                    Enable/disable the per-share recycle bin (true|false). Applied live; disabling auto-empties the bin.
       --encrypt-data string                    Require SMB3 encryption (true|false)
-      --local string                           Local block store name
-      --local-store-size string                Per-share disk cache size override (e.g., 10GiB, 500MiB)
+      --journal-size string                    Per-share journal size override (e.g., 10GiB, 500MiB)
       --quota-bytes string                     Per-share byte quota (e.g., '10GiB'). 0 = remove quota
       --read-buffer-size string                Per-share read buffer size override (e.g., 2GiB, 256MiB)
       --read-only string                       Set read-only (true|false)
-      --remote string                          Remote block store name
+      --relaxed-metadata-commit                Let an operation that promised stable metadata return before the metadata fsync
       --retention string                       Retention policy (pin|ttl|lru)
       --retention-ttl string                   Retention TTL duration (e.g., 72h)
       --trash-exclude strings                  Glob patterns whose deletions bypass the recycle bin (repeatable).
@@ -5395,17 +5385,11 @@ dfsctl store metadata list
 # Add a new metadata store
 dfsctl store metadata add --name new-meta --type memory
 
-# List local block stores
-dfsctl store block local list
+# List block stores
+dfsctl store block list
 
-# List remote block stores
-dfsctl store block remote list
-
-# Add a local block store
-dfsctl store block local add --name fs-cache --type fs --config '{"path":"/data/blocks"}'
-
-# Add a remote block store
-dfsctl store block remote add --name s3-store --type s3 --config '{"bucket":"my-bucket"}'
+# Add a block store
+dfsctl store block add --name s3-store --type s3 --config '{"bucket":"my-bucket"}'
 ```
 
 Global flags:
@@ -5426,26 +5410,110 @@ Global flags:
 
 Block store management
 
-Manage local and remote block stores on the DittoFS server.
+Manage block stores on the DittoFS server.
 
-Block stores hold file content data as blocks. Local block stores provide
-fast disk-backed storage, while remote block stores provide durable cloud
-storage (e.g., S3).
+Block stores hold file content data as blocks. Each share keeps a local
+journal on disk, backed by the block store it is bound to.
+
+Supported types: s3 (AWS S3 or S3-compatible), memory (testing)
 
 **Examples:**
 
 ```bash
-# List local block stores
-dfsctl store block local list
+# List block stores
+dfsctl store block list
 
-# Add a local filesystem block store
-dfsctl store block local add --name fs-cache --type fs --config '{"path":"/data/blocks"}'
+# Add an S3 block store
+dfsctl store block add --name s3-store --type s3 --bucket my-bucket --region us-east-1
 
-# List remote block stores
-dfsctl store block remote list
+# Add a memory block store (for testing)
+dfsctl store block add --name test-store --type memory
+```
 
-# Add an S3 remote block store
-dfsctl store block remote add --name s3-store --type s3 --config '{"bucket":"my-bucket","region":"us-east-1"}'
+Global flags:
+
+```
+      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
+      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
+      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
+      --no-color             Disable colored output
+  -o, --output string        Output format (table|json|yaml) (default "table")
+      --server string        Server URL (overrides stored credential)
+      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
+      --token string         Bearer token (overrides stored credential)
+  -v, --verbose              Enable verbose output
+```
+
+### `dfsctl store block add`
+
+Add a block store
+
+Add a new block store to the DittoFS server.
+
+Supported types:
+
+```
+- s3: AWS S3 or S3-compatible store (durable, production)
+- memory: In-memory store (fast, ephemeral, for testing)
+```
+
+Type-specific options:
+
+```
+s3:
+  --bucket: S3 bucket name (or prompted interactively)
+  --region: AWS region (default: us-east-1)
+  --endpoint: Custom endpoint for S3-compatible stores
+  --prefix: Key prefix within the bucket
+  --access-key: AWS access key ID
+  --secret-key: AWS secret access key
+```
+
+```
+dfsctl store block add [flags]
+```
+
+**Examples:**
+
+```bash
+# Add an S3 store with flags
+dfsctl store block add --name s3-store --type s3 --bucket my-bucket --region us-west-2
+
+# Add an S3 store interactively
+dfsctl store block add --name s3-store --type s3
+
+# Add a MinIO store (S3-compatible)
+dfsctl store block add --name minio-store --type s3 --bucket data --endpoint http://localhost:9000
+
+# Add an S3 store with zstd block compression
+dfsctl store block add --name prod-s3 --type s3 --bucket my-bucket --compression zstd
+
+# Add a memory store (for testing)
+dfsctl store block add --name test-remote --type memory
+```
+
+Flags:
+
+```
+      --access-key string                 AWS access key ID (for s3)
+      --bucket string                     S3 bucket name (required for s3)
+      --compression string                Enable per-block compression: zstd, lz4 (default: off)
+      --config string                     Store configuration as JSON
+      --encryption-aead string            Enable client-side encryption with the given AEAD: aes-256-gcm, chacha20-poly1305, xchacha20-poly1305
+      --encryption-key-file string        Path to local key file (kind=local)
+      --encryption-key-kind string        Key provider: local | kmip (required when --encryption-aead is set)
+      --encryption-kmip-ca string         KMIP server CA bundle (kind=kmip, optional)
+      --encryption-kmip-cert string       KMIP client certificate (kind=kmip)
+      --encryption-kmip-endpoint string   KMIP server endpoint host:port (kind=kmip)
+      --encryption-kmip-key string        KMIP client private key (kind=kmip)
+      --encryption-kmip-key-uid string    KMIP managed symmetric key UID (kind=kmip)
+      --endpoint string                   Custom S3 endpoint (for S3-compatible stores)
+      --name string                       Store name (required)
+      --parallel-uploads int              Max parallel chunk uploads to this remote (0 = adaptive: auto-tune to saturate the uplink)
+      --prefix string                     Key prefix within the bucket (for s3)
+      --region string                     AWS region (for s3) (default "us-east-1")
+      --secret-key string                 AWS secret access key (for s3)
+      --type string                       Store type: s3, memory (default "s3")
 ```
 
 Global flags:
@@ -5510,6 +5578,63 @@ Global flags:
   -v, --verbose              Enable verbose output
 ```
 
+### `dfsctl store block edit`
+
+Edit a block store
+
+Edit an existing block store configuration.
+
+When run without flags, opens an interactive editor to modify store properties.
+When flags are provided, only the specified fields are updated.
+
+```
+dfsctl store block edit <name> [flags]
+```
+
+**Examples:**
+
+```bash
+# Edit interactively
+dfsctl store block edit s3-store
+
+# Update config with JSON
+dfsctl store block edit s3-store --config '{"bucket":"new-bucket"}'
+
+# Update S3 settings
+dfsctl store block edit s3-store --bucket new-bucket --region us-west-2
+
+# Rename a store
+dfsctl store block edit s3-store --name archive-blocks
+```
+
+Flags:
+
+```
+      --access-key string      AWS access key ID (for s3)
+      --bucket string          S3 bucket name (for s3)
+      --config string          Store configuration as JSON
+      --endpoint string        Custom S3 endpoint
+      --name string            Rename the block store (names must be unique)
+      --parallel-uploads int   Max parallel chunk uploads to this remote (0 = adaptive: auto-tune to saturate the uplink)
+      --region string          AWS region (for s3)
+      --secret-key string      AWS secret access key (for s3)
+      --type string            Store type: s3, memory
+```
+
+Global flags:
+
+```
+      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
+      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
+      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
+      --no-color             Disable colored output
+  -o, --output string        Output format (table|json|yaml) (default "table")
+      --server string        Server URL (overrides stored credential)
+      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
+      --token string         Bearer token (overrides stored credential)
+  -v, --verbose              Enable verbose output
+```
+
 ### `dfsctl store block evict`
 
 Evict block store data
@@ -5521,7 +5646,7 @@ By default, evicts both the in-memory read buffer and the resident local
 disk blocks for all shares. Local eviction drains every locally-resident
 block whose bytes are already synced to the remote — including the sealed
 log blobs that hold the bulk of resident data after a rollup, which the
-lazy --local-store-size cap only reclaims on the write path. Blocks not yet
+lazy --journal-size cap only reclaims on the write path. Blocks not yet
 uploaded to the remote are never dropped.
 
 Use --read-buffer-only to evict only the read buffer (in-memory).
@@ -5709,10 +5834,8 @@ Check block store health
 
 Perform a health check on a block store configuration.
 
-For local filesystem stores, checks if the path exists and is writable.
-For local memory stores, always reports healthy.
-For remote S3 stores, performs a HeadBucket call to verify connectivity.
-For remote memory stores, always reports healthy.
+For S3 stores, performs a HeadBucket call to verify connectivity.
+For memory stores, always reports healthy.
 
 ```
 dfsctl store block health [flags]
@@ -5721,20 +5844,16 @@ dfsctl store block health [flags]
 **Examples:**
 
 ```bash
-# Check health of a local block store
-dfsctl store block health --kind local --name fs-cache
-
-# Check health of a remote block store
-dfsctl store block health --kind remote --name s3-store
+# Check health of a block store
+dfsctl store block health --name s3-store
 
 # Output as JSON
-dfsctl store block health --kind remote --name s3-store -o json
+dfsctl store block health --name s3-store -o json
 ```
 
 Flags:
 
 ```
-      --kind string   Block store kind: local or remote (required)
       --name string   Block store name (required)
 ```
 
@@ -5752,229 +5871,34 @@ Global flags:
   -v, --verbose              Enable verbose output
 ```
 
-### `dfsctl store block local`
+### `dfsctl store block list`
 
-Local block store management
+List block stores
 
-Manage local block stores on the DittoFS server.
+List all block stores on the DittoFS server.
 
-Local block stores provide fast disk-backed storage for file content blocks.
-Supported types: fs (filesystem), memory (testing)
-
-**Examples:**
-
-```bash
-# List local block stores
-dfsctl store block local list
-
-# Add a filesystem block store
-dfsctl store block local add --name fs-cache --type fs --config '{"path":"/data/blocks"}'
-
-# Add a memory block store (for testing)
-dfsctl store block local add --name test-local --type memory
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block local add`
-
-Add a local block store
-
-Add a new local block store to the DittoFS server.
-
-Supported types:
-
-```
-- fs: Filesystem-backed block store (fast, persistent)
-- memory: In-memory block store (fast, ephemeral, for testing)
-```
-
-Type-specific options:
-
-```
-fs:
-  --path: Block directory path (or prompted interactively)
-```
-
-```
-dfsctl store block local add [flags]
-```
-
-**Examples:**
-
-```bash
-# Add a filesystem block store
-dfsctl store block local add --name fs-cache --type fs --path /data/blocks
-
-# Add with JSON config
-dfsctl store block local add --name fs-cache --type fs --config '{"path":"/data/blocks"}'
-
-# Add a memory store (for testing)
-dfsctl store block local add --name test-local --type memory
-
-# Add interactively (prompts for path)
-dfsctl store block local add --name fs-cache --type fs
-```
-
-Flags:
-
-```
-      --config string   Store configuration as JSON
-      --name string     Store name (required)
-      --path string     Block directory path (for fs type)
-      --type string     Store type: fs, memory (default "fs")
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block local edit`
-
-Edit a local block store
-
-Edit an existing local block store configuration.
-
-When run without flags, opens an interactive editor to modify store properties.
-When flags are provided, only the specified fields are updated.
-
-```
-dfsctl store block local edit <name> [flags]
-```
-
-**Examples:**
-
-```bash
-# Edit interactively
-dfsctl store block local edit default-local
-
-# Update config with JSON
-dfsctl store block local edit default-local --config '{"path":"/new/path"}'
-
-# Update path for fs store
-dfsctl store block local edit default-local --path /new/path
-```
-
-Flags:
-
-```
-      --config string   Store configuration as JSON
-      --path string     Block directory path (for fs type)
-      --type string     Store type: fs, memory
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block local list`
-
-List local block stores
-
-List all local block stores on the DittoFS server.
-
-Shows the name, ID, type (fs or memory), and configuration of each registered
-local block store. Other sub-commands accept either form, so this is where you
+Shows the name, ID, type (s3 or memory), and configuration of each registered
+block store. Other sub-commands accept either form, so this is where you
 find both. Use it to confirm which stores exist before adding, editing, or
 running health checks against one, or to map the store IDs emitted by
 'share show -o json' back to a store name ('share show' table output already
 resolves them to names).
 
 ```
-dfsctl store block local list
+dfsctl store block list
 ```
 
 **Examples:**
 
 ```bash
 # List as table
-dfsctl store block local list
+dfsctl store block list
 
 # List as JSON
-dfsctl store block local list -o json
+dfsctl store block list -o json
 
 # List as YAML
-dfsctl store block local list -o yaml
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block local remove`
-
-Remove a local block store
-
-Remove a local block store from the DittoFS server.
-
-The server refuses removal if any share currently references the store.
-Detach the store from all shares first, then remove it. Data on disk is
-not deleted by this command. You will be prompted for confirmation unless
---force is specified.
-
-```
-dfsctl store block local remove <name> [flags]
-```
-
-**Examples:**
-
-```bash
-# Remove with confirmation prompt
-dfsctl store block local remove fs-cache
-
-# Remove without confirmation
-dfsctl store block local remove fs-cache --force
-
-# Verify the store is gone afterward
-dfsctl store block local list
-```
-
-Flags:
-
-```
-  -f, --force   Skip confirmation prompt
+dfsctl store block list -o yaml
 ```
 
 Global flags:
@@ -6106,230 +6030,11 @@ Global flags:
   -v, --verbose              Enable verbose output
 ```
 
-### `dfsctl store block remote`
+### `dfsctl store block remove`
 
-Remote block store management
+Remove a block store
 
-Manage remote block stores on the DittoFS server.
-
-Remote block stores provide durable cloud storage for file content blocks.
-Supported types: s3 (AWS S3 or S3-compatible), memory (testing)
-
-**Examples:**
-
-```bash
-# List remote block stores
-dfsctl store block remote list
-
-# Add an S3 block store
-dfsctl store block remote add --name s3-store --type s3 --config '{"bucket":"my-bucket","region":"us-east-1"}'
-
-# Add a memory block store (for testing)
-dfsctl store block remote add --name test-remote --type memory
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block remote add`
-
-Add a remote block store
-
-Add a new remote block store to the DittoFS server.
-
-Supported types:
-
-```
-- s3: AWS S3 or S3-compatible store (durable, production)
-- memory: In-memory store (fast, ephemeral, for testing)
-```
-
-Type-specific options:
-
-```
-s3:
-  --bucket: S3 bucket name (or prompted interactively)
-  --region: AWS region (default: us-east-1)
-  --endpoint: Custom endpoint for S3-compatible stores
-  --prefix: Key prefix within the bucket
-  --access-key: AWS access key ID
-  --secret-key: AWS secret access key
-```
-
-```
-dfsctl store block remote add [flags]
-```
-
-**Examples:**
-
-```bash
-# Add an S3 store with flags
-dfsctl store block remote add --name s3-store --type s3 --bucket my-bucket --region us-west-2
-
-# Add an S3 store interactively
-dfsctl store block remote add --name s3-store --type s3
-
-# Add a MinIO store (S3-compatible)
-dfsctl store block remote add --name minio-store --type s3 --bucket data --endpoint http://localhost:9000
-
-# Add an S3 store with zstd block compression
-dfsctl store block remote add --name prod-s3 --type s3 --bucket my-bucket --compression zstd
-
-# Add a memory store (for testing)
-dfsctl store block remote add --name test-remote --type memory
-```
-
-Flags:
-
-```
-      --access-key string                 AWS access key ID (for s3)
-      --bucket string                     S3 bucket name (required for s3)
-      --compression string                Enable per-block compression: zstd, lz4 (default: off)
-      --config string                     Store configuration as JSON
-      --encryption-aead string            Enable client-side encryption with the given AEAD: aes-256-gcm, chacha20-poly1305, xchacha20-poly1305
-      --encryption-key-file string        Path to local key file (kind=local)
-      --encryption-key-kind string        Key provider: local | kmip (required when --encryption-aead is set)
-      --encryption-kmip-ca string         KMIP server CA bundle (kind=kmip, optional)
-      --encryption-kmip-cert string       KMIP client certificate (kind=kmip)
-      --encryption-kmip-endpoint string   KMIP server endpoint host:port (kind=kmip)
-      --encryption-kmip-key string        KMIP client private key (kind=kmip)
-      --encryption-kmip-key-uid string    KMIP managed symmetric key UID (kind=kmip)
-      --endpoint string                   Custom S3 endpoint (for S3-compatible stores)
-      --name string                       Store name (required)
-      --parallel-uploads int              Max parallel chunk uploads to this remote (0 = adaptive: auto-tune to saturate the uplink)
-      --prefix string                     Key prefix within the bucket (for s3)
-      --region string                     AWS region (for s3) (default "us-east-1")
-      --secret-key string                 AWS secret access key (for s3)
-      --type string                       Store type: s3, memory (default "s3")
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block remote edit`
-
-Edit a remote block store
-
-Edit an existing remote block store configuration.
-
-When run without flags, opens an interactive editor to modify store properties.
-When flags are provided, only the specified fields are updated.
-
-```
-dfsctl store block remote edit <name> [flags]
-```
-
-**Examples:**
-
-```bash
-# Edit interactively
-dfsctl store block remote edit s3-store
-
-# Update config with JSON
-dfsctl store block remote edit s3-store --config '{"bucket":"new-bucket"}'
-
-# Update S3 settings
-dfsctl store block remote edit s3-store --bucket new-bucket --region us-west-2
-```
-
-Flags:
-
-```
-      --access-key string      AWS access key ID (for s3)
-      --bucket string          S3 bucket name (for s3)
-      --config string          Store configuration as JSON
-      --endpoint string        Custom S3 endpoint
-      --parallel-uploads int   Max parallel chunk uploads to this remote (0 = adaptive: auto-tune to saturate the uplink)
-      --region string          AWS region (for s3)
-      --secret-key string      AWS secret access key (for s3)
-      --type string            Store type: s3, memory
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block remote list`
-
-List remote block stores
-
-List all remote block stores on the DittoFS server.
-
-Shows the name, ID, type (s3 or memory), and configuration of each registered
-remote block store. Other sub-commands accept either form, so this is where you
-find both. Use it to confirm which stores exist before adding, editing, or
-running health checks against one, or to map the store IDs emitted by
-'share show -o json' back to a store name ('share show' table output already
-resolves them to names).
-
-```
-dfsctl store block remote list
-```
-
-**Examples:**
-
-```bash
-# List as table
-dfsctl store block remote list
-
-# List as JSON
-dfsctl store block remote list -o json
-
-# List as YAML
-dfsctl store block remote list -o yaml
-```
-
-Global flags:
-
-```
-      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
-      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
-      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
-      --no-color             Disable colored output
-  -o, --output string        Output format (table|json|yaml) (default "table")
-      --server string        Server URL (overrides stored credential)
-      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
-      --token string         Bearer token (overrides stored credential)
-  -v, --verbose              Enable verbose output
-```
-
-### `dfsctl store block remote remove`
-
-Remove a remote block store
-
-Remove a remote block store from the DittoFS server.
+Remove a block store from the DittoFS server.
 
 The server refuses removal if any share currently references the store.
 Detach the store from all shares first, then remove it. No objects are
@@ -6337,20 +6042,20 @@ deleted from the remote bucket by this command. You will be prompted for
 confirmation unless --force is specified.
 
 ```
-dfsctl store block remote remove <name> [flags]
+dfsctl store block remove <name> [flags]
 ```
 
 **Examples:**
 
 ```bash
 # Remove with confirmation prompt
-dfsctl store block remote remove s3-store
+dfsctl store block remove s3-store
 
 # Remove without confirmation
-dfsctl store block remote remove s3-store --force
+dfsctl store block remove s3-store --force
 
 # Verify the store is gone afterward
-dfsctl store block remote list
+dfsctl store block list
 ```
 
 Flags:

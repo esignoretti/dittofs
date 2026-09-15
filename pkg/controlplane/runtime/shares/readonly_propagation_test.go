@@ -40,6 +40,7 @@ func TestAddShare_ReadOnlyPropagatesToShareOptions(t *testing.T) {
 				Name:          tc.share,
 				MetadataStore: "meta-test",
 				Enabled:       true,
+				BlockStoreID:  testBlockStoreID,
 				ReadOnly:      tc.val,
 			}
 
@@ -48,8 +49,8 @@ func TestAddShare_ReadOnlyPropagatesToShareOptions(t *testing.T) {
 				cfg,
 				&metaStoreProvider{name: "meta-test", store: mds},
 				metaSvcRegistrar{},
-				nil, // no block store provider — LocalBlockStoreID empty skips the path
-				nil,
+				memBlockStoreProvider{},
+				journalDefaults(t, svc),
 				nil,
 			)
 			if err != nil {

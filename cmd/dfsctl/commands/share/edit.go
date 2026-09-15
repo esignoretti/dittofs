@@ -12,15 +12,16 @@ import (
 )
 
 var (
-	editLocal             string
-	editRemote            string
+	editBlockStore        string
 	editReadOnly          string
 	editEncryptData       string
 	editDefaultPermission string
 	editDescription       string
 	editRetention         string
 	editRetentionTTL      string
-	editLocalStoreSize    string
+	editJournalSize       string
+	editCommitAck         string
+	editRelaxedMetaCommit bool
 	editReadBufferSize    string
 	editQuotaBytes        string
 	editAclCanonicalize   string
@@ -44,11 +45,8 @@ Examples:
   # Edit share interactively
   dfsctl share edit /archive
 
-  # Update local block store reference
-  dfsctl share edit /archive --local new-fs-cache
-
-  # Update remote block store reference
-  dfsctl share edit /archive --remote new-s3-store
+  # Update the block store reference
+  dfsctl share edit /archive --block-store new-s3-store
 
   # Make share read-only
   dfsctl share edit /archive --read-only true
@@ -68,8 +66,8 @@ Examples:
   # Change retention policy to TTL with 72-hour window
   dfsctl share edit /archive --retention ttl --retention-ttl 72h
 
-  # Override per-share disk cache size
-  dfsctl share edit /archive --local-store-size 10GiB
+  # Override the per-share journal size
+  dfsctl share edit /archive --journal-size 10GiB
 
   # Override per-share read buffer size
   dfsctl share edit /archive --read-buffer-size 2GiB
@@ -84,15 +82,16 @@ Examples:
 }
 
 func init() {
-	editCmd.Flags().StringVar(&editLocal, "local", "", "Local block store name")
-	editCmd.Flags().StringVar(&editRemote, "remote", "", "Remote block store name")
+	editCmd.Flags().StringVar(&editBlockStore, "block-store", "", "Block store name")
 	editCmd.Flags().StringVar(&editReadOnly, "read-only", "", "Set read-only (true|false)")
 	editCmd.Flags().StringVar(&editEncryptData, "encrypt-data", "", "Require SMB3 encryption (true|false)")
 	editCmd.Flags().StringVar(&editDefaultPermission, "default-permission", "", "Default permission (none|read|read-write|admin)")
 	editCmd.Flags().StringVar(&editDescription, "description", "", "Share description")
 	editCmd.Flags().StringVar(&editRetention, "retention", "", "Retention policy (pin|ttl|lru)")
 	editCmd.Flags().StringVar(&editRetentionTTL, "retention-ttl", "", "Retention TTL duration (e.g., 72h)")
-	editCmd.Flags().StringVar(&editLocalStoreSize, "local-store-size", "", "Per-share disk cache size override (e.g., 10GiB, 500MiB)")
+	editCmd.Flags().StringVar(&editJournalSize, "journal-size", "", "Per-share journal size override (e.g., 10GiB, 500MiB)")
+	editCmd.Flags().StringVar(&editCommitAck, "commit-ack", "", "What a COMMIT waits for: journal (survives host crash) or block-store (survives device loss)")
+	editCmd.Flags().BoolVar(&editRelaxedMetaCommit, "relaxed-metadata-commit", false, "Let an operation that promised stable metadata return before the metadata fsync")
 	editCmd.Flags().StringVar(&editReadBufferSize, "read-buffer-size", "", "Per-share read buffer size override (e.g., 2GiB, 256MiB)")
 	editCmd.Flags().StringVar(&editQuotaBytes, "quota-bytes", "", "Per-share byte quota (e.g., '10GiB'). 0 = remove quota")
 	editCmd.Flags().StringVar(&editAclCanonicalize, "acl-canonicalize-inherited", "", "When false, preserves the SE_DACL_AUTO_INHERITED control bit verbatim on SET_INFO Security instead of applying MS-DTYP §2.5.3.4.2 canonicalization (Samba \"acl flag inherited canonicalization = no\"). Default true matches Windows. Takes effect on adapter restart.")
@@ -113,12 +112,13 @@ func runEdit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check if any flags were provided
-	hasFlags := cmd.Flags().Changed("local") || cmd.Flags().Changed("remote") ||
+	hasFlags := cmd.Flags().Changed("block-store") ||
 		cmd.Flags().Changed("read-only") || cmd.Flags().Changed("encrypt-data") ||
 		cmd.Flags().Changed("default-permission") ||
 		cmd.Flags().Changed("description") || cmd.Flags().Changed("retention") ||
-		cmd.Flags().Changed("retention-ttl") || cmd.Flags().Changed("local-store-size") ||
+		cmd.Flags().Changed("retention-ttl") || cmd.Flags().Changed("journal-size") ||
 		cmd.Flags().Changed("read-buffer-size") || cmd.Flags().Changed("quota-bytes") ||
+		cmd.Flags().Changed("commit-ack") || cmd.Flags().Changed("relaxed-metadata-commit") ||
 		cmd.Flags().Changed("acl-canonicalize-inherited") ||
 		cmd.Flags().Changed("access-based-enumeration") ||
 		cmd.Flags().Changed("enable-trash") ||
@@ -136,13 +136,8 @@ func runEdit(cmd *cobra.Command, args []string) error {
 	req := &apiclient.UpdateShareRequest{}
 	hasUpdate := false
 
-	if editLocal != "" {
-		req.LocalBlockStoreID = &editLocal
-		hasUpdate = true
-	}
-
-	if editRemote != "" {
-		req.RemoteBlockStoreID = &editRemote
+	if editBlockStore != "" {
+		req.BlockStoreID = &editBlockStore
 		hasUpdate = true
 	}
 
@@ -178,8 +173,21 @@ func runEdit(cmd *cobra.Command, args []string) error {
 		hasUpdate = true
 	}
 
-	if editLocalStoreSize != "" {
-		req.LocalStoreSize = &editLocalStoreSize
+	if editJournalSize != "" {
+		req.JournalSize = &editJournalSize
+		hasUpdate = true
+	}
+
+	if editCommitAck != "" {
+		req.CommitAck = &editCommitAck
+		hasUpdate = true
+	}
+
+	// Only sent when named, so an unset flag leaves the share's setting alone
+	// rather than silently relaxing it.
+	if cmd.Flags().Changed("relaxed-metadata-commit") {
+		v := editRelaxedMetaCommit
+		req.RelaxedMetadataCommit = &v
 		hasUpdate = true
 	}
 
@@ -257,7 +265,7 @@ func runEdit(cmd *cobra.Command, args []string) error {
 	}
 
 	if !hasUpdate {
-		return fmt.Errorf("no fields specified. Use --local, --remote, --read-only, --default-permission, --description, --retention, --retention-ttl, --local-store-size, --read-buffer-size, --quota-bytes, --acl-canonicalize-inherited, --access-based-enumeration, --enable-trash, --trash-retention-days, --trash-restrict-empty-to-admin, --trash-max-size, or --trash-exclude")
+		return fmt.Errorf("no fields specified. Use --block-store, --read-only, --default-permission, --description, --retention, --retention-ttl, --journal-size, --read-buffer-size, --quota-bytes, --commit-ack, --relaxed-metadata-commit, --acl-canonicalize-inherited, --access-based-enumeration, --enable-trash, --trash-retention-days, --trash-restrict-empty-to-admin, --trash-max-size, or --trash-exclude")
 	}
 
 	share, err := client.UpdateShare(name, req)
@@ -373,18 +381,18 @@ func runEditInteractive(client *apiclient.Client, name string) error {
 		}
 	}
 
-	// Local store size override
-	currentLocalStoreSize := current.LocalStoreSize
-	if currentLocalStoreSize == "" {
-		currentLocalStoreSize = "0 (system default)"
+	// Journal size override
+	currentJournalSize := current.JournalSize
+	if currentJournalSize == "" {
+		currentJournalSize = "0 (system default)"
 	}
-	fmt.Printf("Current local store size: %s\n", currentLocalStoreSize)
-	newLocalStoreSize, err := prompt.Input("Local store size (0 for system default)", current.LocalStoreSize)
+	fmt.Printf("Current journal size: %s\n", currentJournalSize)
+	newJournalSize, err := prompt.Input("Journal size (0 for system default)", current.JournalSize)
 	if err != nil {
 		return cmdutil.HandleAbort(err)
 	}
-	if newLocalStoreSize != current.LocalStoreSize {
-		req.LocalStoreSize = &newLocalStoreSize
+	if newJournalSize != current.JournalSize {
+		req.JournalSize = &newJournalSize
 		hasUpdate = true
 	}
 

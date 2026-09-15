@@ -29,6 +29,7 @@ func TestAddShare_RejectsColonInName(t *testing.T) {
 			Name:          "/foo:bar",
 			MetadataStore: "meta-test",
 			Enabled:       true,
+			BlockStoreID:  testBlockStoreID,
 		}
 
 		err := svc.AddShare(
@@ -36,8 +37,8 @@ func TestAddShare_RejectsColonInName(t *testing.T) {
 			cfg,
 			&metaStoreProvider{name: "meta-test", store: mds},
 			metaSvcRegistrar{},
-			nil,
-			nil,
+			memBlockStoreProvider{},
+			journalDefaults(t, svc),
 			nil,
 		)
 		if err == nil {
@@ -64,6 +65,7 @@ func TestAddShare_RejectsColonInName(t *testing.T) {
 			Name:          name,
 			MetadataStore: "meta-test",
 			Enabled:       true,
+			BlockStoreID:  testBlockStoreID,
 		}
 
 		if err := svc.AddShare(
@@ -71,8 +73,8 @@ func TestAddShare_RejectsColonInName(t *testing.T) {
 			cfg,
 			&metaStoreProvider{name: "meta-test", store: mds},
 			metaSvcRegistrar{},
-			nil,
-			nil,
+			memBlockStoreProvider{},
+			journalDefaults(t, svc),
 			nil,
 		); err != nil {
 			t.Fatalf("AddShare(%q): %v", name, err)
@@ -116,11 +118,11 @@ func TestAddShare_RejectsOverLongName(t *testing.T) {
 		svc := New()
 		err := svc.AddShare(
 			ctx,
-			&ShareConfig{Name: tooLong, MetadataStore: "meta-test", Enabled: true},
+			&ShareConfig{Name: tooLong, MetadataStore: "meta-test", Enabled: true, BlockStoreID: testBlockStoreID},
 			&metaStoreProvider{name: "meta-test", store: mds},
 			metaSvcRegistrar{},
-			nil,
-			nil,
+			memBlockStoreProvider{},
+			journalDefaults(t, svc),
 			nil,
 		)
 		if err == nil {
@@ -149,11 +151,11 @@ func TestAddShare_RejectsOverLongName(t *testing.T) {
 		svc := New()
 		if err := svc.AddShare(
 			ctx,
-			&ShareConfig{Name: longest, MetadataStore: "meta-test", Enabled: true},
+			&ShareConfig{Name: longest, MetadataStore: "meta-test", Enabled: true, BlockStoreID: testBlockStoreID},
 			&metaStoreProvider{name: "meta-test", store: mds},
 			metaSvcRegistrar{},
-			nil,
-			nil,
+			memBlockStoreProvider{},
+			journalDefaults(t, svc),
 			nil,
 		); err != nil {
 			t.Fatalf("AddShare(%q) (%d bytes, the limit): %v", longest, len(longest), err)

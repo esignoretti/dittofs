@@ -2,8 +2,6 @@
 package block
 
 import (
-	"github.com/marmos91/dittofs/cmd/dfsctl/commands/store/block/local"
-	"github.com/marmos91/dittofs/cmd/dfsctl/commands/store/block/remote"
 	"github.com/spf13/cobra"
 )
 
@@ -11,29 +9,29 @@ import (
 var Cmd = &cobra.Command{
 	Use:   "block",
 	Short: "Block store management",
-	Long: `Manage local and remote block stores on the DittoFS server.
+	Long: `Manage block stores on the DittoFS server.
 
-Block stores hold file content data as blocks. Local block stores provide
-fast disk-backed storage, while remote block stores provide durable cloud
-storage (e.g., S3).
+Block stores hold file content data as blocks. Each share keeps a local
+journal on disk, backed by the block store it is bound to.
+
+Supported types: s3 (AWS S3 or S3-compatible), memory (testing)
 
 Examples:
-  # List local block stores
-  dfsctl store block local list
+  # List block stores
+  dfsctl store block list
 
-  # Add a local filesystem block store
-  dfsctl store block local add --name fs-cache --type fs --config '{"path":"/data/blocks"}'
+  # Add an S3 block store
+  dfsctl store block add --name s3-store --type s3 --bucket my-bucket --region us-east-1
 
-  # List remote block stores
-  dfsctl store block remote list
-
-  # Add an S3 remote block store
-  dfsctl store block remote add --name s3-store --type s3 --config '{"bucket":"my-bucket","region":"us-east-1"}'`,
+  # Add a memory block store (for testing)
+  dfsctl store block add --name test-store --type memory`,
 }
 
 func init() {
-	Cmd.AddCommand(local.Cmd)
-	Cmd.AddCommand(remote.Cmd)
+	Cmd.AddCommand(addCmd)
+	Cmd.AddCommand(listCmd)
+	Cmd.AddCommand(editCmd)
+	Cmd.AddCommand(removeCmd)
 	Cmd.AddCommand(statsCmd)
 	Cmd.AddCommand(evictCmd)
 	Cmd.AddCommand(healthCmd)

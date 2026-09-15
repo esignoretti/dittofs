@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/marmos91/dittofs/pkg/controlplane/models"
-	"github.com/marmos91/dittofs/pkg/controlplane/runtime/shares"
 	cpstore "github.com/marmos91/dittofs/pkg/controlplane/store"
 	"github.com/marmos91/dittofs/pkg/metadata/store/memory"
 )
@@ -23,6 +22,7 @@ func setupTestRuntime(t *testing.T) (*Runtime, cpstore.Store) {
 	}
 
 	rt := New(s)
+	setJournalRoot(t, rt)
 	ctx := context.Background()
 
 	// Register a metadata store in the DB and runtime.
@@ -38,28 +38,15 @@ func setupTestRuntime(t *testing.T) (*Runtime, cpstore.Store) {
 		t.Fatalf("failed to register metadata store: %v", err)
 	}
 
-	// Set local store defaults.
-	rt.SetLocalStoreDefaults(&shares.LocalStoreDefaults{
-		MaxSize: 0, // unlimited
-	})
-
-	// Clean up all shares (and their BlockStores) when the test finishes.
-	t.Cleanup(func() {
-		for _, name := range rt.ListShares() {
-			_ = rt.RemoveShare(name)
-		}
-	})
-
 	return rt, s
 }
 
-// createLocalBlockStoreConfig creates a local block store config in the DB with memory type.
-func createLocalBlockStoreConfig(t *testing.T, s cpstore.Store, name string) string {
+// createBlockStoreConfig creates a block store config in the DB with memory type.
+func createBlockStoreConfig(t *testing.T, s cpstore.Store, name string) string {
 	t.Helper()
 	ctx := context.Background()
 	cfg := &models.BlockStoreConfig{
 		Name: name,
-		Kind: models.BlockStoreKindLocal,
 		Type: "memory",
 	}
 	id, err := s.CreateBlockStore(ctx, cfg)
@@ -75,7 +62,6 @@ func createRemoteBlockStoreConfig(t *testing.T, s cpstore.Store, name string) st
 	ctx := context.Background()
 	cfg := &models.BlockStoreConfig{
 		Name: name,
-		Kind: models.BlockStoreKindRemote,
 		Type: "memory",
 	}
 	id, err := s.CreateBlockStore(ctx, cfg)
@@ -90,14 +76,14 @@ func TestPerShareBlockStoreLocalOnly(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a local block store config in the DB.
-	localID := createLocalBlockStoreConfig(t, s, "test-local")
+	localID := createBlockStoreConfig(t, s, "test-local")
 
 	// Create a share in the DB referencing the local block store.
 	metaStores, _ := s.ListMetadataStores(ctx)
 	share := &models.Share{
-		Name:              "/test-share",
-		MetadataStoreID:   metaStores[0].ID,
-		LocalBlockStoreID: localID,
+		Name:            "/test-share",
+		MetadataStoreID: metaStores[0].ID,
+		BlockStoreID:    localID,
 	}
 	if _, err := s.CreateShare(ctx, share); err != nil {
 		t.Fatalf("failed to create share: %v", err)
@@ -155,7 +141,7 @@ func TestLoadSharesResolvesBlockStoreByName(t *testing.T) {
 	// rows produced by `share edit`.
 	const localName = "local-fs"
 	const remoteName = "remote-s3"
-	_ = createLocalBlockStoreConfig(t, s, localName)
+	_ = createBlockStoreConfig(t, s, localName)
 	_ = createRemoteBlockStoreConfig(t, s, remoteName)
 
 	metaStores, _ := s.ListMetadataStores(ctx)
@@ -163,10 +149,9 @@ func TestLoadSharesResolvesBlockStoreByName(t *testing.T) {
 
 	remoteRef := remoteName
 	share := &models.Share{
-		Name:               "/demo",
-		MetadataStoreID:    metaID,
-		LocalBlockStoreID:  localName,  // NAME, not UUID (#1312 repro)
-		RemoteBlockStoreID: &remoteRef, // NAME, not UUID (#1312 repro)
+		Name:            "/demo",
+		MetadataStoreID: metaID,
+		BlockStoreID:    remoteRef, // NAME, not UUID (#1312 repro)
 	}
 	if _, err := s.CreateShare(ctx, share); err != nil {
 		t.Fatalf("failed to create share: %v", err)
@@ -203,22 +188,33 @@ func TestLoadSharesResolvesBlockStoreByName(t *testing.T) {
 }
 
 // TestRebindShareBlockStore_Live exercises the #1532 hot-reload: changing a
-// running share's block-store binding takes effect live (no restart). It walks
-// local-only -> attach remote -> swap remote -> detach remote and asserts the
-// per-share BlockStore's remote presence flips each time without an error.
+// running share's block-store binding takes effect live, with no restart.
+//
+// Every share has exactly one block store, so a rebind repoints it rather than
+// attaching or detaching one. That costs the test its old observation: it used
+// to watch RemoteStore() go nil -> non-nil -> nil. Both states are non-nil now,
+// and pointer identity says nothing either, because a rebind tears the store
+// down and rebuilds it even when the target is unchanged. Which remote is
+// bound is not observable from outside the block store, so what is asserted
+// here is the rebind path's contract: a binding it cannot resolve is refused,
+// and the share is still writable afterwards either way.
+//
+// Two mechanisms deliver that survival — a pre-flight resolve before teardown,
+// and a rebuild of the previous binding if the new store fails to build — so
+// disabling either one alone leaves this passing. Disabling both fails it with
+// "block store is closed", which is the damage it exists to catch.
 func TestRebindShareBlockStore_Live(t *testing.T) {
 	rt, s := setupTestRuntime(t)
 	ctx := context.Background()
 
-	localID := createLocalBlockStoreConfig(t, s, "reb-local")
-	remoteA := createRemoteBlockStoreConfig(t, s, "reb-remote-a")
-	remoteB := createRemoteBlockStoreConfig(t, s, "reb-remote-b")
+	storeA := createRemoteBlockStoreConfig(t, s, "reb-a")
+	storeB := createRemoteBlockStoreConfig(t, s, "reb-b")
 
 	metaStores, _ := s.ListMetadataStores(ctx)
 	share := &models.Share{
-		Name:              "/reb",
-		MetadataStoreID:   metaStores[0].ID,
-		LocalBlockStoreID: localID,
+		Name:            "/reb",
+		MetadataStoreID: metaStores[0].ID,
+		BlockStoreID:    storeA,
 	}
 	if _, err := s.CreateShare(ctx, share); err != nil {
 		t.Fatalf("CreateShare: %v", err)
@@ -227,69 +223,52 @@ func TestRebindShareBlockStore_Live(t *testing.T) {
 		t.Fatalf("LoadSharesFromStore: %v", err)
 	}
 
-	hasRemote := func() bool {
-		shareObj, err := rt.GetShare("/reb")
-		if err != nil {
-			t.Fatalf("GetShare: %v", err)
-		}
-		return shareObj.BlockStore.RemoteStore() != nil
-	}
-	// setRemote persists a new remote binding to the DB, mirroring the PUT handler
-	// before the runtime rebind is invoked.
-	setRemote := func(remoteID string) {
+	// bind persists a new binding to the DB, mirroring the PUT handler before
+	// the runtime rebind is invoked.
+	bind := func(blockStoreID string) {
 		dbShare, err := s.GetShare(ctx, "/reb")
 		if err != nil {
 			t.Fatalf("GetShare(db): %v", err)
 		}
-		if remoteID == "" {
-			dbShare.RemoteBlockStoreID = nil
-		} else {
-			dbShare.RemoteBlockStoreID = &remoteID
-		}
+		dbShare.BlockStoreID = blockStoreID
 		if err := s.UpdateShare(ctx, dbShare); err != nil {
 			t.Fatalf("UpdateShare: %v", err)
 		}
 	}
-
-	if hasRemote() {
-		t.Fatal("expected local-only share to start with no remote store")
+	writable := func(what string) {
+		t.Helper()
+		shareObj, err := rt.GetShare("/reb")
+		if err != nil {
+			t.Fatalf("GetShare (%s): %v", what, err)
+		}
+		if _, err := shareObj.BlockStore.WriteAt(ctx, "payload", nil, []byte("ok"), 0); err != nil {
+			t.Fatalf("WriteAt (%s): %v", what, err)
+		}
 	}
 
-	// 1) Attach a remote live (the #1532 scenario: bind remote to enable mirroring).
-	setRemote(remoteA)
-	if err := rt.RebindShareBlockStore(ctx, "/reb", localID, ""); err != nil {
-		t.Fatalf("rebind attach: %v", err)
-	}
-	if !hasRemote() {
-		t.Fatal("expected remote store attached after live rebind")
-	}
+	writable("before any rebind")
 
-	// 2) Swap remote A -> remote B.
-	setRemote(remoteB)
-	if err := rt.RebindShareBlockStore(ctx, "/reb", localID, remoteA); err != nil {
-		t.Fatalf("rebind swap: %v", err)
+	// A binding that does not resolve must be refused BEFORE the live store is
+	// torn down, so a bad PUT cannot take a serving share down with it.
+	bind("no-such-store")
+	if err := rt.RebindShareBlockStore(ctx, "/reb", storeA); err == nil {
+		t.Fatal("rebind to an unknown block store must be refused")
 	}
-	if !hasRemote() {
-		t.Fatal("expected remote store still attached after swap")
-	}
+	writable("after a refused rebind")
 
-	// 3) Detach: remote -> local-only.
-	setRemote("")
-	if err := rt.RebindShareBlockStore(ctx, "/reb", localID, remoteB); err != nil {
-		t.Fatalf("rebind detach: %v", err)
+	// A resolvable binding is applied live.
+	bind(storeB)
+	if err := rt.RebindShareBlockStore(ctx, "/reb", storeA); err != nil {
+		t.Fatalf("rebind A->B: %v", err)
 	}
-	if hasRemote() {
-		t.Fatal("expected no remote store after detach")
-	}
+	writable("after rebinding to B")
 
-	// The rebuilt store is still usable after all the swaps.
-	shareObj, err := rt.GetShare("/reb")
-	if err != nil {
-		t.Fatalf("GetShare after rebind: %v", err)
+	// And again, back the other way.
+	bind(storeA)
+	if err := rt.RebindShareBlockStore(ctx, "/reb", storeB); err != nil {
+		t.Fatalf("rebind B->A: %v", err)
 	}
-	if _, err := shareObj.BlockStore.WriteAt(ctx, "payload", nil, []byte("ok"), 0); err != nil {
-		t.Fatalf("WriteAt after rebind: %v", err)
-	}
+	writable("after rebinding back to A")
 }
 
 func TestPerShareBlockStoreIsolation(t *testing.T) {
@@ -297,26 +276,26 @@ func TestPerShareBlockStoreIsolation(t *testing.T) {
 	ctx := context.Background()
 
 	// Create two different local block store configs (both memory type for speed).
-	localID1 := createLocalBlockStoreConfig(t, s, "local-1")
-	localID2 := createLocalBlockStoreConfig(t, s, "local-2")
+	localID1 := createBlockStoreConfig(t, s, "local-1")
+	localID2 := createBlockStoreConfig(t, s, "local-2")
 
 	metaStores, _ := s.ListMetadataStores(ctx)
 	metaID := metaStores[0].ID
 
 	// Create two shares in DB.
 	share1 := &models.Share{
-		Name:              "/share-1",
-		MetadataStoreID:   metaID,
-		LocalBlockStoreID: localID1,
+		Name:            "/share-1",
+		MetadataStoreID: metaID,
+		BlockStoreID:    localID1,
 	}
 	if _, err := s.CreateShare(ctx, share1); err != nil {
 		t.Fatalf("failed to create share-1: %v", err)
 	}
 
 	share2 := &models.Share{
-		Name:              "/share-2",
-		MetadataStoreID:   metaID,
-		LocalBlockStoreID: localID2,
+		Name:            "/share-2",
+		MetadataStoreID: metaID,
+		BlockStoreID:    localID2,
 	}
 	if _, err := s.CreateShare(ctx, share2); err != nil {
 		t.Fatalf("failed to create share-2: %v", err)
@@ -409,29 +388,23 @@ func TestPerShareBlockStoreRemoteSharing(t *testing.T) {
 	// Create a SHARED remote block store config.
 	remoteID := createRemoteBlockStoreConfig(t, s, "shared-remote")
 
-	// Create two local block store configs (separate per share).
-	localID1 := createLocalBlockStoreConfig(t, s, "local-r1")
-	localID2 := createLocalBlockStoreConfig(t, s, "local-r2")
-
 	metaStores, _ := s.ListMetadataStores(ctx)
 	metaID := metaStores[0].ID
 
 	// Create two shares referencing the SAME remote block store.
 	share1 := &models.Share{
-		Name:               "/remote-share-1",
-		MetadataStoreID:    metaID,
-		LocalBlockStoreID:  localID1,
-		RemoteBlockStoreID: &remoteID,
+		Name:            "/remote-share-1",
+		MetadataStoreID: metaID,
+		BlockStoreID:    remoteID,
 	}
 	if _, err := s.CreateShare(ctx, share1); err != nil {
 		t.Fatalf("failed to create remote-share-1: %v", err)
 	}
 
 	share2 := &models.Share{
-		Name:               "/remote-share-2",
-		MetadataStoreID:    metaID,
-		LocalBlockStoreID:  localID2,
-		RemoteBlockStoreID: &remoteID,
+		Name:            "/remote-share-2",
+		MetadataStoreID: metaID,
+		BlockStoreID:    remoteID,
 	}
 	if _, err := s.CreateShare(ctx, share2); err != nil {
 		t.Fatalf("failed to create remote-share-2: %v", err)
@@ -495,15 +468,15 @@ func TestRemoveShareClosesBlockStore(t *testing.T) {
 	rt, s := setupTestRuntime(t)
 	ctx := context.Background()
 
-	localID := createLocalBlockStoreConfig(t, s, "local-close")
+	localID := createBlockStoreConfig(t, s, "local-close")
 
 	metaStores, _ := s.ListMetadataStores(ctx)
 	metaID := metaStores[0].ID
 
 	share := &models.Share{
-		Name:              "/close-test",
-		MetadataStoreID:   metaID,
-		LocalBlockStoreID: localID,
+		Name:            "/close-test",
+		MetadataStoreID: metaID,
+		BlockStoreID:    localID,
 	}
 	if _, err := s.CreateShare(ctx, share); err != nil {
 		t.Fatalf("failed to create share: %v", err)

@@ -135,10 +135,10 @@ go build -o dfsctl cmd/dfsctl/main.go
 
 # 4. Create test stores
 ./dfsctl store metadata add --name test-meta --type memory
-./dfsctl store block local add --name test-blocks --type memory
+./dfsctl store block add --name test-blocks --type memory
 
 # 5. Create a test share
-./dfsctl share create --name /smbbasic --metadata test-meta --local test-blocks
+./dfsctl share create --name /smbbasic --metadata test-meta --block-store test-blocks
 
 # 6. Create a test user
 ./dfsctl user create --username testuser    # enter password when prompted
@@ -484,7 +484,7 @@ returning plausible-looking zeros for it is not, because no reader can tell the 
 still there when the server restarts. Only device-level loss exposes the asymmetry between
 metadata that reached stable storage and data that did not.
 
-The rig puts the metadata store and the local block store on an ext4 filesystem over
+The rig puts the metadata store and the share's journal on an ext4 filesystem over
 `dm-flakey`, writes self-identifying 4096-byte records over SMB (`cache=none`, so every
 `write()` is answered by the server), then swaps the device table to `drop_writes` with
 `dmsetup suspend --noflush --nolockfs` — from that instant only bytes that genuinely
