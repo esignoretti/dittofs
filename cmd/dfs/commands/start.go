@@ -271,11 +271,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Load shares (per-share BlockStores are created during AddShare).
-	// Legacy-layout detection is a hard boot stop. Other share-loading
-	// failures stay best-effort (logged + ignored, the historical
-	// behavior).
-	if stop := handleLoadSharesError(runtime.LoadSharesFromStore(ctx, rt, cpStore), os.Stderr); stop {
+	// Legacy-layout detection is a hard boot stop. Other share-loading failures
+	// stay best-effort (logged + ignored, the historical behavior).
+	effectiveKerberos, loadErr := loadSharesWithKerberosCapability(ctx, cpStore, rt, cfg)
+	if stop := handleLoadSharesError(loadErr, os.Stderr); stop {
 		return nil
 	}
 
@@ -327,12 +326,6 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// the same SID on every node yields identical local UID->SID encoding.
 	rt.SetPinnedMachineSID(cfg.Identity.MachineSID)
 
-	// Resolve identity-provider config: a DB row (managed via the API) wins over
-	// the file/env config; on first boot the file/env config seeds the DB. This
-	// sets the runtime's LDAP config and returns the effective Kerberos config to
-	// hand to the adapter factory.
-	effectiveKerberos := resolveIdentityProviders(ctx, cpStore, rt, cfg)
-
 	// Build the single, process-wide NETLOGON authenticator before the adapter
 	// factory so every SMB adapter instance shares it (one machine account per
 	// process). The online-join provider persists its rotated secret in the
@@ -358,7 +351,6 @@ func runStart(cmd *cobra.Command, args []string) error {
 		rt.SetNetlogonController(nlController)
 	}
 
-	rt.SetKerberosEnabled(effectiveKerberos.Enabled)
 	rt.SetAdapterFactory(createAdapterFactory(&effectiveKerberos, nlAuth))
 
 	// Create and set API server
@@ -531,6 +523,32 @@ func buildMetricsListener(cfg *config.MetricsConfig, m *metrics.Metrics) (*metri
 		return nil, fmt.Errorf("create metrics server: %w", err)
 	}
 	return srv, nil
+}
+
+// loadSharesWithKerberosCapability publishes the server's Kerberos capability on
+// the runtime and only then loads the persisted shares. The two steps are one
+// function because their order is load-bearing and invisible at either call
+// site: LoadSharesFromStore refuses a share whose export policy requires a
+// Kerberos the server does not have, so a share loaded before the capability is
+// published is judged against a server that always looks Kerberos-less, and a
+// valid require_kerberos share stops the boot it should have survived.
+//
+// It returns the effective Kerberos config for the adapter factory alongside
+// the share-load error, which the caller grades.
+func loadSharesWithKerberosCapability(
+	ctx context.Context,
+	cpStore store.Store,
+	rt *runtime.Runtime,
+	cfg *config.Config,
+) (config.KerberosConfig, error) {
+	// A DB row (managed via the API) wins over the file/env config; on first
+	// boot the file/env config seeds the DB. This also sets the runtime's LDAP
+	// config.
+	effectiveKerberos := resolveIdentityProviders(ctx, cpStore, rt, cfg)
+	rt.SetKerberosEnabled(effectiveKerberos.Enabled)
+
+	// Per-share BlockStores are created during AddShare.
+	return effectiveKerberos, runtime.LoadSharesFromStore(ctx, rt, cpStore)
 }
 
 // resolveIdentityProviders reconciles identity-provider configuration between
@@ -900,6 +918,15 @@ func handleLoadSharesError(err error, stderr *os.File) bool {
 		return false
 	}
 	if handleFormatMismatch(err, stderr) {
+		return true
+	}
+	// A persisted export policy no auth flavor can satisfy is an operator
+	// configuration error, not a share that can be skipped: the share would
+	// come up refusing every client. The error already names the share and the
+	// missing Kerberos configuration, so print it as-is and exit 78.
+	if errors.Is(err, runtime.ErrKerberosNotConfigured) {
+		_, _ = fmt.Fprintln(stderr, err)
+		exitFn(EX_CONFIG)
 		return true
 	}
 	logger.Warn("Failed to load some shares", "error", err)
