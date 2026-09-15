@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -154,6 +155,27 @@ const (
 	// MaxPathLen is the maximum length of a full path (PATH_MAX)
 	MaxPathLen = 4096
 )
+
+// NormalizeShareName folds the spellings of one share into the single one every
+// seam agrees on: exactly one leading slash.
+//
+// The sanitizer that turns a name into its directory beneath the shares tree
+// drops the leading slash, so "export" and "/export" name one directory and must
+// therefore name one share. Folding before validation lets the second of two such
+// spellings hit the caller's existing duplicate check instead of silently opening
+// a second journal on the first one's directory.
+//
+// A name that is nothing but slashes folds to "/", which ValidateShareName then
+// rejects: it names no directory of its own.
+func NormalizeShareName(name string) string {
+	// Decode first: a name that arrived percent-encoded (a URL path segment)
+	// hides its leading slash from the fold otherwise.
+	decoded, err := url.PathUnescape(name)
+	if err != nil {
+		decoded = name
+	}
+	return "/" + strings.TrimLeft(decoded, "/")
+}
 
 // ValidateShareName validates a share name against the file-handle format.
 //

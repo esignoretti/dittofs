@@ -358,8 +358,11 @@ func modeLabel(hasRemote bool) string {
 }
 
 // sanitizeShareName converts a share name to a filesystem-safe directory name.
-// Uses URL path-escaping to guarantee an injective mapping (no two distinct
-// share names can produce the same directory name).
+//
+// URL path-escaping keeps distinct names distinct, except for the leading
+// slashes it drops first: names differing only in those collapse onto one
+// directory. AddShare folds a name to one spelling before registering it, so no
+// two registered shares reach here differing only that way.
 func sanitizeShareName(name string) string {
 	name = strings.TrimPrefix(name, "/")
 	escaped := url.PathEscape(name)
