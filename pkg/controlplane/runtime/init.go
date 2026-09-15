@@ -270,6 +270,20 @@ func LoadSharesFromStore(ctx context.Context, rt *Runtime, s store.Store) error 
 				errors.Is(err, sharesvc.ErrLegacyLocalFormat) {
 				return fmt.Errorf("share %q: %w", share.Name, err)
 			}
+			// A binding that names no configured store is the one failure an
+			// operator can act on directly, and the construction error wraps it
+			// four levels deep. Say which share and which reference, matching
+			// how an unknown metadata store is reported. Matched on the
+			// resolver's own sentinel so no other failure is relabelled, and
+			// only once the add has failed, so the format sentinels above keep
+			// stopping the boot ahead of it.
+			if errors.Is(err, models.ErrStoreNotFound) {
+				logger.Warn("Share references unknown block store",
+					"share", share.Name,
+					"block_store_id", share.BlockStoreID)
+				rt.markShareSkipped(share.Name, "block store "+share.BlockStoreID+" is not configured")
+				continue
+			}
 			logger.Warn("Failed to add share to runtime",
 				"share", share.Name,
 				"error", err)

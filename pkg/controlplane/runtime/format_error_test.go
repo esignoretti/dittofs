@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/marmos91/dittofs/pkg/block"
@@ -88,5 +89,83 @@ func TestLoadSharesFromStore_FormatErrorStops(t *testing.T) {
 				t.Fatalf("share %s must not be registered after a surfaced format error", share.Name)
 			}
 		})
+	}
+}
+
+// A share can be broken two ways at once: an on-disk format this build cannot
+// read, and a block store binding that names nothing. The format sentinel is a
+// boot stop and must win — reporting the binding instead would leave the daemon
+// running and reporting healthy with the share absent, which is exactly what
+// the boot stop exists to prevent.
+func TestLoadSharesFromStore_FormatErrorWinsOverUnresolvableBlockStore(t *testing.T) {
+	rt, s := setupTestRuntime(t)
+	ctx := context.Background()
+
+	const metaName = "format-meta-both"
+	if _, err := s.CreateMetadataStore(ctx, &models.MetadataStoreConfig{
+		Name: metaName,
+		Type: "memory",
+	}); err != nil {
+		t.Fatalf("CreateMetadataStore: %v", err)
+	}
+	if err := rt.RegisterMetadataStore(metaName, &futureFormatStore{
+		MemoryMetadataStore: metadatamemory.NewMemoryMetadataStoreWithDefaults(),
+		sentinel:            sharesvc.ErrLegacyLocalFormat,
+	}); err != nil {
+		t.Fatalf("RegisterMetadataStore: %v", err)
+	}
+
+	if _, err := s.CreateShare(ctx, &models.Share{
+		Name:            "/broken-both-ways",
+		MetadataStoreID: metaName,
+		BlockStoreID:    "deleted-blocks",
+	}); err != nil {
+		t.Fatalf("CreateShare: %v", err)
+	}
+
+	err := LoadSharesFromStore(ctx, rt, s)
+	if !errors.Is(err, sharesvc.ErrLegacyLocalFormat) {
+		t.Fatalf("LoadSharesFromStore = %v; want errors.Is %v", err, sharesvc.ErrLegacyLocalFormat)
+	}
+}
+
+// The unresolvable-binding report is keyed off the resolver's own sentinel, not
+// off a second existence lookup. A share that fails to add for some unrelated
+// reason keeps that reason even when its binding also happens to name nothing —
+// relabelling it would hide the failure an operator actually has to fix.
+func TestLoadSharesFromStore_UnrelatedFailureKeepsItsReason(t *testing.T) {
+	rt, s := setupTestRuntime(t)
+	ctx := context.Background()
+
+	const metaName = "broken-meta"
+	boom := errors.New("metadata store is wedged")
+	if _, err := s.CreateMetadataStore(ctx, &models.MetadataStoreConfig{
+		Name: metaName,
+		Type: "memory",
+	}); err != nil {
+		t.Fatalf("CreateMetadataStore: %v", err)
+	}
+	if err := rt.RegisterMetadataStore(metaName, &futureFormatStore{
+		MemoryMetadataStore: metadatamemory.NewMemoryMetadataStoreWithDefaults(),
+		sentinel:            boom,
+	}); err != nil {
+		t.Fatalf("RegisterMetadataStore: %v", err)
+	}
+
+	if _, err := s.CreateShare(ctx, &models.Share{
+		Name:            "/wedged",
+		MetadataStoreID: metaName,
+		BlockStoreID:    "deleted-blocks",
+	}); err != nil {
+		t.Fatalf("CreateShare: %v", err)
+	}
+
+	if err := LoadSharesFromStore(ctx, rt, s); err != nil {
+		t.Fatalf("LoadSharesFromStore: %v", err)
+	}
+
+	reason := rt.SkippedShares()["/wedged"]
+	if !strings.Contains(reason, boom.Error()) {
+		t.Errorf("skip reason must keep the real failure, got %q", reason)
 	}
 }

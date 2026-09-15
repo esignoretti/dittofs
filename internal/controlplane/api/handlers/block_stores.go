@@ -201,6 +201,24 @@ func (h *BlockStoreHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		renameTo = *req.Name
+
+		// The rename runs after the type/config write below, so a name that is
+		// already taken would answer 409 with the new config already committed —
+		// a reply that reads as "nothing happened" against a store that changed.
+		// Refuse here instead, before anything is written. A store taking the
+		// name between this check and the rename still lands on the rename's own
+		// refusal.
+		existing, err := h.store.GetBlockStore(r.Context(), renameTo)
+		if err != nil && !errors.Is(err, models.ErrStoreNotFound) {
+			InternalServerError(w, "Failed to get block store")
+			return
+		}
+		// The lookup also answers to an ID, but only a name collides: a store
+		// whose ID reads like the new name does not block the rename.
+		if err == nil && existing.Name == renameTo {
+			Conflict(w, "Block store "+renameTo+" already exists")
+			return
+		}
 	}
 
 	if req.Type != nil {
