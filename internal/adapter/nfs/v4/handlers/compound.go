@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/marmos91/dittofs/internal/adapter/nfs/rpc"
 	"github.com/marmos91/dittofs/internal/adapter/nfs/v4/types"
 	v41handlers "github.com/marmos91/dittofs/internal/adapter/nfs/v4/v41/handlers"
 	"github.com/marmos91/dittofs/internal/adapter/nfs/xdr/core"
@@ -220,6 +221,9 @@ type compoundLoopParams struct {
 	// startIndex is the op index the loop starts at (1 for the SEQUENCE-bearing
 	// v4.1 path, which has already produced the SEQUENCE result).
 	startIndex uint32
+	// limits caps the encoded reply against the session's negotiated fore-channel
+	// reply sizes. Nil on the v4.0 and session-exempt paths, which negotiate none.
+	limits *replyLimits
 	// hardErrOnDecodeError controls opcode-decode failure handling: v4.0 returns
 	// the error (the RPC layer faults the call); the v4.1 paths instead encode a
 	// partial NFS4ERR_BADXDR reply so completed-op results are preserved and the
@@ -265,6 +269,17 @@ func (h *Handler) runCompoundOps(compCtx *types.CompoundContext, numOps uint32, 
 		}
 
 		result := h.dispatchOne(compCtx, p.v41ctx, opCode, reader, p.isV41, p.isV42)
+
+		// Account for this result before it is appended, so an operation whose
+		// output overruns the negotiated reply size is replaced by the error
+		// rather than added to a reply that can no longer be sent.
+		if status := p.limits.account(result); status != types.NFS4_OK {
+			logger.Debug("NFSv4.1 COMPOUND reply exceeds negotiated size",
+				"op_index", i, "opcode", opCode, "op_name", types.OpName(opCode),
+				"status", status, "client", compCtx.ClientAddr)
+			overflow(result, status)
+		}
+
 		results = append(results, *result)
 		lastStatus = result.Status
 
@@ -600,9 +615,45 @@ func (h *Handler) dispatchV41(compCtx *types.CompoundContext, tag []byte, numOps
 		}
 	}()
 
+	// Reply-size accounting starts with the fixed header and the SEQUENCE result,
+	// so the budget the remaining ops are measured against is what is actually
+	// left of it.
+	//
+	// A SEQUENCE reply that already overruns the budget is answered on SEQUENCE
+	// itself, which RFC 8881 Section 2.10.6.4 permits, and is left uncached: the
+	// same section requires caching "except if an error is returned by the
+	// SEQUENCE or CB_SEQUENCE operation". Returning before responseBytes is
+	// assigned leaves the reply uncached while the defer above still releases
+	// the slot.
+	//
+	// This runs before the drain check below because the draining reply is the
+	// same reply — the fixed header and the SEQUENCE result, with the overall
+	// status carrying the error — so a budget that admits SEQUENCE admits the
+	// drain answer too, and one that refuses it must refuse it here rather than
+	// let the drain path encode a reply the session cannot accept.
+	var limits *replyLimits
+	if sess != nil && v41ctx != nil {
+		limits = &replyLimits{
+			// ca_maxresponsesize counts the RPC headers the reply is wrapped
+			// in (RFC 8881 Section 18.36.3), so the count starts with them
+			// rather than at the COMPOUND status word.
+			size:      rpc.ReplyOverhead + compoundHeaderSize(tag),
+			max:       sess.ForeChannelAttrs.MaxResponseSize,
+			maxCached: sess.ForeChannelAttrs.MaxResponseSizeCached,
+			cacheThis: v41ctx.CacheThis,
+		}
+		if status := limits.account(seqResult); status != types.NFS4_OK {
+			logger.Debug("NFSv4.1 SEQUENCE reply exceeds negotiated size",
+				"status", status, "client", compCtx.ClientAddr)
+			overflow(seqResult, status)
+			return encodeCompoundResponse(status, tag, []types.CompoundResult{*seqResult})
+		}
+	}
+
 	// Check if the connection is draining (returns NFS4ERR_DELAY to redirect
 	// client to another connection). SEQUENCE itself always works on draining
-	// connections so it is checked after SEQUENCE validation succeeds.
+	// connections so it is checked after SEQUENCE validation succeeds, and the
+	// reply it builds is the SEQUENCE reply the budget above already admitted.
 	if compCtx.ConnectionID != 0 && h.StateManager.IsConnectionDraining(compCtx.ConnectionID) {
 		logger.Debug("NFSv4.1 COMPOUND connection draining",
 			"connection_id", compCtx.ConnectionID,
@@ -625,6 +676,7 @@ func (h *Handler) dispatchV41(compCtx *types.CompoundContext, tag []byte, numOps
 		isV41:                true,
 		isV42:                isV42,
 		v41ctx:               v41ctx,
+		limits:               limits,
 		startIndex:           1,
 		hardErrOnDecodeError: false,
 	})
@@ -670,6 +722,102 @@ func EncodeAbortCompound(status uint32) ([]byte, error) {
 	return encodeCompoundResponse(status, []byte{}, nil)
 }
 
+// compoundHeaderSize returns the encoded length of everything a COMPOUND reply
+// carries ahead of its first operation result: status, the echoed tag as an XDR
+// opaque, and the result count.
+func compoundHeaderSize(tag []byte) uint32 {
+	return 4 + 4 + uint32(len(tag)) + uint32((4-(len(tag)%4))%4) + 4
+}
+
+// compoundResultSize returns the encoded length one operation result adds to a
+// COMPOUND reply: its opcode followed by its already-encoded result data.
+func compoundResultSize(r *types.CompoundResult) uint32 {
+	return 4 + uint32(len(r.Data))
+}
+
+// replyLimits tracks the encoded size of a COMPOUND reply as its operations
+// complete, against the reply sizes negotiated for the session's fore channel.
+//
+// RFC 8881 Section 2.10.6.4: a reply over ca_maxresponsesize "will have the
+// status NFS4ERR_REP_TOO_BIG", carried either by the first operation (SEQUENCE)
+// or by a later one; and "if the reply exceeds ca_maxresponsesize_cached (and
+// sa_cachethis or csa_cachethis is TRUE), then the server MUST return
+// NFS4ERR_REP_TOO_BIG_TO_CACHE."
+//
+// A nil *replyLimits accounts for nothing and refuses nothing, which is what
+// the v4.0 and session-exempt paths pass: with no session they negotiated no
+// reply sizes to hold a reply to.
+// Neither budget has a value meaning "unlimited". A zero ca_maxresponsesize
+// cannot reach here, because CREATE_SESSION floors that field and answers
+// NFS4ERR_TOOSMALL below it. A zero ca_maxresponsesize_cached is legal and is
+// deliberately not floored there, precisely so that it is answered here: it
+// says the client will hold no cached reply at all, so every reply it asks to
+// have cached is one byte too many.
+type replyLimits struct {
+	size      uint32 // encoded bytes accounted for so far
+	max       uint32 // ca_maxresponsesize
+	maxCached uint32 // ca_maxresponsesize_cached
+	cacheThis bool   // sa_cachethis, from this request's SEQUENCE
+}
+
+// statusOnlyResultSize is what a refused operation contributes to the reply:
+// its opcode and its status, with no output behind them.
+const statusOnlyResultSize = 8
+
+// addSat adds two sizes, pinning at the maximum instead of wrapping, so that a
+// result large enough to overflow the counter reads as over budget rather than
+// as a reply that suddenly fits.
+func addSat(a, b uint32) uint32 {
+	if sum := a + b; sum >= a {
+		return sum
+	}
+	return ^uint32(0)
+}
+
+// account adds one operation result to the running total and returns the status
+// that operation must carry instead of its own, or NFS4_OK to let its own stand.
+//
+// An operation is admitted only if a refusal after it would still fit, because
+// refusing costs statusOnlyResultSize bytes of its own. Without that reserve a
+// result landing exactly on the budget would be admitted, and the refusal of
+// the next operation would then put the reply over it — leaving the server
+// sending the very thing the budget forbids, with the error that says so.
+//
+// REP_TOO_BIG is tested first: a reply that cannot be sent at all is not made
+// sendable by the client declining to have it cached.
+//
+// The total advances by what is actually emitted, so a refusal adds the
+// status-only result rather than the output that did not fit.
+func (l *replyLimits) account(r *types.CompoundResult) uint32 {
+	if l == nil {
+		return types.NFS4_OK
+	}
+	next := addSat(l.size, compoundResultSize(r))
+	room := addSat(next, statusOnlyResultSize)
+
+	switch {
+	case room > l.max:
+		l.size = addSat(l.size, statusOnlyResultSize)
+		return types.NFS4ERR_REP_TOO_BIG
+	case l.cacheThis && room > l.maxCached:
+		l.size = addSat(l.size, statusOnlyResultSize)
+		return types.NFS4ERR_REP_TOO_BIG_TO_CACHE
+	default:
+		l.size = next
+		return types.NFS4_OK
+	}
+}
+
+// overflow rewrites a result that did not fit into the status-only reply for
+// the given error. The operation's own output is dropped: it is what did not
+// fit, and a caller that cannot receive the result must not be told the
+// operation succeeded.
+func overflow(r *types.CompoundResult, status uint32) {
+	r.Status = status
+	r.Data = encodeStatusOnly(status)
+	r.Stateid = nil
+}
+
 // encodeCompoundResponse encodes a COMPOUND4res response.
 //
 // Wire format:
@@ -684,13 +832,11 @@ func encodeCompoundResponse(status uint32, tag []byte, results []types.CompoundR
 	// Presize the buffer to the exact encoded length so the hot COMPOUND reply
 	// path performs a single allocation instead of repeated grow-and-copy. The
 	// wire output is byte-identical; this only reserves capacity up front.
-	//   status(4) + tag opaque(4 + len + pad) + numresults(4)
-	//   + per result: opcode(4) + len(Data)
-	size := 4 + 4 + len(tag) + ((4 - (len(tag) % 4)) % 4) + 4
+	size := compoundHeaderSize(tag)
 	for i := range results {
-		size += 4 + len(results[i].Data)
+		size += compoundResultSize(&results[i])
 	}
-	buf.Grow(size)
+	buf.Grow(int(size))
 
 	// Write overall status
 	if err := xdr.WriteUint32(&buf, status); err != nil {
