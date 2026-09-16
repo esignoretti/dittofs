@@ -3,6 +3,8 @@ package state
 import (
 	"context"
 	"errors"
+	"slices"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +29,18 @@ type spyRecoveryStore struct {
 	listErr      error
 	reclaimErr   error
 
+	// putGate, when non-nil, blocks every PutClientRecovery until it is closed,
+	// so a test can hold one write in flight while another state operation runs.
+	putGate chan struct{}
+
+	// putCalls counts PutClientRecovery attempts, including the ones that fail.
+	putCalls int
+
+	// putFailuresLeft counts down how many PutClientRecovery calls fail before
+	// the store starts succeeding; a test seeds it to make the row write fail
+	// exactly N times.
+	putFailuresLeft int
+
 	// reclaimFailuresLeft counts down how many RecordReclaimComplete calls fail
 	// before the store starts succeeding; a test seeds it to make the persist
 	// fail exactly N times.
@@ -39,7 +53,20 @@ func newSpyRecoveryStore() *spyRecoveryStore {
 
 func (s *spyRecoveryStore) PutClientRecovery(_ context.Context, rec *lock.V4ClientRecoveryRecord) error {
 	s.mu.Lock()
+	s.putCalls++
+	gate := s.putGate
+	s.mu.Unlock()
+
+	if gate != nil {
+		<-gate
+	}
+
+	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.putFailuresLeft > 0 {
+		s.putFailuresLeft--
+		return errors.New("backend down")
+	}
 	if s.putErr != nil {
 		return s.putErr
 	}
@@ -98,6 +125,12 @@ func (s *spyRecoveryStore) snapshotPuts() []*lock.V4ClientRecoveryRecord {
 	return append([]*lock.V4ClientRecoveryRecord(nil), s.puts...)
 }
 
+func (s *spyRecoveryStore) snapshotPutCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putCalls
+}
+
 func (s *spyRecoveryStore) snapshotDeletes() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,11 +143,37 @@ func (s *spyRecoveryStore) snapshotReclaims() []string {
 	return append([]string(nil), s.reclaimMarks...)
 }
 
+// waitFor polls cond until it holds, failing with msg after five seconds. The
+// recovery-row write runs off sm.mu, so a test that has just taken state must
+// wait for it rather than read the store straight away.
+func waitFor(t *testing.T, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Fatal(msg)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// waitForRecordKeys waits until the store holds exactly the given identities.
+func waitForRecordKeys(t *testing.T, spy *spyRecoveryStore, want ...string) {
+	t.Helper()
+	sort.Strings(want)
+	var got []string
+	waitFor(t, "", func() bool {
+		got = spy.snapshotRecordKeys()
+		return slices.Equal(got, want)
+	})
+}
+
 // ---------------------------------------------------------------------------
-// Persist on confirm (v4.0 SETCLIENTID_CONFIRM)
+// Persist on the first OPEN, not on confirm (v4.0)
 // ---------------------------------------------------------------------------
 
-func TestClientRecovery_PersistOnConfirmV40(t *testing.T) {
+func TestClientRecovery_PersistOnFirstOpenV40(t *testing.T) {
 	spy := newSpyRecoveryStore()
 	sm := NewStateManager(5 * time.Second)
 	sm.SetClientRecoveryStore(spy, 42)
@@ -127,6 +186,18 @@ func TestClientRecovery_PersistOnConfirmV40(t *testing.T) {
 	if err := sm.ConfirmClientID(res.ClientID, res.ConfirmVerifier); err != nil {
 		t.Fatalf("ConfirmClientID: %v", err)
 	}
+
+	// Confirmed and holding nothing: no row yet.
+	if puts := spy.snapshotPuts(); len(puts) != 0 {
+		t.Fatalf("confirm alone must write no recovery record, got %d", len(puts))
+	}
+
+	if _, err := sm.OpenFile(res.ClientID, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitFor(t, "the first OPEN must write the recovery record", func() bool {
+		return len(spy.snapshotPuts()) == 1
+	})
 
 	puts := spy.snapshotPuts()
 	if len(puts) != 1 {
@@ -153,8 +224,10 @@ func TestClientRecovery_PersistOnConfirmV40(t *testing.T) {
 	}
 }
 
-// A persist failure must NOT fail the confirm (best-effort durability).
-func TestClientRecovery_ConfirmSucceedsDespitePersistError(t *testing.T) {
+// A persist failure must NOT fail the OPEN that triggered it (best-effort
+// durability), and must leave the write to be retried by the next OPEN rather
+// than latched as done.
+func TestClientRecovery_OpenSucceedsDespitePersistError(t *testing.T) {
 	spy := newSpyRecoveryStore()
 	spy.putErr = errors.New("backend down")
 	sm := NewStateManager(5 * time.Second)
@@ -167,9 +240,27 @@ func TestClientRecovery_ConfirmSucceedsDespitePersistError(t *testing.T) {
 	if err := sm.ConfirmClientID(res.ClientID, res.ConfirmVerifier); err != nil {
 		t.Fatalf("ConfirmClientID must succeed despite persist error, got: %v", err)
 	}
+	if _, err := sm.OpenFile(res.ClientID, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile must succeed despite persist error, got: %v", err)
+	}
 	if sm.GetClient(res.ClientID) == nil {
 		t.Fatal("client must be confirmed in memory despite persist error")
 	}
+	waitFor(t, "a failed write must leave RecoveryPersisted clear so the next OPEN retries", func() bool {
+		sm.mu.RLock()
+		defer sm.mu.RUnlock()
+		rec := sm.clientRecordLocked(res.ClientID)
+		return rec != nil && !rec.RecoveryPersisted
+	})
+
+	// The backend comes back: the next OPEN lands the write.
+	spy.mu.Lock()
+	spy.putErr = nil
+	spy.mu.Unlock()
+	if _, err := sm.OpenFile(res.ClientID, []byte("owner"), 2, []byte("fh2"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile(2): %v", err)
+	}
+	waitForRecordKeys(t, spy, "client-B")
 }
 
 // nil recovery store => behave as today, no panic, no calls.
@@ -207,6 +298,11 @@ func TestClientRecovery_DeleteOnLeaseExpiry(t *testing.T) {
 	if err := sm.ConfirmClientID(res.ClientID, res.ConfirmVerifier); err != nil {
 		t.Fatalf("ConfirmClientID: %v", err)
 	}
+	// Take state so a durable row exists to be deleted.
+	if _, err := sm.OpenFile(res.ClientID, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitForRecordKeys(t, spy, "client-exp")
 
 	// Directly trigger the lease-expiry callback (deterministic, no timer wait).
 	sm.onLeaseExpired(res.ClientID)
@@ -432,12 +528,21 @@ func TestClientRecovery_V41PersistAndReclaimComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExchangeID: %v", err)
 	}
-	// First CREATE_SESSION confirms + persists.
+	// First CREATE_SESSION confirms; it must NOT write a recovery record.
 	if _, _, err := sm.CreateSession(exch.ClientID, exch.SequenceID, 0, defaultForeAttrs(), defaultBackAttrs(), 0, nil, "uid:0"); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
+	if puts := spy.snapshotPuts(); len(puts) != 0 {
+		t.Fatalf("CREATE_SESSION alone must write no recovery record, got %d", len(puts))
+	}
+
+	// Taking an open is what puts the client on the durable roster.
+	if _, err := sm.OpenFile(exch.ClientID, []byte("v41-open-owner"), 0, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
 
 	key := v41RecoveryKey(owner)
+	waitForRecordKeys(t, spy, key)
 	puts := spy.snapshotPuts()
 	if len(puts) != 1 || puts[0].ClientIDString != key {
 		t.Fatalf("expected v4.1 Put keyed by %q, got %v", key, puts)
@@ -496,6 +601,11 @@ func TestClientRecovery_V41DestroyDeletes(t *testing.T) {
 	if _, _, err := sm.CreateSession(exch.ClientID, exch.SequenceID, 0, defaultForeAttrs(), defaultBackAttrs(), 0, nil); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
+	// Take state so a durable row exists for DESTROY_CLIENTID to delete.
+	if _, err := sm.OpenFile(exch.ClientID, []byte("destroy-open-owner"), 0, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitForRecordKeys(t, spy, v41RecoveryKey(owner))
 	// Destroy requires no active sessions; tear them down first.
 	for _, s := range sm.ListSessionsForClient(exch.ClientID) {
 		if err := sm.DestroySession(s.SessionID); err != nil {
@@ -541,6 +651,11 @@ func TestClientRecovery_ReclaimPersistRetriedAfterFailure(t *testing.T) {
 	if _, _, err := sm.CreateSession(exch.ClientID, exch.SequenceID, 0, defaultForeAttrs(), defaultBackAttrs(), 0, nil, "uid:0"); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
+	// Take state so a durable row exists to be marked reclaim-complete.
+	if _, err := sm.OpenFile(exch.ClientID, []byte("retry-open-owner"), 0, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitForRecordKeys(t, spy, v41RecoveryKey(owner))
 	if err := sm.ReclaimComplete(exch.ClientID, false); err != nil {
 		t.Fatalf("ReclaimComplete: %v", err)
 	}
@@ -748,5 +863,391 @@ func TestClientRecovery_ReclaimPersistRescheduleAdoptsExistingChain(t *testing.T
 	}
 	if delay != reclaimPersistRetryBase {
 		t.Errorf("adopted chain delay = %v, want the fresh %v", delay, reclaimPersistRetryBase)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The roster reflects reclaimable state, and grace end retires what is left
+// ---------------------------------------------------------------------------
+
+// snapshotRecordKeys returns the identity strings the store currently holds.
+func (s *spyRecoveryStore) snapshotRecordKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.records))
+	for k := range s.records {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// confirmV40 registers and confirms a v4.0 client, returning its client ID.
+func confirmV40(t *testing.T, sm *StateManager, id string, verf [8]byte) uint64 {
+	t.Helper()
+	res, err := sm.SetClientID(id, verf, CallbackInfo{}, "10.0.0.1:1", "uid:0")
+	if err != nil {
+		t.Fatalf("SetClientID(%s): %v", id, err)
+	}
+	if err := sm.ConfirmClientID(res.ClientID, res.ConfirmVerifier); err != nil {
+		t.Fatalf("ConfirmClientID(%s): %v", id, err)
+	}
+	return res.ClientID
+}
+
+// A client that registers and never takes any state must leave nothing behind
+// for the next boot to wait on. Before the record moved to the OPEN path every
+// confirm wrote a row, so such a client sat on the roster forever.
+func TestClientRecovery_StatelessClientIsNotOnTheBootRoster(t *testing.T) {
+	spy := newSpyRecoveryStore()
+
+	// First server instance: "opener" takes an open, "idler" only registers.
+	sm := NewStateManager(5*time.Second, 30*time.Second)
+	sm.SetClientRecoveryStore(spy, 1)
+	opener := confirmV40(t, sm, "opener", [8]byte{0xa1})
+	confirmV40(t, sm, "idler", [8]byte{0xb2})
+	if _, err := sm.OpenFile(opener, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+
+	waitForRecordKeys(t, spy, "opener")
+	if got := spy.snapshotRecordKeys(); len(got) != 1 || got[0] != "opener" {
+		t.Fatalf("durable rows = %v, want only [opener]: a client holding nothing must write no row", got)
+	}
+
+	// Restart: only the client that held something is waited on.
+	sm2 := NewStateManager(5*time.Second, 30*time.Second)
+	sm2.SetClientRecoveryStore(spy, 2)
+	if n := sm2.LoadClientRecovery(context.Background(), true); n != 1 {
+		t.Fatalf("boot roster seeded %d clients, want 1 (only the one that held state)", n)
+	}
+	sm2.mu.RLock()
+	roster := sm2.gracePeriod.expectedClientStrings
+	onRoster := roster["idler"]
+	sm2.mu.RUnlock()
+	if onRoster {
+		t.Fatal("idler held no state and must not be on the reclaim roster")
+	}
+}
+
+// The grace window must end as soon as the clients that actually held state
+// have reclaimed, instead of running its full duration waiting on a client that
+// had nothing to reclaim in the first place.
+func TestClientRecovery_GraceExitsEarlyWhenEveryStatefulClientReclaims(t *testing.T) {
+	spy := newSpyRecoveryStore()
+	verf := [8]byte{0xa1}
+
+	sm := NewStateManager(5*time.Second, 30*time.Second)
+	sm.SetClientRecoveryStore(spy, 1)
+	opener := confirmV40(t, sm, "opener", verf)
+	confirmV40(t, sm, "idler", [8]byte{0xb2})
+	if _, err := sm.OpenFile(opener, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitForRecordKeys(t, spy, "opener")
+
+	// Restart with a 30s window: only an early exit can end it inside this test.
+	sm2 := NewStateManager(5*time.Second, 30*time.Second)
+	sm2.SetClientRecoveryStore(spy, 2)
+	sm2.LoadClientRecovery(context.Background(), true)
+	if !sm2.IsInGrace() {
+		t.Fatal("restart with a stateful prior client must open the grace window")
+	}
+
+	back := confirmV40(t, sm2, "opener", verf)
+	if _, err := sm2.OpenFile(back, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_PREVIOUS); err != nil {
+		t.Fatalf("CLAIM_PREVIOUS reclaim: %v", err)
+	}
+
+	if sm2.IsInGrace() {
+		t.Fatal("grace must end early once every client that held state has reclaimed, " +
+			"not run its full duration waiting on a client that held nothing")
+	}
+}
+
+// A client that held state and never comes back has its row retired when the
+// window ends, while a client that comes back and reclaims keeps its row and
+// can still reclaim on the restart after that.
+func TestClientRecovery_GraceEndRetiresRowsOfClientsThatNeverReturn(t *testing.T) {
+	spy := newSpyRecoveryStore()
+	returnerVerf := [8]byte{0xc1}
+
+	// First instance: two clients, both holding an open.
+	sm := NewStateManager(5*time.Second, 30*time.Second)
+	sm.SetClientRecoveryStore(spy, 1)
+	returner := confirmV40(t, sm, "returner", returnerVerf)
+	goner := confirmV40(t, sm, "goner", [8]byte{0xd2})
+	for _, id := range []uint64{returner, goner} {
+		if _, err := sm.OpenFile(id, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+	}
+	waitForRecordKeys(t, spy, "returner", "goner")
+
+	// Second instance: only "returner" comes back. A short window so the hard
+	// timer, not an early exit, is what ends it.
+	sm2 := NewStateManager(5*time.Second, 200*time.Millisecond)
+	sm2.SetClientRecoveryStore(spy, 2)
+	if n := sm2.LoadClientRecovery(context.Background(), true); n != 2 {
+		t.Fatalf("boot roster seeded %d clients, want 2", n)
+	}
+	back := confirmV40(t, sm2, "returner", returnerVerf)
+	if _, err := sm2.OpenFile(back, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_PREVIOUS); err != nil {
+		t.Fatalf("CLAIM_PREVIOUS reclaim: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		keys := spy.snapshotRecordKeys()
+		if len(keys) == 1 && keys[0] == "returner" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("durable rows = %v after grace ended, want only [returner]: "+
+				"the row of a client that never returned was not retired", keys)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if sm2.IsInGrace() {
+		t.Fatal("grace should have ended before the purge ran")
+	}
+
+	// The reclaim itself writes nothing, so the row keeps the reclaim-complete
+	// mark and the third boot has nothing to wait on. Taking fresh state in this
+	// epoch is what re-arms it.
+	spy.mu.Lock()
+	complete := spy.records["returner"].ReclaimComplete
+	spy.mu.Unlock()
+	if !complete {
+		t.Fatal("the reclaim must leave the durable row marked reclaim-complete")
+	}
+	if _, err := sm2.OpenFile(back, []byte("owner"), 2, []byte("fh-new"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile(CLAIM_NULL) after grace: %v", err)
+	}
+	waitFor(t, "state taken in this epoch must re-arm the row with the current epoch", func() bool {
+		spy.mu.Lock()
+		defer spy.mu.Unlock()
+		r := spy.records["returner"]
+		return r.ServerEpoch == 2 && !r.ReclaimComplete
+	})
+
+	sm3 := NewStateManager(5*time.Second, 30*time.Second)
+	sm3.SetClientRecoveryStore(spy, 3)
+	if n := sm3.LoadClientRecovery(context.Background(), true); n != 1 {
+		t.Fatalf("third boot seeded %d clients, want 1 (only returner)", n)
+	}
+	back3 := confirmV40(t, sm3, "returner", returnerVerf)
+	if _, err := sm3.OpenFile(back3, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_PREVIOUS); err != nil {
+		t.Fatalf("returner must still be able to reclaim after surviving a purge: %v", err)
+	}
+}
+
+// An incarnation that reclaims its opens writes no row, so the row it reclaimed
+// against still carries the previous window's reclaim-complete mark. A lock
+// taken afterwards is the first state it holds in this epoch, and must re-arm
+// the row — otherwise the next restart does not wait on the client and it loses
+// both the opens and the locks.
+func TestClientRecovery_LockAfterReclaimRearmsTheRow(t *testing.T) {
+	spy := newSpyRecoveryStore()
+	verf := [8]byte{0xe1}
+	fh := []byte("fh")
+
+	sm := NewStateManager(5*time.Second, 30*time.Second)
+	sm.SetClientRecoveryStore(spy, 1)
+	id := confirmV40(t, sm, "locker", verf)
+	if _, err := sm.OpenFile(id, []byte("owner"), 1, fh, 3, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitForRecordKeys(t, spy, "locker")
+
+	// Restart. The client reclaims its open and nothing else, which marks the
+	// row reclaim-complete without rewriting it.
+	sm2 := NewStateManager(5*time.Second, 150*time.Millisecond)
+	sm2.SetLockManager(lock.NewManager())
+	sm2.SetClientRecoveryStore(spy, 2)
+	if n := sm2.LoadClientRecovery(context.Background(), true); n != 1 {
+		t.Fatalf("boot roster seeded %d clients, want 1", n)
+	}
+	back := confirmV40(t, sm2, "locker", verf)
+	open, err := sm2.OpenFile(back, []byte("owner"), 1, fh, 3, 0, types.CLAIM_PREVIOUS)
+	if err != nil {
+		t.Fatalf("CLAIM_PREVIOUS reclaim: %v", err)
+	}
+	waitFor(t, "the reclaim must mark the row complete without rewriting it", func() bool {
+		spy.mu.Lock()
+		defer spy.mu.Unlock()
+		r := spy.records["locker"]
+		return r != nil && r.ReclaimComplete && r.ServerEpoch == 1
+	})
+	waitFor(t, "grace did not lift", func() bool { return !sm2.IsInGrace() })
+
+	// A byte-range lock, and no further OPEN. This is the client's first state
+	// in epoch 2, so the row has to come back onto the next boot's roster.
+	if _, err := sm2.LockNew(context.Background(), back, []byte("lock-owner"), 1,
+		&open.Stateid, 2, fh, types.WRITE_LT, 0, 100, false, 0); err != nil {
+		t.Fatalf("LockNew: %v", err)
+	}
+	waitFor(t, "a lock taken after a reclaim must re-arm the durable row", func() bool {
+		spy.mu.Lock()
+		defer spy.mu.Unlock()
+		r := spy.records["locker"]
+		return r != nil && !r.ReclaimComplete && r.ServerEpoch == 2
+	})
+
+	sm3 := NewStateManager(5*time.Second, 30*time.Second)
+	sm3.SetClientRecoveryStore(spy, 3)
+	if n := sm3.LoadClientRecovery(context.Background(), true); n != 1 {
+		t.Fatalf("third boot seeded %d clients, want 1: the lock holder must be waited on", n)
+	}
+}
+
+// A state operation that arrives while the first row write is in flight is
+// suppressed by the latch, so it schedules no retry. If that in-flight write
+// then fails, the client would hold state with no durable row and nothing left
+// to write one — the next restart would never wait on it. The failed write must
+// re-drive itself.
+func TestClientRecovery_FailedWriteRetriesWhenAnOperationWasSuppressed(t *testing.T) {
+	spy := newSpyRecoveryStore()
+	gate := make(chan struct{})
+	spy.mu.Lock()
+	spy.putGate = gate
+	spy.putFailuresLeft = 1
+	spy.mu.Unlock()
+
+	sm := NewStateManager(5*time.Second, 30*time.Second)
+	sm.SetClientRecoveryStore(spy, 1)
+	id := confirmV40(t, sm, "suppressed", [8]byte{0xa1})
+
+	// First OPEN starts the write and holds it in flight.
+	if _, err := sm.OpenFile(id, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitFor(t, "the first write must be in flight", func() bool { return spy.snapshotPutCalls() == 1 })
+
+	// Second OPEN lands while it is in flight: the latch suppresses it.
+	if _, err := sm.OpenFile(id, []byte("owner"), 2, []byte("fh2"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile(2): %v", err)
+	}
+	waitFor(t, "the suppressed OPEN must be recorded", func() bool {
+		sm.mu.RLock()
+		defer sm.mu.RUnlock()
+		rec := sm.clientRecordLocked(id)
+		return rec != nil && rec.recoveryPersistWaiting
+	})
+
+	// Release the gate: the write fails, and with the second OPEN already
+	// suppressed there is no later operation to retry it.
+	close(gate)
+	waitForRecordKeys(t, spy, "suppressed")
+	if calls := spy.snapshotPutCalls(); calls < 2 {
+		t.Fatalf("a failed write with a suppressed operation behind it must re-drive itself, got %d Put calls", calls)
+	}
+}
+
+// A write that fails with NO operation suppressed leaves the latch clear, so
+// the next state operation retries it. The re-drive must not double-write here.
+func TestClientRecovery_FailedWriteDoesNotRedriveWithoutSuppression(t *testing.T) {
+	spy := newSpyRecoveryStore()
+	spy.mu.Lock()
+	spy.putFailuresLeft = 1
+	spy.mu.Unlock()
+
+	sm := NewStateManager(5*time.Second, 30*time.Second)
+	sm.SetClientRecoveryStore(spy, 1)
+	id := confirmV40(t, sm, "unsuppressed", [8]byte{0xa2})
+
+	if _, err := sm.OpenFile(id, []byte("owner"), 1, []byte("fh"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	waitFor(t, "a failed write must leave the latch clear", func() bool {
+		sm.mu.RLock()
+		defer sm.mu.RUnlock()
+		rec := sm.clientRecordLocked(id)
+		return rec != nil && !rec.RecoveryPersisted
+	})
+	// The one failure is spent; nothing else should have been attempted.
+	waitFor(t, "nothing was suppressed, so no re-drive", func() bool {
+		return spy.snapshotPutCalls() == 1
+	})
+	time.Sleep(100 * time.Millisecond)
+	if calls := spy.snapshotPutCalls(); calls != 1 {
+		t.Fatalf("a failed write with nothing suppressed must not re-drive itself, got %d Put calls", calls)
+	}
+
+	// The next state operation is what retries it.
+	if _, err := sm.OpenFile(id, []byte("owner"), 2, []byte("fh2"), 1, 0, types.CLAIM_NULL); err != nil {
+		t.Fatalf("OpenFile(2): %v", err)
+	}
+	waitForRecordKeys(t, spy, "unsuppressed")
+}
+
+// A client whose only new state in the epoch arrives through LockExisting must
+// still re-arm its durable row. LockExisting grants a fresh byte-range interval
+// onto a lock state a reclaim already rebuilt, so it never passes through
+// LockNew; a hook only on LockNew leaves ReclaimComplete set and the next
+// restart skips the client.
+func TestClientRecovery_LockExistingAfterReclaimRearmsTheRow(t *testing.T) {
+	spy := newSpyRecoveryStore()
+	verf := [8]byte{0xe2}
+	fh := []byte("fh")
+
+	sm := NewStateManager(5*time.Second, 30*time.Second)
+	sm.SetLockManager(lock.NewManager())
+	sm.SetClientRecoveryStore(spy, 1)
+	id := confirmV40(t, sm, "existing-locker", verf)
+	open, err := sm.OpenFile(id, []byte("owner"), 1, fh, 3, 0, types.CLAIM_NULL)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	// A first lock, so a lock state exists for the reclaim to rebuild.
+	if _, err := sm.LockNew(context.Background(), id, []byte("lock-owner"), 1,
+		&open.Stateid, 2, fh, types.WRITE_LT, 0, 100, false, id); err != nil {
+		t.Fatalf("LockNew: %v", err)
+	}
+	waitForRecordKeys(t, spy, "existing-locker")
+
+	// Restart. The client reclaims its open and its lock.
+	sm2 := NewStateManager(5*time.Second, 150*time.Millisecond)
+	sm2.SetLockManager(lock.NewManager())
+	sm2.SetClientRecoveryStore(spy, 2)
+	if n := sm2.LoadClientRecovery(context.Background(), true); n != 1 {
+		t.Fatalf("boot roster seeded %d clients, want 1", n)
+	}
+	back := confirmV40(t, sm2, "existing-locker", verf)
+	reopen, err := sm2.OpenFile(back, []byte("owner"), 1, fh, 3, 0, types.CLAIM_PREVIOUS)
+	if err != nil {
+		t.Fatalf("CLAIM_PREVIOUS reclaim: %v", err)
+	}
+	reLock, err := sm2.LockNew(context.Background(), back, []byte("lock-owner"), 1,
+		&reopen.Stateid, 2, fh, types.WRITE_LT, 0, 100, true, back)
+	if err != nil {
+		t.Fatalf("reclaiming LockNew: %v", err)
+	}
+	waitFor(t, "the reclaim must mark the row complete without rewriting it", func() bool {
+		spy.mu.Lock()
+		defer spy.mu.Unlock()
+		r := spy.records["existing-locker"]
+		return r != nil && r.ReclaimComplete && r.ServerEpoch == 1
+	})
+	waitFor(t, "grace did not lift", func() bool { return !sm2.IsInGrace() })
+
+	// A second byte range through the EXISTING lock-owner. No further OPEN and
+	// no LockNew: this is the client's first new state in epoch 2.
+	if _, err := sm2.LockExisting(context.Background(), &reLock.Stateid, 2,
+		fh, types.WRITE_LT, 200, 100, false, back); err != nil {
+		t.Fatalf("LockExisting: %v", err)
+	}
+	waitFor(t, "a LockExisting after a reclaim must re-arm the durable row", func() bool {
+		spy.mu.Lock()
+		defer spy.mu.Unlock()
+		r := spy.records["existing-locker"]
+		return r != nil && !r.ReclaimComplete && r.ServerEpoch == 2
+	})
+
+	sm3 := NewStateManager(5*time.Second, 30*time.Second)
+	sm3.SetClientRecoveryStore(spy, 3)
+	if n := sm3.LoadClientRecovery(context.Background(), true); n != 1 {
+		t.Fatalf("third boot seeded %d clients, want 1: the LockExisting holder must be waited on", n)
 	}
 }

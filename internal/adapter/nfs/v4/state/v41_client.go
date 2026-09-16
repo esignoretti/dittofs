@@ -438,8 +438,9 @@ func applyImplInfo(record *ClientRecord, clientImplId []types.NfsImplId4) {
 // Caller must hold sm.mu.
 func (sm *StateManager) purgeV41Client(record *ClientRecord) {
 	// Drop the durable recovery record: a purged client (eviction, DESTROY_CLIENTID,
-	// or reboot-replace) cannot reclaim under this identity. Best-effort; no-op when
-	// the client was never confirmed (no record was ever persisted) or no store wired.
+	// or reboot-replace) cannot reclaim under this identity. Best-effort; the
+	// delete is unconditional for a confirmed client because an incarnation that
+	// only reclaimed holds a row it did not itself write.
 	if record.Confirmed {
 		sm.deleteClientRecoveryLocked(v41RecoveryKey(record.OwnerID))
 	}

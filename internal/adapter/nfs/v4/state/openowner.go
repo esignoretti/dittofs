@@ -591,6 +591,13 @@ func (sm *StateManager) OpenFile(
 		sm.addOpenStateToFileLocked(openState)
 	}
 
+	// The client now holds state in this epoch that a later restart would let it
+	// reclaim, which is what puts it on the durable recovery roster. Both
+	// branches above reach here: the accumulate branch is how a write that
+	// failed on the first OPEN gets retried. Best-effort, and a no-op after the
+	// first success or on a reclaim.
+	sm.ensureClientRecoveryLocked(clientID, claimType == types.CLAIM_PREVIOUS)
+
 	// Determine rflags: OPEN4_RESULT_CONFIRM only if owner is not yet confirmed
 	var rflags uint32
 	rflags |= types.OPEN4_RESULT_LOCKTYPE_POSIX
