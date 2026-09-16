@@ -79,7 +79,7 @@ type CommitResponse struct {
 // Flushes cached unstable writes to stable storage for a file byte range.
 // Delegates to BlockStore.Flush and MetadataService.FlushPendingWriteForFile.
 // Triggers cache-to-store transfer; returns WCC data and server boot-time write verifier.
-// Errors: NFS3ErrNoEnt (file not found), NFS3ErrIsDir (directory handle),
+// Errors: NFS3ErrStale (handle does not resolve), NFS3ErrIsDir (directory handle),
 // NFS3ErrAccess / NFS3ErrRofs (no write permission on the file or its share),
 // NFS3ErrIO (flush failure).
 func (h *Handler) Commit(
@@ -117,8 +117,29 @@ func (h *Handler) Commit(
 
 	file, err := metaSvc.GetFileCached(ctx.Context, handle)
 	if err != nil {
-		logger.WarnCtx(ctx.Context, "COMMIT failed: file not found", "handle", xdr.LazyHandle(req.Handle), "client", clientIP, "error", err)
-		return &CommitResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrNoEnt}}, nil
+		// A context that died while the call was in flight is transient; only a
+		// handle the store genuinely cannot resolve is stale. Reporting the
+		// former as stale makes the client throw the handle away and revalidate
+		// the whole path for what was a cancelled request.
+		if ctx.Context.Err() != nil {
+			logger.DebugCtx(ctx.Context, "COMMIT cancelled during file lookup", "handle", xdr.LazyHandle(req.Handle), "client", clientIP, "error", ctx.Context.Err())
+			return &CommitResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrIO}}, nil
+		}
+		// Only a typed not-found/stale resolution is evidence the handle was
+		// revoked; a malformed handle owes BADHANDLE and a backend I/O fault
+		// owes IO, neither of which should make the client discard a valid
+		// handle.
+		switch {
+		case metadata.IsStaleHandleError(err), metadata.IsNotFoundError(err):
+			logger.WarnCtx(ctx.Context, "COMMIT failed: handle not found", "handle", xdr.LazyHandle(req.Handle), "client", clientIP, "error", err)
+			return &CommitResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrStale}}, nil
+		case metadata.IsInvalidHandleError(err):
+			logger.WarnCtx(ctx.Context, "COMMIT failed: malformed handle", "handle", xdr.LazyHandle(req.Handle), "client", clientIP, "error", err)
+			return &CommitResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrBadHandle}}, nil
+		default:
+			logger.WarnCtx(ctx.Context, "COMMIT failed: handle resolution error", "handle", xdr.LazyHandle(req.Handle), "client", clientIP, "error", err)
+			return &CommitResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrIO}}, nil
+		}
 	}
 
 	// Capture pre-operation attributes for WCC data

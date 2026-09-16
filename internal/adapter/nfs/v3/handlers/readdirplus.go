@@ -151,7 +151,8 @@ type DirPlusEntry struct {
 // Lists directory entries with full attributes and file handles, eliminating LOOKUP+GETATTR round trips.
 // Delegates to MetadataService.ReadDirectory and GetFile per entry; checks cookie verifier for staleness.
 // No side effects; read-only with periodic cancellation checks (every 50 entries) for large directories.
-// Errors: NFS3ErrNotDir, NFS3ErrBadCookie, NFS3ErrNotSupp (share-level disable), NFS3ErrIO.
+// Errors: NFS3ErrStale (handle does not resolve), NFS3ErrNotDir, NFS3ErrBadCookie,
+// NFS3ErrNotSupp (share-level disable), NFS3ErrIO.
 func (h *Handler) ReadDirPlus(
 	ctx *NFSHandlerContext,
 	req *ReadDirPlusRequest,
@@ -201,8 +202,29 @@ func (h *Handler) ReadDirPlus(
 
 	dirFile, err := metaSvc.GetFile(ctx.Context, dirHandle)
 	if err != nil {
-		logger.WarnCtx(ctx.Context, "READDIRPLUS failed: directory not found", "handle", fmt.Sprintf("%x", req.DirHandle), "client", clientIP, "error", err)
-		return &ReadDirPlusResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrNoEnt}}, nil
+		// A context that died while the call was in flight is transient; only a
+		// handle the store genuinely cannot resolve is stale. Reporting the
+		// former as stale makes the client throw the handle away and revalidate
+		// the whole path for what was a cancelled request.
+		if ctx.Context.Err() != nil {
+			logger.DebugCtx(ctx.Context, "READDIRPLUS cancelled during directory lookup", "handle", fmt.Sprintf("%x", req.DirHandle), "client", clientIP, "error", ctx.Context.Err())
+			return &ReadDirPlusResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrIO}}, nil
+		}
+		// Only a typed not-found/stale resolution is evidence the handle was
+		// revoked; a malformed handle owes BADHANDLE and a backend I/O fault
+		// owes IO, neither of which should make the client discard a valid
+		// handle.
+		switch {
+		case metadata.IsStaleHandleError(err), metadata.IsNotFoundError(err):
+			logger.WarnCtx(ctx.Context, "READDIRPLUS failed: handle not found", "handle", fmt.Sprintf("%x", req.DirHandle), "client", clientIP, "error", err)
+			return &ReadDirPlusResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrStale}}, nil
+		case metadata.IsInvalidHandleError(err):
+			logger.WarnCtx(ctx.Context, "READDIRPLUS failed: malformed handle", "handle", fmt.Sprintf("%x", req.DirHandle), "client", clientIP, "error", err)
+			return &ReadDirPlusResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrBadHandle}}, nil
+		default:
+			logger.WarnCtx(ctx.Context, "READDIRPLUS failed: handle resolution error", "handle", fmt.Sprintf("%x", req.DirHandle), "client", clientIP, "error", err)
+			return &ReadDirPlusResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrIO}}, nil
+		}
 	}
 
 	// Verify handle is actually a directory

@@ -236,6 +236,7 @@ func (h *Handler) SetAttr(
 	// with the SetFileAttributes mutation(s) (H9). For the two-phase size+other
 	// case, Before comes from the first (size) call and After from the second.
 	var setWcc *metadata.DirWcc
+	sizeApplied := false
 	if hasSize && hasOtherAttrs {
 		// Apply size change first (separate call per RFC 5661)
 		sizeOnlyAttrs := metadata.SetAttrs{Size: req.NewAttr.Size}
@@ -267,6 +268,8 @@ func (h *Handler) SetAttr(
 			}, nil
 		}
 
+		sizeApplied = true
+
 		// Now apply other attributes (without size)
 		otherAttrs := metadata.SetAttrs{
 			Mode:  req.NewAttr.Mode,
@@ -277,6 +280,17 @@ func (h *Handler) SetAttr(
 		}
 		var otherWcc *metadata.DirWcc
 		otherWcc, err = metaSvc.SetFileAttributes(authCtx, fileHandle, &otherAttrs)
+		if err != nil {
+			// The client is about to be told the whole SETATTR failed while the
+			// size change stands. The reply carries one status and one wcc_data
+			// pair (RFC 1813), so that cannot be said on the wire; the refetched
+			// AttrAfter below at least reports the new size.
+			logger.WarnCtx(ctx.Context, "SETATTR partially applied: size committed, remaining attributes rejected",
+				"handle", fmt.Sprintf("%x", req.Handle),
+				"size", *req.NewAttr.Size,
+				"client", clientIP,
+				"error", err)
+		}
 		// Before from the size call (true pre-op), After from the latest call.
 		setWcc = &metadata.DirWcc{}
 		if sizeWcc != nil {
@@ -288,7 +302,39 @@ func (h *Handler) SetAttr(
 	} else {
 		// Only size or only other attributes - single call is fine
 		setWcc, err = metaSvc.SetFileAttributes(authCtx, fileHandle, &req.NewAttr)
+		sizeApplied = hasSize && err == nil
 	}
+
+	// SetFileAttributes prunes FileAttr.Blocks + size, but the per-share block
+	// store still holds the dropped CAS chunks and physical tail bytes. Drive
+	// the shared reclaim with the PRE-truncate snapshot (currentFile, captured
+	// before SetFileAttributes ran) so the engine reaps RefCount on every
+	// dropped block (#832) and a later re-extend reads zeros, not stale data.
+	// No-ops unless a genuine shrink; best-effort (metadata already committed).
+	// Same helper as NFSv4 SETATTR / CREATE-truncate and SMB SetEndOfFile.
+	//
+	// Gated on sizeApplied rather than on overall success, and placed before the
+	// error branch below: the size phase commits on its own, so a later phase
+	// being rejected leaves the blocks past the new size orphaned all the same.
+	//
+	// decision: the reclaim is best-effort and its failure is only logged, so
+	// the client is told NFS3OK with the tail still live. That covers every way
+	// it can fail -- a dead request context, an unresolvable block store, a
+	// failing reap -- not just the cancellation case, and the cost is more than
+	// wasted space: the helper exists because a later re-extend over an
+	// un-reclaimed tail reads the discarded bytes back as file content instead
+	// of a hole. Detaching the context would close the cancellation case alone
+	// and trade it for block-store I/O that outlives the request while holding
+	// the store-close lock. Withdraw the exemption -- fail the SETATTR, or
+	// queue the reclaim for retry -- if a re-extend ever reads back stale tail
+	// bytes in practice rather than in principle.
+	if sizeApplied {
+		if rErr := common.ReclaimTruncatedBlocks(ctx.Context, h.Registry, fileHandle, currentFile, *req.NewAttr.Size); rErr != nil {
+			logger.WarnCtx(ctx.Context, "SETATTR: block store truncate reclaim failed",
+				"handle", fmt.Sprintf("%x", req.Handle), "size", *req.NewAttr.Size, "error", rErr)
+		}
+	}
+
 	if err != nil {
 		// Check if error is due to context cancellation
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -316,20 +362,6 @@ func (h *Handler) SetAttr(
 			AttrBefore:      wccBefore,
 			AttrAfter:       wccAfter,
 		}, nil
-	}
-
-	// SetFileAttributes prunes FileAttr.Blocks + size, but the per-share block
-	// store still holds the dropped CAS chunks and physical tail bytes. Drive
-	// the shared reclaim with the PRE-truncate snapshot (currentFile, captured
-	// before SetFileAttributes ran) so the engine reaps RefCount on every
-	// dropped block (#832) and a later re-extend reads zeros, not stale data.
-	// No-ops unless a genuine shrink; best-effort (metadata already committed).
-	// Same helper as NFSv4 SETATTR / CREATE-truncate and SMB SetEndOfFile.
-	if hasSize {
-		if rErr := common.ReclaimTruncatedBlocks(ctx.Context, h.Registry, fileHandle, currentFile, *req.NewAttr.Size); rErr != nil {
-			logger.WarnCtx(ctx.Context, "SETATTR: block store truncate reclaim failed",
-				"handle", fmt.Sprintf("%x", req.Handle), "size", *req.NewAttr.Size, "error", rErr)
-		}
 	}
 
 	// H9: prefer the file's pre/post attributes captured atomically with the

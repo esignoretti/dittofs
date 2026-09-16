@@ -70,7 +70,8 @@ type LookupResponse struct {
 // Resolves a filename in a directory to a file handle and attributes.
 // Delegates to MetadataService.Lookup which atomically checks permissions and finds the child.
 // No side effects; read-only, high-frequency path resolution operation.
-// Errors: NFS3ErrNoEnt (not found), NFS3ErrNotDir, NFS3ErrAcces, NFS3ErrIO.
+// Errors: NFS3ErrNoEnt (name not found), NFS3ErrStale (directory handle does not
+// resolve), NFS3ErrNotDir, NFS3ErrAcces, NFS3ErrIO.
 func (h *Handler) Lookup(
 	ctx *NFSHandlerContext,
 	req *LookupRequest,
@@ -122,13 +123,23 @@ func (h *Handler) Lookup(
 		return &LookupResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrIO}}, nil
 	}
 
-	dirFile, err := metaSvc.GetFile(ctx.Context, dirHandle)
-	if err != nil {
-		logger.WarnCtx(ctx.Context, "LOOKUP failed: directory not found",
-			"handle", fmt.Sprintf("%x", req.DirHandle),
-			"client", clientIP,
-			"error", err)
-		return &LookupResponse{NFSResponseBase: NFSResponseBase{Status: types.NFS3ErrNoEnt}}, nil
+	// decision: the cancellation error getFileOrError reports is deliberately
+	// not propagated, only its status. A non-nil error from a handler makes the
+	// RPC dispatcher discard the response and answer with the procedure's own
+	// fallback status, and LOOKUP's fallback is NFS3ErrAccess -- so returning
+	// the error here would turn a cancelled lookup into "permission denied" on
+	// the wire.
+	//
+	// This buys LOOKUP alone. GETATTR, SETATTR, READDIR and ACCESS propagate
+	// the same error and carry the same NFS3ErrAccess fallback, so a
+	// cancellation in flight still reaches their clients as a permission
+	// denial; REMOVE, RMDIR, LINK and RENAME propagate too but fall back to
+	// NFS3ErrIO, which is what the cancellation carries anyway. The fix that
+	// covers all of them is for the dispatcher to keep a non-nil response's own
+	// status, at which point this line can go back to propagating.
+	dirFile, status, _ := h.getFileOrError(ctx, dirHandle, "LOOKUP", req.DirHandle)
+	if dirFile == nil {
+		return &LookupResponse{NFSResponseBase: NFSResponseBase{Status: status}}, nil
 	}
 
 	// Verify parent is actually a directory
