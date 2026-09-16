@@ -917,6 +917,48 @@ func (r *Runtime) cancelAndWaitInFlightSnaps(shareName string) {
 // upper bound should pass context.WithTimeout(...); callers passing
 // context.Background block until full drain.
 func (r *Runtime) shutdownSnapshots(ctx context.Context) {
+	// Step 0: stop the scheduler that creates the work, and wait for a tick
+	// already in flight. It reads and writes snapshot policies through the
+	// control-plane store, so it has to be joined here rather than merely
+	// signalled — nothing else in the drain waits for it, and the caller
+	// closes that store once this returns.
+	//
+	// decision: the join is bounded by ctx, so on a shutdown whose deadline
+	// expires it returns with a tick still running and the caller closes the
+	// stores under it. The bound is deliberate — an unbounded join hands one
+	// wedged tick the power to stop the process from ever exiting — and the
+	// cost of losing the race is an error from a closed store, logged by the
+	// tick and discarded, on a process that is milliseconds from exit. What
+	// this must not do is claim the guarantee on that path, so it says which
+	// one happened. Withdraw the bound if a tick ever performs a write whose
+	// partial application outlives the process.
+	//
+	// decision: the scheduler join gets a budget of its own rather than sharing
+	// ctx with the goroutine drain below. Sharing one window means a tick stuck
+	// in a store call that ignores cancellation spends all of it, and the drain
+	// then sees an already-expired context and returns without waiting at all —
+	// so the hardest shutdown is the one that skips the drain entirely. Half the
+	// caller's remaining time, so the two joins together still respect the
+	// deadline the caller chose. Withdraw the split if the drain ever needs the
+	// whole window more than the scheduler needs any of it.
+	r.mu.RLock()
+	ss := r.snapSchedSvc
+	r.mu.RUnlock()
+	if ss != nil {
+		schedCtx := ctx
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining > 0 {
+				var cancel context.CancelFunc
+				schedCtx, cancel = context.WithTimeout(ctx, remaining/2)
+				defer cancel()
+			}
+		}
+		if !ss.StopContext(schedCtx) {
+			logger.Warn("snapshot drain: scheduler was not joined before the stores close; " +
+				"a tick may still be running against them")
+		}
+	}
+
 	// Step 1: cancel every child ctx derived from runtimeCtx. Idempotent:
 	// second call is a no-op.
 	if r.runtimeCancel != nil {

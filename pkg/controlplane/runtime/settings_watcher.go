@@ -45,8 +45,32 @@ type SettingsWatcher struct {
 	smbCallbacks []func(*models.SMBAdapterSettings)
 
 	pollInterval time.Duration
-	stopCh       chan struct{}
-	stopped      chan struct{} // closed when polling goroutine exits
+
+	// lifecycleMu guards stopCh and stopped, which Start replaces and Stop
+	// closes. Stop is reached from two shutdown paths that both bound their
+	// wait and keep running after it — the lifecycle drain and the runtime's
+	// startup drain — so an unsynchronized check-then-close here is two
+	// goroutines racing to close the same channel, which panics the process
+	// during the shutdown it was supposed to make orderly.
+	lifecycleMu sync.Mutex
+	stopCh      chan struct{}
+	stopped     chan struct{} // closed when polling goroutine exits
+	// cancelPoll aborts a poll already inside the control-plane store. Without
+	// it Stop can only stop WAITING for that poll, which is not the same as
+	// stopping it: the caller then closes the store under a query that is still
+	// running, which is the outcome the join exists to prevent.
+	cancelPoll context.CancelFunc
+	// retired is set by Stop and cleared by nothing: a watcher told to stop must
+	// not be startable again by a Start that was already in flight. Without it
+	// a Stop that wins the mutex returns on the constructor's already-closed
+	// `stopped`, and the Start behind it then launches a goroutine no caller
+	// holds a handle to.
+	retired bool
+	// running is set while a polling goroutine exists. A second Start used to
+	// replace the channel pair and leave the first goroutine listening on the
+	// old one, which Stop then never joined — a poller nothing could reach,
+	// still reading the control-plane store after shutdown.
+	running bool
 }
 
 // OnNFSSettingsChange registers a callback invoked whenever NFS settings change
@@ -75,6 +99,12 @@ func NewSettingsWatcher(s store.Store, pollInterval time.Duration) *SettingsWatc
 	// stopped starts already-closed so that Stop() called before Start()
 	// returns immediately instead of deadlocking on <-w.stopped (no goroutine
 	// would ever close it). Start() re-creates it as a fresh open channel.
+	//
+	// A watcher runs at most once. Start is a no-op once one is running or once
+	// Stop has been called, so there is no Start→Stop→Start cycle: reuse means a
+	// new watcher, not this one restarted. That is what lets Stop promise a join
+	// — a Stop that wins the race can prevent a launch behind it, which a
+	// restartable watcher cannot.
 	stopped := make(chan struct{})
 	close(stopped)
 	return &SettingsWatcher{
@@ -109,11 +139,41 @@ func (w *SettingsWatcher) LoadInitial(ctx context.Context) error {
 func (w *SettingsWatcher) Start(ctx context.Context) {
 	// Re-create the channels as fresh, open channels. stopped was created
 	// already-closed (so Stop-before-Start is safe); the goroutine below will
-	// close it on exit. Resetting stopCh allows a Start→Stop→Start→Stop cycle.
+	// close it on exit.
+	//
+	// One way only: a watcher that has been stopped stays stopped. The restart
+	// this used to allow had no caller — lifecycle.serve starts one watcher once
+	// — and supporting it is what makes a Stop that wins the mutex unable to
+	// prevent the launch behind it.
+	//
+	// Derived, so Stop can cancel the polls without disturbing the caller's
+	// context — which on a startup error is still very much alive.
+	pollCtx, cancelPoll := context.WithCancel(ctx)
+
+	w.lifecycleMu.Lock()
+	if w.retired || w.running {
+		// Either a Stop got here first — launching now produces a poller nothing
+		// can join, on a store the caller is about to close — or one is already
+		// polling, and replacing its channels would strand it the same way.
+		reason := "already running"
+		if w.retired {
+			reason = "already stopped"
+		}
+		w.lifecycleMu.Unlock()
+		cancelPoll()
+		logger.Debug("Settings watcher not started", "reason", reason)
+		return
+	}
+	w.running = true
 	w.stopped = make(chan struct{})
 	w.stopCh = make(chan struct{})
+	w.cancelPoll = cancelPoll
+	stopCh, stopped := w.stopCh, w.stopped
+	w.lifecycleMu.Unlock()
+
 	go func() {
-		defer close(w.stopped)
+		defer close(stopped)
+		defer cancelPoll()
 
 		ticker := time.NewTicker(w.pollInterval)
 		defer ticker.Stop()
@@ -122,14 +182,14 @@ func (w *SettingsWatcher) Start(ctx context.Context) {
 
 		for {
 			select {
-			case <-ctx.Done():
+			case <-pollCtx.Done():
 				logger.Debug("Settings watcher stopping (context cancelled)")
 				return
-			case <-w.stopCh:
+			case <-stopCh:
 				logger.Debug("Settings watcher stopping (stop signal)")
 				return
 			case <-ticker.C:
-				w.pollWithRecover(ctx)
+				w.pollWithRecover(pollCtx)
 			}
 		}
 	}()
@@ -137,15 +197,29 @@ func (w *SettingsWatcher) Start(ctx context.Context) {
 
 // Stop signals the polling goroutine to stop and waits for it to exit.
 func (w *SettingsWatcher) Stop() {
+	w.lifecycleMu.Lock()
+	w.retired = true
+	w.running = false
+	stopCh, stopped, cancelPoll := w.stopCh, w.stopped, w.cancelPoll
 	select {
-	case <-w.stopCh:
-		// Already stopped
-		return
+	case <-stopCh:
+		// Already signalled by an earlier Stop, which may still be waiting for
+		// the goroutine. Fall through to the same wait rather than returning:
+		// a caller that gets an immediate return believes it joined.
 	default:
-		close(w.stopCh)
+		close(stopCh)
 	}
-	// Wait for goroutine to exit
-	<-w.stopped
+	w.lifecycleMu.Unlock()
+
+	// Cancel before waiting. A poll already inside the store returns on a
+	// cancelled context, so the wait below is a join that completes rather than
+	// one a caller has to abandon — and abandoning it is what leaves the store
+	// closing under a live query.
+	if cancelPoll != nil {
+		cancelPoll()
+	}
+
+	<-stopped
 	logger.Debug("Settings watcher stopped")
 }
 
