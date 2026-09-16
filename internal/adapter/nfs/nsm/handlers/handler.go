@@ -7,6 +7,7 @@ import (
 
 	"github.com/marmos91/dittofs/internal/adapter/nfs/nsm/callback"
 	"github.com/marmos91/dittofs/internal/adapter/nfs/nsm/types"
+	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/metadata/lock"
 )
 
@@ -47,6 +48,11 @@ type Handler struct {
 	// tracker is the connection tracker for client registration.
 	// Used to track active clients and their NSM callback info.
 	tracker *lock.ConnectionTracker
+
+	// clientStoreMu guards clientStore, which the adapter may install after
+	// construction (a share whose metadata store can persist registrations can
+	// be added at any time) while SM_MON/SM_UNMON handlers read it.
+	clientStoreMu sync.RWMutex
 
 	// clientStore persists client registrations across server restarts.
 	// If nil, registrations are not persisted.
@@ -185,12 +191,49 @@ func (h *Handler) GetTracker() *lock.ConnectionTracker {
 	return h.tracker
 }
 
-// GetClientStore returns the client registration store.
+// GetClientStore returns the client registration store, or nil when no share
+// backed by a store that can persist registrations has been seen yet.
 //
 // This allows the NSM service to access persisted registrations
 // for crash recovery operations.
 func (h *Handler) GetClientStore() lock.ClientRegistrationStore {
+	h.clientStoreMu.RLock()
+	defer h.clientStoreMu.RUnlock()
 	return h.clientStore
+}
+
+// SetClientStore installs the store that persists client registrations.
+//
+// The adapter resolves the store from the shares it can see, and a server can
+// start with no share at all (or none whose metadata store can persist
+// registrations), so the store may only become available later. Until one is
+// installed every SM_MON registration lives in memory alone and is lost on
+// restart, which also costs the client its SM_NOTIFY after a reboot.
+//
+// Passing nil is a no-op: a store already in use is never withdrawn, because
+// the registrations it holds outlive the share that happened to supply it.
+//
+// Clients monitored before the store arrived are written to it here. Without
+// that they would stay memory-only for good, since SM_MON only persists on the
+// call that registers a client and the startup load has already run -- so the
+// very clients that registered during the window this method exists to close
+// would be the ones still missing from the next restart's SM_NOTIFY.
+func (h *Handler) SetClientStore(ctx context.Context, store lock.ClientRegistrationStore) {
+	if store == nil {
+		return
+	}
+
+	h.clientStoreMu.Lock()
+	h.clientStore = store
+	h.clientStoreMu.Unlock()
+
+	for _, reg := range h.tracker.GetNSMClients() {
+		persisted := lock.ToPersistedClientRegistration(reg, uint64(reg.SMState))
+		if err := store.PutClientRegistration(ctx, persisted); err != nil {
+			logger.Warn("NSM: could not persist an already-monitored client to the new store",
+				"client_id", reg.ClientID, "error", err)
+		}
+	}
 }
 
 // GetServerName returns the configured server hostname.

@@ -114,6 +114,7 @@ func (h *Handler) Lock(ctx *NLMHandlerContext, req *LockRequest) (*LockResponse,
 	// Call NLMService to acquire lock (cross-protocol lease checks happen at lock manager level)
 	result, err := h.nlmService.LockFileNLM(
 		ctx.Context,
+		ctx.Credentials(),
 		handle,
 		owner,
 		req.Lock.Offset,
@@ -132,6 +133,20 @@ func (h *Handler) Lock(ctx *NLMHandlerContext, req *LockRequest) (*LockResponse,
 			return &LockResponse{
 				Cookie: req.Cookie,
 				Status: types.NLM4DeniedGrace,
+			}, nil
+		}
+		// A permission refusal is an authorization outcome, not a server
+		// fault. NLM4_DENIED_NOLOCKS rather than NLM4_DENIED, so it matches
+		// what TEST must answer (whose DENIED arm needs a conflicting holder
+		// this has none of) and so the client reads it as terminal (ENOLCK)
+		// rather than as a conflict worth retrying (EAGAIN).
+		if metaerrors.IsAccessDeniedError(err) {
+			logger.Warn("NLM LOCK refused: permission",
+				"client", ctx.ClientAddr,
+				"owner", ownerID)
+			return &LockResponse{
+				Cookie: req.Cookie,
+				Status: types.NLM4DeniedNoLocks,
 			}, nil
 		}
 		// System error

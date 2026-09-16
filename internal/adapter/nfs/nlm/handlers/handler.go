@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 
+	"github.com/marmos91/dittofs/internal/adapter/nfs/auth"
 	"github.com/marmos91/dittofs/internal/adapter/nfs/nlm/blocking"
 	"github.com/marmos91/dittofs/pkg/metadata/lock"
 )
@@ -17,11 +18,13 @@ const DefaultBlockingQueueSize = 100
 // (which uses LockManager directly) and MetadataService (for backward compatibility).
 // It decouples NLM protocol handlers from the MetadataService concrete type.
 type NLMLockService interface {
-	// LockFileNLM acquires a lock for NLM protocol.
-	LockFileNLM(ctx context.Context, handle []byte, owner lock.LockOwner, offset, length uint64, exclusive bool, reclaim bool) (*lock.LockResult, error)
+	// LockFileNLM acquires a lock for NLM protocol. caller is what the client
+	// presented on the RPC; the implementation resolves it against the share
+	// and authorizes the lock.
+	LockFileNLM(ctx context.Context, caller auth.Credentials, handle []byte, owner lock.LockOwner, offset, length uint64, exclusive bool, reclaim bool) (*lock.LockResult, error)
 
 	// TestLockNLM tests if a lock could be granted without acquiring it.
-	TestLockNLM(ctx context.Context, handle []byte, owner lock.LockOwner, offset, length uint64, exclusive bool) (bool, *lock.UnifiedLockConflict, error)
+	TestLockNLM(ctx context.Context, caller auth.Credentials, handle []byte, owner lock.LockOwner, offset, length uint64, exclusive bool) (bool, *lock.UnifiedLockConflict, error)
 
 	// UnlockFileNLM releases a lock for NLM protocol.
 	UnlockFileNLM(ctx context.Context, handle []byte, ownerID string, offset, length uint64) error

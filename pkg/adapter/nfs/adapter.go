@@ -190,11 +190,22 @@ type NFSAdapter struct {
 	// exactly once and no waiter parks until adapter shutdown after a toggle.
 	udpStop context.CancelFunc
 
-	// nsmClientStore persists client registrations for crash recovery
-	nsmClientStore lock.ClientRegistrationStore
-
 	// blockingQueue manages pending NLM blocking lock requests
 	blockingQueue *blocking.BlockingQueue
+
+	// bgTasks tracks the detached NLM/NSM lock work the adapter spawns: the
+	// blocked-waiter drain fired from a byte-range release, and the startup
+	// SM_NOTIFY sweep. Both mutate per-share lock managers and the blocking
+	// queue outside any connection's lifetime, so Stop waits on them before
+	// returning and handing the metadata service back to be torn down.
+	bgTasks sync.WaitGroup
+
+	// bgTasksMu and bgTasksClosed make the hand-off to Stop safe: a WaitGroup
+	// may not take a positive delta once Wait is running on a zero counter, and
+	// the spawners run on connection goroutines Stop is concurrent with. Past
+	// the flag a task is dropped rather than started behind the wait.
+	bgTasksMu     sync.Mutex
+	bgTasksClosed bool
 
 	// nextConnID is a global atomic counter for assigning unique connection IDs.
 	// Incremented at TCP accept() time and passed to each NFSConnection.
@@ -691,7 +702,7 @@ func (s *NFSAdapter) SetRuntime(rtAny any) {
 	// stamp it onto lock managers already created at boot (shares loaded before
 	// this adapter existed), mirroring the grace-coordinator catch-up below.
 	byteRangeReleaseHook := func(handleKey string) {
-		go s.processNLMWaiters(metadata.FileHandle(handleKey))
+		s.goTracked(func() { s.processNLMWaiters(metadata.FileHandle(handleKey)) })
 	}
 	metadataService.SetByteRangeReleaseHook(byteRangeReleaseHook)
 	for _, shareName := range rt.ListShares() {
@@ -823,6 +834,10 @@ func (s *NFSAdapter) SetRuntime(rtAny any) {
 // Thread safety:
 // Serve() should only be called once per NFSAdapter instance.
 func (s *NFSAdapter) Serve(ctx context.Context) error {
+	// A previous Stop latched the background-task group shut; reopen it so a
+	// restarted adapter still drains blocked NLM waiters.
+	s.reopenBackgroundTasks()
+
 	logger.Debug("NFS config", "max_connections", s.config.MaxConnections, "read_timeout", s.config.Timeouts.Read, "write_timeout", s.config.Timeouts.Write, "idle_timeout", s.config.Timeouts.Idle)
 
 	// Build the server TLS config (loads + parses the cert files now, so a bad

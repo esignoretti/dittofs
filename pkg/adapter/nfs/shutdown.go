@@ -64,5 +64,64 @@ func (s *NFSAdapter) Stop(ctx context.Context) error {
 
 	// Delegate to BaseAdapter for shared shutdown (listener close, context cancel,
 	// connection wait, force-close)
-	return s.BaseAdapter.Stop(ctx)
+	err := s.BaseAdapter.Stop(ctx)
+
+	// Only now is ShutdownCtx cancelled, so the tracked NLM/NSM tasks abandon
+	// their in-flight callbacks and drain promptly. Waiting here rather than
+	// earlier keeps the wait bounded, and it still happens before Stop returns
+	// and the caller releases the metadata service and per-share lock managers
+	// those tasks mutate.
+	s.waitForBackgroundTasks(ctx)
+
+	return err
+}
+
+// goTracked runs fn in a goroutine the adapter can wait for in Stop, and drops
+// it when shutdown has already begun.
+//
+// The work it carries -- draining blocked NLM waiters, the startup SM_NOTIFY
+// sweep -- outlives the request that triggers it and touches lock-manager state
+// the adapter is about to release, so it must not run detached.
+func (s *NFSAdapter) goTracked(fn func()) {
+	s.bgTasksMu.Lock()
+	defer s.bgTasksMu.Unlock()
+	if s.bgTasksClosed {
+		return
+	}
+	s.bgTasks.Go(fn)
+}
+
+// waitForBackgroundTasks closes the adapter to new tracked tasks and waits for
+// the ones already running, up to the deadline on ctx. Stop may be called more
+// than once; closing is idempotent and the second wait returns immediately.
+//
+// The tasks are bounded on their own -- each runs on ShutdownCtx, cancelled by
+// the time this is called -- but Stop was handed a deadline and must not
+// overrun it waiting on something slow to notice.
+func (s *NFSAdapter) waitForBackgroundTasks(ctx context.Context) {
+	s.bgTasksMu.Lock()
+	s.bgTasksClosed = true
+	s.bgTasksMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.bgTasks.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		logger.Warn("NFS shutdown deadline reached with NLM/NSM background tasks still running")
+	}
+}
+
+// reopenBackgroundTasks lets a stopped adapter track tasks again. Production
+// builds a fresh adapter per start, but an adapter registered directly and
+// restarted would otherwise stay latched shut and silently drop every
+// blocked-waiter drain for the rest of its life.
+func (s *NFSAdapter) reopenBackgroundTasks() {
+	s.bgTasksMu.Lock()
+	s.bgTasksClosed = false
+	s.bgTasksMu.Unlock()
 }

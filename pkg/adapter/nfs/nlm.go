@@ -2,9 +2,12 @@ package nfs
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"os"
+	"slices"
 
+	"github.com/marmos91/dittofs/internal/adapter/nfs/auth"
 	"github.com/marmos91/dittofs/internal/adapter/nfs/nlm/blocking"
 	"github.com/marmos91/dittofs/internal/adapter/nfs/nlm/callback"
 	"github.com/marmos91/dittofs/internal/adapter/nfs/nsm"
@@ -21,25 +24,29 @@ import (
 	"github.com/marmos91/dittofs/pkg/metadata/lock"
 )
 
-// fileChecker provides file existence checking without importing pkg/metadata.
-// This avoids an import cycle between the NFS adapter and the metadata package.
-type fileChecker interface {
-	GetFile(ctx context.Context, handle []byte) (exists bool, isDir bool, err error)
+// lockAccessChecker authorizes a byte-range lock without the NLM service
+// importing the metadata service directly.
+type lockAccessChecker interface {
+	// CheckLockAccess reports whether authCtx's identity may take or test an
+	// advisory byte-range lock on the file the handle names. It covers
+	// existence too: a handle naming nothing yields a not-found StoreError.
+	// See metadata.CheckByteRangeLockAccess for the rule.
+	CheckLockAccess(authCtx *metadata.AuthContext, handle []byte) error
 }
 
 // nlmService provides NLM-specific lock operations using LockManager directly.
 //
-// Wraps a single share's lock.Manager and a fileChecker for validating file
-// existence before lock operations.
+// Wraps a single share's lock.Manager and a lockAccessChecker that authorizes
+// each lock operation.
 //
 // Thread Safety: Safe for concurrent use (delegates to thread-safe Manager).
 type nlmService struct {
 	lockMgr     *lock.Manager
-	fileChecker fileChecker
+	fileChecker lockAccessChecker
 	onUnlock    func(handle []byte)
 }
 
-func newNLMService(lockMgr *lock.Manager, fc fileChecker) *nlmService {
+func newNLMService(lockMgr *lock.Manager, fc lockAccessChecker) *nlmService {
 	return &nlmService{
 		lockMgr:     lockMgr,
 		fileChecker: fc,
@@ -53,27 +60,13 @@ func lockTypeFromExclusive(exclusive bool) lock.LockType {
 	return lock.LockTypeShared
 }
 
-func (s *nlmService) checkFileExists(ctx context.Context, handle []byte) error {
-	exists, _, err := s.fileChecker.GetFile(ctx, handle)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return &errors.StoreError{
-			Code:    errors.ErrNotFound,
-			Message: "file not found",
-			Path:    string(handle),
-		}
-	}
-	return nil
-}
-
 func (s *nlmService) SetUnlockCallback(fn func(handle []byte)) {
 	s.onUnlock = fn
 }
 
 func (s *nlmService) LockFileNLM(
 	ctx context.Context,
+	authCtx *metadata.AuthContext,
 	handle []byte,
 	owner lock.LockOwner,
 	offset, length uint64,
@@ -84,7 +77,7 @@ func (s *nlmService) LockFileNLM(
 		return nil, err
 	}
 
-	if err := s.checkFileExists(ctx, handle); err != nil {
+	if err := s.fileChecker.CheckLockAccess(authCtx, handle); err != nil {
 		return nil, err
 	}
 
@@ -156,6 +149,7 @@ func (s *nlmService) LockFileNLM(
 
 func (s *nlmService) TestLockNLM(
 	ctx context.Context,
+	authCtx *metadata.AuthContext,
 	handle []byte,
 	owner lock.LockOwner,
 	offset, length uint64,
@@ -165,7 +159,7 @@ func (s *nlmService) TestLockNLM(
 		return false, nil, err
 	}
 
-	if err := s.checkFileExists(ctx, handle); err != nil {
+	if err := s.fileChecker.CheckLockAccess(authCtx, handle); err != nil {
 		return false, nil, err
 	}
 
@@ -180,6 +174,13 @@ func (s *nlmService) TestLockNLM(
 	return true, nil, nil
 }
 
+// decision: UNLOCK is deliberately not gated on lock access, unlike LOCK and
+// TEST. It can only release a lock the same owner ID already holds, which the
+// gate admitted, and the caller_name binding in the handler already refuses a
+// release from a host other than the one that took it. Gating it would only add
+// a way to strand a lock forever when a file's mode changes under a client that
+// still holds it. Revisit if an owner ID ever becomes forgeable from a host
+// that passes the binding check.
 func (s *nlmService) UnlockFileNLM(
 	ctx context.Context,
 	handle []byte,
@@ -215,18 +216,17 @@ func (s *nlmService) CancelBlockingLock(
 	return nil
 }
 
-// metadataFileChecker adapts MetadataService to the fileChecker interface,
+// metadataFileChecker adapts MetadataService to the lockAccessChecker interface,
 // avoiding import cycles with the metadata package.
 type metadataFileChecker struct {
 	metaSvc *metadata.Service
 }
 
-func (c *metadataFileChecker) GetFile(ctx context.Context, handle []byte) (bool, bool, error) {
-	file, err := c.metaSvc.GetFile(ctx, metadata.FileHandle(handle))
-	if err != nil {
-		return false, false, err
-	}
-	return true, file.Type == metadata.FileTypeDirectory, nil
+// CheckLockAccess defers the policy to the metadata layer, so the lock gate
+// reads the same mode bits, ACL and read-only ceilings as every other operation
+// on the file.
+func (c *metadataFileChecker) CheckLockAccess(authCtx *metadata.AuthContext, handle []byte) error {
+	return c.metaSvc.CheckByteRangeLockAccess(authCtx, metadata.FileHandle(handle))
 }
 
 // createRoutingNLMService creates a routingNLMService that routes NLM operations
@@ -237,11 +237,12 @@ func (s *NFSAdapter) createRoutingNLMService(metaSvc *metadata.Service) *routing
 	nlmSvc := &routingNLMService{
 		metaSvc:     metaSvc,
 		fileChecker: checker,
+		rt:          s.Registry,
 	}
 
 	// Set the unlock callback
 	nlmSvc.SetUnlockCallback(func(handle []byte) {
-		go s.processNLMWaiters(metadata.FileHandle(handle))
+		s.goTracked(func() { s.processNLMWaiters(metadata.FileHandle(handle)) })
 	})
 
 	return nlmSvc
@@ -250,8 +251,59 @@ func (s *NFSAdapter) createRoutingNLMService(metaSvc *metadata.Service) *routing
 // routingNLMService routes NLM operations to the correct per-share lock manager.
 type routingNLMService struct {
 	metaSvc     *metadata.Service
-	fileChecker fileChecker
+	fileChecker lockAccessChecker
 	onUnlock    func(handle []byte)
+
+	// rt resolves the share's identity and squash policy for the lock gate. Nil
+	// only in tests that drive a per-share service directly.
+	rt *runtime.Runtime
+}
+
+// resolve turns the credentials the NLM client presented into the effective
+// identity for the share, through the same builder every NFSv3 operation on
+// that share uses.
+//
+// It is the same code, not an equivalent one, on purpose. Two builders let the
+// two gates disagree about one user on one file: a user whose read access comes
+// through a named or SID ACE resolves to a principal on the read path, and
+// would resolve to a bare uid here -- so the read succeeds and the lock on the
+// file just read is refused. That is diagnosed as "NLM is broken", not as an
+// authorization gap.
+//
+// It also applies the export squash policy, without which the gate is close to
+// inert: AUTH_SYS credentials are whatever the client says, and an unmapped
+// uid 0 takes the root bypass inside the permission check.
+//
+// decision: a share whose policy will not resolve authorizes as no identity
+// rather than passing the presented credentials through. The failure means the
+// share is gone or mid-reconfiguration; the caller then gets the file's world
+// permissions only, which is the direction that cannot grant a lock the policy
+// would have refused. A share-level denial is returned as-is, so the caller
+// learns it cannot use the share at all rather than being quietly demoted.
+func (s *routingNLMService) resolve(ctx context.Context, shareName string, caller auth.Credentials) (*metadata.AuthContext, error) {
+	anonymous := &metadata.AuthContext{
+		Context:    ctx,
+		ClientAddr: caller.ClientAddr,
+		AuthMethod: "anonymous",
+		Identity:   &metadata.Identity{},
+	}
+	if s.rt == nil {
+		return anonymous, nil
+	}
+
+	authCtx, err := auth.BuildAuthContext(ctx, s.rt, shareName, caller)
+	if err != nil {
+		if stderrors.Is(err, auth.ErrShareAccessDenied) {
+			return nil, &errors.StoreError{
+				Code:    errors.ErrAccessDenied,
+				Message: "share access denied",
+			}
+		}
+		logger.Warn("NLM: cannot resolve share identity policy; authorizing lock as anonymous",
+			"share", shareName, "error", err)
+		return anonymous, nil
+	}
+	return authCtx, nil
 }
 
 // SetUnlockCallback sets the unlock notification callback.
@@ -262,32 +314,42 @@ func (s *routingNLMService) SetUnlockCallback(fn func(handle []byte)) {
 // LockFileNLM acquires a lock for NLM protocol, routing to the correct share's lock manager.
 func (s *routingNLMService) LockFileNLM(
 	ctx context.Context,
+	caller auth.Credentials,
 	handle []byte,
 	owner lock.LockOwner,
 	offset, length uint64,
 	exclusive bool,
 	reclaim bool,
 ) (*lock.LockResult, error) {
-	svc, err := s.serviceForHandle(handle)
+	svc, shareName, err := s.serviceForHandle(handle)
 	if err != nil {
 		return nil, err
 	}
-	return svc.LockFileNLM(ctx, handle, owner, offset, length, exclusive, reclaim)
+	authCtx, err := s.resolve(ctx, shareName, caller)
+	if err != nil {
+		return nil, err
+	}
+	return svc.LockFileNLM(ctx, authCtx, handle, owner, offset, length, exclusive, reclaim)
 }
 
 // TestLockNLM tests if a lock could be granted, routing to the correct share's lock manager.
 func (s *routingNLMService) TestLockNLM(
 	ctx context.Context,
+	caller auth.Credentials,
 	handle []byte,
 	owner lock.LockOwner,
 	offset, length uint64,
 	exclusive bool,
 ) (bool, *lock.UnifiedLockConflict, error) {
-	svc, err := s.serviceForHandle(handle)
+	svc, shareName, err := s.serviceForHandle(handle)
 	if err != nil {
 		return false, nil, err
 	}
-	return svc.TestLockNLM(ctx, handle, owner, offset, length, exclusive)
+	authCtx, err := s.resolve(ctx, shareName, caller)
+	if err != nil {
+		return false, nil, err
+	}
+	return svc.TestLockNLM(ctx, authCtx, handle, owner, offset, length, exclusive)
 }
 
 // UnlockFileNLM releases a lock, routing to the correct share's lock manager.
@@ -297,7 +359,7 @@ func (s *routingNLMService) UnlockFileNLM(
 	ownerID string,
 	offset, length uint64,
 ) error {
-	svc, err := s.serviceForHandle(handle)
+	svc, _, err := s.serviceForHandle(handle)
 	if err != nil {
 		// No lock manager for the share = no locks held = success per NLM spec.
 		// But propagate decode/validation errors for malformed handles.
@@ -323,20 +385,22 @@ func (s *routingNLMService) CancelBlockingLock(
 	return nil // Blocking queue handles cancellation directly
 }
 
-func (s *routingNLMService) serviceForHandle(handle []byte) (*nlmService, error) {
+// serviceForHandle returns the lock service for the handle's share, along with
+// the share name, which the caller needs to resolve that share's squash policy.
+func (s *routingNLMService) serviceForHandle(handle []byte) (*nlmService, string, error) {
 	shareName, _, err := metadata.DecodeFileHandle(metadata.FileHandle(handle))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	lm := s.metaSvc.GetLockManagerForShare(shareName)
 	if lm == nil {
-		return nil, fmt.Errorf("no lock manager for share %q", shareName)
+		return nil, shareName, fmt.Errorf("no lock manager for share %q", shareName)
 	}
 
 	svc := newNLMService(lm, s.fileChecker)
 	svc.SetUnlockCallback(s.onUnlock)
-	return svc, nil
+	return svc, shareName, nil
 }
 
 // processNLMWaiters processes pending NLM lock requests after a lock is released.
@@ -392,6 +456,13 @@ func (s *NFSAdapter) processNLMWaiters(handle metadata.FileHandle) {
 			lockType,
 		)
 
+		// decision: the grant is not re-gated on lock access. The waiter was
+		// only queued because its LOCK passed the gate, and re-checking here
+		// would deny a lock the client was already told was pending -- with no
+		// NLM status to say so, since the request has already been answered
+		// NLM4_BLOCKED. The exposure is a permission revoked while a blocking
+		// request waits; withdraw this if a revocation is ever required to take
+		// effect on already-queued waiters, which means draining them instead.
 		err := lm.AddUnifiedLock(handleKey, enhancedLock)
 		if err != nil {
 			// Lock still conflicts - try next waiter
@@ -400,8 +471,13 @@ func (s *NFSAdapter) processNLMWaiters(handle metadata.FileHandle) {
 			continue
 		}
 
-		// Lock acquired - update waiter's lock reference
-		waiter.Lock = enhancedLock
+		// The waiter's own Lock is deliberately NOT repointed at enhancedLock.
+		// A queued waiter is shared with the blocking queue, which reads its
+		// identity fields under bq.mu, and this goroutine holds no such lock --
+		// the swap was an unsynchronized write to a struct another goroutine
+		// reads. Nothing needs it: enhancedLock differs only in carrying the
+		// lock type, and the grant callback reads owner, handle, range and
+		// Exclusive, which are identical in both.
 
 		// Send GRANTED callback
 		// ProcessGrantedCallback releases the lock on failure
@@ -449,20 +525,7 @@ func (s *NFSAdapter) initNSMHandler(rt *runtime.Runtime, metadataService *metada
 
 	// Try to get a client registration store from any share's metadata store
 	// Note: In a multi-store setup, we pick the first available store with ClientRegistrationStore
-	var clientStore lock.ClientRegistrationStore
-	shares := rt.ListShares()
-	for _, shareName := range shares {
-		store, err := rt.GetMetadataStoreForShare(shareName)
-		if err != nil {
-			continue
-		}
-		// Check if the store implements ClientRegistrationStore
-		if crs, ok := store.(lock.ClientRegistrationStore); ok {
-			clientStore = crs
-			break
-		}
-	}
-	s.nsmClientStore = clientStore
+	clientStore := resolveClientRegistrationStore(rt)
 
 	// Get server hostname for NSM callbacks
 	serverName, err := os.Hostname()
@@ -502,9 +565,49 @@ func (s *NFSAdapter) initNSMHandler(rt *runtime.Runtime, metadataService *metada
 		OnClientCrash: onClientCrash,
 	})
 
+	// A share supplying a registration store can be added at any time after
+	// startup; see SetClientStore for what is lost until one is. The scan stops
+	// once a store is installed, so a later share never displaces the
+	// registrations the first one already holds.
+	if clientStore == nil {
+		unsubNSMStore := rt.OnShareChange(func([]string) {
+			if s.nsmHandler.GetClientStore() != nil {
+				return
+			}
+			if found := resolveClientRegistrationStore(rt); found != nil {
+				s.nsmHandler.SetClientStore(context.Background(), found)
+				logger.Info("NSM client registration store resolved from a share added after startup")
+			}
+		})
+		s.shareUnsubscribers = append(s.shareUnsubscribers, unsubNSMStore)
+	}
+
 	logger.Debug("NSM handler and notifier initialized",
 		"server_name", serverName,
 		"has_client_store", clientStore != nil)
+}
+
+// resolveClientRegistrationStore returns a share-backed metadata store that can
+// persist NSM client registrations, or nil when no share has one.
+//
+// The registration list is server-wide, not per-share, so it only needs one
+// home -- but which one must not vary between boots. rt.ListShares ranges a
+// map, so without the sort two eligible stores would take turns owning the
+// list and each restart would read its SM_NOTIFY targets back from whichever
+// store did not receive them.
+func resolveClientRegistrationStore(rt *runtime.Runtime) lock.ClientRegistrationStore {
+	shareNames := rt.ListShares()
+	slices.Sort(shareNames)
+	for _, shareName := range shareNames {
+		store, err := rt.GetMetadataStoreForShare(shareName)
+		if err != nil {
+			continue
+		}
+		if crs, ok := store.(lock.ClientRegistrationStore); ok {
+			return crs
+		}
+	}
+	return nil
 }
 
 // handleClientCrash releases all locks held by a crashed client across all shares.
@@ -625,7 +728,7 @@ func (s *NFSAdapter) performNSMStartup(ctx context.Context) {
 	}
 
 	// Load persisted registrations from store
-	if err := s.nsmNotifier.LoadRegistrationsFromStore(ctx, s.nsmClientStore); err != nil {
+	if err := s.nsmNotifier.LoadRegistrationsFromStore(ctx, s.nsmHandler.GetClientStore()); err != nil {
 		logger.Warn("NSM: failed to load persisted registrations", "error", err)
 		// Continue anyway - registrations will be re-established
 	}
@@ -636,8 +739,11 @@ func (s *NFSAdapter) performNSMStartup(ctx context.Context) {
 
 	// Send SM_NOTIFY to all registered clients in background
 	// Per CONTEXT.md: Parallel notification for fastest recovery
-	go func() {
-		results := s.nsmNotifier.NotifyAllClients(ctx)
+	// The sweep dials every registered client, so it runs on ShutdownCtx rather
+	// than the Serve context: the Serve context is only cancelled after Stop
+	// returns, which would make Stop's wait for this task block on live dials.
+	s.goTracked(func() {
+		results := s.nsmNotifier.NotifyAllClients(s.ShutdownCtx)
 
 		// Count successes and failures
 		successCount := 0
@@ -656,7 +762,7 @@ func (s *NFSAdapter) performNSMStartup(ctx context.Context) {
 				"success", successCount,
 				"failed", failedCount)
 		}
-	}()
+	})
 }
 
 // initGSSProcessor initializes the RPCSEC_GSS processor if Kerberos is configured.

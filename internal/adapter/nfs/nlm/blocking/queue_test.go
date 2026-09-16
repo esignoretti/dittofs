@@ -100,3 +100,113 @@ func TestBlockingQueue_RemoveClientWaiters_NoMatchIsSafe(t *testing.T) {
 		t.Fatalf("want 0 removed on empty queue, got %d", removed)
 	}
 }
+
+func TestBlockingQueue_EnqueueDedupesRetransmit(t *testing.T) {
+	t.Parallel()
+
+	bq := NewBlockingQueue(100)
+
+	first := newWaiter("clientA", "nlm:clientA:1:aa", 0)
+	first.Cookie = []byte{1}
+	if err := bq.Enqueue("file1", first); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same blocking LOCK arrives again (lost reply / UDP retransmit): same
+	// owner, same range, different cookie and callback host.
+	retry := newWaiter("clientA", "nlm:clientA:1:aa", 0)
+	retry.Cookie = []byte{2}
+	retry.CallbackHost = "10.0.0.99"
+	if err := bq.Enqueue("file1", retry); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := bq.TotalWaiters(); got != 1 {
+		t.Fatalf("retransmitted LOCK queued a duplicate waiter: want 1, got %d", got)
+	}
+
+	waiters := bq.GetWaiters("file1")
+	if len(waiters) != 1 || waiters[0] != first {
+		t.Fatalf("want the original waiter retained, got %+v", waiters)
+	}
+	// The queued waiter is handed to the grant path by pointer and read there
+	// without the queue lock, and its callback target is pinned by the
+	// caller_name binding; a retransmit must not rewrite either.
+	if string(waiters[0].Cookie) != string(first.Cookie) {
+		t.Fatalf("retransmit rewrote the queued waiter's cookie: got %v", waiters[0].Cookie)
+	}
+	if waiters[0].CallbackHost != "" {
+		t.Fatalf("retransmit redirected the queued waiter's callback host to %q", waiters[0].CallbackHost)
+	}
+
+	// One CANCEL must leave nothing behind.
+	if !bq.Cancel("file1", "nlm:clientA:1:aa", 0, 10) {
+		t.Fatal("CANCEL did not find the waiter")
+	}
+	if got := bq.TotalWaiters(); got != 0 {
+		t.Fatalf("CANCEL left %d stale waiter(s) queued", got)
+	}
+}
+
+func TestBlockingQueue_EnqueueKeepsDistinctRanges(t *testing.T) {
+	t.Parallel()
+
+	bq := NewBlockingQueue(100)
+
+	if err := bq.Enqueue("file1", newWaiter("clientA", "nlm:clientA:1:aa", 0)); err != nil {
+		t.Fatal(err)
+	}
+	// Same owner, different range: a genuinely distinct request.
+	if err := bq.Enqueue("file1", newWaiter("clientA", "nlm:clientA:1:aa", 100)); err != nil {
+		t.Fatal(err)
+	}
+	// Different owner, same range.
+	if err := bq.Enqueue("file1", newWaiter("clientB", "nlm:clientB:1:cc", 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := bq.TotalWaiters(); got != 3 {
+		t.Fatalf("want 3 distinct waiters, got %d", got)
+	}
+}
+
+// TestBlockingQueue_EnqueueKeepsDistinctLockTypes: a shared and an exclusive
+// request over one range from one owner are different requests. Collapsing them
+// answers the second NLM4_BLOCKED and then grants it the wrong lock type -- a
+// GRANTED the client rejects, over a lock the server keeps holding.
+func TestBlockingQueue_EnqueueKeepsDistinctLockTypes(t *testing.T) {
+	t.Parallel()
+
+	bq := NewBlockingQueue(100)
+
+	shared := newWaiter("clientA", "nlm:clientA:1:aa", 0)
+	shared.Exclusive = false
+	if err := bq.Enqueue("file1", shared); err != nil {
+		t.Fatal(err)
+	}
+
+	exclusive := newWaiter("clientA", "nlm:clientA:1:aa", 0)
+	exclusive.Exclusive = true
+	if err := bq.Enqueue("file1", exclusive); err != nil {
+		t.Fatal(err)
+	}
+
+	waiters := bq.GetWaiters("file1")
+	if len(waiters) != 2 {
+		t.Fatalf("an exclusive request was swallowed by a queued shared one: want 2 waiters, got %d", len(waiters))
+	}
+	if waiters[0].Exclusive || !waiters[1].Exclusive {
+		t.Fatalf("want the shared request first and the exclusive second, got %v/%v",
+			waiters[0].Exclusive, waiters[1].Exclusive)
+	}
+
+	// The retransmit of each is still deduped.
+	retryShared := newWaiter("clientA", "nlm:clientA:1:aa", 0)
+	retryShared.Exclusive = false
+	if err := bq.Enqueue("file1", retryShared); err != nil {
+		t.Fatal(err)
+	}
+	if got := bq.TotalWaiters(); got != 2 {
+		t.Fatalf("retransmitted shared LOCK queued a duplicate: want 2, got %d", got)
+	}
+}

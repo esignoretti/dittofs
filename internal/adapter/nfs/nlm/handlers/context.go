@@ -5,7 +5,11 @@
 // handlers for NLM v4 procedures.
 package handlers
 
-import "context"
+import (
+	"context"
+
+	"github.com/marmos91/dittofs/internal/adapter/nfs/auth"
+)
 
 // NLMHandlerContext contains context for NLM procedure handlers.
 //
@@ -47,4 +51,21 @@ type NLMHandlerContext struct {
 	// Some procedures (like FREE_ALL) need to decode request data directly
 	// rather than receiving pre-decoded structures.
 	Data []byte
+}
+
+// Credentials returns what the client presented on the RPC, for the lock
+// service to resolve into the share's effective identity. A nil UID means the
+// call carried no credentials (AUTH_NULL, or an AUTH_UNIX credential that did
+// not parse).
+//
+// Deliberately NOT an identity: these are unresolved, unsquashed and
+// client-supplied, and authorizing against them directly is what let a client
+// claiming uid 0 take the root bypass.
+func (c *NLMHandlerContext) Credentials() auth.Credentials {
+	return auth.Credentials{
+		UID:        c.UID,
+		GID:        c.GID,
+		GIDs:       c.GIDs,
+		ClientAddr: c.ClientAddr,
+	}
 }

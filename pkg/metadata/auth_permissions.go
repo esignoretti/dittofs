@@ -1197,3 +1197,56 @@ func buildEvalContext(ownerUID, ownerGID uint32, identity *Identity) *acl.Evalua
 
 	return evalCtx
 }
+
+// CheckByteRangeLockAccess gates an advisory byte-range lock (NLM LOCK/TEST)
+// on the file the handle names.
+//
+// decision: a lock is granted on read access OR ownership, and a write lock
+// asks for no more than a read lock does. This is knfsd's rule, not a
+// derivation from first principles: nfsd_permission (fs/nfsd/vfs.c) turns
+// NFSD_MAY_LOCK into NFSD_MAY_READ | NFSD_MAY_OWNER_OVERRIDE, so lockd grants a
+// write lock to anyone who may read the file, and to the owner whatever the
+// mode bits say. It holds because real clients are built against knfsd:
+// requiring write access for a write lock would refuse the lock-then-write
+// sequence applications run on a read-opened descriptor, which works
+// everywhere else. What it still refuses is a caller with no access at all --
+// a mode 0600 file belonging to someone else -- which is the case that
+// motivated the gate. Withdraw the parity argument only if a client is found
+// that expects DittoFS to be stricter than the server it was written for.
+//
+// ctx.Identity must already be the share's effective identity: the AUTH_SYS
+// uid a client sends is whatever it chooses, and uid 0 takes the root bypass
+// inside the permission check, so a caller reaching here unsquashed is barely
+// gated at all. The NLM path squashes in routingNLMService.squash.
+//
+// Known ceiling: that identity carries uid and gids only, not the resolved
+// principal NFSv3 builds in BuildAuthContextWithMapping. A file whose ACL
+// grants read through a named or SID ACE rather than through OWNER@/GROUP@/
+// EVERYONE@ or the mode bits therefore evaluates as that bare uid, and a user
+// who can read it over NFSv3 can be refused the lock. Narrow this when NLM
+// gains the full per-share auth context; until then it fails closed, which is
+// the direction to be wrong in for a gate.
+//
+// Returns nil when the lock may proceed, a not-found StoreError when the handle
+// names nothing, and ErrAccessDenied otherwise.
+func (s *Service) CheckByteRangeLockAccess(ctx *AuthContext, handle FileHandle) error {
+	store, err := s.storeForHandle(handle)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Context.Err(); err != nil {
+		return err
+	}
+	file, err := store.GetFile(ctx.Context, handle)
+	if err != nil {
+		return err
+	}
+
+	// The owner override: ownership alone suffices, so a file whose mode denies
+	// its own owner is still lockable by them.
+	if ctx.Identity != nil && ctx.Identity.UID != nil && *ctx.Identity.UID == file.UID {
+		return nil
+	}
+
+	return s.checkPermissionFile(ctx, handle, file, PermissionRead, "lock permission denied")
+}

@@ -59,12 +59,53 @@ func (bq *BlockingQueue) Enqueue(fileHandle string, waiter *Waiter) error {
 	defer bq.mu.Unlock()
 
 	queue := bq.queues[fileHandle]
+
+	// A retransmitted blocking LOCK keeps the waiter it already queued. NLM
+	// runs over UDP (and over a TCP connection a client may re-establish), so
+	// the same request arrives again whenever the reply is lost; appending
+	// would queue one client's retries several times over and grant it the
+	// same range once per copy, leaving stale entries behind when CANCEL
+	// removes only the first. The already-queued waiter is kept as it stands
+	// and the retransmission's is discarded, so the request holds the FIFO
+	// place its first attempt earned. Enqueue still reports success: from the
+	// client's side the request is queued, which is what NLM4_BLOCKED says.
+	//
+	// This buys idempotence for a repeated request, not protection from a
+	// client that floods the queue -- every field of the owner ID is
+	// client-supplied, so distinct owners still fill it to maxQueue.
+	//
+	// decision: the retransmit does not refresh the queued waiter's cookie or
+	// callback target, though it carries its own. Two reasons, and either
+	// alone is sufficient. A queued waiter is handed to the grant path by
+	// pointer and read there without bq.mu, so writing to it here would race a
+	// GRANTED callback already being built from it. And the callback target is
+	// what the caller_name binding exists to pin: letting a retransmit move it
+	// would hand anyone who can replay a LOCK under another client's
+	// caller_name a way to redirect that client's GRANTED. The cost is that a
+	// client which genuinely moves mid-wait is granted at its original address;
+	// revisit if a client is found that survives such a move, since it would
+	// then need the whole waiter made safe to mutate, not just this write.
+	if findRetransmission(queue, waiter) != nil {
+		return nil
+	}
+
 	if len(queue) >= bq.maxQueue {
 		return ErrQueueFull
 	}
 
 	waiter.QueuedAt = time.Now()
 	bq.queues[fileHandle] = append(queue, waiter)
+	return nil
+}
+
+// findRetransmission returns the queued waiter that req repeats, or nil when
+// the queue holds none. Callers must hold bq.mu.
+func findRetransmission(queue []*Waiter, req *Waiter) *Waiter {
+	for _, w := range queue {
+		if w.isRetransmissionOf(req) {
+			return w
+		}
+	}
 	return nil
 }
 
@@ -88,9 +129,7 @@ func (bq *BlockingQueue) Cancel(fileHandle string, ownerID string, offset, lengt
 
 	queue := bq.queues[fileHandle]
 	for i, w := range queue {
-		if w.Lock.Owner.OwnerID == ownerID &&
-			w.Lock.Offset == offset &&
-			w.Lock.Length == length {
+		if w.matches(ownerID, offset, length) {
 			// Mark as cancelled
 			w.Cancel()
 			// Remove from queue
