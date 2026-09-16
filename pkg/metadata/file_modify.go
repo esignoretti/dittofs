@@ -220,14 +220,14 @@ func (s *Service) ReadSymlink(ctx *AuthContext, handle FileHandle) (string, *Fil
 // overwritten by a value newer than its own, or wins it and is left alone.
 // Comparing outside the transaction would only move the window rather than
 // narrow it. What makes this safe is the store's isolation, not the shape of
-// this function: under READ COMMITTED with an unlocked read — postgres — the
-// pair is not atomic and the window stays open.
+// this function — and every backend now provides it, postgres because its
+// transactions run at REPEATABLE READ.
 //
 // On the losing path nothing is written at all. On the winning path the row
 // read in this transaction is written back with nothing but ChangeTime changed,
-// which spares a concurrent size or mtime advance only where that read is
-// serialised against the writer. Where it is not, a write committing between the
-// read and the update is overwritten wholesale — the residual half of the
+// which spares a concurrent size or mtime advance because that read is
+// serialised against the writer. Were it not, a write committing between the
+// read and the update would be overwritten wholesale — the residual half of the
 // lost-update shape the rename path shares, which writing the in-transaction
 // row narrows but only the store's isolation can close.
 //
@@ -279,12 +279,7 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 	// OLDER time (e.g. an SMB frozen-timestamp restore) and resurrect the bump
 	// durably (#1573). Only the time-setting case needs this — a mode/owner-only
 	// change never lowers a timestamp, so a racing flush is harmless there.
-	// The change time as this call found it, before any branch below stamps
-	// `now` over it. PreserveCtime means "leave the stored value as it is", and
-	// what holdCtime must carry forward is the newest value that was NOT written
-	// by this call — a peer's commit, or a coalesced directory bump — never this
-	// call's own stamp, which is always the later of the two and would otherwise
-	// win the comparison.
+	//
 	// Ctime counts as an explicit directory-timestamp set like the others. It
 	// was missing, and the omission had a consequence: a restore that freezes
 	// ONLY the change time (restoreParentDirFrozenTimestamps sends Ctime alone
@@ -318,6 +313,13 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 			pendingDirCtime = ctime
 		}
 	}
+
+	// The row as this call found it, captured before the coalesced-timestamp
+	// overlay and before any mutation below. Every field the commit writes back
+	// is decided by comparing against this, so the overlay counts as one of
+	// this call's changes and is persisted exactly as it is today, while a
+	// field neither the caller nor the overlay touched is left to the row.
+	pre := CopyFileAttr(&file.FileAttr)
 
 	// Overlay any coalesced (not-yet-persisted) directory timestamps so the WCC
 	// pre-op snapshot and the returned post-op attrs match what a concurrent
@@ -457,10 +459,11 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 
 	now := time.Now()
 	modified := false
-	// Set when a size-down truncate prunes the block list, so the commit
-	// below rewrites the stored manifest instead of only the attrs.
-	blocksPruned := false
-
+	// The mode a chmod asks the ACL to be adjusted for, once the SUID/SGID
+	// stripping above has had its say. Nil when this call is not a chmod. The
+	// later ModeOrMask/ModeAndNotMask bits are deliberately not included: they
+	// carry DOS attribute flags, which no ACE expresses.
+	var aclAdjustMode *uint32
 	// Apply requested changes
 	if attrs.Mode != nil {
 		newMode := *attrs.Mode
@@ -485,10 +488,13 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		file.Mode = newMode
 
 		// RFC 7530 Section 6.4.1: chmod adjusts OWNER@/GROUP@/EVERYONE@ ACEs
-		// to match the new mode bits when an ACL is present.
+		// to match the new mode bits when an ACL is present. The adjustment is
+		// redone against the committed row inside the transaction; this one
+		// keeps the in-memory copy consistent for the post-op attributes.
 		if file.ACL != nil {
 			file.ACL = acl.AdjustACLForMode(file.ACL, newMode)
 		}
+		aclAdjustMode = &newMode
 
 		modified = true
 	}
@@ -599,22 +605,13 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		// ignored on read. Block refcounts are reconciled by the block-store
 		// GC, the same as RemoveFile, which drops a file's entire block list
 		// without inline decrements.
-		if *attrs.Size < file.Size && len(file.Blocks) > 0 {
-			file.Blocks = block.PruneChunkRefsToSize(file.Blocks, *attrs.Size)
-			// The manifest actually changed (tail pruned), so the write below
-			// must persist the shortened block list, not just the attrs.
-			blocksPruned = true
-			// Keep ObjectID (the Merkle root over Blocks) consistent with the
-			// trimmed list, or zero it when no blocks remain so the file reads
-			// as "never quiesced" instead of carrying a stale dedup pointer.
-			if !file.ObjectID.IsZero() {
-				if len(file.Blocks) == 0 {
-					file.ObjectID = block.ObjectID{}
-				} else {
-					file.ObjectID = block.ComputeObjectID(file.Blocks)
-				}
-			}
-		}
+		// The prune itself is derived inside the transaction, from the row that
+		// attempt actually read: a list trimmed from this pre-transaction copy
+		// would be written back over whatever a concurrent WRITE committed in
+		// the gap, discarding its new ranges, and on a retry it would re-apply
+		// the same stale trim rather than re-deriving it. Deciding it here
+		// cannot see that writer at all — the row is already in hand before the
+		// transaction opens.
 		file.Size = *attrs.Size
 		modified = true
 
@@ -622,10 +619,10 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		// The server must do this even if the client doesn't send TIME_MODIFY_SET,
 		// because POSIX requires it and NFS clients may rely on server-side updates.
 		file.Mtime = now
-		// Stamped unconditionally, including under PreserveCtime: holdCtime is
-		// the one place that decides what a held change time ends up as, and it
-		// discards whatever this call stamped in favour of the value the call
-		// found. A second guard here would be a second answer to the same
+		// Stamped unconditionally, including under PreserveCtime: the write
+		// closure below is the one place that decides what a held change time
+		// ends up as, and it keeps the row's own value over whatever this call
+		// stamped. A second guard here would be a second answer to the same
 		// question, and the two could drift.
 		file.Ctime = now
 
@@ -701,60 +698,175 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		modified = true
 	}
 
+	// The attributes the transaction actually committed, left nil when nothing
+	// was modified and no transaction ran.
+	var writtenAttr *FileAttr
+
 	// Auto-update ctime when attributes change, unless explicitly set
 	if modified {
 		if attrs.Ctime == nil && !attrs.PreserveCtime {
 			file.Ctime = now
 		}
-		// Holding ChangeTime means writing back whatever the row holds, not
-		// whatever this call read before it began. `file` was loaded before the
-		// transaction opened and every field of it is about to be rewritten, so
-		// leaving Ctime untouched in memory would still revert an advance another
-		// writer committed in between — the backwards move a held timestamp exists
-		// to avoid, and the one NFSv4's change attribute must never make. Re-read
-		// it inside the transaction and write back what the row holds, so the
-		// write carries the current value forward — the CURRENT value, not the
-		// later of two: a peer that deliberately lowered it has said what the
-		// change time is, and taking a maximum would roll that back. Exact on a backend whose transaction serialises the read
-		// against concurrent writers; on one whose in-transaction read takes no
-		// row lock this narrows the window rather than closing it, the same
-		// residue RestoreChangeTimeIfUnchanged documents.
+
+		// writeRow re-reads the inode inside the transaction and copies onto it
+		// exactly the fields this call changed, so every other column comes from
+		// committed state instead of from the copy read before the transaction
+		// opened. Writing that earlier copy back reverts whatever a concurrent
+		// writer committed in the gap — a chmod undoing a WRITE's size and
+		// mtime, the backwards move NFSv4's change attribute must never make —
+		// and no isolation level can help, because the stale row is already in
+		// hand before the transaction starts. Exact on a backend whose
+		// transaction serialises the read against concurrent writers; on one
+		// whose in-transaction read takes no row lock this narrows the window
+		// rather than closing it, the same residue
+		// RestoreChangeTimeIfUnchanged documents.
+		//
+		// Which fields changed is decided by comparing against `pre` rather
+		// than by restating the conditions above, so a branch added later
+		// cannot be forgotten here. The three reference-typed fields are
+		// keyed off the request instead: they are replaced wholesale when the
+		// caller asks for them and are never touched otherwise, which is
+		// cheaper to establish than deep equality.
+		//
 		// The re-read's failure is the operation's failure. Falling back to the
-		// pre-transaction snapshot would write a Ctime this call has already
+		// pre-transaction snapshot would write back a row this call has already
 		// been told not to trust, and UpdateAttrs is allowed to create a row
 		// that is missing — so a file deleted between the two reads would be
-		// recreated carrying the stale value, which is a worse outcome than
+		// recreated carrying the stale state, which is a worse outcome than
 		// refusing the attribute change.
-		holdCtime := func(tx Transaction) error {
-			if !attrs.PreserveCtime || attrs.Ctime != nil {
-				return nil
+		writeRow := func(tx Transaction) error {
+			row, err := tx.GetFile(ctx.Context, handle)
+			if err != nil {
+				return err
 			}
-			cur, curErr := tx.GetFile(ctx.Context, handle)
-			if curErr != nil {
-				return curErr
-			}
-			if cur == nil {
+			if row == nil {
 				return &StoreError{
 					Code:    ErrNotFound,
-					Message: "file disappeared while its change time was being held",
+					Message: "file disappeared while its attributes were being written",
 					Path:    file.Path,
 				}
 			}
-			// The row as it stands now, which is what "hold the stored value"
-			// means — a peer's commit stands, higher or lower. Assigned rather
-			// than compared against file.Ctime, because the branches above may
-			// have stamped `now` there and `now` beats everything.
+
+			// Per attempt, not per call: a retry re-derives the prune from the
+			// row it just read, and a stale true from an earlier attempt would
+			// send an unchanged manifest through SetManifest.
+			pruneManifest := false
+
+			// The ownership gate above ran against the copy read before the
+			// transaction, so an owner-authorized change would otherwise land
+			// on a row a concurrent chown has since handed to someone else —
+			// the gate and the write describing different files. Root and a
+			// handle-authorized timestamp write do not depend on ownership and
+			// are left alone. No isolation level catches this: the chown
+			// committed before this transaction opened, so its row is simply
+			// what the snapshot sees and nothing conflicts.
+			if !isRoot && !timestampAuthorizedByHandle &&
+				(row.UID != pre.UID || row.GID != pre.GID) {
+				return &StoreError{
+					Code:    ErrPermissionDenied,
+					Message: "ownership changed while the attribute change was being applied",
+					Path:    file.Path,
+				}
+			}
+
+			// decision: the EA map is replaced wholesale from the pre-read copy
+			// rather than merged onto the row, so two concurrent EA writers can
+			// still lose each other's keys. SetFileAttributes takes no row lock
+			// — xattr.go's own path takes LockFileRow for exactly this — and
+			// adding one here would put the lock on every chmod and utimes as
+			// well. Withdraw the exemption if EA writes ever arrive on this
+			// path concurrently rather than through xattr.go.
+			if len(attrs.EAMutations) > 0 {
+				row.EAs = file.EAs
+			}
+
+			if file.Mode != pre.Mode {
+				row.Mode = file.Mode
+			}
+			if file.UID != pre.UID {
+				row.UID = file.UID
+			}
+			if file.GID != pre.GID {
+				row.GID = file.GID
+			}
+			if file.Hidden != pre.Hidden {
+				row.Hidden = file.Hidden
+			}
+			if !file.Atime.Equal(pre.Atime) {
+				row.Atime = file.Atime
+			}
+			if !file.Mtime.Equal(pre.Mtime) {
+				row.Mtime = file.Mtime
+			}
+			if !file.CreationTime.Equal(pre.CreationTime) {
+				row.CreationTime = file.CreationTime
+			}
+			// A held change time means the stored value is the authority — a
+			// peer's commit stands, higher or lower — so the row keeps its own
+			// Ctime whatever the branches above stamped.
 			//
 			// Lifted only by a directory bump that is recorded but not yet
 			// flushed: that value is newer than the row by construction, and
 			// the Clear that follows an explicit directory-time set would
 			// otherwise discard it for good, moving a peer's visible change
 			// time backwards.
-			file.Ctime = cur.Ctime
-			if pendingDirCtime.After(file.Ctime) {
-				file.Ctime = pendingDirCtime
+			switch {
+			case attrs.PreserveCtime && attrs.Ctime == nil:
+				if pendingDirCtime.After(row.Ctime) {
+					row.Ctime = pendingDirCtime
+				}
+			case !file.Ctime.Equal(pre.Ctime):
+				row.Ctime = file.Ctime
 			}
-			return nil
+			// An explicit ACL replaces the stored one outright. A chmod only
+			// rewrites the mode's OWNER@/GROUP@/EVERYONE@ ACEs, and it has to
+			// rewrite them on the ACL the row actually holds: the adjustment
+			// made before the transaction opened was computed from a copy that
+			// a concurrent ACL write may since have superseded, and copying it
+			// over would discard that write wholesale.
+			switch {
+			case attrs.ACL != nil:
+				row.ACL = file.ACL
+			case aclAdjustMode != nil && row.ACL != nil:
+				row.ACL = acl.AdjustACLForMode(row.ACL, *aclAdjustMode)
+			}
+			if attrs.Size != nil {
+				row.Size = file.Size
+			}
+			// Derive the prune from the row this attempt read, so a retry
+			// re-derives it and a concurrent writer's ranges are not discarded.
+			// The manifest changed only when the trim actually dropped
+			// something, which is also what selects SetManifest over UpdateAttrs
+			// below: a pure grow keeps the stored list and takes the relaxed
+			// path.
+			if attrs.Size != nil {
+				pruned := block.PruneChunkRefsToSize(row.Blocks, *attrs.Size)
+				if len(pruned) != len(row.Blocks) {
+					row.Blocks = pruned
+					// Keep ObjectID (the Merkle root over Blocks) consistent with
+					// the trimmed list, or zero it when no blocks remain so the
+					// file reads as "never quiesced" instead of carrying a stale
+					// dedup pointer.
+					switch {
+					case len(pruned) == 0 && !row.ObjectID.IsZero():
+						row.ObjectID = block.ObjectID{}
+					case len(pruned) > 0:
+						row.ObjectID = block.ComputeObjectID(pruned)
+					}
+					pruneManifest = true
+				}
+			}
+
+			// The post-op attributes this call reports must describe the row it
+			// actually wrote. Recorded beside `file` rather than onto it: the
+			// transaction is retried on a transient conflict, and a later
+			// attempt still has to compare this call's mutations against `pre`.
+			writtenAttr = CopyFileAttr(&row.FileAttr)
+
+			if pruneManifest {
+				return tx.SetManifest(ctx.Context, row)
+			}
+			return tx.UpdateAttrs(ctx.Context, row)
 		}
 		// A size change (truncate/grow) is data-paired: the new size must
 		// survive a crash together with the block data, or a read past the new
@@ -773,15 +885,7 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 			// file between the two — silently undoing the truncate (#1753).
 			mu := s.pendingWrites.GetFlushLock(handle)
 			mu.Lock()
-			err := store.WithTransaction(ctx.Context, func(tx Transaction) error {
-				if hErr := holdCtime(tx); hErr != nil {
-					return hErr
-				}
-				if blocksPruned {
-					return tx.SetManifest(ctx.Context, file)
-				}
-				return tx.UpdateAttrs(ctx.Context, file)
-			})
+			err := store.WithTransaction(ctx.Context, writeRow)
 			if err == nil {
 				// Discard, don't flush: a buffered MaxSize would resurrect the
 				// pre-truncate size on the next flush.
@@ -792,12 +896,7 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 				return nil, err
 			}
 		} else {
-			if err := withRelaxedTransaction(store, ctx.Context, func(tx Transaction) error {
-				if hErr := holdCtime(tx); hErr != nil {
-					return hErr
-				}
-				return tx.UpdateAttrs(ctx.Context, file)
-			}); err != nil {
+			if err := withRelaxedTransaction(store, ctx.Context, writeRow); err != nil {
 				return nil, err
 			}
 			// Invalidate cached file in pending writes to ensure subsequent
@@ -824,9 +923,13 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		s.dirTimes.ClearIfFlushed(handle, pendingDirCtime)
 	}
 
-	// Post-op attributes reflect the resulting file state (mutated in place
-	// above; equals Before when nothing changed).
-	wcc.After = CopyFileAttr(&file.FileAttr)
+	// Post-op attributes reflect the resulting file state: the row the
+	// transaction wrote when one ran, otherwise the unchanged snapshot (which
+	// equals Before).
+	wcc.After = writtenAttr
+	if wcc.After == nil {
+		wcc.After = CopyFileAttr(&file.FileAttr)
+	}
 	return wcc, nil
 }
 
@@ -1141,9 +1244,31 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 				// closure more than once, and only the committing attempt's
 				// value must survive.
 				clobberedNlink = newCount
-				// Update ctime on the file being unlinked (affects remaining hard links)
-				dstFile.Ctime = now
-				if err := tx.UpdateAttrs(ctx.Context, dstFile); err != nil {
+				// Update ctime on the file being unlinked (affects remaining
+				// hard links).
+				//
+				// Write the row this transaction read, not the copy taken
+				// before it opened. Ctime is the only column an overwriting
+				// rename changes on the victim, so every other one must come
+				// from committed state: writing the earlier snapshot back
+				// would restore whatever Size or Mtime a concurrent write to
+				// the victim had already committed. No isolation level closes
+				// this — the stale copy is in hand before the transaction
+				// starts, so its snapshot already contains that write and the
+				// update conflicts with nothing.
+				//
+				// The re-read also feeds the clobbered-victim report below,
+				// whose PayloadID must name the content actually committed.
+				// Assigned unconditionally: an optimistic backend may run this
+				// closure more than once, and only the committing attempt's
+				// value must survive.
+				victim, err := tx.GetFile(ctx.Context, dstHandle)
+				if err != nil {
+					return err
+				}
+				dstFile = victim
+				victim.Ctime = now
+				if err := tx.UpdateAttrs(ctx.Context, victim); err != nil {
 					return err
 				}
 			}
@@ -1224,10 +1349,10 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 		// and the restore would then write a zero ChangeTime.
 		//
 		// The "before" read covers the window only on backends whose
-		// transaction serialises it against concurrent writers. Under READ
-		// COMMITTED with an unlocked read — postgres — a write can still commit
-		// between this read and the row lock the update takes, narrowing the
-		// window rather than closing it.
+		// transaction serialises it against concurrent writers, which is all of
+		// them: postgres runs this transaction at REPEATABLE READ, so a write
+		// that commits between this read and the row lock the update takes
+		// aborts the update rather than being erased by it.
 		pre, err := tx.GetFile(ctx.Context, srcHandle)
 		if err != nil {
 			return err

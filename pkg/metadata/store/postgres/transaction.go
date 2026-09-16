@@ -21,6 +21,58 @@ import (
 // are retried; non-transient errors return immediately. The deadline and
 // jittered backoff are shared with the sqlite backend in internal/txretry.
 
+// txOptions runs every transaction at REPEATABLE READ.
+//
+// The metadata service reads a value inside a transaction, branches on it, and
+// writes an absolute result back — RemoveFile reads nlink and writes nlink-1,
+// CreateHardLink reads it and writes nlink+1, SetFileAttributes reads a row and
+// writes the whole row. That shape is only atomic if a writer that committed
+// after the read is refused. badger refuses it with SSI, sqlite with a single
+// writer, memory with a store-wide mutex; at postgres's READ COMMITTED default
+// nothing refused it, so the second UPDATE simply overwrote the first and
+// RemoveFile could free a payload a surviving hard link still referenced.
+//
+// REPEATABLE READ makes postgres refuse it too: an UPDATE or DELETE that
+// reaches a row changed since this transaction's snapshot raises 40001, which
+// withTransaction already retries against the committed state. SERIALIZABLE
+// would additionally order read-only predicates, but nothing here needs that —
+// the remaining read-then-write pairs all touch the row they later write, and
+// the only phantom that matters (two creates racing for one name) is already
+// refused by the parent_child_map unique index. SERIALIZABLE also aborts plain
+// SELECTs, which several closures swallow rather than propagate, so a conflict
+// there would be lost instead of retried.
+//
+// ponytail: one isolation level for every transaction, including the ones that
+// were already atomic under READ COMMITTED because they are a single statement
+// holding its own row lock — ApplyDataWrite is the one that matters. Those now
+// restart on a conflict instead of waiting at the lock, which costs nothing
+// when writers are spread over many inodes (measured at within 2%) and about
+// 2.6x when ten of them hammer four. Split the level per call site only if a
+// profile on real write concurrency shows the hot-inode case actually arising;
+// a per-site choice is how the read-then-write sites came to be unprotected in
+// the first place.
+//
+// Two known ceilings come with it. Neither has been observed failing — both
+// are read off the code — so each names the observation that would promote it
+// from a ceiling to a bug. The 2.6x above is measured; these two are not.
+//
+// The retry budget is computed once, before the first attempt, so a
+// transaction whose FIRST attempt runs longer than txretry.Budget has no
+// retries left when it conflicts and surfaces the conflict to the caller. A
+// transaction that holds a snapshot for seconds is also likelier to conflict at
+// all. The clone path is the one that can get there — it runs the payload copy
+// inside the metadata transaction — and it would also redo that copy on the
+// retry. Move the budget to per-attempt, or take the copy out of the
+// transaction, if a clone is ever seen failing this way.
+//
+// And CreateHardLink's statement order now matches RemoveFile's but not Move's:
+// Move still inserts the directory entry (FOR KEY SHARE on the source inode
+// through the parent_child_map foreign key) before updating that inode
+// (FOR UPDATE), so a hard link racing a rename of the same inode still
+// deadlocks and pays a full deadlock_timeout. Give Move the same order if that
+// pair shows up in a deadlock log.
+var txOptions = pgx.TxOptions{IsoLevel: pgx.RepeatableRead}
+
 // ============================================================================
 // Transaction Support
 // ============================================================================
@@ -44,6 +96,11 @@ type postgresTransaction struct {
 	// owner identity. Applied to the store's quota cache exactly once after a
 	// successful commit, so a serialization/deadlock retry never double-counts.
 	quota basestore.QuotaDelta
+	// manifestRowsScanned and manifestWrites accumulate this attempt's manifest
+	// counters. Applied to the store exactly once after a successful commit, so
+	// a serialization or deadlock retry never counts a rolled-back attempt.
+	manifestRowsScanned int64
+	manifestWrites      int64
 	// sharesDirty records that this transaction wrote a share record, so the
 	// store's ShareOptions cache is dropped after the commit. A stale entry is
 	// a wrong permission decision, and shares are few enough that clearing the
@@ -111,7 +168,7 @@ func (s *PostgresMetadataStore) withTransaction(ctx context.Context, fn func(tx 
 		// when the pool is exhausted. This is critical under high concurrent load
 		// (e.g., POSIX compliance tests) where all connections might be in use.
 		acquireCtx, cancel := context.WithTimeout(ctx, poolConnectionAcquireTimeout)
-		tx, err := s.pool.Begin(acquireCtx)
+		tx, err := s.pool.BeginTx(acquireCtx, txOptions)
 		cancel() // Release timer resources immediately after Begin returns
 
 		if err != nil {
@@ -182,6 +239,12 @@ func (s *PostgresMetadataStore) withTransaction(ctx context.Context, fn func(tx 
 		}
 		// Apply the accumulated usage deltas exactly once, after commit.
 		s.applyQuotaDelta(ptx.quota.Map())
+		if ptx.manifestRowsScanned != 0 {
+			s.manifestRowsScanned.Add(ptx.manifestRowsScanned)
+		}
+		if ptx.manifestWrites != 0 {
+			s.manifestWrites.Add(ptx.manifestWrites)
+		}
 		return nil // Success
 	}
 
@@ -339,12 +402,12 @@ func (tx *postgresTransaction) putFile(ctx context.Context, file *metadata.File,
 		// Freshly-inserted rows (!updated) have no prior refs, so every ref is
 		// a plain insert. The counter tracks manifests that truly changed.
 		wrote, scanned, err := storesql.PutFileChunkRefs(ctx, tx.X, tx.D, file.ID, file.Blocks, updated, file.ManifestDirtyOffsets)
-		tx.store.manifestRowsScanned.Add(int64(scanned))
+		tx.manifestRowsScanned += int64(scanned)
 		if err != nil {
 			return mapPgError(err, "SetManifest", "blocks")
 		}
 		if wrote {
-			tx.store.manifestWrites.Add(1)
+			tx.manifestWrites++
 		}
 	}
 
@@ -392,13 +455,13 @@ func (tx *postgresTransaction) SetFilesystemCapabilities(capabilities metadata.F
 // LockFileRow implements metadata.FileRowLocker so a read-modify-write of one
 // inode's attributes serialises.
 //
-// Postgres runs this transaction at READ COMMITTED, where a bare read followed
-// by an UPDATE loses a concurrent writer's change without reporting anything:
-// the second UPDATE waits for the first to commit and then writes attributes
-// computed from the pre-image it read earlier. Taking the row here, before that
-// read, makes the second transaction wait at the lock instead, so its read sees
-// the committed value. sqlite and badger need no equivalent — they refuse the
-// second writer and their retry re-reads.
+// At REPEATABLE READ a bare read followed by an UPDATE of the same row is
+// refused rather than lost. Taking the row up front does not avoid that
+// refusal — SELECT ... FOR UPDATE aborts on a row changed since the snapshot
+// exactly as UPDATE does — but it moves the abort to the transaction's first
+// statement, before the caller has read anything or done any work it would
+// have to discard. sqlite and badger need no equivalent: they refuse the second
+// writer and their retry re-reads.
 //
 // No rows come back when the handle names nothing; the caller's read reports
 // that as ErrNotFound.

@@ -168,6 +168,24 @@ func (s *Service) RemoveFile(ctx *AuthContext, parentHandle FileHandle, name str
 		// making the content eligible for deletion. Reading via tx.GetLinkCount
 		// also registers the key for the backend's read-write conflict
 		// detection so a racing writer triggers an automatic retry.
+		// The inode as committed right now. `file` was read before the
+		// transaction opened, and an unlink changes nothing on it but Ctime and
+		// the link count, so every other column must come from here — writing
+		// the earlier copy back reverts whatever a concurrent WRITE committed
+		// in the gap, and a retry would re-apply that same stale copy rather
+		// than correct it.
+		txFile, fErr := tx.GetFile(ctx.Context, fileHandle)
+		if fErr != nil {
+			return fErr
+		}
+		if txFile == nil {
+			return &StoreError{
+				Code:    ErrNotFound,
+				Message: "file disappeared while it was being removed",
+				Path:    name,
+			}
+		}
+
 		linkCount, lcErr := tx.GetLinkCount(ctx.Context, fileHandle)
 		if lcErr != nil {
 			// Never guess the count. Assuming "last link" would report the
@@ -176,10 +194,20 @@ func (s *Service) RemoveFile(ctx *AuthContext, parentHandle FileHandle, name str
 			return lcErr
 		}
 
-		// Handle link count
+		// Handle link count.
+		//
+		// Both branches stamp lastLink and returnFile.PayloadID, even where the
+		// value is the empty one, because the transaction is retried and the
+		// conflict that retries it — a concurrent CreateHardLink on this inode —
+		// is the same event that flips which branch the re-read count takes. A
+		// value left behind by the rolled-back attempt would then describe the
+		// other branch: an empty PayloadID orphans the content the last-link
+		// attempt freed, and a set lastLink discards buffered WRITE state for a
+		// file a surviving hard link still names.
 		if linkCount > 1 {
 			// File has other hard links, just decrement count
 			// Empty PayloadID signals caller NOT to delete content
+			lastLink = false
 			returnFile.PayloadID = ""
 			returnFile.Nlink = linkCount - 1
 			returnFile.Ctime = now
@@ -190,13 +218,14 @@ func (s *Service) RemoveFile(ctx *AuthContext, parentHandle FileHandle, name str
 			}
 
 			// Update file's ctime
-			file.Ctime = now
-			if err := tx.UpdateAttrs(ctx.Context, file); err != nil {
+			txFile.Ctime = now
+			if err := tx.UpdateAttrs(ctx.Context, txFile); err != nil {
 				return err
 			}
 		} else {
 			// Last link - set nlink=0 but keep metadata for POSIX compliance
 			lastLink = true
+			returnFile.PayloadID = txFile.PayloadID
 			returnFile.Nlink = 0
 			returnFile.Ctime = now
 
@@ -205,10 +234,12 @@ func (s *Service) RemoveFile(ctx *AuthContext, parentHandle FileHandle, name str
 				return err
 			}
 
-			// Update file's ctime and nlink
-			file.Ctime = now
-			file.Nlink = 0
-			if err := tx.UpdateAttrs(ctx.Context, file); err != nil {
+			// Update file's ctime and nlink. SetLinkCount above is the count's
+			// only authority on read; the row is re-read per attempt, so this
+			// zero cannot reach a later decrement attempt either.
+			txFile.Ctime = now
+			txFile.Nlink = 0
+			if err := tx.UpdateAttrs(ctx.Context, txFile); err != nil {
 				return err
 			}
 		}
