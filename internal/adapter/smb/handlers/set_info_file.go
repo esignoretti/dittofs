@@ -133,7 +133,7 @@ func (h *Handler) setFileInfoFromStore(
 		// suppresses the auto-bump in all of these cases.
 		anyBasicMutation := fileAttrs != 0 || creationFT != 0 || atimeFT != 0 || mtimeFT != 0
 		// Serialize concurrent SET_INFO BasicInfo / READ / WRITE / QUERY_INFO on
-		// the same handle (#606). The freeze flags (BtimeFrozen / MtimeFrozen /
+		// the same handle. The freeze flags (BtimeFrozen / MtimeFrozen /
 		// CtimeFrozen / AtimeFrozen) plus their Frozen* timestamp pointers and
 		// the SMB delayed-write fields are read and written here, and observed
 		// by QUERY_INFO / READ / WRITE / COPYCHUNK on parallel goroutines. We
@@ -221,7 +221,7 @@ func (h *Handler) setFileInfoFromStore(
 		basicAuthCtx := withTimestampHandleAuth(authCtx, openFile.GrantedAccess)
 
 		if _, err := metaSvc.SetFileAttributes(basicAuthCtx, openFile.MetadataHandle, setAttrs); err != nil {
-			openFile.mu.Unlock() // release before returning; refs #606.
+			openFile.mu.Unlock() // release before returning.
 			logger.Debug("SET_INFO: failed to set basic info", "path", openFile.Name().Path, "error", err)
 			return setInfoStatus(types.StatusForErr(err)), nil
 		}
@@ -1566,7 +1566,7 @@ func (h *Handler) setFileInfoFromStore(
 //
 // Takes openFile.mu (read) — the freeze flags and Frozen* pointers are mutated
 // under the write lock in SET_INFO BasicInfo and must be observed atomically
-// against a concurrent freeze/thaw on the same handle (#606).
+// against a concurrent freeze/thaw on the same handle.
 
 func applyFrozenTimestamps(openFile *OpenFile, file *metadata.File) {
 	openFile.mu.RLock()
@@ -1659,7 +1659,7 @@ func withTimestampHandleAuth(authCtx *metadata.AuthContext, grantedAccess uint32
 // All reads of the freeze flags / Frozen* pointers go through buildFrozenAttrs
 // (which takes openFile.mu read), snapshotMtimeFrozen (likewise), or the local
 // snapshot taken under openFile.mu — so a concurrent SET_INFO freeze/thaw on
-// the same handle cannot tear our view (#606).
+// the same handle cannot tear our view.
 
 func (h *Handler) restoreFrozenTimestamps(authCtx *metadata.AuthContext, openFile *OpenFile) {
 	restoreAttrs := buildFrozenAttrs(openFile)
@@ -1766,7 +1766,7 @@ func (h *Handler) restoreParentDirFrozenTimestamps(authCtx *metadata.AuthContext
 				"path", openFile.Name().Path, "error", err)
 		} else {
 			// IsMtimeFrozen / IsCtimeFrozen / IsAtimeFrozen each take
-			// openFile.mu (read); see #606. Cheap because the parent-dir
+			// openFile.mu (read). Cheap because the parent-dir
 			// frozen log line is debug-gated.
 			logger.Debug("restoreParentDirFrozenTimestamps: restored",
 				"path", openFile.Name().Path,
@@ -1785,7 +1785,7 @@ func (h *Handler) restoreParentDirFrozenTimestamps(authCtx *metadata.AuthContext
 //
 // Takes openFile.mu (read); see applyFrozenTimestamps for rationale.
 // Snapshots the time pointers so callers using the returned SetAttrs after
-// unlock cannot tear against a concurrent thaw clearing them. (#606)
+// unlock cannot tear against a concurrent thaw clearing them.
 
 func buildFrozenAttrs(openFile *OpenFile) *metadata.SetAttrs {
 	openFile.mu.RLock()
@@ -1818,4 +1818,67 @@ func buildFrozenAttrs(openFile *OpenFile) *metadata.SetAttrs {
 		return nil
 	}
 	return attrs
+}
+
+// holdFrozenCtime marks an attribute write so the metadata layer leaves
+// ChangeTime alone, when this handle has ChangeTime frozen.
+//
+// SetFileAttributes assigns Ctime = now to any change that leaves attrs.Ctime
+// nil, because an attribute change is a metadata change and POSIX says ctime
+// moves. A ChangeTime frozen by SET_INFO(-1) must not move (MS-FSA
+// §2.1.5.15.2), so an attribute write made for an unrelated reason — the
+// LastAccessTime bump that follows a READ, a WRITE or a directory enumeration —
+// would otherwise overwrite it. Suppressing the stamp keeps the store from ever
+// holding a ChangeTime the freeze forbids, rather than writing the wrong value
+// and putting it back afterwards, so a concurrent reader cannot observe one and
+// a concurrent read-modify-write cannot latch one.
+//
+// This holds the stored value rather than writing the frozen one. Naming the
+// frozen value would overwrite a ChangeTime some other opener legitimately
+// advanced after the freeze, dragging it backwards — and NFSv4 encodes the
+// change attribute from Ctime, where a value that goes backwards lets a client
+// keep serving a cache it should have dropped.
+//
+// No-op when this handle has no frozen ChangeTime, or when the caller is
+// setting ChangeTime explicitly.
+//
+// Takes openFile.mu (read); see applyFrozenTimestamps for rationale. A caller
+// that already holds the lock must call holdFrozenCtimeLocked instead.
+//
+// decision: this is not an atomic freeze-and-write. The lock is released before
+// the caller's SetFileAttributes runs, so a SET_INFO that freezes ChangeTime in
+// that gap leaves the in-flight write stamping a value that is now frozen.
+// Closing it means holding a per-handle lock across a metadata-store write,
+// which puts a store round-trip inside a lock every pipelined operation on the
+// handle contends for. The window is one freeze landing between a flag read and
+// a store write on the same handle, and it costs a single stale ChangeTime.
+//
+// How long that value survives depends on what the handle does next, and it is
+// not always short: restoreFrozenTimestamps is what puts the frozen value back,
+// and only CLOSE, WRITE, COPYCHUNK and SET_INFO call it. READ and
+// QUERY_DIRECTORY set PreserveCtime and never restore, so on a handle that only
+// ever reads, the stamped value stands until the handle is closed or something
+// writes through it.
+//
+// Withdraw this if ChangeTime ever becomes load-bearing for a client's
+// cache-validity decision, where a stale value held for the life of a read-only
+// handle is not something the next operation quietly repairs.
+func holdFrozenCtime(openFile *OpenFile, attrs *metadata.SetAttrs) {
+	if attrs.Ctime != nil {
+		return
+	}
+	openFile.mu.RLock()
+	defer openFile.mu.RUnlock()
+	holdFrozenCtimeLocked(openFile, attrs)
+}
+
+// holdFrozenCtimeLocked is the lock-free body of holdFrozenCtime. Callers must
+// hold openFile.mu.
+func holdFrozenCtimeLocked(openFile *OpenFile, attrs *metadata.SetAttrs) {
+	if attrs.Ctime != nil {
+		return
+	}
+	if openFile.CtimeFrozen {
+		attrs.PreserveCtime = true
+	}
 }

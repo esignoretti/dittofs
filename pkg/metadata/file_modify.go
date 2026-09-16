@@ -279,12 +279,44 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 	// OLDER time (e.g. an SMB frozen-timestamp restore) and resurrect the bump
 	// durably (#1573). Only the time-setting case needs this — a mode/owner-only
 	// change never lowers a timestamp, so a racing flush is harmless there.
+	// The change time as this call found it, before any branch below stamps
+	// `now` over it. PreserveCtime means "leave the stored value as it is", and
+	// what holdCtime must carry forward is the newest value that was NOT written
+	// by this call — a peer's commit, or a coalesced directory bump — never this
+	// call's own stamp, which is always the later of the two and would otherwise
+	// win the comparison.
+	// Ctime counts as an explicit directory-timestamp set like the others. It
+	// was missing, and the omission had a consequence: a restore that freezes
+	// ONLY the change time (restoreParentDirFrozenTimestamps sends Ctime alone
+	// when mtime and atime are not frozen) left the coalesced create/remove bump
+	// pending, and the next held write lifted the row back up to it — walking
+	// the frozen value forward, which is the one thing freezing it is for.
 	dirTimeSet := file.Type == FileTypeDirectory &&
-		(attrs.Mtime != nil || attrs.Atime != nil || attrs.MtimeNow || attrs.AtimeNow)
+		(attrs.Mtime != nil || attrs.Atime != nil || attrs.Ctime != nil ||
+			attrs.MtimeNow || attrs.AtimeNow)
 	if dirTimeSet {
 		lock := s.dirTimes.FlushLock(handle)
 		lock.Lock()
 		defer lock.Unlock()
+	}
+
+	// The coalesced directory bump this call must not lose, read AFTER the flush
+	// lock above: a create or remove landing while this was waiting for the lock
+	// records a bump that belongs to the state this write is about to commit,
+	// and a value captured before the wait would not carry it.
+	//
+	// Only the pending bump, not a pre-call snapshot of the whole change time.
+	// A held change time means "leave the stored value as it is", so the stored
+	// value is the authority — including when a peer deliberately lowered it,
+	// which is what an SMB frozen-timestamp restore does. Carrying a pre-call
+	// snapshot forward would write that restore back up to whatever this call
+	// happened to read first. The pending bump is the one exception, because it
+	// is newer than the row by construction and has simply not been flushed.
+	var pendingDirCtime time.Time
+	if file.Type == FileTypeDirectory {
+		if _, ctime, _, ok := s.dirTimes.GetPending(handle); ok {
+			pendingDirCtime = ctime
+		}
 	}
 
 	// Overlay any coalesced (not-yet-persisted) directory timestamps so the WCC
@@ -547,6 +579,11 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		// The server must do this even if the client doesn't send TIME_MODIFY_SET,
 		// because POSIX requires it and NFS clients may rely on server-side updates.
 		file.Mtime = now
+		// Stamped unconditionally, including under PreserveCtime: holdCtime is
+		// the one place that decides what a held change time ends up as, and it
+		// discards whatever this call stamped in favour of the value the call
+		// found. A second guard here would be a second answer to the same
+		// question, and the two could drift.
 		file.Ctime = now
 
 		// POSIX: Clear SUID/SGID bits on truncate for non-root users (like write)
@@ -619,8 +656,58 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 
 	// Auto-update ctime when attributes change, unless explicitly set
 	if modified {
-		if attrs.Ctime == nil {
+		if attrs.Ctime == nil && !attrs.PreserveCtime {
 			file.Ctime = now
+		}
+		// Holding ChangeTime means writing back whatever the row holds, not
+		// whatever this call read before it began. `file` was loaded before the
+		// transaction opened and every field of it is about to be rewritten, so
+		// leaving Ctime untouched in memory would still revert an advance another
+		// writer committed in between — the backwards move a held timestamp exists
+		// to avoid, and the one NFSv4's change attribute must never make. Re-read
+		// it inside the transaction and write back what the row holds, so the
+		// write carries the current value forward — the CURRENT value, not the
+		// later of two: a peer that deliberately lowered it has said what the
+		// change time is, and taking a maximum would roll that back. Exact on a backend whose transaction serialises the read
+		// against concurrent writers; on one whose in-transaction read takes no
+		// row lock this narrows the window rather than closing it, the same
+		// residue RestoreChangeTimeIfUnchanged documents.
+		// The re-read's failure is the operation's failure. Falling back to the
+		// pre-transaction snapshot would write a Ctime this call has already
+		// been told not to trust, and UpdateAttrs is allowed to create a row
+		// that is missing — so a file deleted between the two reads would be
+		// recreated carrying the stale value, which is a worse outcome than
+		// refusing the attribute change.
+		holdCtime := func(tx Transaction) error {
+			if !attrs.PreserveCtime || attrs.Ctime != nil {
+				return nil
+			}
+			cur, curErr := tx.GetFile(ctx.Context, handle)
+			if curErr != nil {
+				return curErr
+			}
+			if cur == nil {
+				return &StoreError{
+					Code:    ErrNotFound,
+					Message: "file disappeared while its change time was being held",
+					Path:    file.Path,
+				}
+			}
+			// The row as it stands now, which is what "hold the stored value"
+			// means — a peer's commit stands, higher or lower. Assigned rather
+			// than compared against file.Ctime, because the branches above may
+			// have stamped `now` there and `now` beats everything.
+			//
+			// Lifted only by a directory bump that is recorded but not yet
+			// flushed: that value is newer than the row by construction, and
+			// the Clear that follows an explicit directory-time set would
+			// otherwise discard it for good, moving a peer's visible change
+			// time backwards.
+			file.Ctime = cur.Ctime
+			if pendingDirCtime.After(file.Ctime) {
+				file.Ctime = pendingDirCtime
+			}
+			return nil
 		}
 		// A size change (truncate/grow) is data-paired: the new size must
 		// survive a crash together with the block data, or a read past the new
@@ -640,6 +727,9 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 			mu := s.pendingWrites.GetFlushLock(handle)
 			mu.Lock()
 			err := store.WithTransaction(ctx.Context, func(tx Transaction) error {
+				if hErr := holdCtime(tx); hErr != nil {
+					return hErr
+				}
 				if blocksPruned {
 					return tx.SetManifest(ctx.Context, file)
 				}
@@ -656,6 +746,9 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 			}
 		} else {
 			if err := withRelaxedTransaction(store, ctx.Context, func(tx Transaction) error {
+				if hErr := holdCtime(tx); hErr != nil {
+					return hErr
+				}
 				return tx.UpdateAttrs(ctx.Context, file)
 			}); err != nil {
 				return nil, err
@@ -672,8 +765,16 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 	// overlay that would otherwise resurrect the newer create time (#1573). Runs
 	// under the flush lock acquired above, so no concurrent flush can re-persist
 	// the bump between the store write and this Clear.
+	//
+	// Conditional on the bump this call actually accounted for, because the
+	// flush lock does not hold the writers back: recordDirTimes runs after a
+	// create's or remove's transaction and takes no lock at all, so one can land
+	// between the read above and here. An unconditional Clear would drop that
+	// newer bump from the overlay and from durable state both — a create whose
+	// directory timestamp simply vanishes. ClearIfFlushed keeps the entry when
+	// a newer bump raced in, and the next flush picks it up.
 	if dirTimeSet {
-		s.dirTimes.Clear(handle)
+		s.dirTimes.ClearIfFlushed(handle, pendingDirCtime)
 	}
 
 	// Post-op attributes reflect the resulting file state (mutated in place

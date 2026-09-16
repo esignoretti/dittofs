@@ -577,14 +577,20 @@ func (h *Handler) executeCopyChunks(
 	// is bumped too; MS-FSA specifies no parent-directory timestamp update here.
 	// Hoist a single timestamp for consistency (matches write.go pattern).
 	now := time.Now()
-	// IsAtimeFrozen takes the per-OpenFile read lock; see #606.
+	// IsAtimeFrozen takes the per-OpenFile read lock.
 	if !srcOpen.IsAtimeFrozen() {
-		_, _ = metaSvc.SetFileAttributes(authCtx, srcOpen.MetadataHandle, &metadata.SetAttrs{Atime: &now})
+		srcAttrs := &metadata.SetAttrs{Atime: &now}
+		holdFrozenCtime(srcOpen, srcAttrs)
+		_, _ = metaSvc.SetFileAttributes(authCtx, srcOpen.MetadataHandle, srcAttrs)
 	}
 	if !dstOpen.IsAtimeFrozen() {
-		_, _ = metaSvc.SetFileAttributes(authCtx, dstOpen.MetadataHandle, &metadata.SetAttrs{Atime: &now})
+		dstAttrs := &metadata.SetAttrs{Atime: &now}
+		holdFrozenCtime(dstOpen, dstAttrs)
+		_, _ = metaSvc.SetFileAttributes(authCtx, dstOpen.MetadataHandle, dstAttrs)
 	}
 	if dstParent := dstOpen.Name().ParentHandle; len(dstParent) > 0 {
+		// decision: the parent's bump stamps ChangeTime and is repaired by the
+		// restore below, for the reason given at the same pair in WRITE.
 		_, _ = metaSvc.SetFileAttributes(authCtx, dstParent, &metadata.SetAttrs{Atime: &now})
 		h.restoreParentDirFrozenTimestamps(authCtx, dstParent)
 	}
