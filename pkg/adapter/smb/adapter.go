@@ -714,7 +714,7 @@ func (s *Adapter) SetKerberosProvider(provider *kerberos.Provider) {
 	s.kerberosProvider = provider
 	s.handler.KerberosProvider = provider
 
-	// Make the SMB handler domain-aware (AD-4): advertise the AD NetBIOS/DNS
+	// Make the SMB handler domain-aware: advertise the AD NetBIOS/DNS
 	// domain in the NTLM challenge TargetInfo, add it to the NTLMv2 domain-try
 	// list, and stamp it on authenticated domain sessions. When the provider was
 	// not configured with a domain these stay empty and the handler falls back
