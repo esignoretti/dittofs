@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,6 +35,10 @@ func (s *Service) AddShare(
 	// Fold the name before anything keys off it: spellings differing only in
 	// leading slashes share a journal directory, so the second one must fail the
 	// reservation below as a duplicate instead of opening the first one's journal.
+	//
+	// The fold touches only leading slashes. The name arrives from a persisted
+	// share row, where a '%' is a character and not an escape, so decoding it
+	// would key the journal directory and the registry off a name no row holds.
 	config.Name = metadata.NormalizeShareName(config.Name)
 
 	// A share whose name cannot encode a file handle can never serve a file, so
@@ -440,7 +445,7 @@ func (s *Service) prepareShare(
 	// already has one would leave the real files addressable by nothing. Refuse
 	// that share rather than serve it empty. Renaming the namespace would be the
 	// other way out; it reissues every handle, and a handle must survive a
-	// restart. The two spellings are compared in the store, not against the name
+	// restart. The spellings are compared in the store, not against the name
 	// as it was persisted, so correcting the persisted name alone does not
 	// silence this.
 	unfolded := strings.TrimPrefix(config.Name, "/")
@@ -457,6 +462,30 @@ func (s *Service) prepareShare(
 			return nil, nil, fmt.Errorf(
 				"share %q would be served from a new, empty root: its files are keyed by %q, which this build addresses as %q",
 				config.Name, unfolded, config.Name)
+		}
+
+		// decision: a root under the name's decoded spelling is reported, not
+		// refused, because unlike the slash-trimmed spelling above it is not
+		// evidence on its own. No registered share is ever named without a
+		// leading slash, so a root under one can only be a leftover; a decoded
+		// spelling is an ordinary name, so "/a b" may equally be a live sibling
+		// of "/a%20b" that owns that root outright. Refusing on it would make
+		// two lawful shares block each other by load order, and the seam cannot
+		// tell the two apart — it sees one metadata store, not the set of share
+		// rows. Promote this to a refusal from somewhere that holds every row
+		// and can say the spelling belongs to no other share.
+		if decoded, derr := url.PathUnescape(config.Name); derr == nil {
+			if folded := metadata.NormalizeShareName(decoded); folded != config.Name {
+				decodedRoot, rerr := rootExists(ctx, metadataStore, folded)
+				if rerr != nil {
+					return nil, nil, fmt.Errorf("failed to look up the root of share %q: %w", folded, rerr)
+				}
+				if decodedRoot {
+					logger.Warn("share has no root of its own while its decoded spelling does; "+
+						"if no share by that name exists, this one is being served empty and its files are keyed by the other name",
+						"share", config.Name, "decoded", folded)
+				}
+			}
 		}
 	}
 
