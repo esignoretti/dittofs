@@ -1599,6 +1599,46 @@ func (h *Handler) setFileInfoFromStore(
 			}
 		}
 
+		// An EA write is a data-modifying operation: it invalidates the file's
+		// cached attributes, so Read caching held by other clients (an SMB
+		// read lease, or an NFSv4 delegation whose client would otherwise keep
+		// serving the old value) must be broken first. Same break the truncate
+		// path above performs, for the same reason.
+		if h.LeaseManager != nil && len(openFile.MetadataHandle) > 0 {
+			lockFileHandle := lock.FileHandle(openFile.MetadataHandle)
+			if breakErr := h.LeaseManager.BreakReadLeasesOnWrite(lockFileHandle, openFile.ShareName, openFile.LeaseKey); breakErr != nil {
+				logger.Debug("SET_INFO: oplock break on EA set failed (non-fatal)", "path", openFile.Name().Path, "error", breakErr)
+			}
+			// An NFSv4 delegation is broken by the same call, but its holder
+			// keeps serving cached attributes until it answers CB_RECALL. The
+			// next NFS GETXATTR would otherwise observe the pre-write value, so
+			// wait out the break before committing the mutation — same wait the
+			// rename path above performs.
+			//
+			// Step out of the response order first, for the same reason the
+			// rename path does: the holder may be this very connection, and it
+			// cannot read the break or send its ACK while this response is
+			// still queued ahead of it.
+			releaseResponseOrder(ctx)
+			waitCtx, cancelWait := context.WithTimeout(authCtx.Context, lease.AsyncCreateBreakWaitTimeout)
+			waitErr := h.LeaseManager.WaitForOtherKeyBreaks(
+				waitCtx, lockFileHandle, openFile.ShareName, openFile.LeaseKey,
+			)
+			cancelWait()
+			if waitErr != nil {
+				// The timeout path force-completes SMB leases but not delegations,
+				// so an unanswered recall leaves the holder's cache authoritative.
+				// Committing the EA here would hand the NFS client a stale value
+				// on its next GETXATTR — the very thing the recall is for — so the
+				// write fails instead. A client that never answers costs a failed
+				// EA set, which the SMB client may retry; a silently stale reader
+				// is not recoverable.
+				logger.Debug("SET_INFO: EA set break incomplete, refusing the write",
+					"path", openFile.Name().Path, "error", waitErr)
+				return setInfoStatus(types.StatusFileLockConflict), nil
+			}
+		}
+
 		// Persist the EA set/delete mutations through the metadata layer.
 		// A zero-length value deletes the named EA; a non-empty value upserts
 		// it (MS-FSCC §2.4.16 ("FileFullEaInformation")). EA-name matching is
