@@ -2,6 +2,7 @@ package netlogon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -51,6 +52,11 @@ type onlineProvider struct {
 	// scheduled RotationManager and set two different passwords on the DC at once
 	// (which would leave the persisted secret out of sync with whichever set won).
 	rotateMu sync.Mutex
+
+	// rotateHook, when set, runs after the DC has accepted the new password and
+	// before it is persisted. A test uses it to cancel the rotation context in
+	// that window, which is where a shutdown cancellation can land.
+	rotateHook func()
 }
 
 // onlineSnapshot is a side-effect-free view of an onlineProvider's introspectable
@@ -164,6 +170,11 @@ func (p *onlineProvider) ensureJoinedLocked(ctx context.Context) error {
 	return nil
 }
 
+// machineSecretPersistTimeout bounds the detached persist that follows a
+// password change on the DC. Long enough for a local write, short enough that
+// an unresponsive secret store cannot hold shutdown open.
+const machineSecretPersistTimeout = 10 * time.Second
+
 // rotate generates a new password, sets it on the DC via the authenticator's
 // established secure channel (authenticated with the CURRENT password), and on
 // success persists it and switches the in-memory credential. The order matters:
@@ -194,9 +205,24 @@ func (p *onlineProvider) rotate(ctx context.Context, auth *Authenticator) error 
 	p.lastRotation = time.Now()
 	p.mu.Unlock()
 
+	if p.rotateHook != nil {
+		p.rotateHook()
+	}
+
 	// Then persist so the new secret survives a restart.
+	//
+	// This step must not be abandoned once the DC has switched: the password on
+	// the DC and the one on disk have to agree, or a restart authenticates with
+	// the stale secret and the machine account is locked out until a re-join. So
+	// it runs detached from the caller's cancellation, which Stop may have
+	// triggered while the DC round-trip above was still in flight — that is the
+	// cancellation this whole path exists to honour, and it must not reach past
+	// the point where the DC and the persisted copy diverge. It is still bounded,
+	// so an unresponsive secret store cannot hold shutdown open indefinitely.
 	if p.secret != nil {
-		if err := p.secret.SetMachineSecret(ctx, newPassword); err != nil {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), machineSecretPersistTimeout)
+		defer cancel()
+		if err := p.secret.SetMachineSecret(persistCtx, newPassword); err != nil {
 			// In-memory is already consistent with the DC, so the live process is
 			// fine. But the persisted secret is now stale: after a restart it would
 			// no longer match the DC. Surface loudly so an operator can intervene
@@ -222,6 +248,13 @@ type RotationManager struct {
 	stop chan struct{}
 	done chan struct{}
 
+	// rotateCtx is cancelled by Stop so an in-flight rotation stops waiting on
+	// the DC instead of holding the join for the length of its own timeout. The
+	// loop owns the per-tick deadline on top of it; this is the cancellation
+	// that makes Stop bounded rather than merely patient.
+	rotateCtx    context.Context
+	rotateCancel context.CancelFunc
+
 	startOnce sync.Once
 	stopOnce  sync.Once
 	started   atomic.Bool
@@ -238,12 +271,15 @@ func NewRotationManager(prov MachineCredentialProvider, auth *Authenticator, int
 	if !ok || interval <= 0 || auth == nil {
 		return nil
 	}
+	rotateCtx, rotateCancel := context.WithCancel(context.Background())
 	return &RotationManager{
-		provider: op,
-		auth:     auth,
-		interval: interval,
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		provider:     op,
+		auth:         auth,
+		interval:     interval,
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		rotateCtx:    rotateCtx,
+		rotateCancel: rotateCancel,
 	}
 }
 
@@ -285,10 +321,30 @@ func (m *RotationManager) run() {
 		case <-m.stop:
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			// Bounded per tick by the rotation's own deadline, and by the
+			// manager's cancellation on top of it: a rotate that is waiting on
+			// an unresponsive DC ends when Stop is called rather than holding
+			// the shutdown join for the full two minutes. A manager built by
+			// hand (tests) may carry no context; fall back to the background
+			// one so the tick still runs.
+			parent := m.rotateCtx
+			if parent == nil {
+				parent = context.Background()
+			}
+			ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
 			if err := m.provider.rotate(ctx, m.auth); err != nil {
-				slog.Default().Error("netlogon: machine-password rotation failed (will retry next interval)",
-					"account", m.provider.cfg.AccountName, "error", err)
+				// A rotation cancelled by Stop is the expected outcome of a clean
+				// shutdown, not a failed rotation: logging it at ERROR makes every
+				// ordinary stop look like a machine-account problem to anything
+				// watching the logs. Expected errors are logged below ERROR per the
+				// project's logging convention.
+				if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+					slog.Default().Debug("netlogon: rotation cancelled during shutdown",
+						"account", m.provider.cfg.AccountName)
+				} else {
+					slog.Default().Error("netlogon: machine-password rotation failed (will retry next interval)",
+						"account", m.provider.cfg.AccountName, "error", err)
+				}
 			}
 			cancel()
 		}
@@ -299,11 +355,22 @@ func (m *RotationManager) run() {
 // nil receiver, idempotent, and non-blocking when Start was never called (no
 // goroutine to wait for) — so `m := NewRotationManager(...); defer m.Stop()`
 // with an early return before Start does not deadlock.
+//
+// Stop cancels the context an in-flight rotation runs under before joining, so
+// the join is bounded by real cancellation rather than by that rotation's own
+// two-minute deadline. Without it, a rotate waiting on an unresponsive DC kept
+// the caller in this join for up to the full deadline, ahead of whatever
+// shutdown work is sequenced after it.
 func (m *RotationManager) Stop() {
 	if m == nil {
 		return
 	}
-	m.stopOnce.Do(func() { close(m.stop) })
+	m.stopOnce.Do(func() {
+		if m.rotateCancel != nil {
+			m.rotateCancel()
+		}
+		close(m.stop)
+	})
 	if !m.started.Load() {
 		return
 	}

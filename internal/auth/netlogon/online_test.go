@@ -208,3 +208,107 @@ func TestRotationManager_StartThenStop(t *testing.T) {
 
 // ensure fakeLDAP search returns an empty (non-nil) result for the no-OU path.
 var _ = ldapv3.NewSearchRequest
+
+// TestRotationManager_StopDoesNotWaitOutTheRotationDeadline is the timing half of
+// #2674: Stop must return on cancellation, not after rotate's own two-minute
+// deadline. The assertion is generous — the point is that it is bounded by
+// cancellation at all, not that it is instantaneous.
+func TestRotationManager_StopDoesNotWaitOutTheRotationDeadline(t *testing.T) {
+	inFlight := make(chan struct{}, 1)
+
+	blocking := func(ctx context.Context, _ *JoinConfig) (ldapConn, error) {
+		select {
+		case inFlight <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	p := &onlineProvider{cfg: onlineCfg(), secret: &memSecretStore{}, dial: blocking}
+	auth := NewAuthenticator(p)
+
+	m := NewRotationManager(p, auth, 10*time.Millisecond)
+	m.Start()
+
+	// Wait until a rotate is blocked inside the dial.
+	select {
+	case <-inFlight:
+	case <-time.After(5 * time.Second):
+		m.Stop()
+		t.Fatal("rotation never reached the blocking dial")
+	}
+
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() blocked while a rotation was waiting on an unresponsive DC: " +
+			"the join is not bounded by cancellation")
+	}
+}
+
+// TestRotate_PersistsEvenWhenTheRotationContextIsCancelled pins the invariant
+// that keeps the DC and the persisted secret in agreement. Stop cancels the
+// context a rotation runs under, and that cancellation can land after the DC
+// has accepted the new password but before the secret is written to disk. If it
+// reached the persist, the DC would hold one password and the disk another, and
+// a restart would authenticate with the stale one — locking the machine account
+// out until a re-join. The persist therefore runs detached from that
+// cancellation, still bounded by its own deadline.
+//
+// The hook fires in exactly that window: after setPassword returns (the DC has
+// switched) and before the persist is reached.
+func TestRotate_PersistsEvenWhenTheRotationContextIsCancelled(t *testing.T) {
+	st := &fakeState{}
+	withFakeChannels(t, st)
+
+	secret := &cancelledAwareSecret{memSecretStore: &memSecretStore{}}
+	p := &onlineProvider{
+		cfg:      onlineCfg(),
+		secret:   secret,
+		password: "old-password",
+		joined:   true,
+		dial:     func(context.Context, *JoinConfig) (ldapConn, error) { return &fakeLDAP{}, nil },
+	}
+	auth := NewAuthenticator(p)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p.rotateHook = cancel // cancel after the DC switch, before the persist
+
+	if err := p.rotate(ctx, auth); err != nil {
+		t.Fatalf("rotate returned %v; the persist must not be abandoned after the DC switched", err)
+	}
+	if !secret.persisted {
+		t.Fatal("rotation succeeded but the new secret was never persisted")
+	}
+	if secret.sawCancelled {
+		t.Error("the persist ran on an already-cancelled context: a cancellation landing " +
+			"after the DC switched would leave disk and DC disagreeing")
+	}
+	if secret.val == "" || secret.val == "old-password" {
+		t.Errorf("persisted secret = %q, want the newly rotated password", secret.val)
+	}
+}
+
+// cancelledAwareSecret wraps memSecretStore and records whether the context it
+// was handed was already cancelled.
+type cancelledAwareSecret struct {
+	*memSecretStore
+	persisted    bool
+	sawCancelled bool
+}
+
+func (s *cancelledAwareSecret) SetMachineSecret(ctx context.Context, v string) error {
+	s.persisted = true
+	if ctx.Err() != nil {
+		s.sawCancelled = true
+	}
+	return s.memSecretStore.SetMachineSecret(ctx, v)
+}
+
+func (s *cancelledAwareSecret) GetMachineSecret(ctx context.Context) (string, error) {
+	return s.memSecretStore.GetMachineSecret(ctx)
+}
