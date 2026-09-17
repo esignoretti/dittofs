@@ -114,3 +114,52 @@ func (g *shareGrantStore) DeleteSIDSharePermissionsByDisplayName(ctx context.Con
 	g.grantsChanged(ctx, shareName)
 	return nil
 }
+
+// UpdateUser completes an identity change the same way a grant write does. A
+// user's grants project onto a share root as ACEs keyed on the user's Unix id,
+// so moving that id orphans every ACE built from the old one: the grant row is
+// untouched by the update, no grant write fires, and the grantee is left
+// holding a live grant with no ACE on a root owned by uid 0 mode 0755. The
+// reprojection belongs here rather than in the user handler so every caller of
+// the identity mutation gets it, exactly as the grant writes do.
+//
+// Every persisted update reprojects, rather than only one that moved the id.
+// Comparing against a pre-read id cannot be made atomic with the update — the
+// read and the write are separate store calls — so two concurrent edits could
+// each see the original id, let the later write restore it, and both skip the
+// reprojection, leaving the projection describing an id the user no longer has.
+// That is the same orphaning this method exists to prevent. The reprojection is
+// a full rebuild from current state and the invalidation is a broadcast, so
+// repeating it for an edit that did not move the id is redundant, not wrong.
+func (g *shareGrantStore) UpdateUser(ctx context.Context, user *models.User) error {
+	if err := g.Store.UpdateUser(ctx, user); err != nil {
+		return err
+	}
+	perms, err := g.GetUserSharePermissions(ctx, user.Username)
+	if err != nil {
+		logger.Warn("Failed to list share grants after a user update", "user", user.Username, "error", err)
+		return nil
+	}
+	for _, p := range perms {
+		g.grantsChanged(ctx, p.ShareName)
+	}
+	return nil
+}
+
+// UpdateGroup is UpdateUser for a group's GID: a group grant projects under the
+// group's Unix id just as a user grant does, and it reprojects unconditionally
+// for the same reason.
+func (g *shareGrantStore) UpdateGroup(ctx context.Context, group *models.Group) error {
+	if err := g.Store.UpdateGroup(ctx, group); err != nil {
+		return err
+	}
+	perms, err := g.GetGroupSharePermissions(ctx, group.Name)
+	if err != nil {
+		logger.Warn("Failed to list share grants after a group update", "group", group.Name, "error", err)
+		return nil
+	}
+	for _, p := range perms {
+		g.grantsChanged(ctx, p.ShareName)
+	}
+	return nil
+}

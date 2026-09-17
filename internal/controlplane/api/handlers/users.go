@@ -2,24 +2,28 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/marmos91/dittofs/internal/controlplane/api/auth"
 	"github.com/marmos91/dittofs/internal/controlplane/api/middleware"
 	"github.com/marmos91/dittofs/pkg/controlplane/models"
 	"github.com/marmos91/dittofs/pkg/controlplane/store"
+	"github.com/marmos91/dittofs/pkg/metadata"
 )
 
 // userStore is the minimal store surface needed by UserHandler. It composes the
 // sub-interfaces required to manage users plus their group memberships and
 // share permissions. store.Store satisfies it because Store embeds all of these.
 //
-// The share-permission mutations on it complete themselves: the store the
-// router supplies is the runtime's grant-completing wrapper, which reprojects
-// the share root ACL and invalidates the adapters' auth caches after a
-// successful write, so a grant written here lands identically to the same grant
-// written through the share permission routes.
+// The mutations on it that move a projected grant identity complete themselves:
+// the store the router supplies is the runtime's grant-completing wrapper, which
+// reprojects the share root ACL and invalidates the adapters' auth caches after a
+// successful share-permission write or a user UID change, so a grant written
+// here lands identically to the same grant written through the share permission
+// routes.
 type userStore interface {
 	store.UserStore
 	store.GroupStore
@@ -164,11 +168,14 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Apply any requested share permissions. These are best-effort and
 	// non-transactional with user creation: an unresolvable share or invalid
-	// permission is skipped rather than rolling back the created user. The
-	// dedicated permissions endpoint remains the canonical management path.
-	h.applySharePerms(r, user.ID, req.SharePerms)
+	// permission is skipped rather than rolling back the created user, and the
+	// skipped entries are named in the response so a 200 does not read as
+	// success for a permission that was never applied. The dedicated
+	// permissions endpoint remains the canonical management path.
+	resp := userToResponse(user)
+	resp.Warnings = h.applySharePerms(r, user.ID, req.SharePerms)
 
-	WriteJSONCreated(w, userToResponse(user))
+	WriteJSONCreated(w, resp)
 }
 
 // List handles GET /api/v1/users.
@@ -296,8 +303,9 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply any requested share permissions (best-effort; see Create).
+	var permWarnings []string
 	if req.SharePerms != nil {
-		h.applySharePerms(r, user.ID, *req.SharePerms)
+		permWarnings = h.applySharePerms(r, user.ID, *req.SharePerms)
 	}
 
 	// Re-fetch so the response reflects the updated groups and permissions.
@@ -307,7 +315,9 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	WriteJSONOK(w, userToResponse(user))
+	resp := userToResponse(user)
+	resp.Warnings = permWarnings
+	WriteJSONOK(w, resp)
 }
 
 // applySharePerms applies the requested share permissions to a user. It is
@@ -315,26 +325,78 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 // a bad entry never blocks user create/update. Logged at debug per the
 // expected-error logging convention.
 //
+// The share name is a JSON map key rather than a URL path segment, so it is
+// folded with metadata.NormalizeShareName before the lookup — the share
+// permission routes accept both "export" and "/export", and the user route
+// must reach the same share for the same spelling. The lookup still misses a
+// name that names no share, and that skip is reported rather than silent: the
+// caller asked for a permission and a 200 alone cannot distinguish "applied"
+// from "dropped". The returned warnings are empty when nothing was skipped.
+//
+// Two spellings of one share in the same request are one grant, not two: they
+// resolve to the same share and therefore the same (user, share) row, so
+// applying both would leave the winner to Go's random map iteration order — the
+// same request could produce different effective permissions on different runs.
+// Entries are therefore applied in sorted key order, so the last spelling in
+// that order wins deterministically, and the collision is reported.
+//
 // Each write also reprojects the share's root ACL, because the store carries
 // that completion (see userStore) — without it a grant made here would leave
 // the grantee unable to traverse a share root owned by uid 0.
-func (h *UserHandler) applySharePerms(r *http.Request, userID string, perms map[string]models.SharePermission) {
-	for shareName, perm := range perms {
+func (h *UserHandler) applySharePerms(r *http.Request, userID string, perms map[string]models.SharePermission) []string {
+	var warnings []string
+
+	// Sorted so a request naming one share twice resolves the same way every
+	// time; the map's own order is random.
+	names := make([]string, 0, len(perms))
+	for name := range perms {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	// appliedByShare records which key last wrote each resolved share, so a
+	// second spelling of it can be reported rather than silently overwriting.
+	appliedByShare := make(map[string]string, len(names))
+
+	for _, shareName := range names {
+		perm := perms[shareName]
 		if !perm.IsValid() {
+			warnings = append(warnings, fmt.Sprintf("share_permissions[%q]: invalid permission %q", shareName, perm))
 			continue
 		}
-		sh, err := h.store.GetShare(r.Context(), shareName)
+		sh, err := h.store.GetShare(r.Context(), metadata.NormalizeShareName(shareName))
 		if err != nil {
-			// Share not found (or other lookup error): skip silently.
+			// Share not found (or other lookup error): skip rather than roll
+			// back the user write, and report so the caller can see it. A
+			// lookup failure that is not a miss is named as such: reporting a
+			// store outage as "share not found" sends the operator to correct
+			// a key that was never wrong.
+			if errors.Is(err, models.ErrShareNotFound) {
+				warnings = append(warnings, fmt.Sprintf("share_permissions[%q]: share not found", shareName))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("share_permissions[%q]: share lookup failed: %v", shareName, err))
+			}
 			continue
 		}
-		_ = h.store.SetUserSharePermission(r.Context(), &models.UserSharePermission{
+		if prev, dup := appliedByShare[sh.Name]; dup {
+			warnings = append(warnings, fmt.Sprintf(
+				"share_permissions[%q]: also names share %q as %q; the later entry in sorted order applies",
+				shareName, sh.Name, prev))
+		}
+		if err := h.store.SetUserSharePermission(r.Context(), &models.UserSharePermission{
 			UserID:     userID,
 			ShareID:    sh.ID,
 			ShareName:  sh.Name,
 			Permission: string(perm),
-		})
+		}); err != nil {
+			warnings = append(warnings, fmt.Sprintf("share_permissions[%q]: %v", shareName, err))
+			continue
+		}
+		appliedByShare[sh.Name] = shareName
 	}
+	// Deterministic order: the map iteration above is random.
+	slices.Sort(warnings)
+	return warnings
 }
 
 // Remove handles DELETE /api/v1/users/{username}.
