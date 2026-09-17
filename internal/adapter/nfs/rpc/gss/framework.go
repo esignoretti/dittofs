@@ -855,13 +855,28 @@ func (p *GSSProcessor) resolveIdentity(ctx context.Context, principal, realm str
 			return nil, fmt.Errorf("identity resolver unavailable for %s@%s: %w", principal, realm, err)
 		}
 		if resolved.Found {
-			return &metadata.Identity{
+			identity := &metadata.Identity{
 				UID:      &resolved.UID,
 				GID:      &resolved.GID,
 				GIDs:     resolved.GIDs,
 				Username: resolved.Username,
 				Domain:   resolved.Domain,
-			}, nil
+			}
+			// Carry the Windows identity across. These fields are not consumed
+			// here: the RPC layer extracts only UID/GID/GIDs into the handler
+			// context, and the auth-context builders read SID/GroupSIDs back
+			// out of the Go context (auth.BuildAuthContext,
+			// v4/handlers.buildV4AuthContext) before ACL evaluation matches
+			// ACEs against them. Populating them here is what makes that
+			// possible; without it a Kerberos principal's SID-keyed ACEs never
+			// match on the NFS side even though the same user's SMB requests
+			// match them via PACGroupSIDs. Dropping them fails closed.
+			if resolved.SID != "" {
+				sid := resolved.SID
+				identity.SID = &sid
+			}
+			identity.GroupSIDs = resolved.GroupSIDs
+			return identity, nil
 		}
 		return nobodyIdentity(), nil
 	}
