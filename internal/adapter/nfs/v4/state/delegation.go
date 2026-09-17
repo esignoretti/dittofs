@@ -748,18 +748,47 @@ func (sm *StateManager) nextUntriedSender(clientID uint64, tried map[*Backchanne
 // attemptRecallV41 sends one CB_RECALL through one sender and waits for its
 // result. It starts the delegation's long timer on success; every other outcome
 // leaves the timer to the caller, which knows whether any session is left.
+//
+// The wait has two bounds because a sender serialises its sends and the recall
+// spends two different kinds of time before its result arrives: time queued
+// behind the callback in flight, and time being sent. Only the second is what
+// worstCaseSendDuration describes, so the first is bounded separately and the
+// send watchdog starts when the request is dequeued rather than when it was
+// enqueued. Bounding only the total would revoke a delegation whose callback
+// was still deliverable, because the queue wait is charged against a budget
+// that exists to cover the send.
+//
 // recallResultGrace is the margin added to a sender's worst-case retry schedule
 // before the recall gives up waiting for it. It covers scheduling delay only:
 // the wait exists to catch a sender that will never report at all, not to
 // out-wait one that is still working.
-const recallResultGrace = 5 * time.Second
+//
+// A var rather than a const so a test can shrink the margin and still exercise
+// the same two-phase wait; nothing outside a test writes it.
+var recallResultGrace = 5 * time.Second
+
+// queueWaitBound is how long a request enqueued with `ahead` requests in front
+// of it may sit in the queue before its caller calls the sender wedged. Each
+// request ahead of it can consume a full retry schedule, so the bound is one
+// schedule per request in front plus the dequeue margin. A single schedule is
+// not enough: a healthy sender draining a queue of notifications and recalls
+// takes several, and a bound that expired mid-drain would report the recall
+// local while it was still deliverable.
+func (bs *BackchannelSender) queueWaitBound(ahead int) time.Duration {
+	if ahead < 1 {
+		ahead = 1
+	}
+	return time.Duration(ahead)*bs.worstCaseSendDuration() + recallResultGrace
+}
 
 func (sm *StateManager) attemptRecallV41(deleg *DelegationState, sender *BackchannelSender, recallOp []byte) recallOutcome {
 	resultCh := make(chan error, 1)
+	dequeue := newCallbackDequeue()
 	req := CallbackRequest{
 		OpCode:   types.OP_CB_RECALL,
 		Payload:  recallOp,
 		ResultCh: resultCh,
+		Dequeue:  dequeue,
 	}
 
 	if !sender.Enqueue(req) {
@@ -767,6 +796,11 @@ func (sm *StateManager) attemptRecallV41(deleg *DelegationState, sender *Backcha
 			"client_id", deleg.ClientID, "session_id", sender.sessionID.String())
 		return recallSenderLocal
 	}
+
+	// Requests in front of this one at enqueue: everything already in the queue
+	// plus the one the sender is working on. It bounds the queue wait, so a
+	// recall behind a burst of callbacks is not mistaken for a wedged sender.
+	ahead := len(sender.queue) + 1
 
 	// One place that turns a result into an outcome, because two select branches
 	// need it: the normal receive, and the watchdog, where a result can have
@@ -802,6 +836,36 @@ func (sm *StateManager) attemptRecallV41(deleg *DelegationState, sender *Backcha
 			"client_id", deleg.ClientID,
 			"deleg_type", deleg.DelegType)
 		return recallSent
+	}
+
+	// Queue wait. The sender serialises sends, so this request sits behind every
+	// request already queued, each of which can consume a full retry schedule
+	// before its own send begins. The wait is bounded by the requests actually
+	// ahead rather than by one schedule, so a healthy sender draining a burst is
+	// not called wedged — and a sender that never dequeues at all still gives up.
+	select {
+	case <-dequeue.started:
+		// Dequeued; the send watchdog below starts now, not at enqueue.
+	case err := <-resultCh:
+		return classify(err)
+	case <-sender.stopCh:
+		logger.Debug("CB_RECALL (v4.1) aborted while queued: backchannel sender stopped",
+			"client_id", deleg.ClientID, "session_id", sender.sessionID.String())
+		return recallSenderLocal
+	case <-time.After(sender.queueWaitBound(ahead)):
+		// The timer and a dequeue can be ready together, and a select with two
+		// ready cases picks uniformly — so arriving here does not mean the
+		// sender never began the request. The claim decides which happened:
+		// losing it means the sender never took the request and the recall is
+		// local; winning it means the send is under way, so the wait falls
+		// through to the send watchdog below rather than reporting local here.
+		if dequeue.abandon() {
+			logger.Warn("CB_RECALL (v4.1) never dequeued: sender did not begin the request within the queue bound",
+				"client_id", deleg.ClientID, "session_id", sender.sessionID.String(),
+				"requests_ahead", ahead,
+				"waited", sender.queueWaitBound(ahead))
+			return recallSenderLocal
+		}
 	}
 
 	select {
