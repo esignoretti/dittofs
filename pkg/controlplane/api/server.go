@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,6 +24,13 @@ import (
 // REST snapshot-restore handler when callers do not supply an explicit
 // timeout. The dfs binary sources this from config.SnapshotConfig.
 const DefaultRestoreHTTPTimeout = 30 * time.Minute
+
+// defaultDrainTimeout bounds how long Stop waits for in-flight API handlers
+// after http.Server.Shutdown has returned. Shutdown returns when its own
+// deadline expires whether or not the handlers behind it have finished, and the
+// caller closes the control-plane store next, so this wait is the only thing
+// that orders that close after a request still using the store.
+const defaultDrainTimeout = 5 * time.Second
 
 // Timeouts bundles the per-handler budgets for long-running control-plane
 // operations that must outlive the global HTTP request timeout
@@ -61,6 +69,21 @@ type Server struct {
 	cpStore      store.Store
 	config       APIConfig
 	shutdownOnce sync.Once
+
+	// inflight counts requests currently inside the handler chain. Stop waits
+	// on it (bounded by drainTimeout) after Shutdown returns, so a request that
+	// outlived the server's own deadline is joined before the caller closes the
+	// control-plane store the handlers read directly.
+	inflight sync.WaitGroup
+	// drainMu guards draining and makes admission atomic with the counter: a
+	// request takes it for read, checks draining, and only then Adds. Drain takes
+	// it for write to set draining before Waiting, so no Add can start after Wait
+	// begins (a prohibited WaitGroup use) and no request admitted after that
+	// point reaches a handler.
+	drainMu  sync.RWMutex
+	draining bool
+	// drainTimeout overrides defaultDrainTimeout; tests shorten it.
+	drainTimeout time.Duration
 }
 
 // NewServer creates a new API HTTP server.
@@ -144,6 +167,15 @@ func NewServer(config APIConfig, rt *runtime.Runtime, cpStore store.Store, timeo
 	// cpStore implements both IdentityStore and Store
 	router := NewRouter(rt, jwtService, cpStore, config.Pprof, timeouts)
 
+	srv := &Server{
+		tlsConfig:    tlsConfig,
+		runtime:      rt,
+		jwtService:   jwtService,
+		cpStore:      cpStore,
+		config:       config,
+		drainTimeout: defaultDrainTimeout,
+	}
+
 	writeTimeout := config.WriteTimeout
 	if config.Pprof && writeTimeout < 120*time.Second {
 		writeTimeout = 120 * time.Second
@@ -151,21 +183,40 @@ func NewServer(config APIConfig, rt *runtime.Runtime, cpStore store.Store, timeo
 
 	server := &http.Server{
 		Addr:         net.JoinHostPort(config.Host, strconv.Itoa(config.Port)),
-		Handler:      router,
+		Handler:      srv.trackInflight(router),
 		ReadTimeout:  config.ReadTimeout,
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  config.IdleTimeout,
 		TLSConfig:    tlsConfig,
 	}
+	srv.server = server
 
-	return &Server{
-		server:     server,
-		tlsConfig:  tlsConfig,
-		runtime:    rt,
-		jwtService: jwtService,
-		cpStore:    cpStore,
-		config:     config,
-	}, nil
+	return srv, nil
+}
+
+// trackInflight wraps a handler so every request in flight is counted for the
+// duration of the handler chain, and refuses requests once draining has begun.
+// It is the outermost wrapper, so a request is counted for as long as anything
+// downstream (middleware included) is still running.
+//
+// The admission check and the counter increment are one critical section: a
+// request that saw draining=false has already Added before Drain can set
+// draining and Wait, so the WaitGroup contract holds and the request is joined.
+// A request that arrives after draining is set is refused here rather than
+// dispatched into a handler that would touch the closing store.
+func (s *Server) trackInflight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.drainMu.RLock()
+		if s.draining {
+			s.drainMu.RUnlock()
+			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		s.inflight.Add(1)
+		s.drainMu.RUnlock()
+		defer s.inflight.Done()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start starts the API HTTP server and blocks until the context is cancelled
@@ -244,14 +295,66 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		logger.Debug("API server shutdown initiated")
 
+		// Stop admitting before Shutdown, so a request the still-open listener
+		// accepts during Shutdown's own window is refused rather than counted —
+		// the same gate the caller's Drain relies on.
+		s.drainMu.Lock()
+		s.draining = true
+		s.drainMu.Unlock()
+
 		if err := s.server.Shutdown(ctx); err != nil {
 			shutdownErr = fmt.Errorf("API server shutdown error: %w", err)
 			logger.Error("API server shutdown error", "error", err)
 		} else {
 			logger.Info("API server stopped gracefully")
 		}
+
+		// Shutdown returns on its own deadline whether or not the handlers
+		// behind it returned. The caller closes the control-plane store after
+		// this returns, and handlers read that store directly, so wait (bounded)
+		// for the stragglers before reporting. Losing this bound means the store
+		// closes under a request still using it — the same shape as before, but
+		// now it takes a handler that outlasted both deadlines rather than any
+		// slow one.
+		drainCtx, cancel := context.WithTimeout(context.Background(), s.drainTimeout)
+		defer cancel()
+		if !s.Drain(drainCtx) {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("in-flight API request did not finish within %s", s.drainTimeout))
+			logger.Error("API server drain did not complete", "timeout", s.drainTimeout)
+		}
 	})
 	return shutdownErr
+}
+
+// Drain stops admitting new requests and waits for the ones already counted to
+// finish, returning true when they all have and false when ctx expires first.
+// It is the fence that lets the caller close a resource the handlers read
+// directly (the control-plane store) only after they are done with it, and it
+// is separate from Stop so the caller can apply it on a path where Stop never
+// ran — the forced-exit branch of the daemon's shutdown wait returns while
+// Serve, and with it Stop, may still be in flight.
+//
+// Setting draining first is what makes the wait safe on that path: without it a
+// request accepted by the still-open listener could Add after Wait began, which
+// both breaks the WaitGroup contract and lets that request reach the store after
+// this returned. Once draining is set the listener refuses such a request, so a
+// false result means only that a request already in flight outlasted ctx.
+func (s *Server) Drain(ctx context.Context) bool {
+	s.drainMu.Lock()
+	s.draining = true
+	s.drainMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.inflight.Wait()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // Handler returns the underlying HTTP handler for the API server.

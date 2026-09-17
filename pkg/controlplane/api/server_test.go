@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	goruntime "runtime"
 	"testing"
 	"time"
@@ -298,6 +299,191 @@ func TestAPIConfig_PprofRateDefaults(t *testing.T) {
 		})
 	}
 }
+
+// TestAPIServer_StopDrainsInflightHandlers pins the shutdown fence: Stop must
+// not return while a request that outlived http.Server.Shutdown's deadline is
+// still running, because the caller closes the control-plane store the handlers
+// read directly once Stop reports. Two branches: a handler that finishes inside
+// the drain bound is joined (Stop returns nil), and one that does not is
+// abandoned after the bound (Stop returns an error) rather than blocking the
+// process. The store close is ordered after whichever branch Stop took.
+func TestAPIServer_StopDrainsInflightHandlers(t *testing.T) {
+	t.Run("handler finishes inside the drain bound", func(t *testing.T) {
+		cpStore, cfg := testSetup(t, 18101)
+		server, err := NewServer(cfg, nil, cpStore, Timeouts{Restore: 30 * time.Minute})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		server.drainTimeout = 5 * time.Second
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		// Insert the blocking handler inside the in-flight tracker, so the
+		// request is counted exactly as a real one would be.
+		server.server.Handler = server.trackInflight(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(entered)
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startErr := make(chan error, 1)
+		go func() { startErr <- server.Start(ctx) }()
+		waitForServerReady(t, fmt.Sprintf("localhost:%d", cfg.Port), startErr, 5*time.Second)
+
+		go func() { _, _ = http.Get(fmt.Sprintf("http://localhost:%d/health", cfg.Port)) }()
+		<-entered
+
+		// Shutdown's own deadline expires immediately, so the drain is what has
+		// to keep Stop waiting for the handler.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer shutdownCancel()
+		stopReturned := make(chan error, 1)
+		go func() { stopReturned <- server.Stop(shutdownCtx) }()
+
+		select {
+		case err := <-stopReturned:
+			t.Fatalf("Stop returned before the in-flight handler finished: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		close(release)
+		select {
+		case <-stopReturned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not return after the handler finished")
+		}
+	})
+
+	t.Run("handler outlasts the drain bound", func(t *testing.T) {
+		cpStore, cfg := testSetup(t, 18102)
+		server, err := NewServer(cfg, nil, cpStore, Timeouts{Restore: 30 * time.Minute})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		server.drainTimeout = 100 * time.Millisecond
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		defer close(release)
+		server.server.Handler = server.trackInflight(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(entered)
+			<-release
+		}))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startErr := make(chan error, 1)
+		go func() { startErr <- server.Start(ctx) }()
+		waitForServerReady(t, fmt.Sprintf("localhost:%d", cfg.Port), startErr, 5*time.Second)
+
+		go func() { _, _ = http.Get(fmt.Sprintf("http://localhost:%d/health", cfg.Port)) }()
+		<-entered
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer shutdownCancel()
+		select {
+		case err := <-stopReturnedChan(server, shutdownCtx):
+			if err == nil {
+				t.Fatal("Stop returned nil, want an error for an undrained handler")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not give up on the undrained handler")
+		}
+	})
+}
+
+// stopReturnedChan runs Stop in a goroutine and returns its result channel.
+func stopReturnedChan(s *Server, ctx context.Context) <-chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- s.Stop(ctx) }()
+	return ch
+}
+
+// TestAPIServer_DrainRefusesRequestsAdmittedAfterItStarts pins the admission
+// gate: Drain sets draining before it waits, so a request arriving once the
+// drain is under way is refused (503) instead of being counted and dispatched
+// into a handler that would touch the store being closed. Without the gate, a
+// request accepted by the still-open listener on the forced-exit path could Add
+// after Wait began — a prohibited WaitGroup use — and reach the store after
+// Drain returned.
+func TestAPIServer_DrainRefusesRequestsAdmittedAfterItStarts(t *testing.T) {
+	cpStore, cfg := testSetup(t, 18103)
+	server, err := NewServer(cfg, nil, cpStore, Timeouts{Restore: 30 * time.Minute})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	// A drain that blocks until the counted request is released, so we can send
+	// another request while it is still waiting and observe the gate rather than
+	// a closed listener.
+	server.drainTimeout = 5 * time.Second
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	go func() {
+		server.trackInflight(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(entered)
+			<-release
+		})).ServeHTTP(newRecordingResponseWriter(), httptest.NewRequest(http.MethodGet, "/health", nil))
+	}()
+	<-entered // the blocking request is counted before the drain starts
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	drainResult := make(chan bool, 1)
+	go func() { drainResult <- server.Drain(drainCtx) }()
+
+	// Wait until draining is set, then send a request through the tracker.
+	deadline := time.After(2 * time.Second)
+	for {
+		server.drainMu.RLock()
+		draining := server.draining
+		server.drainMu.RUnlock()
+		if draining {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("Drain did not set the draining gate")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	rec := newRecordingResponseWriter()
+	server.trackInflight(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler ran after draining began")
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d for a request refused mid-drain", rec.status, http.StatusServiceUnavailable)
+	}
+
+	close(release)
+	if !<-drainResult {
+		t.Error("Drain returned false, want true once the counted request finished")
+	}
+}
+
+// recordingResponseWriter captures the status written through it.
+type recordingResponseWriter struct {
+	header http.Header
+	status int
+}
+
+func newRecordingResponseWriter() *recordingResponseWriter {
+	return &recordingResponseWriter{header: make(http.Header)}
+}
+
+func (w *recordingResponseWriter) Header() http.Header { return w.header }
+
+func (w *recordingResponseWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return len(b), nil
+}
+
+func (w *recordingResponseWriter) WriteHeader(status int) { w.status = status }
 
 // TestNewServer_PprofSamplingWired verifies NewServer actually applies the
 // mutex sampling fraction to the Go runtime when Pprof is enabled — the gap
