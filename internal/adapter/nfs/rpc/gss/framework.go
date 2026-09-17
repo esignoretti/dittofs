@@ -644,6 +644,12 @@ func (p *GSSProcessor) handleData(ctx context.Context, cred *RPCGSSCredV1, verif
 		}
 	}
 
+	// The call is authenticated: refresh the idle-eviction clock. This sits
+	// after the MIC so a replayed handle — which travels in the clear and is
+	// not a secret — cannot hold a context off idle eviction with a request
+	// that then fails authentication.
+	gssCtx.Touch()
+
 	// 3. Enforce the negotiated service level (no downgrade).
 	//
 	// RFC 2203 Section 5.3.3.4 permits per-call service selection, but a
@@ -924,6 +930,10 @@ func (p *GSSProcessor) handleDestroy(cred *RPCGSSCredV1, verifBody []byte, heade
 				AuthStat: AuthStatCredProblem,
 			}
 		}
+		// Authenticated: refresh the idle clock. The context is deleted below on
+		// the success path, but a sequence-window rejection returns before that
+		// and leaves it alive, and only a key-holder reaches this point.
+		gssCtx.Touch()
 		if !gssCtx.SeqWindow.Accept(cred.SeqNum) {
 			logger.Debug("GSS DESTROY: sequence number rejected (duplicate or out of window)",
 				"seq_num", cred.SeqNum,
