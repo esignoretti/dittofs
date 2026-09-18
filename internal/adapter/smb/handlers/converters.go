@@ -744,3 +744,39 @@ func modeBitMaskAttrs(bit uint32, set bool) metadata.SetAttrs {
 	}
 	return attrs
 }
+
+// carriedAttr fills in the owner on dst from a file that a remove-then-recreate
+// is replacing, so the replacement stays the same object to its owner. Both
+// symlink-conversion paths (SET_REPARSE_POINT and the MFsymlink CLOSE path)
+// remove a placeholder and re-create the name, and the auth context driving the
+// pair is the caller's — passing an empty FileAttr would take UID/GID from the
+// caller and silently re-home the result.
+//
+// It also sets ExactAttrs, which tells the create path that these attributes
+// describe an entry that already existed rather than a new one: the defaults it
+// would otherwise apply (a zero-mode default, the caller's UID/GID, SGID-parent
+// inheritance, the setid strip) all describe a *new* entry and would re-home or
+// widen a re-created one. src's own mode is deliberately not carried — the
+// caller decides that, since a symlink's POSIX mode is not meaningful.
+//
+// A nil src means RemoveFile reported success without a file, which its
+// success paths do not do; the guard is defensive. In that case ExactAttrs is
+// left unset so the create path applies its ordinary defaults — a caller-owned
+// entry — rather than marking the attributes exact and producing a root-owned
+// one from the zero UID/GID.
+//
+// decision: ExactAttrs exempts the create from the owner/mode defaults and the
+// setid strip. It is only ever set here, from attributes read off an inode the
+// caller just removed, so it cannot be reached from client input — the values
+// are an existing entry's, already validated when it was first created, and
+// defaulting them would re-home or widen the re-create. Revisit if any caller
+// can set ExactAttrs from a create request rather than from a removed inode.
+func carriedAttr(src *metadata.File, dst *metadata.FileAttr) *metadata.FileAttr {
+	if src == nil {
+		return dst
+	}
+	dst.ExactAttrs = true
+	dst.UID = src.UID
+	dst.GID = src.GID
+	return dst
+}

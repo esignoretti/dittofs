@@ -356,14 +356,35 @@ func (s *Service) createEntry(
 	newAttr.Type = fileType
 	newAttr.LinkTarget = linkTarget
 	ApplyCreateDefaults(&newAttr, ctx, linkTarget)
-	ApplyOwnerDefaults(&newAttr, ctx)
+	if attr.ExactAttrs {
+		// decision: exact re-create exempt from the zero-mode widening; see
+		// ExactAttrs.
+		//
+		// The mask is modeMask plus the DOS bits ApplyModeDefault deliberately
+		// drops. Those bits are excluded from a *new* create so they cannot
+		// suppress the automatic ARCHIVE bit; a re-create is restoring an
+		// existing entry's stored mode, so it must keep them (attr.Mode still
+		// holds the pre-default value — ApplyCreateDefaults only rewrote the
+		// copy).
+		newAttr.Mode = attr.Mode & (modeMask | dosAttributeModeBits)
+
+		// decision: exact re-create exempt from ApplyOwnerDefaults, which would
+		// re-home a root-owned placeholder onto whoever ran the conversion; see
+		// ExactAttrs.
+	} else {
+		ApplyOwnerDefaults(&newAttr, ctx)
+	}
 
 	// POSIX SGID inheritance:
 	// When parent directory has SGID bit set:
 	// 1. New entries inherit parent's GID (not the creating user's primary GID)
 	// 2. New directories also get SGID bit set (to propagate the behavior)
 	// 3. New regular files do NOT get SGID bit set
-	parentHasSGID := parent.Mode&0o2000 != 0
+	//
+	// decision: exact re-create exempt from SGID-parent inheritance, which
+	// would hand it the parent's group instead of the one it already had; see
+	// ExactAttrs.
+	parentHasSGID := !attr.ExactAttrs && parent.Mode&0o2000 != 0
 	if parentHasSGID {
 		// Inherit GID from parent directory
 		newAttr.GID = parent.GID
@@ -379,10 +400,14 @@ func (s *Service) createEntry(
 	}
 
 	// POSIX: Validate SUID/SGID bits for non-root users
-	// Even during file creation, non-root users cannot arbitrarily set these bits
+	// Even during file creation, non-root users cannot arbitrarily set these bits.
+	//
+	// decision: exact re-create exempt from the non-root setid strip, which
+	// would alter the identity the re-create exists to preserve; see
+	// ExactAttrs.
 	identity := ctx.Identity
 	isRoot := identity != nil && identity.UID != nil && *identity.UID == 0
-	if !isRoot {
+	if !isRoot && !attr.ExactAttrs {
 		// SUID (04000): Only root can set on new files
 		newAttr.Mode &= ^uint32(0o4000)
 
@@ -397,6 +422,12 @@ func (s *Service) createEntry(
 	if fileType == FileTypeRegular {
 		newAttr.PayloadID = PayloadID(buildPayloadID(parent.ShareName, id))
 	}
+
+	// The exact-attrs marker is a create-path instruction, not file state: it is
+	// cleared before the File is stored so a backend that persists the whole
+	// FileAttr (the memory store) does not hand it back through GetFile and let a
+	// later caller take the exact-create path by accident.
+	newAttr.ExactAttrs = false
 
 	// Set device numbers for block/char devices
 	if fileType == FileTypeBlockDevice || fileType == FileTypeCharDevice {

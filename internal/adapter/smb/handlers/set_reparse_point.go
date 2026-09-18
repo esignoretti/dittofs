@@ -227,6 +227,14 @@ func (h *Handler) convertOpenFileToNativeSymlink(ctx *SMBHandlerContext, openFil
 		return fmt.Errorf("failed to remove placeholder file: %w", err)
 	}
 
+	// Carry the placeholder's owner onto whatever replaces it. authCtx is the
+	// caller's, so an empty FileAttr would take its UID/GID from the caller and
+	// silently re-home the symlink — the conversion replaces the same object, it
+	// does not create a new one. The mode is the symlink default: a symlink's
+	// POSIX mode is not meaningful, and ExactAttrs suppresses the automatic
+	// default, so it has to be named here.
+	symlinkAttr := carriedAttr(removed, &metadata.FileAttr{Mode: 0o777})
+
 	// Delete content from block store (best-effort). RemoveFile returns an
 	// empty PayloadID when content must survive (hard link / recycle).
 	var removedPayloadID metadata.PayloadID
@@ -235,15 +243,21 @@ func (h *Handler) convertOpenFileToNativeSymlink(ctx *SMBHandlerContext, openFil
 	}
 	h.purgeBlockStorePayload(ctx.Context, openFile.MetadataHandle, removedPayloadID, name.Path, "SET_REPARSE_POINT")
 
-	symlink, _, err := metaSvc.CreateSymlink(authCtx, parentHandle, fileName, target, &metadata.FileAttr{})
+	symlink, _, err := metaSvc.CreateSymlink(authCtx, parentHandle, fileName, target, symlinkAttr)
 	if err != nil {
 		// The placeholder is already unlinked; CreateSymlink failing would
 		// otherwise leave the name with neither a file nor a symlink. Best-effort
 		// re-create an empty regular placeholder so the namespace entry (and the
 		// still-open handle's CLOSE path) survive. Return the original error.
-		if _, _, reErr := metaSvc.CreateFile(authCtx, parentHandle, fileName, &metadata.FileAttr{
-			Type: metadata.FileTypeRegular, Mode: 0o644,
-		}); reErr != nil {
+		// Restore the placeholder's exact owner and mode rather than inventing a
+		// world-readable file over a private one — carriedAttr's ExactAttrs keeps
+		// the create path from defaulting the mode or inheriting the parent's
+		// group over what the placeholder actually had.
+		rollbackAttr := carriedAttr(removed, &metadata.FileAttr{Type: metadata.FileTypeRegular})
+		if removed != nil {
+			rollbackAttr.Mode = removed.Mode
+		}
+		if _, _, reErr := metaSvc.CreateFile(authCtx, parentHandle, fileName, rollbackAttr); reErr != nil {
 			logger.Warn("SET_REPARSE_POINT: symlink create failed and placeholder rollback failed",
 				"path", name.Path, "createErr", err, "rollbackErr", reErr)
 		}

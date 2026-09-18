@@ -33,8 +33,11 @@ func principalOf(ctx *AuthContext) string {
 // recycleNode moves the child named name under parentHandle into the share's
 // #recycle bin, recreating the original parent subtree beneath the bin and
 // stamping recycle metadata (DeletedAt/OriginalPath/DeletedBy) on the victim.
-// It returns a copy of the victim's pre-move *File with PayloadID cleared, so
-// adapters skip block deletion (deferred reaping).
+// It returns the victim's *File with PayloadID cleared, so adapters skip block
+// deletion (deferred reaping). The returned attributes are the ones the move
+// committed, not the pre-move snapshot: the stamp and the move both write the
+// inode, and a caller that re-creates the entry from this result must not
+// resurrect an identity a concurrent chown committed before the move.
 //
 // origRel is the share-relative path the victim occupies before the move, with
 // no leading slash (e.g. "documents/report.pdf"). On ANY failure it returns an
@@ -116,13 +119,26 @@ func (s *Service) recycleNode(ctx *AuthContext, shareName string, parentHandle F
 		}
 	}
 
-	// 7. Return a copy of the pre-move file with PayloadID cleared so the
-	//    adapter skips block deletion.
+	// 7. Return the attributes that the move actually committed, not the
+	//    pre-move snapshot. The stamp above and the move both write the inode, so
+	//    a concurrent chown/chmod that commits between the snapshot and the move
+	//    would otherwise be dropped — and a caller that re-creates the entry from
+	//    this result (the symlink conversions) would resurrect the stale identity
+	//    over a removal that linearized after it. The handle encodes the inode and
+	//    the move is metadata-only, so it still resolves here. Fall back to the
+	//    snapshot only if that re-read fails; PayloadID is cleared either way so
+	//    the adapter skips block deletion.
+	attrs := victim.FileAttr
+	// GetFile tolerates a backend returning (nil, nil), so the re-read is only
+	// usable when it actually produced a file.
+	if committed, rErr := s.GetFile(ctx.Context, victimHandle); rErr == nil && committed != nil {
+		attrs = committed.FileAttr
+	}
 	out := &File{
 		ID:        victim.ID,
 		ShareName: victim.ShareName,
 		Path:      victim.Path,
-		FileAttr:  victim.FileAttr,
+		FileAttr:  attrs,
 	}
 	out.PayloadID = ""
 	return out, nil
