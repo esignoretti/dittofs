@@ -377,12 +377,17 @@ func (h *Handler) overwriteFile(
 
 	// Per MS-FSA 2.1.5.1.2 ("Open of an Existing File"): OVERWRITE/SUPERSEDE forces FILE_ATTRIBUTE_ARCHIVE
 	// on the post-overwrite metadata regardless of what the client sent — the
-	// data is "needs backup" again. Apply the requested attributes plus ARCHIVE,
-	// and preserve modeDOSCompressed (controlled only via FSCTL_SET_COMPRESSION).
-	attrs := req.FileAttributes | types.FileAttributeArchive
-	mode := SMBModeFromAttrs(attrs, existingFile.Type == metadata.FileTypeDirectory)
-	mode |= existingFile.Mode & modeDOSCompressed
-	setAttrs.Mode = &mode
+	// data is "needs backup" again.
+	//
+	// decision: that same step assigns FileAttributes outright, which would
+	// clear COMPRESSED and SPARSE along with everything the client omitted.
+	// DittoFS keeps both, treating them as properties of the storage the
+	// overwritten file still occupies rather than attributes the client
+	// restates on every open; clearing SPARSE in particular would claim an
+	// allocation the truncate just released. Revisit if a client is found that
+	// relies on SUPERSEDE to reset them. POSIX permissions are likewise the
+	// file's own and are not the client's to restate here.
+	applyDOSAttrUpdate(setAttrs, req.FileAttributes|types.FileAttributeArchive)
 	hiddenVal := req.FileAttributes&types.FileAttributeHidden != 0
 	setAttrs.Hidden = &hiddenVal
 

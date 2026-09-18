@@ -443,7 +443,18 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		}
 	}
 
-	noOwnershipAttrs := attrs.Mode == nil && attrs.UID == nil && attrs.GID == nil
+	// The attributes that require ownership rather than mere write permission.
+	//
+	// decision: the mode-bit masks count as ownership-requiring, the same as an
+	// absolute Mode. They flip DOS attribute bits, and a DOS attribute change is
+	// ownership-gated in its own right — so none of the write-permission
+	// relaxations below may admit one, however small the truncate or timestamp
+	// bump it is bundled with. Every relaxation keyed on this flag inherits the
+	// rule; onlyClearingSuidSgid does not use it and carries its own clause.
+	// Withdraw this only if DOS attributes stop being ownership-gated, not
+	// because a caller finds a pairing convenient.
+	noOwnershipAttrs := attrs.Mode == nil && attrs.UID == nil && attrs.GID == nil &&
+		attrs.ModeOrMask == nil && attrs.ModeAndNotMask == nil
 
 	// POSIX: For utimensat() with UTIME_NOW, write permission is sufficient.
 	onlySettingTimesToNow := noOwnershipAttrs && attrs.Size == nil &&
@@ -466,7 +477,6 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		!attrs.AtimeNow && !attrs.MtimeNow &&
 		attrs.Atime == nil && attrs.Mtime == nil && attrs.Ctime == nil &&
 		attrs.CreationTime == nil &&
-		attrs.ModeOrMask == nil && attrs.ModeAndNotMask == nil &&
 		attrs.Hidden == nil && attrs.ACL == nil &&
 		len(attrs.EAMutations) > 0
 
@@ -476,7 +486,11 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 	// the WRITE. We must allow this SETATTR even from non-owners who have write
 	// permission, as long as the ONLY mode change is clearing SUID/SGID bits.
 	onlyClearingSuidSgid := false
-	if attrs.Mode != nil && attrs.UID == nil && attrs.GID == nil && attrs.Size == nil {
+	// The mask clause mirrors noOwnershipAttrs, which this predicate cannot use
+	// because it requires a non-nil Mode: a privilege strip bundled with a DOS
+	// attribute flip is not a privilege strip.
+	if attrs.Mode != nil && attrs.UID == nil && attrs.GID == nil && attrs.Size == nil &&
+		attrs.ModeOrMask == nil && attrs.ModeAndNotMask == nil {
 		clearedMode := file.Mode & ^uint32(0o6000)
 		if *attrs.Mode == clearedMode && file.Mode&0o6000 != 0 {
 			onlyClearingSuidSgid = true
@@ -495,7 +509,6 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 	// checkFilePermissions). Both read-only ceilings are already enforced by
 	// shareForbidsWrites above. See AuthContext.TimestampAuthorizedByHandle.
 	onlySettingExplicitTimes := noOwnershipAttrs && attrs.Size == nil &&
-		attrs.ModeOrMask == nil && attrs.ModeAndNotMask == nil &&
 		attrs.Hidden == nil && attrs.ACL == nil && len(attrs.EAMutations) == 0 &&
 		!attrs.AtimeNow && !attrs.MtimeNow &&
 		(attrs.Atime != nil || attrs.Mtime != nil ||
@@ -626,7 +639,9 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 	// as the rest of SetFileAttributes so concurrent bit flips (e.g. SET_SPARSE
 	// racing SET_COMPRESSION) cannot clobber each other with a stale snapshot.
 	//
-	// These fields exist solely for FSCTL-managed DOS attribute bits (high word).
+	// These fields exist solely for DOS attribute bits (high word) — the
+	// FSCTL-managed compression and sparse flags, and the attributes an SMB
+	// FileAttributes update sets and clears.
 	// They are applied AFTER the POSIX SUID/SGID stripping above, so they must
 	// not be allowed to carry permission/setid/sticky bits — otherwise a caller
 	// could set e.g. SGID via ModeOrMask and bypass that validation. Whitelist
