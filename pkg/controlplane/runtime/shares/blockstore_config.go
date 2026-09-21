@@ -525,8 +525,18 @@ func (s *Service) RebindShareBlockStore(
 	defer s.rebindMu.Unlock()
 
 	s.mu.RLock()
+	closed := s.closed
 	share, ok := s.registry[name]
 	s.mu.RUnlock()
+	// A rebind during shutdown would close a store the fence is already closing
+	// and then build a replacement it never sees. Refuse before the teardown so
+	// the share keeps the store it has for the little that is left of the
+	// process. The two swaps below check again: the fence can fall while the
+	// rebuild is in flight, which is the window that makes this path worse than
+	// AddShare rather than merely equal to it.
+	if closed {
+		return fmt.Errorf("cannot rebind share %q: %w", name, ErrShuttingDown)
+	}
 	if !ok {
 		return fmt.Errorf("cannot rebind share %q: not found in registry", name)
 	}
@@ -590,14 +600,14 @@ func (s *Service) RebindShareBlockStore(
 		// still registered; a concurrent RemoveShare would already have released
 		// oldRemoteConfigID, so releasing it again here underflows the ref-count.
 		s.mu.Lock()
-		if cur, ok := s.registry[name]; !ok || cur != share {
+		cur, stillRegistered := s.registry[name]
+		closedNow := s.closed
+		if closedNow || !stillRegistered || cur != share {
 			s.mu.Unlock()
-			if closeErr := recovered.BlockStore.Close(); closeErr != nil {
-				logger.Warn("rebind: failed to close recovered block store after concurrent share removal",
-					"share", name, "error", closeErr)
-			}
-			if recovered.remoteConfigID != "" {
-				s.releaseRemoteStore(recovered.remoteConfigID)
+			s.discardUnpublished(name, recovered)
+			if closedNow {
+				return fmt.Errorf("share %q could not be rebound and its previous binding could not be restored (%w); new binding also failed: %v",
+					name, ErrShuttingDown, buildErr)
 			}
 			return fmt.Errorf("share %q was removed during rebind (new binding also failed: %v)", name, buildErr)
 		}
@@ -620,16 +630,19 @@ func (s *Service) RebindShareBlockStore(
 	// would double-decrement the shared remote ref-count and could close a
 	// remote store still used by other shares.
 	s.mu.Lock()
-	if cur, ok := s.registry[name]; !ok || cur != share {
+	cur, stillRegistered := s.registry[name]
+	// Shutdown closed every block store while this one was being rebuilt.
+	// Swapping it in now is the back door the fence cannot see: the snapshot it
+	// closed held the OLD store, so the new one would run its carve dispatcher
+	// on past the metadata store's close.
+	closedNow := s.closed
+	if closedNow || !stillRegistered || cur != share {
 		s.mu.Unlock()
-		// Share removed during rebind. Tear down the store we just built and
-		// drop its own remote ref; leave the old ref to RemoveShare.
-		if closeErr := rebuilt.BlockStore.Close(); closeErr != nil {
-			logger.Warn("rebind: failed to close new block store after concurrent share removal",
-				"share", name, "error", closeErr)
-		}
-		if rebuilt.remoteConfigID != "" {
-			s.releaseRemoteStore(rebuilt.remoteConfigID)
+		s.discardUnpublished(name, rebuilt)
+		if closedNow {
+			// The share keeps its now-closed old store, so its ops answer
+			// ErrClosed for the rest of the shutdown.
+			return fmt.Errorf("share %q was rebound but the result could not be published: %w", name, ErrShuttingDown)
 		}
 		return fmt.Errorf("share %q was removed during rebind", name)
 	}
@@ -651,6 +664,27 @@ func (s *Service) RebindShareBlockStore(
 		"block_store_id", newConfig.BlockStoreID,
 		"mode", modeLabel(newConfig.BlockStoreID != ""))
 	return nil
+}
+
+// discardUnpublished tears down a block store a rebind built but could not
+// install, and drops the remote reference that store acquired.
+//
+// The OUTGOING store's remote reference is deliberately not touched here. From
+// this point it is not knowable whether a concurrent RemoveShare has already
+// released it, and releasing it twice underflows the shared ref-count and can
+// close a remote other shares are still using. The cost of the other direction
+// is a reference that outlives its share — on a process that is leaving, or on
+// one share whose removal already accounted for it.
+func (s *Service) discardUnpublished(name string, built *Share) {
+	if built.BlockStore != nil {
+		if closeErr := built.BlockStore.Close(); closeErr != nil {
+			logger.Warn("rebind: failed to close the block store that could not be published",
+				"share", name, "error", closeErr)
+		}
+	}
+	if built.remoteConfigID != "" {
+		s.releaseRemoteStore(built.remoteConfigID)
+	}
 }
 
 // acquireRemoteStore returns a shared remote store, creating it if needed.

@@ -72,6 +72,19 @@ type BlockStoreCloser interface {
 	CloseBlockStores(ctx context.Context)
 }
 
+// BackgroundWorkerStopper stops the runtime's background workers that are not
+// owned by the adapter, snapshot or block-store machinery — the recycle-bin
+// reaper and any async block GC run in flight. Both write through the metadata
+// stores, so they are signalled first, before any teardown step runs.
+//
+// It joins the block GC run and only signals the reaper — see
+// Runtime.StopBackgroundWorkers for why the two differ and what the signalled
+// half still permits. The join is bounded, so this step can cost the shutdown
+// time it does not get back.
+type BackgroundWorkerStopper interface {
+	StopBackgroundWorkers()
+}
+
 // MachineSIDStore provides access to the SettingsStore for machine SID
 // persistence. The lifecycle service uses this to load or generate the
 // machine SID on first boot, ensuring consistent identity mapping across
@@ -269,15 +282,18 @@ type Deps struct {
 	// identity mapping. Nil yields an ephemeral SID (testing).
 	MachineSIDStore MachineSIDStore
 
-	// SnapshotDrainer is invoked as the FIRST shutdown step so in-flight
-	// snapshot orchestration goroutines are cancelled and drained BEFORE
-	// StopAllAdapters + CloseMetadataStores — otherwise those goroutines would
-	// race a closing metadata store / control-plane DB.
+	// SnapshotDrainer cancels and drains in-flight snapshot orchestration
+	// goroutines BEFORE StopAllAdapters + CloseMetadataStores — otherwise those
+	// goroutines would race a closing metadata store / control-plane DB.
 	SnapshotDrainer SnapshotDrainer
 
 	// BlockStoreCloser quiesces the per-share data plane before the metadata
 	// stores close.
 	BlockStoreCloser BlockStoreCloser
+
+	// BackgroundWorkerStopper is invoked as the FIRST shutdown step, so the
+	// workers it signals have the whole teardown in which to notice.
+	BackgroundWorkerStopper BackgroundWorkerStopper
 }
 
 // Serve starts all components and blocks until shutdown. It fails fast when
@@ -351,6 +367,11 @@ func (s *Service) serve(ctx context.Context, deps Deps) error {
 }
 
 func (s *Service) shutdown(deps Deps) {
+	// See BackgroundWorkerStopper for why this is first and why it does not wait.
+	if deps.BackgroundWorkerStopper != nil {
+		deps.BackgroundWorkerStopper.StopBackgroundWorkers()
+	}
+
 	if deps.Settings != nil {
 		// Bounded, because Stop waits for a poll already in flight and takes no
 		// context of its own. On the API-error path the root context is still

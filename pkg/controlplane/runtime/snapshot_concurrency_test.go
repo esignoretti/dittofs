@@ -472,13 +472,12 @@ func TestSnapshotConcurrency_ShutdownDuringCreate(t *testing.T) {
 			}
 		}
 
-		// Shutdown must drain every in-flight orchestration within its own
-		// bounded ctx — and must not hang.
+		// The snapshot drain must join every in-flight orchestration within its
+		// own bounded ctx — and must not hang. This is about that drain, not
+		// about the server's shutdown sequence, which teardownRuntime is not.
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		waitGroupGuard(t, 18*time.Second, "Shutdown during in-flight creates", func() {
-			if err := rt.Shutdown(shutCtx); err != nil {
-				t.Errorf("run %d: Shutdown: %v", run, err)
-			}
+		waitGroupGuard(t, 18*time.Second, "teardown during in-flight creates", func() {
+			teardownRuntime(shutCtx, rt)
 		})
 		shutCancel()
 

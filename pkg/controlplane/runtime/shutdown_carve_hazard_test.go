@@ -3,9 +3,7 @@ package runtime
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -134,44 +132,6 @@ func (f *carveHazardFixture) write(t *testing.T) {
 	}
 }
 
-// serveUntilShutdown runs the server's own lifecycle and then cancels it, so
-// the shutdown sequence under test is the one production takes — no step of it
-// is supplied by the test.
-//
-// The context must stay live until startup completes. Serve returns a startup
-// error rather than running the shutdown sequence if the cancellation lands
-// while a startup step is still using that context, and the assertions below
-// then report a shutdown that never ran instead of the startup that failed —
-// so the barrier is StartupDone, which closes only once every step that can
-// fail is past. Serve's own return is watched alongside it: a failed startup
-// leaves StartupDone open, and the error names the cause.
-func (f *carveHazardFixture) serveUntilShutdown(t *testing.T) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- f.rt.Serve(ctx) }()
-
-	select {
-	case <-f.rt.StartupDone():
-	case err := <-done:
-		t.Fatalf("Serve returned before finishing startup: %v", err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("Serve did not finish startup")
-	}
-	cancel()
-
-	select {
-	case err := <-done:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("Serve: %v", err)
-		}
-	case <-time.After(60 * time.Second):
-		t.Fatal("Serve did not return after cancellation")
-	}
-}
-
 // TestServerShutdownQuiescesCarveBeforeClosingMetadataStores is the regression
 // guard: the server's shutdown sequence must stop and drain every share's carve
 // dispatcher before it closes the metadata stores those commits run through.
@@ -197,7 +157,7 @@ func TestServerShutdownQuiescesCarveBeforeClosingMetadataStores(t *testing.T) {
 		t.Fatal("the share started no carve dispatcher: there is nothing for the fence to stop")
 	}
 
-	f.serveUntilShutdown(t)
+	serveUntilShutdown(t, f.rt)
 
 	// Long enough for several dispatcher intervals: one still running would
 	// commit more than once in this window.
@@ -230,19 +190,7 @@ func TestServerShutdownQuiescesCarveBeforeClosingMetadataStores(t *testing.T) {
 // data-plane loop and not about whatever else the process happens to be
 // running.
 func carveDispatchers() int {
-	return strings.Count(goroutineDump(), "engine.(*RemoteSync).carveDispatcher")
-}
-
-// goroutineDump returns every goroutine's stack. The buffer grows until the
-// dump fits: runtime.Stack truncates rather than reporting how much it needed,
-// and a truncated dump silently drops the frames the assertions look for.
-func goroutineDump() string {
-	for size := 1 << 20; ; size *= 2 {
-		buf := make([]byte, size)
-		if n := runtime.Stack(buf, true); n < size {
-			return string(buf[:n])
-		}
-	}
+	return countGoroutines("engine.(*RemoteSync).carveDispatcher")
 }
 
 // TestCarveCommitsReachAClosedMetadataStore_WithoutTheFence is the

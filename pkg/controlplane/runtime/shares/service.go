@@ -336,6 +336,33 @@ type Service struct {
 	// falls through to the locked registry, which reproduces the exact
 	// not-found/no-store errors, so the cache holds only non-nil stores.
 	blockStoreCache sync.Map // shareName -> *engine.Store
+
+	// closed is set by CloseBlockStores, under mu, before it snapshots the
+	// registry. It is the fence's memory: a share whose block store is composed
+	// after that snapshot is taken would start a carve dispatcher the fence has
+	// already run past, and that dispatcher commits FileChunk manifest rows
+	// through a metadata store the shutdown is about to close — or has closed.
+	//
+	// Both paths that can install a live store check it under mu at the moment
+	// they publish, which is what orders them against the snapshot: either the
+	// publish wins and the snapshot sees the store, or closed is already set and
+	// the publish refuses. AddShare and RebindShareBlockStore also check it on
+	// entry, so neither builds a store it would then have to tear down.
+	//
+	// decision: what this orders is PUBLICATION, not the dispatcher. Both paths
+	// start the store they are composing well before they reach their publish
+	// check, so a store that loses the race was running for the length of that
+	// window and is then closed by the refusal — and that close drains it
+	// against metadata stores the shutdown may already have closed. The window
+	// is short, unreachable without an operator editing shares during a
+	// shutdown, and costs a logged failed carve on a process that is leaving.
+	// Withdraw the exemption by moving the composition itself under a gate,
+	// which means holding a lock across a block-store open.
+	//
+	// It is never cleared. CloseBlockStores runs when the process is leaving,
+	// and a Service that has quiesced its data plane has no way back: the
+	// registry's stores are closed and nothing re-opens them.
+	closed bool
 }
 
 func New() *Service {
