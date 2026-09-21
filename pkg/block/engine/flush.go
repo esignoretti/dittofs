@@ -342,11 +342,23 @@ type engineBlockSink struct {
 	rbs         remote.RemoteBlockStore
 	committer   blockCommitter
 	commitLocks *carveCommitLocks
-	// onBlockCommitted reports each block as it lands, carrying the block's
-	// uploaded byte count. Reporting here rather than after a flush pass
-	// returns is what makes the count advance *during* a long flush: the drain
-	// path force-flushes in one call that can run for many minutes, and its
-	// supervisor reads these counters as a liveness signal. Nil in fixtures
+	// onPutInFlight brackets the PutBlock call itself: +1 before, -1 after it
+	// returns either way. It is what lets the controller sample upload
+	// concurrency without the metadata commit folded in. Nil in fixtures that
+	// don't care.
+	onPutInFlight func(delta int64)
+	// onBlockUploaded reports each block's bytes the moment PutBlock returns,
+	// before the metadata commit. That is the signal the upload window is
+	// actually steering: the commit is serialized per file and no amount of
+	// upload concurrency relieves it, so folding its latency into the goodput
+	// sample would have the controller shrink the window in answer to a
+	// bottleneck somewhere else entirely. Nil in fixtures that don't care.
+	onBlockUploaded func(bytes int64)
+	// onBlockCommitted reports each block as it lands durably, after the
+	// commit. Reporting here rather than after a flush pass returns is what
+	// makes the count advance *during* a long flush: the drain path
+	// force-flushes in one call that can run for many minutes, and its
+	// supervisor reads this counter as a liveness signal. Nil in fixtures
 	// that don't care.
 	onBlockCommitted func(bytes int64)
 }
@@ -421,11 +433,21 @@ func (s engineBlockSink) CommitBlock(ctx context.Context, chunks []CarveChunk) e
 
 	// PutBlock first: a crash before the commit leaves an orphan block (GC
 	// reclaims it), never an unbacked record. The upload slot is held by the
-	// upload chain (acquired before this goroutine spawned), so concurrent
-	// blocks never exceed the pass's window.
+	// upload chain (acquired before this goroutine spawned), and that window is
+	// shared by every carve pass, so concurrent blocks never exceed it
+	// syncer-wide rather than merely per pass.
+	if s.onPutInFlight != nil {
+		s.onPutInFlight(1)
+	}
 	err = s.rbs.PutBlock(ctx, blockID, bytes.NewReader(blockBytes))
+	if s.onPutInFlight != nil {
+		s.onPutInFlight(-1)
+	}
 	if err != nil {
 		return fmt.Errorf("flush: put block %s: %w", blockID, err)
+	}
+	if s.onBlockUploaded != nil {
+		s.onBlockUploaded(int64(len(blockBytes)))
 	}
 
 	rec := block.BlockRecord{

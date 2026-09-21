@@ -116,11 +116,12 @@ type RemoteSync struct {
 	completedSyncs atomic.Int64
 	failedSyncs    atomic.Int64
 
-	// uploadLimiter bounds concurrent whole-file carve passes: carveDispatcher
-	// acquires it before starting a file and releases it when that file's pass
-	// returns. It does not bound the block PUTs inside a pass — those have their
-	// own per-file semaphore sized by CarveUploadConcurrency — so the PUTs
-	// actually in flight are the product of the two windows, not this limit.
+	// uploadLimiter bounds concurrent block PUTs across the whole syncer: every
+	// flush pass shares it, holding one slot per block from submit until that
+	// block's CommitBlock returns. It is the only bound on upload concurrency,
+	// so Limit() is the number the config declares and the peak the controller
+	// samples. How many files carve at once is a separate fixed cap
+	// (carveFanOut) that holds no upload slot of its own.
 	// When ParallelUploads is pinned (> 0) its limit is fixed at that value.
 	// When unset (adaptive mode) the uploadController resizes it every control
 	// interval to track the goodput knee.
@@ -135,6 +136,24 @@ type RemoteSync struct {
 	// goodput sample and the error flag. Plain atomics — no lock needed.
 	uploadedBytesWindow atomic.Int64
 	uploadErrWindow     atomic.Int64
+
+	// putSample tracks concurrent PutBlock calls directly, which is what the
+	// controller samples. The upload window cannot stand in for it: a slot is
+	// held across PutBlock AND the metadata commit that follows, so a slow
+	// per-file commit fills the window after the uploads have finished and the
+	// window's own peak then reports uplink saturation that is really commit
+	// backpressure. This counts only the time inside PutBlock.
+	//
+	// The live count and the high-water mark share ONE word — peak in the high
+	// 32 bits, in-flight in the low 32 — so that sampling them is a single
+	// atomic step. Held as two atomics they could not be read together: a PUT
+	// that had incremented the in-flight count but not yet raised the peak
+	// would be folded into the baseline the sampler installed and then find
+	// nothing left to raise, so the interval it overlapped reported a peak one
+	// short. That loss only ever runs downward, and an under-reported peak is
+	// what reads as app-limited — the misclassification this whole path exists
+	// to remove.
+	putSample atomic.Uint64
 
 	// --- block carve path (object packing) ---
 
@@ -459,14 +478,93 @@ func (m *RemoteSync) SyncCounts() (completed, failed int) {
 	return int(m.completedSyncs.Load()), int(m.failedSyncs.Load())
 }
 
-// noteBlockCommitted records one block reaching the remote. Every carve routes
-// its commits through the same sink, so counting here covers both the
+// noteBlockUploaded feeds the goodput sample with one block's bytes as soon as
+// its PutBlock returns. It is deliberately not the same moment as
+// noteBlockCommitted: the controller resizes the upload window, so its sample
+// has to be the uplink alone and not the per-file-serialized metadata commit
+// that follows.
+//
+// decision: a block whose PutBlock succeeds and whose metadata commit then
+// fails still counts its bytes here, with no compensating error flag on the
+// Flush/SyncNow/Drain paths (only carvePass feeds uploadErrWindow). That is
+// intended rather than overlooked: those bytes did cross the uplink, and a
+// commit failure is not a signal to back the upload window off — backing off
+// would answer a metadata fault by throttling a healthy link. The caller still
+// gets the error. Revisit if commit failures ever correlate with uplink faults,
+// where suppressing the bytes would become the honest reading.
+func (m *RemoteSync) noteBlockUploaded(bytes int64) {
+	m.uploadedBytesWindow.Add(bytes)
+}
+
+// putInFlightBits is the width of the live-count half of putSample; the peak
+// occupies the other half. Upload concurrency is bounded by the window
+// (MaxParallelUploads at the very most), so neither half can approach 2^32.
+const putInFlightBits = 32
+
+func packPutSample(peak, inFlight uint32) uint64 {
+	return uint64(peak)<<putInFlightBits | uint64(inFlight)
+}
+
+func unpackPutSample(v uint64) (peak, inFlight uint32) {
+	return uint32(v >> putInFlightBits), uint32(v)
+}
+
+// notePutInFlight brackets one PutBlock: +1 before the call, -1 after it
+// returns (success or failure). Delta rather than a start/end pair keeps it to
+// one sink hook.
+//
+// The count and the peak move together in one compare-and-swap, so a sampler
+// never sees a PUT counted in one and missing from the other. This is a CAS
+// loop rather than a mutex on purpose: it brackets every upload, and the
+// previous version already ran a CAS loop here to raise the peak, so nothing
+// on the hot path got slower.
+func (m *RemoteSync) notePutInFlight(delta int64) {
+	if delta == 0 {
+		return
+	}
+	for {
+		old := m.putSample.Load()
+		peak, inFlight := unpackPutSample(old)
+		if delta > 0 {
+			inFlight++
+			if inFlight > peak {
+				peak = inFlight
+			}
+		} else {
+			if inFlight == 0 {
+				return // unbalanced release; refuse to wrap the counter
+			}
+			inFlight--
+		}
+		if m.putSample.CompareAndSwap(old, packPutSample(peak, inFlight)) {
+			return
+		}
+	}
+}
+
+// takePutPeak returns the high-water mark of concurrent PutBlock calls since
+// the last call and resets it to the count still in flight — the same contract
+// as DynamicSemaphore.TakePeak, so a control interval never inherits a peak
+// that belongs to an earlier one. Read and reset are one compare-and-swap, so
+// no upload can slip between them.
+func (m *RemoteSync) takePutPeak() int {
+	for {
+		old := m.putSample.Load()
+		peak, inFlight := unpackPutSample(old)
+		if m.putSample.CompareAndSwap(old, packPutSample(inFlight, inFlight)) {
+			return int(peak)
+		}
+	}
+}
+
+// noteBlockCommitted records one block reaching the remote durably. Every carve
+// routes its commits through the same sink, so counting here covers both the
 // background dispatcher and the drain's force-carve — the latter runs as a
 // single call that can span minutes, and counting only on its return would
-// leave the progress signal flat for that whole time.
-func (m *RemoteSync) noteBlockCommitted(bytes int64) {
+// leave the progress signal flat for that whole time. The block's byte count
+// goes to noteBlockUploaded instead, one step earlier.
+func (m *RemoteSync) noteBlockCommitted(int64) {
 	m.completedSyncs.Add(1)
-	m.uploadedBytesWindow.Add(bytes)
 }
 
 // DrainAllUploads performs an immediate synchronous upload of every local
@@ -804,7 +902,13 @@ func (m *RemoteSync) adaptiveUploadTick(intervalSec float64) {
 	// app-limited: uploads that filled the window mean goodput reflects the
 	// window; otherwise the upstream carve pipeline was the constraint (see
 	// syncer.GoodputController.Observe).
-	peak := m.uploadLimiter.TakePeak()
+	//
+	// Sampled from PutBlock concurrency rather than from the semaphore, whose
+	// slots also span the metadata commit. Reading the semaphore here let a
+	// slow commit hold slots after the uploads were done and report a full
+	// window, so the controller settled on a metadata bottleneck believing it
+	// had found the uplink knee.
+	peak := m.takePutPeak()
 	windowLimited := peak >= m.uploadLimiter.Limit()
 
 	if bytes == 0 && peak == 0 && !sawErr {
@@ -850,21 +954,38 @@ func (m *RemoteSync) flushFn() (journal.FlushFunc, func(context.Context, journal
 		blockSize = paramsBlockSize(params)
 	}
 	if m.remoteBlockStore != nil {
-		// One window governs concurrent PutBlock calls: blocks hold a slot from
-		// submit until CommitBlock returns, so at most `window` uploads (and
-		// their arenas) are in flight per pass.
-		sink := engineBlockSink{sealer: m.chunkSealer, rbs: m.remoteBlockStore, committer: m.blockCommitter, commitLocks: &carveCommitLocks{}, onBlockCommitted: m.noteBlockCommitted}
+		// The syncer's own uploadLimiter is the window, shared by every
+		// concurrent pass rather than rebuilt per pass: blocks hold a slot from
+		// submit until CommitBlock returns, so at most Limit() uploads (and
+		// their arenas) are in flight across the whole syncer. A per-pass
+		// semaphore here would nest inside the dispatcher's own window and make
+		// the PUTs in flight their product, which is both a bound nobody
+		// declared and a peak the controller cannot see.
+		sink := engineBlockSink{sealer: m.chunkSealer, rbs: m.remoteBlockStore, committer: m.blockCommitter, commitLocks: &carveCommitLocks{}, onPutInFlight: m.notePutInFlight, onBlockUploaded: m.noteBlockUploaded, onBlockCommitted: m.noteBlockCommitted}
 		// The dedup Skip hook consults the per-share synced-hash store: without
 		// it every flush treats every chunk as novel and uploads whole new
 		// blocks instead of landing manifest-only rows for content the remote
 		// already holds.
-		return newFlushClosure(m.local, params, blockSize, engineDeduper{synced: m.syncedHashStore}, sink, syncer.NewDynamicSemaphore(window))
+		// The window must exist on this path. A nil semaphore is silently
+		// accepted by the upload chain and bounds nothing, which is the same
+		// failure shape as a window negotiated by type assertion that nothing
+		// satisfies: no error, no bound, and no test notices. Every syncer
+		// built by NewRemoteSync has one; this covers a hand-built struct.
+		slots := m.uploadLimiter
+		if slots == nil {
+			slots = syncer.NewDynamicSemaphore(window)
+		}
+		return newFlushClosure(m.local, params, blockSize, engineDeduper{synced: m.syncedHashStore}, sink, slots)
 	}
 	// Local-only (no remote block store): the flush cannot upload, but it must
 	// still populate the FileChunk manifest (and project File.Blocks) so a
 	// local-only DrainRollups is not a hard error and clone/snapshot/restore
 	// resolve the file's chunks. blockCommitter is nil only for the clone
 	// fixture, whose source has no dirty data so CommitBlock never fires.
+	//
+	// This branch keeps a window of its own: uploadLimiter is an *upload*
+	// window sized by a controller chasing uplink goodput, and there is no
+	// uplink here to chase.
 	sink := localBlockSink{committer: m.blockCommitter, commitLocks: &carveCommitLocks{}}
 	return newFlushClosure(m.local, params, blockSize, localDeduper{}, sink, syncer.NewDynamicSemaphore(window))
 }

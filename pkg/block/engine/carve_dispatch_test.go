@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,21 +51,39 @@ func (f *carveFanoutLocal) Flush(_ context.Context, id journal.FileID, _ journal
 	return nil
 }
 
-// TestCarvePass_FansOutBoundedByUploadWindow proves carvePass carves every file
-// (with its FileID set), runs them concurrently, and never exceeds the upload
-// window — the fix that gives the uploader more than one block in flight.
-func TestCarvePass_FansOutBoundedByUploadWindow(t *testing.T) {
+// TestCarvePass_FanOutIsCappedIndependentlyOfUploadWindow proves carvePass
+// carves every file exactly once, runs them concurrently, and does not let a
+// narrow upload window narrow the fan-out with it: the window is pinned as
+// small as it goes and carveFanOut workers still start.
+//
+// carveFanOut is the FLOOR, not a fixed cap — carvePass sizes the fan-out as
+// max(carveFanOut, window), so a wide window widens it. This test exercises the
+// floor end only; TestUploadWindow_FanOutDoesNotThrottleBelowTheWindow covers
+// the other, where a fan-out frozen at carveFanOut collides with the shard
+// count and throttles uploads.
+//
+// The two were the same semaphore once, and that is what made upload
+// concurrency the product of two windows: a pass held an upload slot for its
+// whole carve while the blocks inside it opened a second window on the PUTs.
+// Re-coupling them would also deadlock — a pass cannot upload through a slot
+// its own loop is holding.
+func TestCarvePass_FanOutIsCappedIndependentlyOfUploadWindow(t *testing.T) {
+	files := make([]string, 0, carveFanOut+2)
+	for i := range cap(files) {
+		files = append(files, fmt.Sprintf("f%02d", i))
+	}
 	fl := &carveFanoutLocal{
 		LocalStore: memory.New(),
-		files:      []string{"a", "b", "c", "d", "e"},
-		started:    make(chan string, 5),
+		files:      files,
+		started:    make(chan string, len(files)), // never blocks a Flush on send
 		release:    make(chan struct{}),
 		carved:     map[string]int{},
 	}
-	const window = 3
 	m := &RemoteSync{
-		local:         fl,
-		uploadLimiter: syncer.NewDynamicSemaphore(window),
+		local: fl,
+		// One slot: on a build where the loop acquires this, only a single
+		// carve ever starts and the wait below reports it.
+		uploadLimiter: syncer.NewDynamicSemaphore(1),
 		stopCh:        make(chan struct{}),
 		config:        DefaultConfig(),
 	}
@@ -72,23 +91,28 @@ func TestCarvePass_FansOutBoundedByUploadWindow(t *testing.T) {
 	done := make(chan struct{})
 	go func() { m.carvePass(context.Background()); close(done) }()
 
-	// Exactly `window` carves start; the loop's Acquire blocks the rest.
+	// Exactly carveFanOut carves start; the loop's Acquire blocks the rest.
 	seen := map[string]bool{}
-	for i := 0; i < window; i++ {
-		seen[<-fl.started] = true
+	for i := range carveFanOut {
+		select {
+		case id := <-fl.started:
+			seen[id] = true
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d carves started, want %d: the fan-out is gated by something narrower than carveFanOut", i, carveFanOut)
+		}
 	}
-	require.Equal(t, int32(window), fl.inFlight.Load(), "in-flight carves should fill the window")
+	require.Equal(t, int32(carveFanOut), fl.inFlight.Load(), "in-flight carves should fill the fan-out")
 
 	// A further carve must NOT start until a slot frees.
 	select {
 	case id := <-fl.started:
-		t.Fatalf("carve %q started before the upload window freed", id)
+		t.Fatalf("carve %q started beyond the fan-out cap", id)
 	case <-time.After(50 * time.Millisecond):
 	}
 
 	// Let everything drain; the remaining files carve as slots free.
 	close(fl.release)
-	for i := 0; i < len(fl.files)-window; i++ {
+	for range len(fl.files) - carveFanOut {
 		seen[<-fl.started] = true
 	}
 	<-done
@@ -105,4 +129,39 @@ func TestCarvePass_NoFilesIsNoop(t *testing.T) {
 	m := &RemoteSync{local: fl, uploadLimiter: syncer.NewDynamicSemaphore(4), stopCh: make(chan struct{}), config: DefaultConfig()}
 	m.carvePass(context.Background()) // returns immediately, acquires nothing
 	require.Equal(t, int32(0), fl.inFlight.Load())
+}
+
+// TestCarvePass_NilUploadLimiterDoesNotPanic pins that a RemoteSync built
+// without an upload limiter still carves. NewRemoteSync always sets one, but
+// the type is also built as a bare struct literal here and in several other
+// tests in this package, so nil is a representable state that reaches
+// carvePass.
+//
+// It is a plain read (sizing the fan-out) rather than an acquire, which is
+// exactly why it needs the guard: the acquire it replaced was itself nil
+// checked, so sizing from the limiter moved the access earlier and lost the
+// check with it. Without the guard this panics rather than falling back to the
+// fan-out floor.
+func TestCarvePass_NilUploadLimiterDoesNotPanic(t *testing.T) {
+	fl := &carveFanoutLocal{
+		LocalStore: memory.New(),
+		files:      []string{"a", "b", "c"},
+		started:    make(chan string, 3),
+		release:    make(chan struct{}),
+		carved:     map[string]int{},
+	}
+	close(fl.release) // let every Flush return immediately
+	m := &RemoteSync{
+		local: fl,
+		// uploadLimiter deliberately left nil.
+		stopCh: make(chan struct{}),
+		config: DefaultConfig(),
+	}
+	require.Nil(t, m.uploadLimiter, "fixture must exercise the nil window")
+
+	m.carvePass(context.Background())
+
+	for _, id := range fl.files {
+		require.Equal(t, 1, fl.carved[id], "file %q carved exactly once", id)
+	}
 }

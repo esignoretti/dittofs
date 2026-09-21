@@ -10,6 +10,7 @@ import (
 
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/block/journal"
+	"github.com/marmos91/dittofs/pkg/block/syncer"
 )
 
 // carveDispatcher is the background carve loop. Every UploadInterval it asks the
@@ -48,25 +49,40 @@ func (m *RemoteSync) carveDispatcher(ctx context.Context) {
 	}
 }
 
+// carveFanOut is the FLOOR on how many files one pass carves at once, not the
+// cap: carvePass sizes its fan-out to max(carveFanOut, current upload window).
+// The fan-out must never be the narrower of the two, because carve serializes
+// per shard (journal flushMu is shard-scoped) and workers scatter over shards
+// balls-in-bins — a fan-out equal to the shard count leaves roughly a third of
+// the shards idle. Pinning it at a constant therefore capped PUT concurrency
+// near 13 of an allowed 64, relocating "the window does not bound what it
+// claims to" from one large file onto many small ones.
+//
+// ponytail: a floor plus the live window read once per pass, not a second
+// controller. Sizing from the window is not the same as acquiring it — taking
+// a slot per file is what made upload concurrency the product of two windows,
+// and would deadlock a pass against its own uploads.
+//
+// The ceiling this buys is read-buffer memory, and it is bounded by shards
+// rather than by the fan-out: a worker allocates chunker.MaxChunkSize (16 MiB)
+// inside the flush, after the shard lock, so parked workers hold nothing. Peak
+// is min(fanOut, ShardCount) x 16 MiB — 256 MiB at the default 16 shards, and
+// flat as the window ramps. Revisit if ShardCount ever grows far past the
+// window, where that product stops being bounded by the shard count.
+const carveFanOut = AdaptiveUploadFloor
+
 // carvePass packs every file with local data into remote blocks, carving files
 // concurrently so multiple blocks are uploaded at once. A single sequential
 // pass (one file, one block, one PutBlock at a time) leaves the uplink almost
 // idle — the block-upload latency, not the link or CPU, caps throughput.
 //
-// The adaptive upload window bounds how many files carve at once: the loop
-// acquires uploadLimiter before starting each file's carve and releases it when
-// that file's pass returns, so at most Limit() passes run together. It does not
-// bound the block PUTs inside a pass — each pass opens its own window on those —
-// so the PUTs in flight are the product of the two, and so is the memory held by
-// the blocks waiting on them.
-//
-// What the goodput controller samples through TakePeak is therefore this window,
-// the count of files, not the count of PUTs. Draining one large file peaks at a
-// single pass and reads as app-limited however many PUTs that pass has in the
-// air. Acquiring the window is still what keeps it consumed at all; without it
-// the window is never taken and stays pinned at the floor. Files in one shard
-// still serialize on the journal's internal carve lock, so the concurrency here
-// overlaps distinct shards' upload latency.
+// Concurrency here is max(carveFanOut, upload window) files, sized from the
+// window but holding none of its slots. The window itself is consumed one slot
+// per in-flight PutBlock inside the passes, so it bounds exactly what it is
+// named for, and what the controller samples through TakePeak is the count of
+// PUTs. Acquiring the window here instead would both nest the two bounds into a
+// product and deadlock: a pass cannot upload while the loop holds the slot it
+// needs.
 func (m *RemoteSync) carvePass(ctx context.Context) {
 	ids := m.local.ListFiles(ctx)
 	files := make([]string, 0, len(ids))
@@ -76,7 +92,7 @@ func (m *RemoteSync) carvePass(ctx context.Context) {
 	if len(files) == 0 {
 		return
 	}
-	// stopCh is not observed once blocked inside uploadLimiter.Acquire or a
+	// stopCh is not observed once blocked inside the fan-out Acquire or a
 	// file's Carve, so derive a pass context that a stop cancels — otherwise a
 	// shutdown while the window is full (or a carve is stuck on a slow PutBlock)
 	// would hang the dispatcher until the slot frees.
@@ -89,6 +105,21 @@ func (m *RemoteSync) carvePass(ctx context.Context) {
 		case <-ctx.Done():
 		}
 	}()
+	// Bounds goroutine spawn and live read buffers. Sized from the window but
+	// holding none of its slots; read once per pass, so a mid-pass resize lands
+	// on the next one. See carveFanOut.
+	//
+	// The nil check is not defensive noise: NewRemoteSync always sets the
+	// limiter, but RemoteSync is also built as a bare struct literal in tests,
+	// and this is a plain read rather than an acquire, so a missing window must
+	// degrade to the floor rather than panic. It cannot silently un-bound
+	// anything — the fan-out is its own semaphore, and the upload bound lives
+	// on the limiter that flushFn passes to the chain.
+	window := carveFanOut
+	if m.uploadLimiter != nil {
+		window = max(carveFanOut, m.uploadLimiter.Limit())
+	}
+	fanOut := syncer.NewDynamicSemaphore(window)
 	var wg sync.WaitGroup
 	for _, id := range files {
 		stop := false
@@ -102,19 +133,15 @@ func (m *RemoteSync) carvePass(ctx context.Context) {
 		if stop {
 			break
 		}
-		if m.uploadLimiter != nil {
-			// Blocks here when the window is full, throttling both concurrency
-			// and goroutine spawn to the current limit; released by the worker.
-			if err := m.uploadLimiter.Acquire(ctx); err != nil {
-				break // context cancelled
-			}
+		// Blocks here when the fan-out is full, throttling goroutine spawn;
+		// released by the worker.
+		if err := fanOut.Acquire(ctx); err != nil {
+			break // context cancelled
 		}
 		wg.Add(1)
 		go func(fileID string) {
 			defer wg.Done()
-			if m.uploadLimiter != nil {
-				defer m.uploadLimiter.Release()
-			}
+			defer fanOut.Release()
 			// Success needs no bookkeeping here: the sink feeds the goodput sample
 			// and the completed-sync counter as each block lands, which keeps both
 			// advancing during a pass rather than only at its end.

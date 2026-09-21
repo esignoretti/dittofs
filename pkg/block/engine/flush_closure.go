@@ -12,9 +12,11 @@ import (
 	"github.com/marmos91/dittofs/pkg/block/syncer"
 )
 
-// defaultBlockUploadWindow bounds how many of one file's packed blocks are
-// uploaded (PutBlock) at once inside one flush pass, via the sink's upload
-// semaphore. Packing itself stays sequential.
+// defaultBlockUploadWindow is the fallback window for a local store exposing no
+// UploadConcurrency of its own. It bounds how many of one pass's packed blocks
+// are in flight at once; packing itself stays sequential. The remote path does
+// not reach it — that shares the syncer's own upload limiter, so the window
+// bounding PutBlock is the one the config declares.
 const defaultBlockUploadWindow = 8
 
 // flushClosure is the fn + AfterFile pair one Flush pass calls back into: the
@@ -341,7 +343,15 @@ type uploadChain struct {
 	// the same as no window at all.
 	slots *syncer.DynamicSemaphore
 	prev  chan struct{} // resolution of the last-submitted flight
-	wg    sync.WaitGroup
+	// wg is never Waited on, deliberately. collect() is the real join: it blocks
+	// on every flight it has not yet reported, and fn calls it at the end of each
+	// run, so a file that finishes normally leaves nothing in flight. The only
+	// escape is a run that returns early with an error before reaching collect —
+	// those flights keep running, though each still releases its upload slot when
+	// its commit returns, so they occupy the window honestly rather than leaking
+	// it. Waiting here would not close that gap: the site that would have to wait
+	// is the journal's own flush error path, which this closure does not own.
+	wg sync.WaitGroup
 
 	mu        sync.Mutex
 	flights   []*flight
@@ -376,6 +386,30 @@ func newUploadChain(sink BlockSink, slots *syncer.DynamicSemaphore) *uploadChain
 // it would bound nothing: submit returns as soon as the goroutine is spawned.
 // The release deliberately precedes the <-prev ordering wait, so a slow
 // predecessor delays the flip but never holds a successor's memory.
+//
+// decision: the slot spans the whole of CommitBlock — PutBlock *and* the
+// metadata commit after it — not just the upload, because what it bounds is the
+// chunk arena's lifetime and the arena outlives the upload. Releasing at
+// PutBlock would bound submissions rather than live arenas, which bounds
+// nothing, so the span is not movable.
+//
+// The consequence is that window OCCUPANCY carries commit backpressure: a slow
+// per-file commit holds slots while the uplink sits idle. The controller no
+// longer reads that as saturation — it samples PutBlock concurrency directly
+// (RemoteSync.takePutPeak) rather than this semaphore's peak — but two things
+// remain true and are worth stating rather than implying:
+//
+//   - A slow commit still REFUSES new uploads a healthy link could carry. Only
+//     the misreading was fixed, not the throttling.
+//   - The sample is a high-water mark over the control interval and brackets
+//     the PutBlock call, so time a client spends queued on its own connection
+//     pool counts as in flight, and one brief burst of real uploads can fill
+//     the window. Both are upload time, so this is honest, but it does mean a
+//     single burst can read as saturation for that interval.
+//
+// Overturn the whole arrangement by giving arenas a lifetime independent of the
+// slot; then the window would bound uploads alone and admit them while commits
+// drain.
 func (u *uploadChain) submit(ctx context.Context, chunks []CarveChunk, extents []journal.Extent) {
 	held := false
 	if u.slots != nil {
