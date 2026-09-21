@@ -18,7 +18,11 @@
 // existing mutex.
 package basestore
 
-import "github.com/marmos91/dittofs/pkg/metadata"
+import (
+	"sort"
+
+	"github.com/marmos91/dittofs/pkg/metadata"
+)
 
 // QuotaKey identifies a per-identity usage bucket: an owner id within a scope
 // (user or group), within one share. The share dimension is load-bearing: a
@@ -289,4 +293,137 @@ func (d *QuotaDelta) Map() map[QuotaKey]metadata.UsageStat {
 // nothing ever deletes it.
 func Charged(fileType metadata.FileType, nlink uint32) bool {
 	return fileType == metadata.FileTypeRegular && nlink > 0
+}
+
+// FileUsage is the chargeable view of one version of an inode: whether it
+// counts toward the usage buckets at all and, when it does, the bytes and the
+// owner it counts against.
+type FileUsage struct {
+	Charged  bool
+	Size     uint64
+	UID, GID uint32
+}
+
+// ApplyPutDelta records the usage change a whole-inode write produces, given
+// the inode as it was stored and as it is being written.
+//
+// Chargeability is decided from both versions because a write can cross the
+// boundary in either direction. An inode rewritten as a symlink, a device or a
+// fifo holds no logical bytes, and its row survives the write still linked, so
+// nothing downstream ever releases what it was carrying: no unlink fires and no
+// delete fires. Deciding from the version being written alone keeps the owner
+// billed for a file that holds nothing, for as long as the row lives.
+//
+// The link count is not a term here: a whole-inode write never touches it, so
+// it is the same on both sides and the caller has already folded it into each
+// Charged.
+func ApplyPutDelta(d *QuotaDelta, share string, old, now FileUsage) {
+	switch {
+	case !old.Charged && !now.Charged:
+		// Neither version holds bytes — a symlink's target grew, a device's
+		// mode changed. Nothing moves.
+	case !old.Charged:
+		// A fresh regular file, or one that just became regular: it
+		// contributed nothing before, so the write adds the whole size.
+		d.Add(share, now.UID, now.GID, int64(now.Size), 1)
+	case !now.Charged:
+		// It stopped holding bytes: refund everything to the owner that was
+		// being billed.
+		d.Add(share, old.UID, old.GID, -int64(old.Size), -1)
+	case old.UID == now.UID && old.GID == now.GID:
+		d.Add(share, now.UID, now.GID, int64(now.Size)-int64(old.Size), 0)
+	default:
+		// Chown: the bytes and the inode move from the old owner to the new.
+		d.Add(share, old.UID, old.GID, -int64(old.Size), -1)
+		d.Add(share, now.UID, now.GID, int64(now.Size), 1)
+	}
+}
+
+// QuotaDriftScopeShare names a drift row that compares a share's total rather
+// than one owner's bucket. It is not a QuotaScope: no counter is keyed by it,
+// and the share total is derived from the user-scope buckets.
+const QuotaDriftScopeShare = "share"
+
+// Drift compares an aggregate derived from the store's file rows against the
+// buckets this cache holds, and reports every bucket the two disagree on. The
+// result is ordered by share, then scope, then identity, so two runs of the
+// same comparison read the same way.
+//
+// The derived side arrives raw from a scan, so it is clamped at zero the way
+// the cache clamps itself before anything is compared. Without that a bucket
+// the cache had dropped would be reported against a negative derived value.
+//
+// A bucket present on one side only is drift: that is the shape a counter left
+// charged for a file the rows no longer describe takes.
+//
+// The per-share totals are compared as their own rows, not derived from the
+// identity rows. Apply moves a share total by the raw per-share sum while
+// clamping each identity bucket on its own, so a delta that drives one bucket
+// negative leaves the two permanently apart — and the share total is what
+// GetUsedBytesForShare, statfs and the share-wide quota gate read. Reading only
+// the identity buckets would call that agreement.
+//
+// decision: the comparison is against the live cache, not the durable counters
+// the backends also keep. The cache is what answers every quota check and every
+// statfs, and it is seeded from those durable rows at open, so a divergence
+// confined to the durable side reads as agreement here until a restart brings
+// it into the cache. Narrow it to the durable rows as well once a bug is found
+// that moves one without the other.
+func (c *QuotaCache) Drift(derived map[QuotaKey]*metadata.UsageStat) []metadata.QuotaDrift {
+	var out []metadata.QuotaDrift
+
+	report := func(k QuotaKey, counter, want metadata.UsageStat) {
+		if counter == want {
+			return
+		}
+		out = append(out, metadata.QuotaDrift{
+			Share: k.Share, Scope: k.Scope.String(), ID: k.ID, Counter: counter, Derived: want,
+		})
+	}
+
+	// A share's total is the sum of its user-scope buckets: every regular file
+	// has exactly one owner uid, so those partition the share's bytes and
+	// inodes. Shares the cache knows but the scan did not produce are seeded at
+	// zero so they are compared rather than skipped.
+	derivedShare := make(map[string]metadata.UsageStat)
+	for share := range c.byShare {
+		derivedShare[share] = metadata.UsageStat{}
+	}
+
+	for k, u := range derived {
+		want := metadata.UsageStat{Bytes: max(u.Bytes, 0), Files: max(u.Files, 0)}
+		report(k, c.Get(k.Share, k.Scope, k.ID), want)
+		if k.Scope == metadata.QuotaScopeUser {
+			cur := derivedShare[k.Share]
+			cur.Bytes += want.Bytes
+			cur.Files += want.Files
+			derivedShare[k.Share] = cur
+		}
+	}
+	// A bucket the cache holds that the scan never produced is drift against a
+	// derived zero.
+	for k, u := range c.byIdentity {
+		if _, ok := derived[k]; !ok {
+			report(k, *u, metadata.UsageStat{})
+		}
+	}
+	for share, want := range derivedShare {
+		if got := c.Share(share); got != want {
+			out = append(out, metadata.QuotaDrift{
+				Share: share, Scope: QuotaDriftScopeShare, Counter: got, Derived: want,
+			})
+		}
+	}
+
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Share != b.Share {
+			return a.Share < b.Share
+		}
+		if a.Scope != b.Scope {
+			return a.Scope < b.Scope
+		}
+		return a.ID < b.ID
+	})
+	return out
 }

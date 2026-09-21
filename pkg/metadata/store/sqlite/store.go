@@ -388,7 +388,34 @@ func initializeFilesystemCapabilities(ctx context.Context, db *sql.DB, caps meta
 // The rebuild's own DELETE already locks every bucket for the length of both
 // aggregate scans, so writers queue behind this regardless of the Go-side
 // lock. See RebuildQuotaCounters for what that costs and what would remove it.
-func (s *SQLiteMetadataStore) RecomputeUsage(ctx context.Context) error {
+//
+// A dry run takes neither of those locks and writes nothing: it runs the same
+// aggregate on the pool, compares it against the cache, and reports the buckets
+// that disagree.
+//
+// decision: it is still not concurrent. The pool admits one connection, so each
+// aggregate holds it for the length of a full table scan and readers as well as
+// writers queue behind it — a stricter wait than the shared side of
+// quotaRealign, which readers pass. What the dry run avoids is the rebuild's
+// DELETE, which holds every bucket's row lock across both scans and leaves the
+// counters replaced. Give it its own connection once a dry run is something run
+// against a live store rather than a question asked before a repair.
+//
+// The two aggregates and the cache are read at three different instants, so a
+// store taking writes reports small transient deltas, and the user-scope and
+// group-scope rows for one file can disagree with each other. Eliminating that
+// means the lock the dry run exists to avoid.
+func (s *SQLiteMetadataStore) RecomputeUsage(ctx context.Context, dryRun bool) ([]metadata.QuotaDrift, error) {
+	if dryRun {
+		derived, err := s.ScanQuotaUsage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		s.quotaMu.Lock()
+		defer s.quotaMu.Unlock()
+		return s.quota.Drift(derived), nil
+	}
+
 	s.quotaRealign.Lock()
 	defer s.quotaRealign.Unlock()
 
@@ -397,9 +424,9 @@ func (s *SQLiteMetadataStore) RecomputeUsage(ctx context.Context) error {
 	if err := s.runTransaction(ctx, func(tx metadata.Transaction) error {
 		return tx.(*sqliteTransaction).RebuildQuotaCounters(ctx)
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	return s.initUsedBytesCounter(ctx)
+	return nil, s.initUsedBytesCounter(ctx)
 }
 
 // metadata.Store does not embed lock.LockStore: the store's lock surface is

@@ -36,9 +36,33 @@ func (s QuotaScope) String() string {
 // Only regular files contribute (directories, symlinks, devices do not),
 // matching the per-share usage semantics. Files is the inode count used for the
 // inode-quota dimension.
+// The JSON names are lower case because this type reaches the REST surface
+// inside a drift report, where every neighbouring field is lower case.
 type UsageStat struct {
 	// Bytes is the sum of logical sizes of regular files owned by the identity.
-	Bytes int64
+	Bytes int64 `json:"bytes"`
 	// Files is the number of regular files owned by the identity (inode count).
-	Files int64
+	Files int64 `json:"files"`
+}
+
+// QuotaDrift reports one usage bucket whose maintained counter disagrees with
+// the value derived from the store's file rows. Both numbers travel: an
+// operator deciding whether to run a rebuild needs to see how far apart they
+// are and in which direction, not just that they differ.
+type QuotaDrift struct {
+	// Share is the share the bucket belongs to.
+	Share string `json:"share"`
+	// Scope names whether the bucket is keyed by owning uid ("user"), owning gid
+	// ("group"), or is the share's own total ("share"), rather than carrying the
+	// numeric QuotaScope. The numeric values are a storage detail of the
+	// backends, and a byte a corrupt key decoded to has to render as a row in
+	// this report rather than fail the whole response — the report is what a
+	// corrupt store is diagnosed with. A share row leaves ID at zero.
+	Scope string `json:"scope"`
+	// ID is the owning uid or gid.
+	ID uint32 `json:"identity_id"`
+	// Counter is what the maintained counter reports for the bucket.
+	Counter UsageStat `json:"counter"`
+	// Derived is what the store's file rows add up to for the bucket.
+	Derived UsageStat `json:"derived"`
 }

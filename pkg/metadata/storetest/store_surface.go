@@ -35,6 +35,8 @@ func runStoreSurfaceTests(t *testing.T, factory StoreFactory) {
 	t.Run("DeleteSharePurgesUsedBytesAndObjectIndex", func(t *testing.T) { testDeleteSharePurgesCounters(t, factory) })
 	t.Run("ListChildrenCursorAfterDeletedEntry", func(t *testing.T) { testListChildrenCursorAfterDelete(t, factory) })
 	t.Run("UnlinkReleasesUsedBytes", func(t *testing.T) { testUnlinkReleasesUsedBytes(t, factory) })
+	t.Run("TypeChangeRefundsUsedBytes", func(t *testing.T) { testTypeChangeRefundsUsedBytes(t, factory) })
+	t.Run("RecomputeUsageDryRun", func(t *testing.T) { testRecomputeUsageDryRun(t, factory) })
 }
 
 func testDeleteSharePurgesCounters(t *testing.T, factory StoreFactory) {
@@ -215,7 +217,7 @@ func testUnlinkReleasesUsedBytes(t *testing.T, factory StoreFactory) {
 	// must read the retained inode the same way the transactional deltas did.
 	// A recompute that counted it would put the bytes back — and, for the
 	// backends that seed their counters the same way, so would a restart.
-	if err := store.RecomputeUsage(ctx); err != nil {
+	if _, err := store.RecomputeUsage(ctx, false); err != nil {
 		t.Fatalf("RecomputeUsage() failed: %v", err)
 	}
 	assertShareUsed("recomputing usage", 0)
@@ -224,7 +226,7 @@ func testUnlinkReleasesUsedBytes(t *testing.T, factory StoreFactory) {
 	// And it must agree with the live counter for files that are still linked.
 	createTestFileOwned(t, store, shareName, rootHandle, "kept.bin", uid, gid, 4096)
 	assertShareUsed("creating kept.bin", 4096)
-	if err := store.RecomputeUsage(ctx); err != nil {
+	if _, err := store.RecomputeUsage(ctx, false); err != nil {
 		t.Fatalf("RecomputeUsage() after kept.bin failed: %v", err)
 	}
 	assertShareUsed("recomputing usage with a live file", 4096)
@@ -1008,4 +1010,145 @@ func testIdempotencyTokenRoundTrip(t *testing.T, factory StoreFactory) {
 	if plain.IdempotencyToken != 0 {
 		t.Errorf("IdempotencyToken on an untouched file = %#x, want 0", plain.IdempotencyToken)
 	}
+}
+
+// testTypeChangeRefundsUsedBytes pins the other half of the chargeability rule
+// that testUnlinkReleasesUsedBytes covers: an inode that stops being a regular
+// file must release the bytes it was carrying.
+//
+// Only regular files hold logical bytes, so rewriting one as a symlink (or a
+// device, or a fifo) leaves a row that is charged for a file that holds
+// nothing. Nothing downstream ever releases it: the inode is still linked, so
+// no unlink fires, and the row survives, so no delete fires either. Deciding
+// chargeability from the version being written alone gets the regular-to-other
+// direction wrong in exactly that way.
+//
+// The assertion is on the counters an operator and the quota gate read —
+// GetUsedBytesForShare and GetQuotaUsage — and on the from-rows recompute
+// agreeing with them, because the counters are what a drifted delta poisons.
+func testTypeChangeRefundsUsedBytes(t *testing.T, factory StoreFactory) {
+	store := factory(t)
+	ctx := t.Context()
+
+	const shareName = "/typechange-usage"
+	const uid, gid = uint32(1301), uint32(1302)
+	rootHandle := createTestShare(t, store, shareName)
+
+	assertShareUsed := func(what string, want int64) {
+		t.Helper()
+		got, err := store.GetUsedBytesForShare(ctx, shareName)
+		if err != nil {
+			t.Fatalf("GetUsedBytesForShare(%q) failed after %s: %v", shareName, what, err)
+		}
+		if got != want {
+			t.Fatalf("GetUsedBytesForShare(%q) = %d, want %d after %s", shareName, got, want, what)
+		}
+	}
+
+	// retype rewrites the inode in place with a new type and size, the way
+	// UpdateAttrs lets any caller do.
+	retype := func(handle metadata.FileHandle, fileType metadata.FileType, size uint64, linkTarget string) {
+		t.Helper()
+		file, err := store.GetFile(ctx, handle)
+		if err != nil {
+			t.Fatalf("GetFile() failed: %v", err)
+		}
+		file.Type = fileType
+		file.Size = size
+		file.LinkTarget = linkTarget
+		if err := store.UpdateAttrs(ctx, file); err != nil {
+			t.Fatalf("UpdateAttrs(type=%v) failed: %v", fileType, err)
+		}
+	}
+
+	handle := createTestFileOwned(t, store, shareName, rootHandle, "shifty.bin", uid, gid, 8192)
+	assertShareUsed("creating shifty.bin", 8192)
+	wantUsage(t, store, shareName, metadata.QuotaScopeUser, uid, 8192, 1)
+
+	// Regular -> symlink on the same inode: the bytes and the inode are no
+	// longer held by anything, so both buckets must empty.
+	retype(handle, metadata.FileTypeSymlink, 0, "elsewhere")
+	assertShareUsed("rewriting shifty.bin as a symlink", 0)
+	wantUsage(t, store, shareName, metadata.QuotaScopeUser, uid, 0, 0)
+	wantUsage(t, store, shareName, metadata.QuotaScopeGroup, gid, 0, 0)
+
+	// The delta-maintained counter must agree with what the rows say: a
+	// recompute is the operator's repair, and it deriving a different number is
+	// the drift itself.
+	if _, err := store.RecomputeUsage(ctx, false); err != nil {
+		t.Fatalf("RecomputeUsage() failed: %v", err)
+	}
+	assertShareUsed("recomputing usage after the type change", 0)
+	wantUsage(t, store, shareName, metadata.QuotaScopeUser, uid, 0, 0)
+
+	// Symlink -> regular puts the whole size back, because the row contributed
+	// nothing while it was a symlink.
+	retype(handle, metadata.FileTypeRegular, 4096, "")
+	assertShareUsed("rewriting the symlink back as a regular file", 4096)
+	wantUsage(t, store, shareName, metadata.QuotaScopeUser, uid, 4096, 1)
+
+	if _, err := store.RecomputeUsage(ctx, false); err != nil {
+		t.Fatalf("RecomputeUsage() after the second type change failed: %v", err)
+	}
+	assertShareUsed("recomputing usage after the second type change", 4096)
+	wantUsage(t, store, shareName, metadata.QuotaScopeUser, uid, 4096, 1)
+
+	// The same agreement stated the way an operator would ask for it: the drift
+	// report is empty after a sequence that used to leave the counter charged
+	// for a file holding nothing.
+	drift, err := store.RecomputeUsage(ctx, true)
+	if err != nil {
+		t.Fatalf("RecomputeUsage(dryRun) failed: %v", err)
+	}
+	if len(drift) != 0 {
+		t.Fatalf("RecomputeUsage(dryRun) = %+v, want no drift after the type changes", drift)
+	}
+}
+
+// testRecomputeUsageDryRun pins the portable half of the drift report: on a
+// store whose counters match its rows it reports nothing, and whichever way it
+// answers it changes nothing.
+//
+// The reporting-drift half needs a counter corrupted behind the store's back,
+// which has no portable expression — each backend covers that against its own
+// durable counters.
+func testRecomputeUsageDryRun(t *testing.T, factory StoreFactory) {
+	store := factory(t)
+	ctx := t.Context()
+
+	const shareName = "/dryrun-usage"
+	const uid, gid = uint32(1401), uint32(1402)
+	rootHandle := createTestShare(t, store, shareName)
+	createTestFileOwned(t, store, shareName, rootHandle, "a.bin", uid, gid, 8192)
+	createTestFileOwned(t, store, shareName, rootHandle, "b.bin", uid, gid, 4096)
+
+	drift, err := store.RecomputeUsage(ctx, true)
+	if err != nil {
+		t.Fatalf("RecomputeUsage(dryRun) failed: %v", err)
+	}
+	if len(drift) != 0 {
+		t.Fatalf("RecomputeUsage(dryRun) = %+v, want no drift — the counters agree with the rows", drift)
+	}
+
+	// The dry run must not have moved anything, in either direction.
+	used, err := store.GetUsedBytesForShare(ctx, shareName)
+	if err != nil {
+		t.Fatalf("GetUsedBytesForShare() failed: %v", err)
+	}
+	if used != 12288 {
+		t.Fatalf("GetUsedBytesForShare() = %d after a dry run, want 12288 — the dry run must change nothing", used)
+	}
+	wantUsage(t, store, shareName, metadata.QuotaScopeUser, uid, 12288, 2)
+	wantUsage(t, store, shareName, metadata.QuotaScopeGroup, gid, 12288, 2)
+
+	// A repair reports no drift of its own: the counters it would have been
+	// compared against are the ones it just replaced.
+	repairDrift, err := store.RecomputeUsage(ctx, false)
+	if err != nil {
+		t.Fatalf("RecomputeUsage(repair) failed: %v", err)
+	}
+	if len(repairDrift) != 0 {
+		t.Fatalf("RecomputeUsage(repair) = %+v, want no drift reported", repairDrift)
+	}
+	wantUsage(t, store, shareName, metadata.QuotaScopeUser, uid, 12288, 2)
 }
