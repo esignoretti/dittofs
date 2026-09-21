@@ -9,8 +9,8 @@ import (
 	"github.com/marmos91/dittofs/pkg/metadata"
 )
 
-// newShareOptionsStore opens a store holding one share the share cache has to
-// defend.
+// newShareOptionsStore opens a store holding one share whose options the share
+// cache has to defend — the cached entry is the options record, not the share.
 func newShareOptionsStore(t *testing.T) (*BadgerMetadataStore, string) {
 	t.Helper()
 	ctx := context.Background()
@@ -20,7 +20,8 @@ func newShareOptionsStore(t *testing.T) (*BadgerMetadataStore, string) {
 
 	const shareName = "/opts"
 	createShareRoot(t, store, shareName)
-	require.NoError(t, store.UpdateShareOptions(ctx, shareName, &metadata.ShareOptions{Async: true}))
+	require.NoError(t, store.UpdateShareOptions(ctx, shareName,
+		&metadata.ShareOptions{ReadOnly: true, Async: true}))
 	return store, shareName
 }
 
@@ -53,14 +54,25 @@ func TestGetShareOptions_CallerCannotMutateCachedEntry(t *testing.T) {
 			require.NoError(t, err)
 
 			// A caller does what callers do with a value they believe they own.
-			got.ReadOnly = true
+			// Both fields are true in the stored record, so both move away from
+			// it — a field left at its zero value could not tell a dropped copy
+			// from a correct one.
+			got.ReadOnly = false
 			got.Async = false
 
 			after, err := store.GetShareOptions(ctx, shareName)
 			require.NoError(t, err)
 
-			require.False(t, after.ReadOnly, "a caller's write reached the cached share entry")
-			require.True(t, after.Async, "a caller's write reached the cached share entry")
+			// Compare the whole struct rather than a field at a time. One
+			// assertion then carries both properties, and neither can hide
+			// behind an earlier require aborting the subtest: a caller's write
+			// reaching the entry shows up as ReadOnly, and a Clone that copies
+			// some fields and drops others shows up as Async. The decision:
+			// marker on Clone says it must deepen when a reference-bearing
+			// field arrives, and that edit is exactly where a field gets
+			// dropped.
+			require.Equal(t, metadata.ShareOptions{ReadOnly: true, Async: true}, *after,
+				"the cached share entry was reached by a caller's write, or Clone did not copy it whole")
 		})
 	}
 }
