@@ -92,7 +92,7 @@ func (h *Handler) electDeleteOnClose(openFile *OpenFile) (docDecision, docTarget
 	h.docElectionMu.Lock()
 	defer h.docElectionMu.Unlock()
 
-	openFile.docLeaving = true
+	openFile.SetDOCLeaving(true)
 
 	// Promote the per-handle InitialDeleteOnClose from CREATE
 	// FILE_DELETE_ON_CLOSE to the shared committed flag, mirroring Samba
@@ -107,7 +107,7 @@ func (h *Handler) electDeleteOnClose(openFile *OpenFile) (docDecision, docTarget
 	// The read of DeletePending happens inside the election, not before it, so
 	// a closer that was propagated to by an earlier closer observes the flag
 	// and takes its turn as the last handle.
-	openFile.mu.Lock()
+	openFile.Lock()
 	if openFile.InitialDeleteOnClose && !openFile.DeletePending {
 		openFile.DeletePending = true
 	}
@@ -117,7 +117,7 @@ func (h *Handler) electDeleteOnClose(openFile *OpenFile) (docDecision, docTarget
 	baseFileName := openFile.BaseFileDeleteFileName
 	docSetterKey := openFile.DeleteOnCloseParentKey
 	hasDocSetterKey := openFile.HasDeleteOnCloseParentKey
-	openFile.mu.Unlock()
+	openFile.Unlock()
 
 	if !deletePending && !baseFileDeletePending {
 		return docDecisionNone, docTarget{}
@@ -137,7 +137,7 @@ func (h *Handler) electDeleteOnClose(openFile *OpenFile) (docDecision, docTarget
 	if len(ownHandle) > 0 {
 		h.files.Range(func(_, value any) bool {
 			other := value.(*OpenFile)
-			if other.FileID == openFile.FileID || other.docLeaving {
+			if other.FileID == openFile.FileID || other.IsDOCLeaving() {
 				return true
 			}
 			// Guard the read: SET_REPARSE_POINT repoints a live handle's
@@ -152,11 +152,11 @@ func (h *Handler) electDeleteOnClose(openFile *OpenFile) (docDecision, docTarget
 			// re-Store follows: re-Storing would resurrect a handle whose own
 			// CLOSE removed it, leaving a delete-pending entry nothing ever
 			// reaps and every later CREATE on the path answered DELETE_PENDING.
-			other.mu.Lock()
+			other.Lock()
 			other.DeletePending = true
 			other.DeleteOnCloseParentKey = docSetterKey
 			other.HasDeleteOnCloseParentKey = hasDocSetterKey
-			other.mu.Unlock()
+			other.Unlock()
 			return true
 		})
 	}
@@ -181,13 +181,13 @@ func (h *Handler) electDeleteOnClose(openFile *OpenFile) (docDecision, docTarget
 			// Guard the write: concurrent readers on the stream handle
 			// (QUERY_INFO / open path via isFileOrBaseDeletePending) may be
 			// reading these fields on `other`.
-			other.mu.Lock()
+			other.Lock()
 			other.BaseFileDeletePending = true
 			other.BaseFileDeleteParentHandle = docName.ParentHandle
 			other.BaseFileDeleteFileName = docName.FileName
 			other.DeleteOnCloseParentKey = docSetterKey
 			other.HasDeleteOnCloseParentKey = hasDocSetterKey
-			other.mu.Unlock()
+			other.Unlock()
 			return true
 		})
 		if streamHandleExists {
@@ -242,7 +242,7 @@ func (h *Handler) electDeleteOnClose(openFile *OpenFile) (docDecision, docTarget
 func (h *Handler) rangeLiveStreamsOfBase(selfFileID [16]byte, parentHandle metadata.FileHandle, basePrefix string, fn func(*OpenFile) bool) {
 	h.files.Range(func(_, value any) bool {
 		other := value.(*OpenFile)
-		if other.FileID == selfFileID || other.IsPipe || other.docLeaving {
+		if other.FileID == selfFileID || other.IsPipe || other.IsDOCLeaving() {
 			return true
 		}
 		otherName := other.Name()
