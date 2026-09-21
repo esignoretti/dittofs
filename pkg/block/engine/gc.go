@@ -268,10 +268,11 @@ type SyncedHashIndex interface {
 	// remote locator, and first-mirror timestamp. The locator is read from the
 	// same marker row, so callers that need it resolve every hash in a single
 	// scan instead of a GetLocator round trip per hash — the O(N)-serial cost on
-	// the sqlite MaxOpenConns(1) pool behind the slow cold-start. A
-	// standalone (pre-flip) marker yields the zero ChunkLocator. A zero syncedAt
-	// means the backend has no recorded time (legacy marker) — the sweep treats
-	// it as fail-closed.
+	// the sqlite MaxOpenConns(1) pool behind the slow cold-start. A zero
+	// syncedAt means the backend has no recorded time (legacy marker) — the
+	// sweep treats it as fail-closed. A marker may also yield the zero
+	// ChunkLocator; the reclaimer refuses to act on one, and states why at the
+	// branch that does so.
 	//
 	// fn is invoked SEQUENTIALLY (never concurrently), so the sweep mutates its
 	// unsynchronized per-run counters from inside fn without a lock. A non-nil

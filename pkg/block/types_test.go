@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -329,28 +330,16 @@ func TestChunkRef_JSON(t *testing.T) {
 	})
 }
 
-// TestContentHash_JSONBackwardCompat asserts UnmarshalJSON accepts both
-// the new canonical "blake3:{hex}" form and the legacy default base64
-// form that encoding/json produced for [32]byte before added a
-// MarshalJSON. Critical for reading FileChunk rows persisted by
-// Badger backends.
-func TestContentHash_JSONBackwardCompat(t *testing.T) {
+// TestContentHash_UnmarshalJSON_AcceptedForms asserts UnmarshalJSON accepts
+// the canonical "blake3:{hex}" form MarshalJSON writes and the bare "{hex}"
+// form, and nothing else.
+func TestContentHash_UnmarshalJSON_AcceptedForms(t *testing.T) {
 	hash, err := ParseContentHash(blake3EmptyHex)
 	if err != nil {
 		t.Fatalf("setup: ParseContentHash: %v", err)
 	}
 
-	// Default base64 encoding of the 32 raw hash bytes (legacy wire form).
-	legacyB64 := `"rxNJufX5oaagQE3qNtzJSZvLJcmtwRK3zJqTyuQfMmI="`
-	var got ContentHash
-	if err := got.UnmarshalJSON([]byte(legacyB64)); err != nil {
-		t.Fatalf("UnmarshalJSON legacy base64: %v", err)
-	}
-	if !bytes.Equal(got[:], hash[:]) {
-		t.Fatalf("legacy base64 decode mismatch:\n got: %x\nwant: %x", got[:], hash[:])
-	}
-
-	// New canonical form round-trips.
+	// Canonical form round-trips.
 	gotCanonical := ContentHash{}
 	if err := gotCanonical.UnmarshalJSON([]byte(`"blake3:` + blake3EmptyHex + `"`)); err != nil {
 		t.Fatalf("UnmarshalJSON canonical: %v", err)
@@ -369,13 +358,108 @@ func TestContentHash_JSONBackwardCompat(t *testing.T) {
 	}
 }
 
-// TestContentHash_JSONBackwardCompat_V014Array asserts UnmarshalJSON accepts
-// the JSON number-array form that v0.14.x and earlier serialized for
-// ContentHash (encoding/json's default for [32]byte when no custom
-// MarshalJSON existed). Critical for reading badger metadata written by
-// v0.14.2 servers during upgrade migration.
+// TestContentHash_UnmarshalJSON_RejectsBase64 pins the refusal of the base64
+// string form. Unlike the number array it is not read-compat for anything:
+// encoding/json base64s byte slices, never byte arrays, and ContentHash has
+// been [32]byte since it was introduced, so no build ever wrote this shape.
+func TestContentHash_UnmarshalJSON_RejectsBase64(t *testing.T) {
+	const legacyB64 = `"rxNJufX5oaagQE3qNtzJSZvLJcmtwRK3zJqTyuQfMmI="`
+	var got ContentHash
+	if err := got.UnmarshalJSON([]byte(legacyB64)); err == nil {
+		t.Fatalf("UnmarshalJSON(%s) = nil error, want refusal (got %x)", legacyB64, got[:])
+	}
+	if !got.IsZero() {
+		t.Fatalf("refused input mutated the receiver: %x", got[:])
+	}
+}
+
+// TestContentHash_UnmarshalJSON_MalformedArray enumerates the ways a legacy
+// number array can be malformed and pins a refusal for each, plus a well-formed
+// control that must still decode to the exact hash.
+//
+// The cases exist because a nil error from encoding/json does not mean the
+// input was well formed. Decoding into [HashSize]byte zero-fills a short array,
+// drops a long array's tail, and treats a null element as a no-op that leaves
+// its byte zero — each silently yielding a wrong hash. The single-null case is
+// the sharpest: it is not an obviously-empty hash but a plausible one with a
+// single wrong byte, which resolves to a different chunk or to none.
+func TestContentHash_UnmarshalJSON_MalformedArray(t *testing.T) {
+	elems := func(n int, v string) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = v
+		}
+		return out
+	}
+	arr := func(e []string) string { return "[" + strings.Join(e, ",") + "]" }
+	// A full-length array whose last element is replaced.
+	withLast := func(v string) string {
+		e := elems(HashSize-1, "7")
+		return arr(append(e, v))
+	}
+	oneNull := func() string {
+		e := elems(HashSize, "7")
+		e[5] = "null"
+		return arr(e)
+	}
+
+	malformed := map[string]string{
+		// null elements — no error, no length change, silent zero byte.
+		"all elements null": arr(elems(HashSize, "null")),
+		"one element null":  oneNull(),
+		// wrong length — zero-filled or truncated, no error.
+		"empty array":       "[]",
+		"short array":       "[1,2,3]",
+		"one element short": arr(elems(HashSize-1, "7")),
+		"one element long":  arr(elems(HashSize+1, "7")),
+		"long array":        arr(elems(40, "7")),
+		// out of range for a byte.
+		"element above uint8": withLast("256"),
+		"negative element":    withLast("-1"),
+		// non-integer and wrong element types.
+		"non-integer element":  withLast("7.5"),
+		"string element":       withLast(`"7"`),
+		"bool element":         withLast("true"),
+		"nested array element": withLast("[1,2]"),
+		"object element":       withLast(`{"a":1}`),
+	}
+	for name, raw := range malformed {
+		t.Run(name, func(t *testing.T) {
+			var got ContentHash
+			if err := got.UnmarshalJSON([]byte(raw)); err == nil {
+				t.Fatalf("UnmarshalJSON(%s) = nil error, want refusal (got hash %x)", raw, got[:])
+			}
+			if !got.IsZero() {
+				t.Fatalf("refused input mutated the receiver: %x", got[:])
+			}
+		})
+	}
+
+	t.Run("control: well-formed array decodes", func(t *testing.T) {
+		want, err := ParseContentHash(blake3EmptyHex)
+		if err != nil {
+			t.Fatalf("ParseContentHash: %v", err)
+		}
+		nums := make([]string, HashSize)
+		for i, b := range want {
+			nums[i] = strconv.Itoa(int(b))
+		}
+		var got ContentHash
+		if err := got.UnmarshalJSON([]byte(arr(nums))); err != nil {
+			t.Fatalf("control: well-formed array rejected: %v", err)
+		}
+		if got != want {
+			t.Fatalf("control decode mismatch:\n got: %x\nwant: %x", got[:], want[:])
+		}
+	})
+}
+
+// TestContentHash_JSONBackwardCompat_V014Array asserts UnmarshalJSON still
+// accepts the JSON number-array form that encoding/json produced for
+// ContentHash before this type had a custom MarshalJSON. Badger stores written
+// then still hold it, and refusing it drops the row from the listing scan with
+// a nil error rather than failing loudly — see the UnmarshalJSON decision note.
 func TestContentHash_JSONBackwardCompat_V014Array(t *testing.T) {
-	// v0.14.x zero-value ContentHash serialized as [0,0,...,0]
 	zeroArr := "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"
 	var got ContentHash
 	if err := got.UnmarshalJSON([]byte(zeroArr)); err != nil {
@@ -385,7 +469,6 @@ func TestContentHash_JSONBackwardCompat_V014Array(t *testing.T) {
 		t.Fatalf("expected zero hash, got %x", got[:])
 	}
 
-	// Non-zero array (simulates a v0.14.x row with actual content hash)
 	nonZeroArr := "[175,19,73,185,245,249,161,166,160,64,77,234,54,220,201,73,155,203,37,201,173,193,18,183,204,154,147,202,228,31,50,98]"
 	var got2 ContentHash
 	if err := got2.UnmarshalJSON([]byte(nonZeroArr)); err != nil {

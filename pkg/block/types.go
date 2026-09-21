@@ -1,7 +1,6 @@
 package block
 
 import (
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -103,28 +102,56 @@ func (h ContentHash) MarshalJSON() ([]byte, error) {
 	return out, nil
 }
 
-// UnmarshalJSON accepts the canonical "blake3:{hex}" form, the bare
-// "{hex}" form, and two legacy encodings written before this type had a
-// custom MarshalJSON: a JSON number array and a base64 string. Those
-// fallbacks keep FileChunk rows persisted by earlier Badger builds
-// readable.
+// UnmarshalJSON accepts the canonical "blake3:{hex}" form written by
+// MarshalJSON, the bare "{hex}" form, and the JSON number array that
+// encoding/json emits for a bare [32]byte.
+//
+// decision: the number-array branch is read-compat for badger stores written
+// before this type had a MarshalJSON, and it stays even though nothing writes
+// that form any more. Refusing it does not fail loudly: the row-listing scan
+// skips any fb: row whose value does not unmarshal, so a refused hash drops the
+// row with a nil error rather than surfacing one, and a caller reading extents
+// off that list then reports the range as a hole instead of erroring — stored
+// bytes read back as zeros. Withdraw it only once no store can hold the form
+// AND the listing path distinguishes a decode failure from an absent row.
 func (h *ContentHash) UnmarshalJSON(data []byte) error {
-	// v0.14.x and earlier had no custom MarshalJSON — encoding/json
-	// serialized [32]byte as a JSON number array: [0,0,...,0]. Accept
-	// that form so develop can read legacy badger metadata.
 	if len(data) > 0 && data[0] == '[' {
-		var arr [HashSize]byte
-		if err := json.Unmarshal(data, &arr); err == nil {
-			*h = ContentHash(arr)
-			return nil
+		// Decode the elements into pointers, because a decode error does not
+		// mean the input was well formed. Unmarshalling into [HashSize]byte has
+		// three silent paths: a short array is zero-filled, a long array's tail
+		// is dropped, and a null element is a no-op that leaves its byte zero —
+		// none of them an error, all of them yielding a confidently wrong hash.
+		// A pointer element makes absence representable, and the same pass
+		// carries the element count and rejects a wrong type or an
+		// out-of-byte-range value, so this is the whole validation rather than
+		// one guard stacked on another.
+		var elems []*uint8
+		if err := json.Unmarshal(data, &elems); err != nil {
+			// Wrap rather than replace: the decoder's own message names the
+			// offending value and the type it would not fit, which is the
+			// detail that tells a corrupt legacy row apart from a merely
+			// unexpected one.
+			return fmt.Errorf("ContentHash.UnmarshalJSON: invalid JSON array %q: %w", data, err)
 		}
-		return fmt.Errorf("ContentHash.UnmarshalJSON: invalid JSON array: %q", data)
+		if len(elems) != HashSize {
+			return fmt.Errorf("ContentHash.UnmarshalJSON: %w: JSON array has %d elements, want %d",
+				ErrInvalidHash, len(elems), HashSize)
+		}
+		var parsed ContentHash
+		for i, e := range elems {
+			if e == nil {
+				return fmt.Errorf("ContentHash.UnmarshalJSON: %w: JSON array element %d is null",
+					ErrInvalidHash, i)
+			}
+			parsed[i] = *e
+		}
+		*h = parsed
+		return nil
 	}
 	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
 		return fmt.Errorf("ContentHash.UnmarshalJSON: not a JSON string: %q", data)
 	}
 	s := string(data[1 : len(data)-1])
-	// Canonical / hex form.
 	hexStr := strings.TrimPrefix(s, "blake3:")
 	if len(hexStr) == HashSize*2 {
 		parsed, err := ParseContentHash(hexStr)
@@ -132,13 +159,6 @@ func (h *ContentHash) UnmarshalJSON(data []byte) error {
 			*h = parsed
 			return nil
 		}
-	}
-	// Legacy: encoding/json's default base64 form for [32]byte (no custom
-	// MarshalJSON existed before). Decode and copy.
-	b, b64Err := base64.StdEncoding.DecodeString(s)
-	if b64Err == nil && len(b) == HashSize {
-		copy(h[:], b)
-		return nil
 	}
 	return fmt.Errorf("ContentHash.UnmarshalJSON: %w (input %q)", ErrInvalidHash, s)
 }
