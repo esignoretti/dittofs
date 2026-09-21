@@ -59,7 +59,27 @@ type sqliteTransaction struct {
 // the transaction is committed. Retries automatically on a busy/locked
 // condition. The accumulated usedBytes / per-identity quota deltas are applied
 // exactly once after a successful commit so a retry never double-counts.
+//
+// The shared side of quotaRealign is taken before the transaction opens, not
+// around the commit. A writer blocked here holds no pooled connection, so a
+// realign holding the exclusive side can still reach the database; taking it
+// after the body had already run statements would let a writer wait for the
+// lock while holding the connection the realign needs, and the two would wait
+// on each other. It covers the commit and the post-commit fold together, which
+// is what stops a realign re-deriving between them.
 func (s *SQLiteMetadataStore) WithTransaction(ctx context.Context, fn func(tx metadata.Transaction) error) error {
+	s.quotaRealign.RLock()
+	defer s.quotaRealign.RUnlock()
+	return s.runTransaction(ctx, fn)
+}
+
+// afterCommitFold is a test seam: see its use in runTransaction.
+var afterCommitFold func()
+
+// runTransaction is WithTransaction without the realign guard. Only a caller
+// that already holds quotaRealign may use it, because an RWMutex does not
+// re-enter.
+func (s *SQLiteMetadataStore) runTransaction(ctx context.Context, fn func(tx metadata.Transaction) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -94,7 +114,18 @@ func (s *SQLiteMetadataStore) WithTransaction(ctx context.Context, fn func(tx me
 
 		ptx := &sqliteTransaction{store: s, tx: execer{e: rawTx, op: "tx"}}
 		ptx.Core = &storesql.Core{X: ptx.tx, D: sqliteDialect, Caps: s.currentCapabilities, Quota: &ptx.quota, Log: s.logger}
-		if err := fn(ptx); err != nil {
+		// The durable counters move inside the transaction that moved the rows,
+		// so the two commit together or not at all. That is what lets an open
+		// read them rather than re-aggregate the inodes table: there is no
+		// window in which they can drift apart, and so nothing to repair after
+		// a crash. It shares the body's rollback and retry, being one more
+		// statement on the same transaction.
+		err = fn(ptx)
+		delta := ptx.quota.Map()
+		if err == nil {
+			err = ptx.PersistQuotaDelta(ctx, delta)
+		}
+		if err != nil {
 			_ = rawTx.Rollback()
 			if isBusyError(err) {
 				lastErr = err
@@ -126,8 +157,14 @@ func (s *SQLiteMetadataStore) WithTransaction(ctx context.Context, fn func(tx me
 		if ptx.sharesDirty {
 			s.shareCache.InvalidateAll()
 		}
+		// afterCommitFold, when set, runs in the gap between the commit and the
+		// fold. Nil outside tests; it exists so the ordering that keeps a
+		// realign out of that gap can be exercised rather than argued.
+		if afterCommitFold != nil {
+			afterCommitFold()
+		}
 		// Apply the accumulated usage deltas exactly once, after commit.
-		s.applyQuotaDelta(ptx.quota.Map())
+		s.applyQuotaDelta(delta)
 		return nil // Success
 	}
 

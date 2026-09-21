@@ -80,10 +80,18 @@ type SQLiteMetadataStore struct {
 	manifestRowsScanned atomic.Int64
 
 	// quota tracks per-identity usage (bytes + file count) for regular files,
-	// keyed by owner uid / gid. Seeded from a GROUP BY query on startup and
-	// updated from each committed transaction's deltas. Guarded by quotaMu.
+	// keyed by owner uid / gid. Seeded at open from the durable quota_usage
+	// counters and updated from each committed transaction's deltas. Guarded
+	// by quotaMu.
 	quotaMu sync.Mutex
 	quota   *basestore.QuotaCache
+
+	// quotaRealign orders a realign against the commit path. A committing
+	// transaction holds the shared side across both its commit and its
+	// in-memory fold, so a realign cannot re-derive from rows that already
+	// include a transaction and then have that transaction's delta folded on
+	// top, counting it twice in the cache that answers every quota check.
+	quotaRealign sync.RWMutex
 
 	// shareCache caches decoded ShareOptions so the permission funnel every
 	// read/write/create/setattr traverses does not re-run the options SELECT
@@ -215,49 +223,23 @@ func (s *SQLiteMetadataStore) GetUsedBytesForShare(ctx context.Context, shareNam
 	return s.quota.Share(shareName).Bytes, nil
 }
 
-// initUsedBytesCounter seeds the usage cache — per share, and per owner
-// identity within a share — from GROUP BY aggregates over the inodes table (the
-// source of truth).
+// initUsedBytesCounter seeds the per-identity usage cache from the durable
+// counters.
+//
+// Those counters are maintained inside the same transactions that move the
+// inode rows, and the migration that introduced them seeded them from the rows
+// that predate them, so reading them is equivalent to aggregating the inodes
+// table — at one row per distinct owner rather than one per file. That is the
+// difference between an open that scales with the namespace and one that does
+// not. RecomputeUsage re-derives them if they are ever suspected of drift.
 func (s *SQLiteMetadataStore) initUsedBytesCounter(ctx context.Context) error {
-	byIdentity := make(map[basestore.QuotaKey]*metadata.UsageStat)
-	if err := s.seedUsageByColumn(ctx, "uid", metadata.QuotaScopeUser, byIdentity); err != nil {
-		return err
-	}
-	if err := s.seedUsageByColumn(ctx, "gid", metadata.QuotaScopeGroup, byIdentity); err != nil {
+	byIdentity, err := s.ReadQuotaCounters(ctx)
+	if err != nil {
 		return err
 	}
 	s.quotaMu.Lock()
 	s.quota.Seed(byIdentity, nil)
 	s.quotaMu.Unlock()
-	return nil
-}
-
-// seedUsageByColumn aggregates usage (bytes + count) for regular files grouped
-// by share and by the given owner column ("uid" or "gid"), accumulating into
-// out under the matching scope. The column name is a fixed internal constant,
-// never user input.
-func (s *SQLiteMetadataStore) seedUsageByColumn(ctx context.Context, col string, scope metadata.QuotaScope, out map[basestore.QuotaKey]*metadata.UsageStat) error {
-	query := fmt.Sprintf(
-		`SELECT share_name, %s, COALESCE(SUM(size), 0), COUNT(*) FROM inodes WHERE file_type = ?1 AND nlink > 0 GROUP BY share_name, %s`,
-		col, col,
-	)
-	rows, err := s.db.QueryContext(ctx, query, int(metadata.FileTypeRegular))
-	if err != nil {
-		return fmt.Errorf("failed to seed %s usage: %w", col, err)
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var share string
-		var id int64
-		var bytes, files int64
-		if err := rows.Scan(&share, &id, &bytes, &files); err != nil {
-			return fmt.Errorf("failed to scan %s usage: %w", col, err)
-		}
-		out[basestore.QuotaKey{Share: share, Scope: scope, ID: uint32(id)}] = &metadata.UsageStat{Bytes: bytes, Files: files}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed iterating %s usage: %w", col, err)
-	}
 	return nil
 }
 
@@ -386,16 +368,37 @@ func initializeFilesystemCapabilities(ctx context.Context, db *sql.DB, caps meta
 	return err
 }
 
-// RecomputeUsage rebuilds the usage counters from the inodes table, discarding
-// whatever the in-memory buckets hold. Same aggregate the store runs at open,
-// re-run on demand.
+// RecomputeUsage re-derives the durable counters from the inode rows and
+// reseeds the cache from them, discarding whatever either held. This is the
+// realign an operator invokes: counters maintained incrementally have no
+// self-correction, so it is the only way back from a drift bug.
+//
+// The exclusive side of quotaRealign is held across the rebuild AND the
+// reseed, which are separate transactions. The durable rows are correct
+// without it — a commit racing the rebuild is either included in the aggregate
+// or added on top of the rebuilt row. The cache is not: a transaction that
+// committed before the aggregate ran can still be waiting to fold its delta,
+// and that fold would land on a reseed which already counted it, leaving the
+// cache over-counted for good. It is the cache that answers every quota check,
+// so the error direction is writes wrongly refused as over-quota.
+//
+// No BeginRebuild here, unlike the KV backend: holding the exclusive side
+// throughout means there is no in-flight commit left to capture and replay.
+//
+// The rebuild's own DELETE already locks every bucket for the length of both
+// aggregate scans, so writers queue behind this regardless of the Go-side
+// lock. See RebuildQuotaCounters for what that costs and what would remove it.
 func (s *SQLiteMetadataStore) RecomputeUsage(ctx context.Context) error {
-	// The aggregate runs with no lock held, so arm the cache to record what
-	// commits during it — otherwise a transaction landing between the query and
-	// the seed is scanned out and then overwritten.
-	s.quotaMu.Lock()
-	s.quota.BeginRebuild()
-	s.quotaMu.Unlock()
+	s.quotaRealign.Lock()
+	defer s.quotaRealign.Unlock()
+
+	// runTransaction rather than WithTransaction: the guarded entry point would
+	// take the shared side of the lock this call already holds exclusively.
+	if err := s.runTransaction(ctx, func(tx metadata.Transaction) error {
+		return tx.(*sqliteTransaction).RebuildQuotaCounters(ctx)
+	}); err != nil {
+		return err
+	}
 	return s.initUsedBytesCounter(ctx)
 }
 

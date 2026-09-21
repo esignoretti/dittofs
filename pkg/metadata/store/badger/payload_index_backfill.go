@@ -61,6 +61,17 @@ func indexFileByPayload(batch *badgerdb.WriteBatch, file *metadata.File) error {
 	return batch.Set(keyPayloadID(file.PayloadID), id)
 }
 
+// clearPayloadIndexBackfilled withdraws the claim that every file row carrying
+// a PayloadID has a pl: index entry, so the next open rebuilds it.
+func clearPayloadIndexBackfilled(db *badgerdb.DB) error {
+	if err := db.Update(func(txn *badgerdb.Txn) error {
+		return txn.Delete(keyPayloadIndexBackfilled)
+	}); err != nil {
+		return fmt.Errorf("clear payload index backfill marker: %w", err)
+	}
+	return nil
+}
+
 // recordPayloadIndexBackfilled marks the backfill complete. Called only after
 // the staged entries are durable, so an interrupted run repeats the work rather
 // than recording what it did not finish.
@@ -70,36 +81,83 @@ func recordPayloadIndexBackfilled(db *badgerdb.DB) error {
 	})
 }
 
-// initUsedBytesAndPayloadIndex runs the open-time file scan, extending it to
-// write the pl: index when this store still lacks it.
+// initUsedBytesAndPayloadIndex seeds the usage cache, and writes the pl: index
+// when this store still lacks it.
+//
+// The usage cache is seeded from the durable counters when they already account
+// for every file row, which is the ordinary case and reads one key per bucket
+// per stripe. Only a store that has neither been backfilled nor indexed reads
+// the file keyspace, and each of those is a once-per-store debt: the markers
+// they record are what keep a later open off this path.
 //
 // Shared by store open and snapshot restore because both land on a keyspace
-// whose rows may predate the index — a restore from an old dump would otherwise
-// leave every payload lookup scanning until the next restart.
+// whose rows may predate either marker.
+//
+// The markers are read from the store, so they answer for whatever keyspace is
+// there now. That makes them trustworthy at open and NOT at restore, where the
+// keyspace has just been replaced under them: the restore withdraws both before
+// calling this, because a marker recorded by the destination's own first open
+// would otherwise certify the dump's rows on the strength of a scan that never
+// saw them.
 func (s *BadgerMetadataStore) initUsedBytesAndPayloadIndex() error {
-	need, err := payloadIndexBackfillNeeded(s.db)
+	needIndex, err := payloadIndexBackfillNeeded(s.db)
 	if err != nil {
 		return fmt.Errorf("check payload index state: %w", err)
 	}
+	haveCounters, err := quotaCountersBackfilled(s.db)
+	if err != nil {
+		return fmt.Errorf("check quota counter state: %w", err)
+	}
+
+	if haveCounters && !needIndex {
+		byIdentity, err := s.readQuotaCounters()
+		if err != nil {
+			return fmt.Errorf("read quota counters: %w", err)
+		}
+		s.seedUsage(byIdentity)
+		return nil
+	}
 
 	var batch *badgerdb.WriteBatch
-	if need {
+	if needIndex {
 		batch = s.db.NewWriteBatch()
 		defer batch.Cancel()
 	}
 
-	if err := s.initUsedBytesCounter(batch); err != nil {
+	// Held across the scan as well as the write, not just the write. What this
+	// path persists is the scan's own result, so a delta committing after the
+	// scan's snapshot would be deleted from the durable counters by the rewrite
+	// AND overwritten in the cache by the seed — lost on both sides, with no
+	// later open re-deriving it. Unlike a realign there is no capture to fold it
+	// back, because the buckets being seeded are the scan's, not the cache's.
+	//
+	// At open this is uncontended. Snapshot restore reaches it on a store that
+	// is already open, which is the case that needs the cover.
+	s.quotaRealign.Lock()
+	defer s.quotaRealign.Unlock()
+
+	byIdentity, err := s.scanUsage(batch)
+	if err != nil {
 		return err
 	}
-	if !need {
-		return nil
+	s.seedUsage(byIdentity)
+
+	if needIndex {
+		if err := batch.Flush(); err != nil {
+			return fmt.Errorf("write payload index entries: %w", err)
+		}
+		if err := recordPayloadIndexBackfilled(s.db); err != nil {
+			return fmt.Errorf("record payload index backfill: %w", err)
+		}
 	}
 
-	if err := batch.Flush(); err != nil {
-		return fmt.Errorf("write payload index entries: %w", err)
-	}
-	if err := recordPayloadIndexBackfilled(s.db); err != nil {
-		return fmt.Errorf("record payload index backfill: %w", err)
+	if !haveCounters {
+		if err := s.writeQuotaCounters(byIdentity); err != nil {
+			return err
+		}
+		if err := recordQuotaCountersBackfilled(s.db); err != nil {
+			return fmt.Errorf("record quota counter backfill: %w", err)
+		}
 	}
 	return nil
 }

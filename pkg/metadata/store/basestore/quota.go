@@ -75,9 +75,26 @@ func (c *QuotaCache) BeginRebuild() {
 // at startup. byShare may be nil, in which case it is derived from the
 // user-scope entries of byIdentity — every regular file has exactly one owner
 // uid, so those buckets already partition the share's bytes and inodes.
+//
+// Buckets arrive raw and signed: a backend that maintains its counters
+// incrementally stores partials whose sum is the only meaningful number, so
+// they are folded onto the invariant the cache holds everywhere else — clamped
+// at zero, emptied buckets dropped — before anything is derived from them. That
+// is why no caller clamps on its way in.
 func (c *QuotaCache) Seed(byIdentity map[QuotaKey]*metadata.UsageStat, byShare map[string]*metadata.UsageStat) {
 	if byIdentity == nil {
 		byIdentity = make(map[QuotaKey]*metadata.UsageStat)
+	}
+	for k, u := range byIdentity {
+		if u.Bytes < 0 {
+			u.Bytes = 0
+		}
+		if u.Files < 0 {
+			u.Files = 0
+		}
+		if u.Bytes == 0 && u.Files == 0 {
+			delete(byIdentity, k)
+		}
 	}
 	if byShare == nil {
 		byShare = make(map[string]*metadata.UsageStat)
@@ -105,6 +122,21 @@ func (c *QuotaCache) Seed(byIdentity map[QuotaKey]*metadata.UsageStat, byShare m
 		c.captured = nil
 		c.Apply(replay)
 	}
+}
+
+// Buckets returns a copy of the per-identity usage buckets.
+//
+// Used to persist the cache after a rebuild, so that what reaches durable
+// storage is what the cache actually holds — including any delta that committed
+// while the rebuild was scanning and was folded back in by Seed. Rebuilding the
+// durable rows from the raw scan instead would drop exactly those.
+func (c *QuotaCache) Buckets() map[QuotaKey]*metadata.UsageStat {
+	out := make(map[QuotaKey]*metadata.UsageStat, len(c.byIdentity))
+	for k, u := range c.byIdentity {
+		stat := *u
+		out[k] = &stat
+	}
+	return out
 }
 
 // Get returns the usage for one identity within one share. A missing key

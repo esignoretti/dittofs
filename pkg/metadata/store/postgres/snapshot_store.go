@@ -53,7 +53,11 @@ const (
 	// that into a legible refusal.
 	// v11 adds the filesystem_meta table section (migration 000046), raising
 	// the backup table count by one.
-	postgresSchemaVersion = uint32(11)
+	// v12 adds the quota_usage table section (migration 000048), likewise. An
+	// old binary reading a v12 stream would otherwise count sixteen sections,
+	// fail to recognise quota_usage and report the stream as corrupt instead of
+	// as a version it cannot read.
+	postgresSchemaVersion = uint32(12)
 )
 
 // backupTables lists every metadata table in FK-safe dependency order
@@ -79,6 +83,7 @@ var backupTables = []string{
 	"v4_client_recovery",
 	"synced_hashes",
 	"block_records",
+	"quota_usage",
 }
 
 // Compile-time assertion: PostgresMetadataStore implements Snapshotable.
@@ -358,8 +363,12 @@ func (s *PostgresMetadataStore) RestoreSnapshot(ctx context.Context, r io.Reader
 	// in metadata/io.go that reads it — reflect the restored contents without a
 	// process restart. The query runs on the pool, which now sees the committed
 	// data. Badger's restore path does the same at backup.go:291 for parity.
-	if err := s.initUsedBytesCounter(ctx); err != nil {
-		return fmt.Errorf("restore: reinitialize used-bytes counter: %w", err)
+	// Re-derived from the restored rows rather than read back: a dump taken
+	// before the counters existed carries none, so restoring it into a migrated
+	// schema would otherwise leave every bucket at zero, and no later open would
+	// notice because opens no longer consult the inode rows.
+	if err := s.RecomputeUsage(ctx); err != nil {
+		return fmt.Errorf("restore: recompute usage counters: %w", err)
 	}
 
 	return nil
