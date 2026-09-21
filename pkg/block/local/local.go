@@ -16,6 +16,13 @@ import (
 	"github.com/marmos91/dittofs/pkg/block/journal"
 )
 
+// The journal-backed store is the production local tier, and this is where the
+// compiler is told so: a capability the interface names but journal no longer
+// exports (a rename, a signature change) fails the build here, at the
+// declaration, rather than silently deselecting a consumer that reached for it
+// structurally.
+var _ LocalStore = (*journal.Store)(nil)
+
 // LocalStore is the per-share local byte cache. All production consumers hold
 // the whole interface, so it is deliberately one wide interface rather than
 // composable slices — see the ponytail note below.
@@ -42,6 +49,37 @@ type LocalStore interface {
 	// evicted ranges are both zero-filled and reported through ReadState, so the
 	// caller can hydrate a cold range from the remote store and reconcile a hole
 	// against the CAS manifest before trusting the zeros.
+	//
+	// What the flags must mean, stated as a rule rather than as a description
+	// of any one tier:
+	//
+	//   - Hole false claims every byte of the window is one this tier was given
+	//     — written or hydrated — so the bytes in dst are those bytes. It ends
+	//     the caller's inquiry: nothing downstream re-checks it.
+	//   - Hole true claims only that the tier does not hold all of the window.
+	//     It is not a claim that the share lacks those bytes; it asks the caller
+	//     to resolve them against the manifest and the remote first.
+	//   - A range the tier cannot classify reports Hole true. Never false.
+	//
+	// The asymmetry is the whole point, and it is why zero-filling is safe at
+	// all: a wrong Hole true costs a manifest check or a fetch that finds
+	// nothing, while a wrong Hole false hands the zero fill to the client as
+	// data. Uncertainty resolves toward the answer that forces another
+	// question, never toward the one that ends the inquiry.
+	//
+	// The counterpart surface is engine.Store.DataExtents, in
+	// pkg/block/engine/dataextents.go, which obeys this same rule through the
+	// opposite token: it may over-report data but must never under-report it.
+	// The polarity differs because the terminal answer differs — there "hole"
+	// is what ends the inquiry, since a sparse-copy client skips a range the
+	// map calls empty, while "data" merely forces a READ that can still refuse.
+	//
+	// So the two surfaces disagree on which token is the safe one BY DESIGN.
+	// Anyone reading both in one sitting will be tempted to tidy them into
+	// agreement; that edit is the bug, in whichever direction it is made. The
+	// rule they share is the sentence above about uncertainty, not the token
+	// each one reaches for. engine.Store.DataExtents carries the reverse
+	// pointer back here.
 	ReadAt(ctx context.Context, id journal.FileID, offset int64, dst []byte) (n int, st journal.ReadState, err error)
 
 	// Hydrate writes bytes fetched from the remote store during a cold read.
@@ -53,6 +91,16 @@ type LocalStore interface {
 	// since, so a fetch stalled across a write, truncate or punch cannot put
 	// the pre-mutation bytes back. Zero disables the gate.
 	Hydrate(ctx context.Context, id journal.FileID, offset int64, data []byte, notAfter uint64) error
+
+	// SeedCold and SeedColdBatch mark extents remote-durable-but-not-local, so
+	// a read of them faults in from the remote store instead of zero-filling.
+	// They arm cold reads over a tier that holds none of the bytes: a restore, a
+	// pre-journal upgrade and a server-side copy all leave ranges the manifest
+	// places and the tier has never seen. The batch form exists because a tier
+	// makes the markers durable once per call rather than once per payload.
+	// A tier that cannot hold a range it does not have records nothing.
+	SeedCold(ctx context.Context, id journal.FileID, extents [][2]int64) error
+	SeedColdBatch(ctx context.Context, seeds []journal.ColdSeed) error
 
 	// WriteVersion reports a monotonic marker of the store's write history,
 	// sampled before resolving a fetch to bound what it may write back.
@@ -108,6 +156,14 @@ type LocalStore interface {
 	// eviction backpressure signal.
 	UnsyncedBytes() int64
 
+	// UploadConcurrency and BlockSize report the flush shape the tier was
+	// configured for: how many block uploads a pass may hold in flight, and the
+	// target carve block size. A non-positive answer means the tier has no
+	// preference and the caller's own default applies, so a store that does not
+	// size its own flushes returns 0 rather than inventing a number.
+	UploadConcurrency() int
+	BlockSize() int64
+
 	// --- Eviction ---
 
 	// Evict frees local storage under pressure, coldest first, until targetBytes
@@ -124,6 +180,44 @@ type LocalStore interface {
 	// independent of SetEvictionEnabled: a pinned store never evicts, so a
 	// health transition re-enabling eviction cannot shed a pinned share's bytes.
 	SetEvictionPinned(pinned bool)
+
+	// MaxLocalBytes reports the tier's effective disk cap in bytes, 0 when it
+	// is uncapped. The store resolves it itself (an explicit budget, or one
+	// derived from free space at open), so the cap is a store fact rather than
+	// a caller's guess.
+	MaxLocalBytes() int64
+
+	// ColdExtents totals the ranges the tier has demoted to remote-only: bytes
+	// it no longer holds and would have to fetch to serve. A store that never
+	// evicts reports (0, 0). O(live intervals), so callers treat it as a
+	// periodic gauge, and a cancelled walk reports no counts rather than a
+	// partial total that would read as less remote-only data than there is.
+	ColdExtents(ctx context.Context) (bytes int64, extents int64, err error)
+
+	// ColdSeeded reports whether the tier's account of its remote-only ranges
+	// can be trusted yet. A tier that has never been told what the share's
+	// manifest holds describes an evicted range as absent rather than cold, so
+	// its ColdExtents total reads as zero on exactly the case a caller asks
+	// about. A tier with no cold ranges to seed is seeded by construction.
+	ColdSeeded() bool
+
+	// --- Snapshots ---
+
+	// JournalVersion reports the tier's current write watermark, captured by
+	// snapshot create to record the point in time the snapshot names. A tier
+	// that keeps no version history reports 0.
+	JournalVersion() uint64
+
+	// SetPinVersion holds the bytes of every record at or below v against GC
+	// and eviction, so a live snapshot's durable copy cannot be reclaimed out
+	// from under it. A tier that never reclaims has nothing to hold back.
+	SetPinVersion(v uint64)
+
+	// RestoreToVersion rewinds the tier to v's point-in-time view and
+	// re-materializes it durably at the head of the log. It is the local-only
+	// restore primitive, used where the tier is the only durable copy of the
+	// bytes; it must not run against a share that is still serving writes.
+	RestoreToVersion(ctx context.Context, v uint64) error
 
 	// --- Lifecycle ---
 
@@ -142,6 +236,21 @@ type LocalStore interface {
 
 	// SetDurable overrides the durability report (config["durable"]).
 	SetDurable(v bool)
+
+	// DurableExtent reports how far a file's bytes are on stable storage: bytes
+	// below the returned offset survive an unclean shutdown, bytes above it
+	// were only buffered and are gone after one. ok is false when the tier
+	// cannot answer, which callers must read as "unknown", never as "nothing is
+	// durable" — a published size derived from it would otherwise describe
+	// bytes a crash takes away, leaving the range reading as a hole of zeros.
+	DurableExtent(ctx context.Context, id journal.FileID) (int64, bool)
+
+	// SetVerifyReads turns per-read integrity verification of already-resident
+	// bytes on and off while the share serves. On, a read that does not match
+	// what the tier recorded is healed or failed closed instead of handing back
+	// silently-wrong bytes; off is the raw fast path. A tier that stores no
+	// checksum has nothing to verify either way.
+	SetVerifyReads(v bool)
 
 	// --- Observability ---
 

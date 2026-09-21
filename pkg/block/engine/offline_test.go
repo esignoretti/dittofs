@@ -9,6 +9,7 @@ import (
 
 	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/block/journal"
+	"github.com/marmos91/dittofs/pkg/block/local/memory"
 )
 
 // fakeColdReporter stands in for the local tier's residency surface so the
@@ -66,15 +67,19 @@ func TestOfflineReadiness_Safe(t *testing.T) {
 func TestOfflineReadinessOf_Gating(t *testing.T) {
 	tests := []struct {
 		name      string
-		localTier any
+		localTier coldRangeReporter
 		hasRemote bool
 		shortfall shortfallFunc
 		wantKnown bool
 		wantBytes int64
 	}{
 		{"no remote, tier confirms nothing evicted", &fakeColdReporter{}, false, noShortfall, true, 0},
-		{"tier that cannot report residency", struct{}{}, true, noShortfall, false, 0},
-		{"no remote and no residency tracking", struct{}{}, false, noShortfall, true, 0},
+		// The in-memory tier answers the same three questions the journal
+		// does rather than being recognised as a tier that cannot: it never
+		// evicts, so it is seeded by construction and holds no remote-only
+		// range, and that is why it reads as safe. It is the real store, not a
+		// fake, so a change to those answers fails here.
+		{"in-memory tier holds everything it was given", memory.New(), true, noShortfall, true, 0},
 		{"unseeded tier cannot see remote-only ranges", &fakeColdReporter{seeded: false, bytes: 0}, true, noShortfall, false, 0},
 		{"seeded and fully local", &fakeColdReporter{seeded: true}, true, noShortfall, true, 0},
 		{"seeded with evicted ranges", &fakeColdReporter{seeded: true, bytes: 4096, extents: 2}, true, noShortfall, true, 4096},
@@ -500,4 +505,82 @@ func TestIntersectExtents(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestManifestShortfall_MemoryTier drives the cross-check against a real
+// in-memory tier rather than a stub, because that tier's ColdSeeded answer
+// ("nothing to seed") rests on this check being the thing that catches what it
+// has forgotten. The tier reports no cold ranges by construction, so if the
+// manifest cross-check did not run, or ran and found nothing, a restarted
+// memory-backed share would report provably offline-safe while holding none of
+// its bytes. Asserting it here keeps that argument from being self-certifying.
+func TestManifestShortfall_MemoryTier(t *testing.T) {
+	ctx := context.Background()
+	// One payload the manifest places 8 KiB of.
+	manifest := stubManifest{"p": {
+		chunkRow("p", 0, 4096, true),
+		chunkRow("p", 4096, 4096, true),
+	}}
+
+	t.Run("tier that lost everything reports the whole placement", func(t *testing.T) {
+		bytes, ranges, err := manifestShortfall(ctx, memory.New(), manifest)
+		if err != nil {
+			t.Fatalf("manifestShortfall: %v", err)
+		}
+		if bytes != 8192 || ranges != 1 {
+			t.Errorf("shortfall = (%d bytes, %d ranges), want (8192, 1); an empty tier that "+
+				"reports no shortfall lets a restarted share pass as offline-safe holding nothing",
+				bytes, ranges)
+		}
+	})
+
+	t.Run("tier holding every placed byte reports none", func(t *testing.T) {
+		local := memory.New()
+		if err := local.WriteAt(ctx, "p", 0, make([]byte, 8192)); err != nil {
+			t.Fatalf("WriteAt: %v", err)
+		}
+		bytes, ranges, err := manifestShortfall(ctx, local, manifest)
+		if err != nil {
+			t.Fatalf("manifestShortfall: %v", err)
+		}
+		if bytes != 0 || ranges != 0 {
+			t.Errorf("shortfall = (%d bytes, %d ranges), want (0, 0); a check that fires on a "+
+				"healthy share makes every answer indeterminate", bytes, ranges)
+		}
+	})
+
+	// The gap is INTERIOR: the later chunk arrived, the earlier one never did.
+	// A tier that describes its coverage as one span from zero cannot express
+	// this and reports full coverage, so the cross-check sees no shortfall and
+	// calls a share safe over 4 KiB that reads as zeros. The trailing-gap case
+	// below passes either way, which is why it cannot stand in for this one.
+	t.Run("interior gap is reported, not swallowed", func(t *testing.T) {
+		local := memory.New()
+		if err := local.WriteAt(ctx, "p", 4096, make([]byte, 4096)); err != nil {
+			t.Fatalf("WriteAt: %v", err)
+		}
+		bytes, ranges, err := manifestShortfall(ctx, local, manifest)
+		if err != nil {
+			t.Fatalf("manifestShortfall: %v", err)
+		}
+		if bytes != 4096 || ranges != 1 {
+			t.Errorf("shortfall = (%d bytes, %d ranges), want (4096, 1); the first 4 KiB was "+
+				"never written and reads as zeros, so a zero shortfall here is a share "+
+				"reported offline-safe over bytes it does not hold", bytes, ranges)
+		}
+	})
+
+	t.Run("trailing gap reports only the gap", func(t *testing.T) {
+		local := memory.New()
+		if err := local.WriteAt(ctx, "p", 0, make([]byte, 4096)); err != nil {
+			t.Fatalf("WriteAt: %v", err)
+		}
+		bytes, ranges, err := manifestShortfall(ctx, local, manifest)
+		if err != nil {
+			t.Fatalf("manifestShortfall: %v", err)
+		}
+		if bytes != 4096 || ranges != 1 {
+			t.Errorf("shortfall = (%d bytes, %d ranges), want (4096, 1)", bytes, ranges)
+		}
+	})
 }
