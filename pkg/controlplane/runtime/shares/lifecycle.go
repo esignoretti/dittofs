@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -625,39 +627,52 @@ func (s *Service) RemoveShare(name string) error {
 	return errors.Join(errs...)
 }
 
-// StopRollups stops and drains the rollup worker pool of every registered
-// share's block store. The runtime calls this during shutdown BEFORE it closes
-// the metadata stores (#1543): the rollup ticker persists FileChunk manifests
-// and rollup offsets through the metadata store, so it must be fenced first or
-// an in-flight rollup races the DB close ("sql: database is closed") and can
-// drop a local chunk that was never mirrored.
+// CloseBlockStores closes every registered share's block store. It is the
+// shutdown fence between the data plane and the metadata stores, and it MUST
+// run before they close.
 //
-// The ctx bounds the TOTAL drain time (an overall deadline): each store is
-// given the time remaining until ctx's deadline as its grace, so shutdown stays
-// bounded regardless of share count. Once the budget is spent the worker-pool
-// fence still runs (that is the load-bearing part — it stops the ticker); only
-// the best-effort drain is skipped, and those intervals resume on restart.
+// A share's block store owns a carve dispatcher that ticks on its own interval
+// and commits FileChunk manifest rows through that share's metadata store.
+// Nothing else stops it: it runs on a background context, so cancelling the
+// runtime's does not reach it. Closing here stops the loops, drains the
+// uploads in flight and joins the goroutines while the metadata store can
+// still receive their commits — otherwise every tick after the close fails
+// with "sql: database is closed" and the chunks it was carving stay local and
+// unmirrored.
 //
-// Best-effort — a per-share drain error is logged, not propagated, so one share
-// cannot block the rest of shutdown. Drains run outside the registry lock (a
-// drain can block up to its grace window). The block stores stay OPEN; their
-// full teardown still happens in RemoveShare.
-// CloseBlockStores closes every registered share's block store.
-//
-// Shutdown fenced the rollup workers and closed the metadata stores but left
-// the journals open, so each share held its append log and index open for the
-// rest of the process's life. Nothing on a Unix filesystem reports that — an
-// open file can still be unlinked — but the handles are real, and a platform
-// that refuses to remove a file while it is open surfaces the leak as a
-// directory that cannot be cleaned up.
-//
-// Runs before the metadata stores close, for the reason StopRollups already
-// runs there: closing drains in-flight work that writes manifests through the
-// metadata store, which has to still be open to receive them.
+// Closing also releases the journals. Each share holds its append log and
+// index open for as long as it is registered; nothing on a Unix filesystem
+// reports that — an open file can still be unlinked — but the handles are
+// real, and a platform that refuses to remove a file while it is open
+// surfaces the leak as a directory that cannot be cleaned up.
 //
 // Close is idempotent, so a share removed afterwards closes harmlessly again.
 // The registry is left intact: this is resource teardown, not removal.
-func (s *Service) CloseBlockStores() {
+//
+// The shares close concurrently, and ctx bounds the WAIT — not any single
+// close. Concurrency is what keeps a slow share's cost from being paid once per
+// share, and it is also what lets one budget cover them all: the deadline is
+// wall clock every share shares rather than a slice each. A ctx with no
+// deadline waits indefinitely.
+//
+// decision: nothing here can bound a close itself. bs.Close takes no context
+// and opens by waiting on closeMu until every in-flight data op on that store
+// returns, and stopping the adapters does not join the handlers that may still
+// be inside one. So when the budget expires this RETURNS, naming the shares
+// still closing, and leaves them running.
+//
+// That is a trade, not a safety margin. The degraded path reintroduces the very
+// harm this ordering exists to prevent: the wedged share's in-flight carve
+// commits meet a metadata store that is closing and fail, and the chunks it was
+// carving stay local and unmirrored. It is chosen because waiting instead is
+// worse in kind rather than in degree — the process reaches its own self-exit
+// deadline and is killed with EVERY share's metadata store unclosed, so one
+// share's lost carve becomes all of them. An operator who sets a shutdown
+// timeout is asking for exactly this trade.
+//
+// Withdraw it by bounding the closeMu wait, which would make the close itself
+// interruptible and the expiry branch dead.
+func (s *Service) CloseBlockStores(ctx context.Context) {
 	s.mu.RLock()
 	stores := make(map[string]*engine.Store, len(s.registry))
 	for name, share := range s.registry {
@@ -667,42 +682,52 @@ func (s *Service) CloseBlockStores() {
 	}
 	s.mu.RUnlock()
 
+	// Filled before anything is spawned, so every write to the map happens on
+	// this goroutine and mu is left guarding the deletes alone. Inserting
+	// inside the spawn loop instead would race a delete from a store that
+	// closed while the loop was still going — a map write concurrent with
+	// another goroutine's delete is a fatal error, not a recoverable panic,
+	// and it would land on the one path where aborting costs what this
+	// ordering exists to protect.
+	stillOpen := make(map[string]struct{}, len(stores))
+	for name := range stores {
+		stillOpen[name] = struct{}{}
+	}
+
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
 	for name, bs := range stores {
-		if err := bs.Close(); err != nil {
-			logger.Warn("Shutdown: failed to close block store for share", "share", name, "error", err)
-		}
-	}
-}
-
-func (s *Service) StopRollups(ctx context.Context) {
-	type namedStore struct {
-		name string
-		bs   *engine.Store
-	}
-	s.mu.RLock()
-	stores := make([]namedStore, 0, len(s.registry))
-	for name, share := range s.registry {
-		if share.BlockStore != nil {
-			stores = append(stores, namedStore{name: name, bs: share.BlockStore})
-		}
-	}
-	s.mu.RUnlock()
-
-	for _, ns := range stores {
-		// grace = time left until the shared deadline (overall bound). No
-		// deadline → 0, which defers to the store's default. Budget already
-		// spent → a 1ms floor so we still fence the pool without reviving the
-		// 30s default that GracefulStopRollup applies to grace <= 0.
-		grace := time.Duration(0)
-		if dl, ok := ctx.Deadline(); ok {
-			if grace = time.Until(dl); grace <= 0 {
-				grace = time.Millisecond
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := bs.Close(); err != nil {
+				logger.Warn("Shutdown: failed to close block store for share", "share", name, "error", err)
 			}
-		}
-		if err := ns.bs.StopRollup(grace); err != nil {
-			logger.Warn("Failed to stop rollup for share; remaining rollups resume on restart",
-				"share", ns.name, "error", err)
-		}
+			mu.Lock()
+			delete(stillOpen, name)
+			mu.Unlock()
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		mu.Lock()
+		stuck := slices.Collect(maps.Keys(stillOpen))
+		mu.Unlock()
+		slices.Sort(stuck)
+		logger.Warn("Shutdown: block stores did not finish closing within the budget; "+
+			"closing the metadata stores anyway, so any carve still in flight on these shares fails "+
+			"and its chunks stay local and unmirrored",
+			"shares", stuck)
 	}
 }
 

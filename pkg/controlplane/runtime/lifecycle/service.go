@@ -49,19 +49,27 @@ type SnapshotDrainer interface {
 	ShutdownSnapshots(ctx context.Context)
 }
 
-// RollupStopper stops + drains every share's block-store rollup worker pool.
+// BlockStoreCloser closes every share's block store, stopping and draining the
+// data-plane work that writes through the metadata stores.
+//
 // Threaded through Serve so the normal server shutdown path (signal -> ctx
-// cancel -> lifecycle.shutdown) fences the rollup ticker BEFORE
-// CloseMetadataStores (#1543): the ticker persists FileChunk manifests and
-// rollup offsets through the metadata store, so closing the DB with a rollup in
-// flight races it and fails with "sql: database is closed", which can drop a
-// local chunk that was never mirrored. Called AFTER StopAllAdapters (no new
-// writes create fresh rollup work) and BEFORE the stores close. Pass nil to
-// skip (tests without a block-store rollup pool). The ctx bounds the total
-// drain time so shutdown has a predictable upper bound regardless of share
-// count; each share's rollup fence still runs even once the deadline passes.
-type RollupStopper interface {
-	StopRollups(ctx context.Context)
+// cancel -> lifecycle.shutdown) quiesces the data plane BEFORE
+// CloseMetadataStores. A share's carve dispatcher ticks on its own interval and
+// commits FileChunk manifest rows through that share's metadata store; closing
+// the block store is what stops it, drains its uploads and joins its
+// goroutines. Closing the DB underneath a live dispatcher instead fails every
+// commit with "sql: database is closed" and leaves the chunks it was carving
+// local and unmirrored.
+//
+// Called AFTER StopAllAdapters, so no new client writes create fresh carve
+// work, and BEFORE the stores close. Pass nil to skip (tests with no data
+// plane). The closes run concurrently, so ctx is a single wall-clock budget
+// they all share rather than one divided between them. It bounds the WAIT, not
+// a close: on expiry the step returns and lets the metadata stores close while
+// the stragglers are still running. See the decision marker on
+// shares.Service.CloseBlockStores for what that costs and why it beats waiting.
+type BlockStoreCloser interface {
+	CloseBlockStores(ctx context.Context)
 }
 
 // MachineSIDStore provides access to the SettingsStore for machine SID
@@ -81,6 +89,12 @@ type Service struct {
 	serveOnce       sync.Once
 	served          bool
 
+	// startupDone is closed by serve() once startup has completed and it is
+	// blocked waiting for the shutdown signal. It is NOT closed when startup
+	// fails, because at that point Serve has already returned the error — a
+	// waiter watches both, and the error is the more informative of the two.
+	startupDone chan struct{}
+
 	// sidMapper is the machine SID mapper, initialized on first Serve().
 	// It is exposed via SIDMapper() for adapters to use.
 	sidMapper *sid.SIDMapper
@@ -99,6 +113,7 @@ func New(shutdownTimeout time.Duration) *Service {
 	}
 	return &Service{
 		shutdownTimeout: shutdownTimeout,
+		startupDone:     make(chan struct{}),
 	}
 }
 
@@ -110,9 +125,19 @@ func (s *Service) SetShutdownTimeout(d time.Duration) {
 }
 
 // SIDMapper returns the machine SID mapper initialized during Serve().
-// Returns nil if Serve() has not been called yet.
+// Returns nil if Serve() has not been called yet. Safe to read from an
+// adapter, which Serve starts after publishing the mapper; reading it from a
+// goroutine that runs CONCURRENTLY with Serve is a race, and waiting for
+// startup is what StartupDone is for.
 func (s *Service) SIDMapper() *sid.SIDMapper {
 	return s.sidMapper
+}
+
+// StartupDone returns a channel closed once Serve has finished starting every
+// component and is waiting for the shutdown signal. It does not close when
+// startup fails, so a caller waits on it and on Serve's own return together.
+func (s *Service) StartupDone() <-chan struct{} {
+	return s.startupDone
 }
 
 // SetPinnedMachineSID records an operator-supplied machine SID to seed during
@@ -250,9 +275,9 @@ type Deps struct {
 	// race a closing metadata store / control-plane DB.
 	SnapshotDrainer SnapshotDrainer
 
-	// RollupStopper fences the per-share rollup workers before the metadata
+	// BlockStoreCloser quiesces the per-share data plane before the metadata
 	// stores close.
-	RollupStopper RollupStopper
+	BlockStoreCloser BlockStoreCloser
 }
 
 // Serve starts all components and blocks until shutdown. It fails fast when
@@ -302,6 +327,12 @@ func (s *Service) serve(ctx context.Context, deps Deps) error {
 			}
 		}()
 	}
+
+	// Startup is complete: every step that can still fail has run, and the
+	// only thing left is to wait. A cancellation arriving from here on is a
+	// shutdown signal rather than a startup abort, which is the distinction a
+	// waiter needs before it cancels.
+	close(s.startupDone)
 
 	var shutdownErr error
 	select {
@@ -375,14 +406,13 @@ func (s *Service) shutdown(deps Deps) {
 		}
 	}
 
-	// Fence the per-share rollup workers BEFORE closing the metadata stores
-	// (#1543): the rollup ticker persists FileChunk manifests + rollup offsets
-	// through the metadata store, so an in-flight rollup must be drained while
-	// the DB is still open or it races the close ("sql: database is closed").
-	// Runs after StopAllAdapters (no new writes create fresh rollup work).
-	if deps.RollupStopper != nil {
-		rollupCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
-		deps.RollupStopper.StopRollups(rollupCtx)
+	// Quiesce the data plane BEFORE the stores it writes through close. See
+	// BlockStoreCloser. Bounded so one wedged share cannot cost every share its
+	// metadata-store close: the process self-exits on its own deadline, and
+	// reaching that means nothing below runs at all.
+	if deps.BlockStoreCloser != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+		deps.BlockStoreCloser.CloseBlockStores(closeCtx)
 		cancel()
 	}
 

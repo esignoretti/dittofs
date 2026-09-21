@@ -82,18 +82,21 @@ type fakeDrainer struct{ drained bool }
 
 func (f *fakeDrainer) ShutdownSnapshots(ctx context.Context) { f.drained = true }
 
-// fakeRollupStopper records whether StopRollups ran and, via the shared closer,
-// that it ran BEFORE the metadata stores were closed (#1543 ordering).
-type fakeRollupStopper struct {
-	stopped       bool
-	closedAtStop  bool
-	closerToCheck *fakeStoreCloser
+// fakeBlockStoreCloser pins the ORDER of the two steps and nothing else: it
+// cannot show that closing a real block store quiesces anything. That is pinned
+// against the real chain by
+// TestServerShutdownQuiescesCarveBeforeClosingMetadataStores in the runtime
+// package, which cannot live here because the Runtime imports this package.
+type fakeBlockStoreCloser struct {
+	closedStores      bool
+	metaAlreadyClosed bool
+	closerToCheck     *fakeStoreCloser
 }
 
-func (f *fakeRollupStopper) StopRollups(ctx context.Context) {
-	f.stopped = true
+func (f *fakeBlockStoreCloser) CloseBlockStores(context.Context) {
+	f.closedStores = true
 	if f.closerToCheck != nil {
-		f.closedAtStop = f.closerToCheck.closed
+		f.metaAlreadyClosed = f.closerToCheck.closed
 	}
 }
 
@@ -167,18 +170,18 @@ func TestServeGracefulShutdownOnCancel(t *testing.T) {
 	flusher := &fakeFlusher{n: 3}
 	closer := &fakeStoreCloser{}
 	drainer := &fakeDrainer{}
-	rollups := &fakeRollupStopper{closerToCheck: closer}
+	blockStores := &fakeBlockStoreCloser{closerToCheck: closer}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	err := s.Serve(ctx, Deps{
-		Settings:        settings,
-		AdapterLoader:   adapters,
-		MetadataFlusher: flusher,
-		StoreCloser:     closer,
-		SnapshotDrainer: drainer,
-		RollupStopper:   rollups,
+		Settings:         settings,
+		AdapterLoader:    adapters,
+		MetadataFlusher:  flusher,
+		StoreCloser:      closer,
+		SnapshotDrainer:  drainer,
+		BlockStoreCloser: blockStores,
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
@@ -201,13 +204,13 @@ func TestServeGracefulShutdownOnCancel(t *testing.T) {
 	if !closer.closed {
 		t.Error("metadata stores not closed")
 	}
-	if !rollups.stopped {
-		t.Error("rollup stopper not invoked")
+	if !blockStores.closedStores {
+		t.Error("block stores not closed")
 	}
-	// #1543: rollups MUST be fenced before the metadata stores close, or an
-	// in-flight rollup races the DB close ("sql: database is closed").
-	if rollups.closedAtStop {
-		t.Error("StopRollups ran AFTER CloseMetadataStores — rollup ticker can race the DB close")
+	// The block stores MUST be closed before the metadata stores, or a share's
+	// carve dispatcher commits into a closed DB ("sql: database is closed").
+	if blockStores.metaAlreadyClosed {
+		t.Error("CloseBlockStores ran AFTER CloseMetadataStores — carve can commit into a closed DB")
 	}
 }
 

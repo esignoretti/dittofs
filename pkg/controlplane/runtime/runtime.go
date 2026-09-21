@@ -317,12 +317,10 @@ func (r *Runtime) SetShutdownTimeout(d time.Duration) {
 //     use-after-close.
 //  2. StopAllAdapters — adapters no longer accept new RPCs. Existing
 //     in-flight RPCs fail naturally (no waiters left to receive them).
-//  3. StopRollups — fence every share's rollup worker pool (#1543). The
-//     rollup ticker persists FileChunk manifests + rollup offsets through the
-//     metadata store; if the store's DB closes while a rollup is in flight it
-//     fails with "sql: database is closed" and can drop a local chunk that was
-//     never mirrored. Draining here (metadata still open) closes that race.
-//     Block stores stay open — their full teardown is RemoveShare's job.
+//  3. CloseBlockStores — quiesce every share's data plane while the metadata
+//     stores can still receive its commits, and release the journals with it.
+//     Bounded by ctx, which here bounds this step as well as the snapshot
+//     drain. See shares.Service.CloseBlockStores for what expiry costs.
 //  4. CloseMetadataStores — now safe; nothing holds open references.
 //
 // Idempotent: a second call is a no-op (runtimeCancel is already
@@ -394,14 +392,9 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 		// close still must run so file handles are released.
 		logger.Warn("Runtime.Shutdown: StopAllAdapters error", "error", err)
 	}
-	// Fence the per-share rollup workers BEFORE closing the metadata stores
-	// (#1543): the rollup ticker writes FileChunk manifests + rollup offsets
-	// through the metadata store, so an in-flight rollup must be drained while
-	// the DB is still open or it races the close. Bounded by the caller's ctx
-	// (an overall deadline across shares) so shutdown stays predictable.
-	r.sharesSvc.StopRollups(ctx)
-	// Release the journals before the metadata stores they write through.
-	r.sharesSvc.CloseBlockStores()
+	// Quiesce the per-share data plane BEFORE closing the metadata stores it
+	// writes through, bounded by the caller's ctx.
+	r.sharesSvc.CloseBlockStores(ctx)
 	r.CloseMetadataStores()
 	return nil
 }
@@ -976,13 +969,13 @@ func (r *Runtime) Serve(ctx context.Context) error {
 	}
 
 	err := r.lifecycleSvc.Serve(ctx, lifecycle.Deps{
-		Settings:        r.settingsWatcher,
-		AdapterLoader:   r.adaptersSvc,
-		MetadataFlusher: r.metadataService,
-		StoreCloser:     r.storesSvc,
-		MachineSIDStore: r.store,
-		SnapshotDrainer: r,
-		RollupStopper:   r,
+		Settings:         r.settingsWatcher,
+		AdapterLoader:    r.adaptersSvc,
+		MetadataFlusher:  r.metadataService,
+		StoreCloser:      r.storesSvc,
+		MachineSIDStore:  r.store,
+		SnapshotDrainer:  r,
+		BlockStoreCloser: r.sharesSvc,
 	})
 	// lifecycle.Serve returns its startup errors before it reaches its shutdown
 	// hook, so the drain that joins the workers started above never runs — and
@@ -1060,13 +1053,6 @@ func (r *Runtime) drainStartupWorkers(ctx context.Context) {
 	defer cancelSnap()
 	r.shutdownSnapshots(snapCtx)
 }
-
-// StopRollups stops + drains every share's block-store rollup worker pool.
-// Exposed for the lifecycle.Service shutdown sequence (#1543) so the normal
-// server path (signal -> ctx cancel -> lifecycle.shutdown) fences the rollup
-// ticker BEFORE CloseMetadataStores — otherwise an in-flight rollup races the
-// metadata-store close and fails with "sql: database is closed".
-func (r *Runtime) StopRollups(ctx context.Context) { r.sharesSvc.StopRollups(ctx) }
 
 // ShutdownSnapshots exposes shutdownSnapshots for the lifecycle.Service
 // shutdown sequence so the normal server path (signal -> ctx cancel ->
@@ -1164,6 +1150,11 @@ func (r *Runtime) GetMetadataService() *metadata.Service { return r.metadataServ
 // SIDMapper returns the machine SID mapper for Windows identity mapping.
 // Returns nil if the runtime has not been started yet (Serve not called).
 func (r *Runtime) SIDMapper() *sid.SIDMapper { return r.lifecycleSvc.SIDMapper() }
+
+// StartupDone returns a channel closed once Serve has finished startup and is
+// waiting for the shutdown signal. It stays open when startup fails, so a
+// caller waits on it and on Serve's own return together.
+func (r *Runtime) StartupDone() <-chan struct{} { return r.lifecycleSvc.StartupDone() }
 
 // SetPinnedMachineSID seeds an operator-supplied machine SID (config/env) used
 // during Serve(). Must be called before Serve(). Empty string is a no-op.
