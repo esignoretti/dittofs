@@ -30,9 +30,30 @@ if [ -z "$PKGS" ]; then
     exit 0
 fi
 
-# shellcheck disable=SC2086  # intentional word-splitting
-if ! go test -short -race -timeout=60s $PKGS; then
-    echo "" >&2
-    echo "pre-push: tests failed on changed packages. 'git push --no-verify' skips." >&2
-    exit 1
-fi
+# The operator is a separate Go module; root-relative package paths cannot
+# be tested from the main module.
+OPERATOR_DIR="k8s/dittofs-operator"
+ROOT_PKGS=""
+OPERATOR_PKGS=""
+while IFS= read -r pkg; do
+    case "$pkg" in
+        "./$OPERATOR_DIR") OPERATOR_PKGS+=" ." ;;
+        "./$OPERATOR_DIR/"*) OPERATOR_PKGS+=" ./${pkg#"./$OPERATOR_DIR/"}" ;;
+        *) ROOT_PKGS+=" $pkg" ;;
+    esac
+done <<< "$PKGS"
+
+test_packages() {
+    local module="$1" packages="$2"
+    [ -n "$packages" ] || return 0
+
+    # shellcheck disable=SC2086  # intentional word-splitting
+    if ! (cd "$module" && go test -short -race -timeout=60s $packages); then
+        echo "" >&2
+        echo "pre-push: tests failed on changed packages in $module. 'git push --no-verify' skips." >&2
+        exit 1
+    fi
+}
+
+test_packages . "$ROOT_PKGS"
+test_packages "$OPERATOR_DIR" "$OPERATOR_PKGS"
