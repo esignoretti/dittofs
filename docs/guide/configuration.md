@@ -2817,7 +2817,7 @@ DittoFS provides a JSON schema for configuration validation and autocomplete in 
 If modified:
 
 ```bash
-go run cmd/generate-schema/main.go config.schema.json
+go run ./cmd/dfs config schema --output config.schema.json
 ```
 
 ### Features

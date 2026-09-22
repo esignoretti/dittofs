@@ -187,15 +187,18 @@ Test suites cover:
 - Idempotency guarantees
 - Edge cases and boundary conditions
 
+Run these commands from the repository root. The runner supplies the required
+`e2e` build tag; preserving `PATH` lets it find Go when running under `sudo`.
+
 ```bash
-# Run E2E tests (requires NFS client installed)
-go test -v -timeout 30m ./test/e2e/...
+# Run E2E tests (requires root privileges and an NFS client)
+sudo env "PATH=$PATH" ./test/e2e/run-e2e.sh --verbose
 
 # Run specific E2E suite
-go test -v ./test/e2e -run TestE2E/memory/BasicOperations
+sudo env "PATH=$PATH" ./test/e2e/run-e2e.sh --verbose --test '^TestNFSv4BasicOperations$'
 
-# Test specific backend
-go test -v ./test/e2e -run TestE2E/filesystem/
+# Test the in-memory metadata and block stores
+sudo env "PATH=$PATH" ./test/e2e/run-e2e.sh --verbose --test '^TestStoreMatrixOperations$/^memory$/^memory$'
 ```
 
 NFSv4/v4.1 tests are in `internal/adapter/nfs/v4/handlers/` and cover sessions, delegations, ACLs, and Kerberos.
