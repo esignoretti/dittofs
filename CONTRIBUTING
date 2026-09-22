@@ -48,25 +48,26 @@ cd dittofs
 # Install dependencies
 go mod download
 
-# Build the project
-go build -o dittofs cmd/dittofs/main.go
+# Build the server and management client
+go build -o dfs cmd/dfs/main.go
+go build -o dfsctl cmd/dfsctl/main.go
 
 # Run tests
 go test ./...
 
-# Run the server
-./dittofs -port 2049 -log-level DEBUG
+# Initialize the development configuration (overwrites an existing config)
+./dfs init --force
+
+# Run in the foreground
+DITTOFS_LOGGING_LEVEL=DEBUG ./dfs start --foreground
 ```
 
 ### Mount for Testing
 
-```bash
-# Linux
-sudo mount -t nfs -o nfsvers=3,tcp,port=2049,mountport=2049 localhost:/export /mnt/test
-
-# macOS
-sudo mount -t nfs -o nfsvers=3,tcp,port=2049,mountport=2049,resvport localhost:/export /mnt/test
-```
+With the server running, follow the [Getting Started guide](docs/guide/getting-started.md#3-log-in-and-set-the-admin-password)
+in a second terminal to log in, create stores and a share, grant access, and mount
+over NFS. Use `./dfs` and `./dfsctl` in place of `dfs` and `dfsctl` when running
+from this checkout.
 
 ## How to Contribute
 
@@ -78,7 +79,7 @@ Use the [bug report template](.github/issue_template.md) and include:
 - Steps to reproduce
 - Expected vs. actual behavior
 - Environment details (OS, Go version, NFS client)
-- Relevant logs with `-log-level DEBUG`
+- Relevant logs with `DITTOFS_LOGGING_LEVEL=DEBUG`
 
 ### Suggesting Features
 
