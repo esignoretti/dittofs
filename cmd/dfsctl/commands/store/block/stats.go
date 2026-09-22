@@ -78,6 +78,8 @@ func printBlockStoreStatsTable(resp *apiclient.BlockStoreStatsResponse) error {
 		{"Blocks Remote", fmt.Sprintf("%d", t.BlocksRemote)},
 		{"Local Disk Used", formatBytes(t.LocalDiskUsed)},
 		{"Local Disk Max", formatBytes(t.LocalDiskMax)},
+		{"Segments", fmt.Sprintf("%d", t.Segments)},
+		{"Segments Pinned Unsynced", fmt.Sprintf("%d (%s)", t.PinnedSegments, formatBytes(t.PinnedBytes))},
 		{"Local Mem Used", formatBytes(t.LocalMemUsed)},
 		{"Append-Log Limit", formatBytes(t.AppendLogLimitBytes)},
 		{"Read Buffer Entries", fmt.Sprintf("%d", t.ReadBufferEntries)},

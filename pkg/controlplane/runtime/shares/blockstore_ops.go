@@ -274,6 +274,9 @@ func addBlockStoreStats(dst *engine.BlockStoreStats, src engine.BlockStoreStats)
 	dst.BlocksCached += src.BlocksCached
 	dst.LocalDiskUsed += src.LocalDiskUsed
 	dst.LocalDiskMax += src.LocalDiskMax
+	dst.Segments += src.Segments
+	dst.PinnedSegments += src.PinnedSegments
+	dst.PinnedBytes += src.PinnedBytes
 	dst.LocalMemUsed += src.LocalMemUsed
 	dst.LocalMemMax += src.LocalMemMax
 	dst.AppendLogLimitBytes += src.AppendLogLimitBytes

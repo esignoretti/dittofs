@@ -24,7 +24,18 @@ type BlockStoreStats struct {
 
 	LocalDiskUsed int64 `json:"local_disk_used"`
 	LocalDiskMax  int64 `json:"local_disk_max"`
-	LocalMemUsed  int64 `json:"local_mem_used"`
+
+	// Segments is the journal's whole-segment count and PinnedSegments the
+	// subset the eviction synced-gate refuses, each holding a record not yet on
+	// the remote; PinnedBytes is their on-disk footprint. Eviction frees whole
+	// segments, so these say what an unsynced residue actually costs in local
+	// disk, which is not derivable from UnsyncedBytes: the same byte count
+	// spread over one segment or over twenty pins wildly different amounts.
+	Segments       int   `json:"segments"`
+	PinnedSegments int   `json:"pinned_segments"`
+	PinnedBytes    int64 `json:"pinned_bytes"`
+
+	LocalMemUsed int64 `json:"local_mem_used"`
 	// LocalMemMax is retained for wire/JSON compatibility but is always 0:
 	// the FSStore no longer tracks a configurable dirty-buffer memory budget
 	// (the former MaxMemory knob was never enforced and was removed). The real
@@ -155,6 +166,9 @@ func (bs *Store) getStats(withBlockCounts bool) BlockStoreStats {
 		FileCount:           bs.local.FileCount(),
 		LocalDiskUsed:       js.DiskBytes,
 		LocalDiskMax:        bs.MaxLocalBytes(),
+		Segments:            js.Segments,
+		PinnedSegments:      js.PinnedSegments,
+		PinnedBytes:         js.PinnedBytes,
 		LocalMemUsed:        0, // retained for wire compatibility; the journal tracks no in-memory buffer
 		LocalMemMax:         0, // retained for wire compatibility; always 0 since the mem budget was removed
 		AppendLogLimitBytes: js.MaxLogBytes,
