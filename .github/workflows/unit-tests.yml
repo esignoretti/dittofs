@@ -74,7 +74,7 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
-          file: ./coverage.txt
+          files: ./coverage.txt
           flags: unittests
           name: codecov-unit-tests
         continue-on-error: true
