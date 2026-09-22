@@ -63,17 +63,9 @@ fi
 
 # 4. go.mod / go.sum drift — only when those files or any .go file are staged.
 if [ -z "${DITTOFS_SKIP_TIDY:-}" ] && { [ -n "$STAGED_GO" ] || echo "$STAGED_ALL" | grep -Eq '^go\.(mod|sum)$'; }; then
-    TIDY_TMP=$(mktemp -d)
-    trap 'rm -rf "$TIDY_TMP"' EXIT
-    cp go.mod go.sum "$TIDY_TMP/"
-    if ! GOFLAGS=-mod=mod go mod tidy >&2 2>&1; then
-        fail "go mod tidy: failed."
-    else
-        if ! diff -q go.mod "$TIDY_TMP/go.mod" >/dev/null 2>&1 || ! diff -q go.sum "$TIDY_TMP/go.sum" >/dev/null 2>&1; then
-            fail "go mod tidy: go.mod/go.sum are not tidy. Run 'go mod tidy' and stage the changes."
-        fi
-        # Restore — don't silently mutate the working tree.
-        cp "$TIDY_TMP/go.mod" "$TIDY_TMP/go.sum" ./
+    # Show required changes without modifying the working tree.
+    if ! GOFLAGS=-mod=mod go mod tidy -diff >&2; then
+        fail "go mod tidy: failed or changes are needed. Run 'go mod tidy' and stage the changes."
     fi
 fi
 
