@@ -137,36 +137,6 @@ jobs:
       - name: Test the conformance admission lease
         run: ./test/smb-conformance/compose-env_test.sh
 
-  build:
-    name: Build Binaries
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      # No Nix cache here: .#build is the Go toolchain alone, all of it
-      # substituted from cache.nixos.org, so this job realizes nothing locally
-      # and has nothing worth pushing back. Entering .#ci instead would build
-      # pynfs and pjdfstest from source just to run `go build`.
-      - name: Build DittoFS binaries
-        run: |
-          # Static binaries so they work outside the Nix environment.
-          nix develop .#build --command sh -c "CGO_ENABLED=0 go build -o dfs cmd/dfs/main.go"
-          nix develop .#build --command sh -c "CGO_ENABLED=0 go build -o dfsctl cmd/dfsctl/main.go"
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: dfs-binaries
-          path: |
-            dfs
-            dfsctl
-          retention-days: 1
-
   # ---------------------------------------------------------------------------
   # SMB — Docker Compose, no host services, no root.
   # ---------------------------------------------------------------------------
@@ -294,7 +264,7 @@ jobs:
   pjdfstest:
     name: NFS v${{ matrix.variant }} / ${{ matrix.profile }}
     runs-on: ubuntu-latest
-    needs: [matrix, build]
+    needs: matrix
     if: needs.matrix.outputs.pjdfstest != '[]'
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -367,30 +337,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nfs-common
 
-      - name: Download binaries
-        id: download-binaries
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: dfs-binaries
-
-      # The artifact service refuses for a few seconds at a time, long enough
-      # to fail two sibling jobs at once while others pull the same artifact
-      # minutes either side and succeed. One paused retry covers that window,
-      # and an artifact that genuinely is not there still fails the job.
-      - name: Pause before retrying the binaries download
-        if: steps.download-binaries.outcome == 'failure'
-        run: sleep 20
-
-      - name: Download binaries (second attempt)
-        if: steps.download-binaries.outcome == 'failure'
-        uses: actions/download-artifact@v8
-        with:
-          name: dfs-binaries
-
-      - name: Make binaries executable
-        run: chmod +x dfs dfsctl
-
       - name: Build pjdfstest in Nix
         run: |
           PJDFSTEST=$(nix build .#pjdfstest --print-out-paths)
@@ -405,6 +351,8 @@ jobs:
           PGPASSWORD=dittofs psql -h localhost -U dittofs -d dittofs_test -c "ALTER SYSTEM SET work_mem = '64MB';"
           PGPASSWORD=dittofs psql -h localhost -U dittofs -d dittofs_test -c "SELECT pg_reload_conf();"
 
+      # setup-posix.sh builds both binaries from the checkout before starting
+      # the server, so no prebuilt artifact is needed.
       - name: Run pjdfstest
         run: |
           ./test/conformance/run.sh \
