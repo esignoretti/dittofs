@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/marmos91/dittofs/pkg/block"
+	blockgc "github.com/marmos91/dittofs/pkg/block/gc"
 	remotememory "github.com/marmos91/dittofs/pkg/block/remote/memory"
 )
 
@@ -13,7 +14,7 @@ import (
 // exactly in the sweep's decision window: the sweep has already read syncedAt
 // and consulted the mark-phase live set, and has not yet freed anything.
 type reclaimHook struct {
-	inner  BlockReclaimer
+	inner  blockgc.BlockReclaimer
 	before func(block.ContentHash)
 }
 
@@ -28,6 +29,10 @@ func (r reclaimHook) ReclaimDeadChunk(ctx context.Context, h block.ContentHash) 
 // afterwards. The oracle's true answer costs the carver its only copy — the
 // carve drops the plaintext and writes a manifest row alone — so a sweep that
 // frees the block leaves that file pointing at nothing.
+//
+// The oracle is the production one — engineDeduper.IsChunkDurable — so its
+// routing through gc.AdoptDedup is part of what this test pins: answering
+// straight from the synced-hash index breaks both subtests.
 //
 // Both orderings of the two decisions are driven deterministically; neither
 // subtest depends on goroutine scheduling.
@@ -46,15 +51,15 @@ func TestGCIndexSweep_ConcurrentDedupKeepsBytes(t *testing.T) {
 		h := hashFromString("dedup-race-before")
 		seedRemoteChunk(t, st, rs, h) // synced, backdated past grace, no manifest row
 
-		durable, err := (engineDeduper{synced: st}).IsChunkDurable(ctx, ChunkHash(h))
+		durable, err := engineDeduper{synced: st}.IsChunkDurable(ctx, ChunkHash(h))
 		if err != nil {
 			t.Fatalf("IsChunkDurable: %v", err)
 		}
 		if !durable {
-			t.Fatalf("IsChunkDurable = false for a synced hash; fixture no longer exercises a dedup hit")
+			t.Fatalf("dedup oracle = false for a synced hash; fixture no longer exercises a dedup hit")
 		}
 
-		stats := collectGarbageBlocks(t, rec, st, rs, &Options{
+		stats := collectGarbageBlocks(t, rec, st, rs, &blockgc.Options{
 			GCStateRoot: t.TempDir(),
 			GracePeriod: time.Hour,
 		})
@@ -81,16 +86,15 @@ func TestGCIndexSweep_ConcurrentDedupKeepsBytes(t *testing.T) {
 		h := hashFromString("dedup-race-during")
 		seedRemoteChunk(t, st, rs, h)
 
-		deduper := engineDeduper{synced: st}
 		var durable bool
 		var dedupErr error
-		opts := &Options{
+		opts := &blockgc.Options{
 			GCStateRoot: t.TempDir(),
 			GracePeriod: time.Hour,
 		}
-		idx, ok := st.(SyncedHashIndex)
+		idx, ok := st.(blockgc.SyncedHashIndex)
 		if !ok {
-			t.Fatalf("metadata store %T does not implement SyncedHashIndex", st)
+			t.Fatalf("metadata store %T does not implement blockgc.SyncedHashIndex", st)
 		}
 		opts.SyncedHashIndex = idx
 		opts.BlockReclaimer = reclaimHook{
@@ -99,13 +103,13 @@ func TestGCIndexSweep_ConcurrentDedupKeepsBytes(t *testing.T) {
 				if swept != h {
 					return
 				}
-				durable, dedupErr = deduper.IsChunkDurable(ctx, ChunkHash(swept))
+				durable, dedupErr = engineDeduper{synced: st}.IsChunkDurable(ctx, ChunkHash(swept))
 			},
 		}
 
-		stats := CollectGarbage(ctx, rec, opts)
+		stats := blockgc.CollectGarbage(ctx, rec, opts)
 		if dedupErr != nil {
-			t.Fatalf("IsChunkDurable during sweep: %v", dedupErr)
+			t.Fatalf("dedup oracle during sweep: %v", dedupErr)
 		}
 		if stats.ObjectsSwept != 1 {
 			t.Fatalf("ObjectsSwept = %d, want 1 (the hook must fire inside a real reclamation)", stats.ObjectsSwept)

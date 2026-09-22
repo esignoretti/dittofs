@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/marmos91/dittofs/pkg/block"
+	blockgc "github.com/marmos91/dittofs/pkg/block/gc"
 	"github.com/marmos91/dittofs/pkg/block/local/memory"
 	"github.com/marmos91/dittofs/pkg/metadata"
 )
@@ -159,7 +160,7 @@ func (s *recordingSyncedHashStore) MarkSynced(_ context.Context, hash block.Cont
 	return nil
 }
 
-// EnumerateSynced satisfies engine.SyncedHashIndex, yielding each marker with
+// EnumerateSynced satisfies gc.SyncedHashIndex, yielding each marker with
 // its locator (standalone here — this fake records no block locators) and
 // recorded first-mirror time (the LIST-free sweep's grace anchor).
 func (s *recordingSyncedHashStore) EnumerateSynced(ctx context.Context, fn func(block.ContentHash, block.ChunkLocator, time.Time) error) error {
@@ -210,7 +211,7 @@ func (s *recordingSyncedHashStore) deletedHashes() []block.ContentHash {
 
 var (
 	_ metadata.SyncedHashStore = (*recordingSyncedHashStore)(nil)
-	_ SyncedHashIndex          = (*recordingSyncedHashStore)(nil)
+	_ blockgc.SyncedHashIndex  = (*recordingSyncedHashStore)(nil)
 )
 
 // buildCascadeFixture wires a Store with the supplied coordinator

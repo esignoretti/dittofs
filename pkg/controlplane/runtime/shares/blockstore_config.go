@@ -12,11 +12,11 @@ import (
 
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/block"
-	"github.com/marmos91/dittofs/pkg/block/compression"
-	"github.com/marmos91/dittofs/pkg/block/encryption"
-	"github.com/marmos91/dittofs/pkg/block/encryption/keyprovider"
 	"github.com/marmos91/dittofs/pkg/block/engine"
 	"github.com/marmos91/dittofs/pkg/block/journal"
+	"github.com/marmos91/dittofs/pkg/block/middleware/compression"
+	"github.com/marmos91/dittofs/pkg/block/middleware/encryption"
+	"github.com/marmos91/dittofs/pkg/block/middleware/encryption/keyprovider"
 	"github.com/marmos91/dittofs/pkg/block/remote"
 	remotememory "github.com/marmos91/dittofs/pkg/block/remote/memory"
 	remotes3 "github.com/marmos91/dittofs/pkg/block/remote/s3"
@@ -138,16 +138,16 @@ func (n *nonClosingRemote) Close() error { return nil }
 // remote.RemoteStore (which has no Durable method) would silently drop the
 // capability, and engine.Store.RemoteDurable() would type-assert to
 // block.DurabilityReporter, fail, and report NOT durable for every production
-// S3-remote share — breaking the honest COMMIT/CLOSE contract (#1274) with a
-// spurious ErrNotDurableYet on every commit.
+// S3-remote share — breaking the contract that COMMIT and CLOSE answer
+// truthfully, with a spurious ErrNotDurableYet on every commit.
 func (n *nonClosingRemote) Durable() bool { return block.IsDurable(n.RemoteStore) }
 
 // decision: ReadChunk keeps its type assertion although RemoteStore embeds
-// ChunkReader, so like the block-keyed forwards just deleted it can never
-// fail. It stays because the fallback is a real error the caller handles
-// (ErrChunkReadUnsupported), not a silent capability drop, and deleting the
-// method would change which type serves the call. Drop it when ChunkReader
-// stops being optional anywhere.
+// ChunkReader, so a non-nil wrapped store always satisfies it. The one case the
+// fallback still covers is a nonClosingRemote built with a nil RemoteStore:
+// the assertion then fails and the caller gets ErrChunkReadUnsupported instead
+// of a nil-pointer panic deep in the read path. That is the whole of its value
+// — drop the assertion once construction cannot produce a nil wrapped store.
 //
 // ReadChunk delegates the remote.ChunkReader capability to the wrapped
 // store. The syncer's read path type-asserts ChunkReader on ITS remote — this
@@ -687,6 +687,14 @@ func (s *Service) acquireRemoteStore(ctx context.Context, ref string, provider B
 	//
 	// Apply order in code is therefore encryption first (innermost),
 	// then compression (outermost).
+	//
+	// decision: these two statements are the only thing that enforces that
+	// order — the decorators accept each other in either arrangement, and a
+	// swap produces a working store that compresses ciphertext at a ratio of
+	// ~1.0 forever, silently. It stays a call-sequence convention because
+	// this is the sole construction site and the stack is fixed at two
+	// layers; give the order its own type the moment a second site builds
+	// the stack, or a third transform joins it.
 	encWrapped, err := maybeWrapEncryption(ctx, newStore, remoteCfg)
 	if err != nil {
 		_ = newStore.Close()

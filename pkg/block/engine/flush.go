@@ -12,6 +12,7 @@ import (
 	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/block/blockcodec"
 	"github.com/marmos91/dittofs/pkg/block/carver"
+	"github.com/marmos91/dittofs/pkg/block/gc"
 	"github.com/marmos91/dittofs/pkg/block/journal"
 	"github.com/marmos91/dittofs/pkg/block/remote"
 	"github.com/marmos91/dittofs/pkg/metadata"
@@ -141,12 +142,12 @@ type engineDeduper struct {
 	synced metadata.SyncedHashStore
 }
 
-// IsChunkDurable answers through dedupGuard, which records the adoption so a
+// IsChunkDurable answers through gc.AdoptDedup, which records the adoption so a
 // remote sweep running concurrently cannot reclaim the hash the carver is
 // about to point a manifest row at.
 func (d engineDeduper) IsChunkDurable(ctx context.Context, hash ChunkHash) (bool, error) {
 	h := block.ContentHash(hash)
-	return dedupGuard.adopt(h, func() (bool, error) {
+	return gc.AdoptDedup(h, func() (bool, error) {
 		return d.synced.IsSynced(ctx, h)
 	})
 }
@@ -385,9 +386,9 @@ func (s engineBlockSink) CommitBlock(ctx context.Context, chunks []CarveChunk) e
 		return commitManifestRows(ctx, s.committer, s.commitLocks, string(chunks[0].FileID), fileChunks)
 	}
 
-	blockID, err := newBlockID()
+	blockID, err := block.NewBlockID()
 	if err != nil {
-		return err
+		return fmt.Errorf("carve: %w", err)
 	}
 
 	var buf bytes.Buffer
