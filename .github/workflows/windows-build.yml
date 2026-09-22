@@ -12,6 +12,7 @@ on:
       - 'internal/**/*.go'
       - 'go.mod'
       - 'go.sum'
+      - 'bench/workloads/**'
       - '.github/workflows/windows-build.yml'
 
 permissions:

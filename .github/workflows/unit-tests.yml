@@ -12,6 +12,7 @@ on:
       - 'internal/**/*.go'
       - 'go.mod'
       - 'go.sum'
+      - 'bench/workloads/**'
       - '.github/workflows/unit-tests.yml'
 
 permissions:
