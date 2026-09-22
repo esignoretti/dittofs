@@ -146,9 +146,11 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.matrix.outputs.cells) }}
 
+    # An empty image means the service is not started; the matrix profile
+    # decides which services this cell gets.
     services:
       postgres:
-        image: postgres:16-alpine
+        image: ${{ startsWith(matrix.profile, 'postgres') && 'postgres:16-alpine' || '' }}
         env:
           POSTGRES_USER: dittofs
           POSTGRES_PASSWORD: dittofs
@@ -164,7 +166,7 @@ jobs:
           --shm-size=256mb
 
       localstack:
-        image: localstack/localstack:4.13.1
+        image: ${{ endsWith(matrix.profile, '-s3') && 'localstack/localstack:4.13.1' || '' }}
         env:
           SERVICES: s3
           EAGER_SERVICE_LOADING: "1"
