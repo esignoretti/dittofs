@@ -1304,8 +1304,7 @@ authoritative content list for every file.
 defined in `pkg/block/types.go`. `FileAttr.Blocks []BlockRef` (in
 `pkg/metadata/file_types.go`) is the authoritative, offset-sorted list of
 every chunk that composes a file. It is populated on every sync
-finalization; the engine binary-searches it via `findBlocksForRange`
-(`pkg/block/engine/range.go`).
+finalization; the engine resolves a read range against it.
 
 Storage encodings differ per backend:
 
@@ -1327,9 +1326,8 @@ Delete(ctx, payloadID, blocks []BlockRef) error
 CopyPayload(ctx, srcPayloadID, srcBlocks []BlockRef, dstPayloadID) ([]BlockRef, error)
 ```
 
-Range-coverage semantics: `findBlocksForRange(blocks, offset, size)`
-returns `[start, end)` of the BlockRef slice that overlaps the requested
-range using binary search on the offset-sorted slice; sparse holes
+Range-coverage semantics: the engine resolves the requested range against
+the offset-sorted slice; sparse holes
 inside `FileAttr.Size` are zero-filled — `no BlockRef for this range` is
 documented behavior, not a bug. Past `FileAttr.Size` returns short-read or
 EOF.
@@ -1588,10 +1586,10 @@ Two consequences worth knowing:
   share resolves to a block locator, and fails toward leaking rather than
   deleting an object it cannot attribute, so leftover `cas/` objects are billed
   until removed by hand.
-- The hash-keyed CAS accessors (`Put`/`Get`/`GetRange`/`Has`/`Head`/`Delete`/
-  `Walk` + `ReadBlockVerified`) survive on the concrete backends and decorators,
-  reachable through `remote.CASInner`. They are not part of the block-keyed
-  production `RemoteStore` surface and have no production caller.
+- The hash-keyed CAS accessors are gone entirely. They were removed along with
+  the `block.Store` interface, on the backends and the decorators alike, so
+  nothing in the tree can read a `cas/` object any more — not even by
+  type-asserting past `remote.RemoteStore`.
 
 ### Pre-v0.16 `.blk` -> CAS: migrate with dittofs <= v0.21
 

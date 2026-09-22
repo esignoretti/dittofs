@@ -57,16 +57,13 @@ type EvictResult struct {
 // set smaller than the segment-roll threshold otherwise sits entirely in the
 // never-sealed active segment, where nothing can reclaim it.
 func (s *Store) Evict(ctx context.Context, targetBytes int64) (EvictResult, error) {
-	return s.evict(ctx, targetBytes, true)
+	return s.evict(ctx, targetBytes)
 }
 
-// evict is the shared eviction loop. allowActiveSeal enables the force-seal
-// fall-through, which both callers want: without it the sealed set is the only
-// reclaimable set, and a working set below the rotation threshold never enters
-// it. The parameter stays so a caller that must not disturb segment layout can
-// opt out. The fall-through is bounded to one pass per call, and sealableActive
-// keeps it from touching an active holding unsynced records.
-func (s *Store) evict(ctx context.Context, targetBytes int64, allowActiveSeal bool) (EvictResult, error) {
+// evict is the shared eviction loop. Its force-seal fall-through is bounded to
+// one pass per call, and sealableActive keeps it from touching an active
+// holding unsynced records.
+func (s *Store) evict(ctx context.Context, targetBytes int64) (EvictResult, error) {
 	if err := ctx.Err(); err != nil {
 		return EvictResult{}, err
 	}
@@ -81,11 +78,11 @@ func (s *Store) evict(ctx context.Context, targetBytes int64, allowActiveSeal bo
 	for {
 		seg, sh := s.claimColdestEvictable()
 		if seg == nil {
-			// Sealed set exhausted. On an explicit force-evict, seal the
-			// fully-synced active segments once so their bytes become evictable —
-			// the next iteration drains them. Bounded to a single pass so a fresh
-			// (empty) active segment is never sealed in a spin.
-			if allowActiveSeal && !sealedActives {
+			// Sealed set exhausted. Seal the fully-synced active segments once so
+			// their bytes become evictable — the next iteration drains them.
+			// Bounded to a single pass so a fresh (empty) active segment is never
+			// sealed in a spin.
+			if !sealedActives {
 				sealedActives = true
 				sealed, err := s.sealSyncedActives(ctx)
 				if err != nil {
@@ -207,10 +204,35 @@ func (s *Store) claimColdestEvictable() (*segmentMeta, *shard) {
 	}
 }
 
-// evictable reports whether seg can be dropped whole: sealed, unclaimed, and with
-// every record synced to the remote store. Caller holds seg's shard lock.
+// evictable reports whether a segment can be unlinked outright: sealed, idle,
+// and every record it holds already durable on the remote.
+//
+// records counts only payload-bearing records — markers (tombstone, truncate)
+// never raise it, on the append path, the recovery replay, or the repack
+// carry-forward. A segment holding nothing but markers therefore reports
+// 0 == 0, reads as fully synced, and would be unlinked with the delete's only
+// durable trace inside it while the records it buries sit in another segment;
+// the next recovery replays them and the file comes back. Requiring a record
+// excludes that segment, the same reason sealableActive requires one.
+//
+// decision: this covers the marker-ONLY segment and nothing more. A segment
+// holding one synced data record PLUS a marker reports 1 == 1, passes here,
+// and loses the marker exactly the same way — that hazard is open, predates
+// this predicate, and is not closed by it. The obvious widening (refuse any
+// segment holding a marker) is wrong: evictable is also the post-delete
+// reclaim gate via reclaimEmptied, so it would pin a full segment's payload
+// behind one 0-payload marker and make ErrLocalStoreFull reachable under
+// delete-heavy pressure. The fix is to carry markers forward on evict the way
+// repackSegment already does, which is more than a predicate can do.
+//
+// decision: excluding a marker-only segment makes it permanent, because
+// pickVictim skips it too — deadBytes stays 0, so a repack would copy it into
+// an identical segment forever. The cost is that segment's tail plus its open
+// fd, so the real ceiling is RLIMIT_NOFILE, not disk. Withdraw it for a rule
+// that can prove a marker's records are all reclaimed — a store-wide minimum
+// live Version would do it — never for disk pressure alone.
 func evictable(seg *segmentMeta) bool {
-	return seg.sealed.Load() && !seg.busy.Load() &&
+	return seg.sealed.Load() && !seg.busy.Load() && seg.records.Load() > 0 &&
 		seg.syncedRecords.Load() == seg.records.Load()
 }
 
@@ -360,15 +382,15 @@ func (s *Store) ensureSpace(ctx context.Context, needed int64) error {
 			return err
 		}
 		overage := s.diskBytes.Load() + needed - s.cfg.MaxLocalBytes
-		// Force-sealing is enabled here for the same reason the explicit drain
-		// enables it: sealing happens only when an append would overflow
+		// evict's force-seal fall-through is what makes the cap reachable at all:
+		// sealing otherwise happens only when an append would overflow
 		// SegmentSize, so a working set below that threshold sits entirely in
-		// active segments, and eviction scans the sealed set alone. Denying the
-		// gate a seal leaves the cap structurally unreachable — every byte synced
-		// and droppable, nothing evictable. It cannot strand this writer's own
-		// dirty bytes: sealableActive refuses any active still holding an unsynced
-		// record, so a sustained writer's segment stays put and backpressures.
-		res, err := s.evict(ctx, overage, true)
+		// active segments, and eviction scans the sealed set alone — every byte
+		// synced and droppable, nothing evictable. It cannot strand this writer's
+		// own dirty bytes: sealableActive refuses any active still holding an
+		// unsynced record, so a sustained writer's segment stays put and
+		// backpressures.
+		res, err := s.evict(ctx, overage)
 		if err != nil {
 			return err
 		}
@@ -422,7 +444,7 @@ func (s *Store) ensureSpace(ctx context.Context, needed int64) error {
 // This drops the segment from the sealed set under sh.mu, drains in-flight
 // unlocked preads via the exclusive readGuard — taken WITHOUT sh.mu so it can't
 // deadlock a reader that holds sh.mu while acquiring the shared guard — closes
-// the fd, unlinks the .seg/.idx files, and decrements diskBytes by the reclaimed
+// the fd, unlinks the .seg file, and decrements diskBytes by the reclaimed
 // on-disk bytes. It returns those bytes.
 //
 // On unlink failure the segment is already out of the index and its fd closed —
@@ -442,7 +464,6 @@ func (s *Store) retireSegment(sh *shard, seg *segmentMeta) (int64, error) {
 	if err := os.Remove(s.segPath(seg.id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 0, fmt.Errorf("journal: retire remove segment %d: %w", seg.id, err)
 	}
-	_ = os.Remove(s.idxPath(seg.id)) // best-effort: the .idx is rebuildable
 	s.diskBytes.Add(-freed)
 	return freed, nil
 }
@@ -810,7 +831,6 @@ func (s *Store) repackSegment(sh *shard, victim *segmentMeta, live map[uint64]in
 	cleanup := func() {
 		_ = target.close()
 		_ = os.Remove(s.segPath(target.id))
-		_ = os.Remove(s.idxPath(target.id))
 	}
 	newOff := make([]int64, len(moves))
 	var relocated, syncedCount int64

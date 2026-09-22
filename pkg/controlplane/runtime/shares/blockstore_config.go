@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"path/filepath"
@@ -143,60 +142,14 @@ func (n *nonClosingRemote) Close() error { return nil }
 // spurious ErrNotDurableYet on every commit.
 func (n *nonClosingRemote) Durable() bool { return block.IsDurable(n.RemoteStore) }
 
-// --- remote.RemoteBlockStore proxy (#1414 object packing) ---
+// decision: ReadChunk keeps its type assertion although RemoteStore embeds
+// ChunkReader, so like the block-keyed forwards just deleted it can never
+// fail. It stays because the fallback is a real error the caller handles
+// (ErrChunkReadUnsupported), not a silent capability drop, and deleting the
+// method would change which type serves the call. Drop it when ChunkReader
+// stops being optional anywhere.
 //
-// The no-op-Close wrapper embeds only remote.RemoteStore, so without these
-// forwards it would silently HIDE the block-keyed surface (PutBlock/GetBlock/
-// GetBlockRange/DeleteBlock/WalkBlocks) of a wrapped store that implements it —
-// exactly the trap the Durable() forward above fixes for durability. The
-// snapshot durability-verify gate reaches the block store via
-// engine.Store.RemoteStore() (this wrapper), so it MUST be able to probe a
-// packed blocks/<id> object. Each method delegates to the embedded store when it
-// implements RemoteBlockStore; otherwise it returns remote.ErrChunkReadUnsupported
-// (a standalone-only remote is never asked for a block via the locator path).
-func (n *nonClosingRemote) blockInner() (remote.RemoteBlockStore, error) {
-	if rbs, ok := n.RemoteStore.(remote.RemoteBlockStore); ok {
-		return rbs, nil
-	}
-	return nil, remote.ErrChunkReadUnsupported
-}
-func (n *nonClosingRemote) PutBlock(ctx context.Context, blockID string, r io.Reader) error {
-	rbs, err := n.blockInner()
-	if err != nil {
-		return err
-	}
-	return rbs.PutBlock(ctx, blockID, r)
-}
-func (n *nonClosingRemote) GetBlock(ctx context.Context, blockID string) ([]byte, error) {
-	rbs, err := n.blockInner()
-	if err != nil {
-		return nil, err
-	}
-	return rbs.GetBlock(ctx, blockID)
-}
-func (n *nonClosingRemote) GetBlockRange(ctx context.Context, blockID string, offset, length int64) ([]byte, error) {
-	rbs, err := n.blockInner()
-	if err != nil {
-		return nil, err
-	}
-	return rbs.GetBlockRange(ctx, blockID, offset, length)
-}
-func (n *nonClosingRemote) DeleteBlock(ctx context.Context, blockID string) error {
-	rbs, err := n.blockInner()
-	if err != nil {
-		return err
-	}
-	return rbs.DeleteBlock(ctx, blockID)
-}
-func (n *nonClosingRemote) WalkBlocks(ctx context.Context, fn func(blockID string, meta block.Meta) error) error {
-	rbs, err := n.blockInner()
-	if err != nil {
-		return err
-	}
-	return rbs.WalkBlocks(ctx, fn)
-}
-
-// ReadChunk delegates the remote.ChunkReader capability (#1414) to the wrapped
+// ReadChunk delegates the remote.ChunkReader capability to the wrapped
 // store. The syncer's read path type-asserts ChunkReader on ITS remote — this
 // wrapper — to serve a chunk whose only copy lives inside a packed block.
 // Without this forward every cold read of a packed chunk (local copy lost:
