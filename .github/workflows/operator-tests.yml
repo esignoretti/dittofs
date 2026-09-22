@@ -43,6 +43,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: k8s/dittofs-operator/go.mod
+          cache-dependency-path: k8s/dittofs-operator/go.mod
           cache: true
 
       - name: Download dependencies
@@ -73,6 +74,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: k8s/dittofs-operator/go.mod
+          cache-dependency-path: k8s/dittofs-operator/go.mod
           cache: true
 
       - name: Run linter
@@ -91,6 +93,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: k8s/dittofs-operator/go.mod
+          cache-dependency-path: k8s/dittofs-operator/go.mod
           cache: true
 
       # Regenerates CRDs/RBAC/deepcopy from kubebuilder markers, syncs the Helm
