@@ -566,7 +566,7 @@ DITTOFS_LOGGING_LEVEL=DEBUG ./dfs start
 ### Log Messages Reference
 
 | Log Message | Level | Meaning |
-|-------------|-------|---------|
+| ------------- | ------- | --------- |
 | `cross_protocol_break` | INFO | A caching break was initiated across protocols |
 | `delegation_recall` | DEBUG | CB_RECALL sent to NFS client |
 | `delegation_returned` | DEBUG | NFS client returned delegation voluntarily |

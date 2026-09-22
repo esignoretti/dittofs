@@ -34,7 +34,6 @@ TEST_DIR="$(cd "$(dirname "$MANIFEST")/.." && pwd)"
 # its exit code says nothing about how many tests regressed.
 GRADED_STEP="run"
 
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -166,11 +165,11 @@ clear_orphan_server() {
     for pid in $(lsof -ti "tcp:${ADAPTER_PORT}" -sTCP:LISTEN 2>/dev/null); do
         name="$(ps -p "$pid" -o comm= 2>/dev/null)"
         name="${name##*/}"
-        [[ "$name" == "dfs" ]] \
-            || die "port ${ADAPTER_PORT} is held by ${name:-pid $pid}, which is not a dfs; stop it first"
+        [[ "$name" == "dfs" ]] ||
+            die "port ${ADAPTER_PORT} is held by ${name:-pid $pid}, which is not a dfs; stop it first"
         log_warn "stopping a leftover dfs on port ${ADAPTER_PORT} (pid ${pid})"
-        kill "$pid" 2>/dev/null \
-            || die "could not stop the dfs on port ${ADAPTER_PORT} (pid ${pid})"
+        kill "$pid" 2>/dev/null ||
+            die "could not stop the dfs on port ${ADAPTER_PORT} (pid ${pid})"
     done
 }
 
@@ -185,31 +184,76 @@ DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --list) list_suites; exit 0 ;;
-        --suite) SUITE="${2:?--suite requires a value}"; shift 2 ;;
-        --suite=*) SUITE="${1#*=}"; shift ;;
-        --profile) PROFILE="${2:?--profile requires a value}"; shift 2 ;;
-        --profile=*) PROFILE="${1#*=}"; shift ;;
-        --variant) VARIANT="${2:?--variant requires a value}"; shift 2 ;;
-        --variant=*) VARIANT="${1#*=}"; shift ;;
-        --tier) TIER="${2:?--tier requires a value}"; shift 2 ;;
-        --tier=*) TIER="${1#*=}"; shift ;;
-        --matrix) MATRIX_EVENT="${2:?--matrix requires a value}"; shift 2 ;;
-        --matrix=*) MATRIX_EVENT="${1#*=}"; shift ;;
-        --results-dir) RESULTS_ROOT="${2:?--results-dir requires a value}"; shift 2 ;;
-        --results-dir=*)
-            RESULTS_ROOT="${1#*=}"
-            # An empty value here is not a missing flag, it is a root: the
-            # suite/label path built from it becomes /<suite>/<label>, which the
-            # per-run clear below would then delete. Refuse it where it is
-            # parsed rather than defending against it later.
-            [[ -n "$RESULTS_ROOT" ]] || die "--results-dir= requires a value"
-            shift
-            ;;
-        --keep) KEEP=true; shift ;;
-        --dry-run) DRY_RUN=true; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) die "unknown argument: $1 (try --help)" ;;
+    --list)
+        list_suites
+        exit 0
+        ;;
+    --suite)
+        SUITE="${2:?--suite requires a value}"
+        shift 2
+        ;;
+    --suite=*)
+        SUITE="${1#*=}"
+        shift
+        ;;
+    --profile)
+        PROFILE="${2:?--profile requires a value}"
+        shift 2
+        ;;
+    --profile=*)
+        PROFILE="${1#*=}"
+        shift
+        ;;
+    --variant)
+        VARIANT="${2:?--variant requires a value}"
+        shift 2
+        ;;
+    --variant=*)
+        VARIANT="${1#*=}"
+        shift
+        ;;
+    --tier)
+        TIER="${2:?--tier requires a value}"
+        shift 2
+        ;;
+    --tier=*)
+        TIER="${1#*=}"
+        shift
+        ;;
+    --matrix)
+        MATRIX_EVENT="${2:?--matrix requires a value}"
+        shift 2
+        ;;
+    --matrix=*)
+        MATRIX_EVENT="${1#*=}"
+        shift
+        ;;
+    --results-dir)
+        RESULTS_ROOT="${2:?--results-dir requires a value}"
+        shift 2
+        ;;
+    --results-dir=*)
+        RESULTS_ROOT="${1#*=}"
+        # An empty value here is not a missing flag, it is a root: the
+        # suite/label path built from it becomes /<suite>/<label>, which the
+        # per-run clear below would then delete. Refuse it where it is
+        # parsed rather than defending against it later.
+        [[ -n "$RESULTS_ROOT" ]] || die "--results-dir= requires a value"
+        shift
+        ;;
+    --keep)
+        KEEP=true
+        shift
+        ;;
+    --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
 
@@ -218,7 +262,10 @@ if [[ -n "$MATRIX_EVENT" ]]; then
     exit 0
 fi
 
-[[ -n "$SUITE" ]] || { usage >&2; die "no --suite given"; }
+[[ -n "$SUITE" ]] || {
+    usage >&2
+    die "no --suite given"
+}
 suite_exists "$SUITE" || die "unknown suite: ${SUITE} (known: $(suite_names | tr '\n' ' '))"
 
 # run_one PROFILE VARIANT — runs a suite's steps once and returns the suite's
@@ -272,7 +319,8 @@ run_one() {
         local name cmd needs_root always
         IFS=$'\t' read -r name cmd needs_root always < <(
             mq --arg s "$SUITE" --argjson i "$i" \
-               '.suites[$s].steps[$i] | [.name, .cmd, (.root // false), (.always // false)] | @tsv')
+                '.suites[$s].steps[$i] | [.name, .cmd, (.root // false), (.always // false)] | @tsv'
+        )
 
         # A step that already failed skips the rest, except teardown, which has
         # to run precisely when something went wrong.
@@ -353,8 +401,8 @@ run_one() {
 # parser starts writing one.
 suite_writes_verdict() {
     case "$1" in
-        wpts|pynfs|pjdfstest) return 1 ;;
-        *) return 0 ;;
+    wpts | pynfs | pjdfstest) return 1 ;;
+    *) return 0 ;;
     esac
 }
 
@@ -392,39 +440,39 @@ write_summary() {
         # graded step exists to remove, one layer up and in the line a human
         # actually reads.
         local category n_fail n_trunc n_noresult
-        read -r category n_fail n_trunc n_noresult < "${results_dir}/verdict"
+        read -r category n_fail n_trunc n_noresult <"${results_dir}/verdict"
         case "$category" in
-            refused)
-                verdict="refused to run — another instance of this stack is live; no tests were graded"
-                icon=":construction:"
-                ;;
-            ungraded)
-                verdict="no test results at all — the suite produced no output to grade"
-                icon=":construction:"
-                ;;
-            infrastructure)
-                # The graded step said so itself. It parses before it discovers
-                # the docker failure, so a verdict exists and the exit status is
-                # ambiguous with a failure count — the category is what settles
-                # it, which is why the step writes one rather than leaving the
-                # summary to guess.
-                verdict="the graded step hit an infrastructure failure; its results are not a verdict"
-                icon=":construction:"
-                ;;
-            inconclusive)
-                verdict="inconclusive — ${n_noresult} test(s) produced no server result"
-                icon=":warning:"
-                ;;
-            *)
-                # Each count under its own name. A truncated test stopped without
-                # saying why and an ungraded one never reached the server;
-                # neither is a regression, and calling either one sends the
-                # reader hunting a change that did not happen.
-                verdict="${n_fail} new failure(s)"
-                [[ "${n_trunc:-0}" -gt 0 ]] && verdict+=", ${n_trunc} truncated"
-                [[ "${n_noresult:-0}" -gt 0 ]] && verdict+=", ${n_noresult} inconclusive"
-                icon=":x:"
-                ;;
+        refused)
+            verdict="refused to run — another instance of this stack is live; no tests were graded"
+            icon=":construction:"
+            ;;
+        ungraded)
+            verdict="no test results at all — the suite produced no output to grade"
+            icon=":construction:"
+            ;;
+        infrastructure)
+            # The graded step said so itself. It parses before it discovers
+            # the docker failure, so a verdict exists and the exit status is
+            # ambiguous with a failure count — the category is what settles
+            # it, which is why the step writes one rather than leaving the
+            # summary to guess.
+            verdict="the graded step hit an infrastructure failure; its results are not a verdict"
+            icon=":construction:"
+            ;;
+        inconclusive)
+            verdict="inconclusive — ${n_noresult} test(s) produced no server result"
+            icon=":warning:"
+            ;;
+        *)
+            # Each count under its own name. A truncated test stopped without
+            # saying why and an ungraded one never reached the server;
+            # neither is a regression, and calling either one sends the
+            # reader hunting a change that did not happen.
+            verdict="${n_fail} new failure(s)"
+            [[ "${n_trunc:-0}" -gt 0 ]] && verdict+=", ${n_trunc} truncated"
+            [[ "${n_noresult:-0}" -gt 0 ]] && verdict+=", ${n_noresult} inconclusive"
+            icon=":x:"
+            ;;
         esac
     else
         verdict="${status} new failure(s)"
@@ -465,8 +513,8 @@ else
     if [[ -z "$PROFILE" ]]; then
         PROFILE="$(suite_profiles "$SUITE" | head -1)"
     fi
-    suite_profiles "$SUITE" | grep -qxF "$PROFILE" \
-        || die "profile ${PROFILE} is not one of ${SUITE}'s: $(suite_profiles "$SUITE" | tr '\n' ' ')"
+    suite_profiles "$SUITE" | grep -qxF "$PROFILE" ||
+        die "profile ${PROFILE} is not one of ${SUITE}'s: $(suite_profiles "$SUITE" | tr '\n' ' ')"
     PROFILES=("$PROFILE")
 fi
 
@@ -474,8 +522,8 @@ VARIANTS=("")
 VARIANT_NAME="$(suite_variant_name "$SUITE")"
 if [[ -n "$VARIANT_NAME" ]]; then
     if [[ -n "$VARIANT" ]]; then
-        suite_variants "$SUITE" | grep -qxF "$VARIANT" \
-            || die "${VARIANT_NAME} ${VARIANT} is not one of ${SUITE}'s: $(suite_variants "$SUITE" | tr '\n' ' ')"
+        suite_variants "$SUITE" | grep -qxF "$VARIANT" ||
+            die "${VARIANT_NAME} ${VARIANT} is not one of ${SUITE}'s: $(suite_variants "$SUITE" | tr '\n' ' ')"
         VARIANTS=("$VARIANT")
     else
         VARIANTS=()

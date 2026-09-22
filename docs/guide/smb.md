@@ -28,10 +28,10 @@ configuration, and lease/durable-handle behaviour as seen from clients.
 
 DittoFS negotiates the highest mutually-supported dialect with each client.
 
-| Dialect | Hex    | Key Features |
-|---------|--------|--------------|
+| Dialect | Hex | Key Features |
+| --------- | -------- | -------------- |
 | SMB 2.0.2 | 0x0202 | Basic file operations, credits, HMAC-SHA256 signing |
-| SMB 3.0   | 0x0300 | AES-128-CCM encryption, AES-128-CMAC signing, secure dialect negotiation |
+| SMB 3.0 | 0x0300 | AES-128-CCM encryption, AES-128-CMAC signing, secure dialect negotiation |
 | SMB 3.0.2 | 0x0302 | VALIDATE_NEGOTIATE_INFO downgrade protection |
 | SMB 3.1.1 | 0x0311 | Preauth integrity (SHA-512), AES-256/128-GCM & -CCM encryption (AES-256-GCM preferred), GMAC signing, negotiate contexts |
 
@@ -48,7 +48,7 @@ flag at all.
 You only pin a dialect when troubleshooting or forcing weaker/stronger crypto:
 
 | Client | How to pin a dialect | Default behaviour |
-|--------|----------------------|-------------------|
+| -------- | ---------------------- | ------------------- |
 | **Linux** (`mount.cifs`) | `-o vers=3.1.1` (also `2.0`, `2.1`, `3.0`) | Modern `cifs-utils` negotiates ≥ 2.1 automatically. |
 | **macOS** (`mount_smbfs`) | No per-mount dialect flag — always negotiates the best. | Negotiates up to 3.1.1. |
 | **Windows** (`net use` / Explorer) | No per-mount flag (tune via the SMB client service). | Negotiates up to 3.1.1. |
@@ -66,7 +66,7 @@ The matching `dfsctl` convenience wrapper is shown under
 **Session and negotiation:**
 
 | Command | Status | Notes |
-|---------|--------|-------|
+| --------- | -------- | ------- |
 | NEGOTIATE | Implemented | Multi-dialect (2.0.2 through 3.1.1), negotiate contexts |
 | SESSION_SETUP | Implemented | NTLM and Kerberos via SPNEGO, key derivation |
 | LOGOFF | Implemented | |
@@ -76,7 +76,7 @@ The matching `dfsctl` convenience wrapper is shown under
 **File operations:**
 
 | Command | Status | Notes |
-|---------|--------|-------|
+| --------- | -------- | ------- |
 | CREATE | Implemented | Files and directories, lease V2 request/grant, durable handle create contexts |
 | CLOSE | Implemented | |
 | FLUSH | Implemented | Flushes data to block store |
@@ -92,7 +92,7 @@ The matching `dfsctl` convenience wrapper is shown under
 **SMB3 advanced features:**
 
 | Feature | Status | Notes |
-|---------|--------|-------|
+| --------- | -------- | ------- |
 | Multi-Dialect Negotiation | Implemented | 2.0.2, 3.0, 3.0.2, 3.1.1 |
 | Negotiate Contexts | Implemented | PREAUTH_INTEGRITY, ENCRYPTION, SIGNING |
 | Preauth Integrity Hash | Implemented | SHA-512 chain over raw wire bytes |
@@ -119,7 +119,7 @@ The matching `dfsctl` convenience wrapper is shown under
 **Features not supported:**
 
 | Feature | Notes |
-|---------|-------|
+| --------- | ------- |
 | SMB1 | Legacy protocol, security risk |
 | Compression | SMB 3.1.1 compression contexts not implemented |
 | Multichannel | Multiple TCP connections per session |
@@ -257,7 +257,7 @@ only the transform header (52 bytes) and ciphertext.
 Cipher suites supported:
 
 | Cipher | Default For | Key Size |
-|--------|-------------|----------|
+| -------- | ------------- | ---------- |
 | AES-128-CCM | SMB 3.0, 3.0.2 | 128-bit |
 | AES-128-GCM | SMB 3.1.1 | 128-bit |
 | AES-256-CCM | -- | 256-bit |
@@ -269,7 +269,7 @@ SMB confidentiality is provided by **SMB3 in-protocol encryption**, not TLS or Q
 ### Encryption Modes
 
 | Mode | Behaviour |
-|------|-----------|
+| ------ | ----------- |
 | `disabled` | No encryption for any session |
 | `preferred` | Encrypt SMB 3.x sessions that support it; allow unencrypted 2.x (**default**) |
 | `required` | Reject SMB 2.x clients; encrypt all SMB 3.x sessions |
@@ -318,7 +318,7 @@ it server-wide.
 Signing algorithms by dialect:
 
 | Dialect | Algorithm |
-|---------|-----------|
+| --------- | ----------- |
 | SMB 2.0.2 | HMAC-SHA256 |
 | SMB 3.0 | AES-128-CMAC |
 | SMB 3.0.2 | AES-128-CMAC |
@@ -353,7 +353,7 @@ handles locally without round-tripping to the server on every access.
 Three caching flags compose a lease state:
 
 | Flag | Abbreviation | What the Client May Do |
-|------|-------------|------------------------|
+| ------ | ------------- | ------------------------ |
 | Read | R | Cache read data without revalidating against the server |
 | Write | W | Cache writes and defer flushing to the server |
 | Handle | H | Cache the file handle and defer CLOSE |
@@ -361,7 +361,7 @@ Three caching flags compose a lease state:
 Common state combinations you'll see:
 
 | State | Flags | Typical Use |
-|-------|-------|-------------|
+| ------- | ------- | ------------- |
 | None | -- | No caching |
 | Read | R | Shared read caching (multiple clients) |
 | Read-Handle | RH | Read caching with handle caching |
@@ -668,7 +668,7 @@ See [Troubleshooting › Cross-Protocol Issues](troubleshooting.md#cross-protoco
 ## Glossary
 
 | Term | Definition |
-|------|------------|
+| ------ | ------------ |
 | **AEAD** | Authenticated Encryption with Associated Data -- encryption providing both confidentiality and integrity (AES-GCM, AES-CCM) |
 | **ACL** | Access Control List -- Windows permission model |
 | **AES-CCM** | AES in Counter with CBC-MAC mode -- AEAD cipher for SMB 3.0/3.0.2 |
