@@ -52,6 +52,7 @@ const writeBenchSeedChunkSize = 8 * 1024 * 1024
 // engine (which also closes the remote).
 func newWriteBenchEngine(tb testing.TB) *Store {
 	tb.Helper()
+	silenceLoggerForBench(tb)
 	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
 	localStore, err := journal.Open(tb.TempDir(), journal.Config{
 		MaxLogBytes: writeBenchLogBudget,

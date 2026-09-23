@@ -49,12 +49,15 @@ go test -bench=. -benchmem -run=^$ ./pkg/snapshot/        # snapshot create/mani
 go test -bench=. -benchmem -run=^$ ./pkg/block/chunker/   # FastCDC throughput
 ```
 
-Use `benchstat` to A/B two commits:
+Use `benchstat` to compare the five write-path benchmarks across two commits.
+`make bench-blockstore` collects ten samples per benchmark (`-count=10`),
+with ten iterations in each sample (`-benchtime=10x`). Keep the machine,
+Go version, and benchmark settings the same for both runs:
 
 ```sh
-go test -bench=. -count=10 -run=^$ ./pkg/block/engine/ > before.txt
+make bench-blockstore > before.txt
 # ... checkout other commit ...
-go test -bench=. -count=10 -run=^$ ./pkg/block/engine/ > after.txt
+make bench-blockstore > after.txt
 benchstat before.txt after.txt
 ```
 

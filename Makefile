@@ -61,10 +61,10 @@ bench-phase12:
 build-bench:
 	go build -o dfsbench ./cmd/bench
 
-# Run the blockstore engine write-path Go benchmarks (10 iterations for benchstat).
+# Run the blockstore engine write-path Go benchmarks (10 samples of 10 iterations).
 bench-blockstore:
 	go test -bench 'SequentialWrite8MB|RandomWrite4KB|DedupHeavy|MixedRW|FlushChurn' \
-		-benchtime=10x -run=^$$ ./pkg/block/engine/
+		-benchtime=10x -count=10 -run=^$$ ./pkg/block/engine/
 
 # Umbrella target for the relocated component benches. Append more bench-<area>
 # targets (e.g. ./pkg/snapshot/) as they grow.
