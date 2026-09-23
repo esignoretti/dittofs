@@ -339,6 +339,15 @@ func TestBackchannelSender_CbProgramRace(t *testing.T) {
 	const iterations = 500
 	done := make(chan struct{}, 2)
 
+	// decision: this test leaks goroutines and is allowed to. Every
+	// UpdateBackchannelParams below spawns a detached probeV41CallbackPath,
+	// which nothing joins, so up to `iterations` of them outlive the test and
+	// keep drawing from package state. The only package state they touch is
+	// nextCallbackXID, and the tests that read it assert a strict advance
+	// rather than an exact delta, so a foreign draw cannot fail them. The
+	// tolerance is worth exactly that much: any new assertion on package state
+	// this test's probes can reach has to join them first.
+
 	// Writer: BACKCHANNEL_CTL updating the callback program number.
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -488,6 +497,17 @@ func TestBackchannelSender_SeqIDAndXIDAreIndependent(t *testing.T) {
 	}()
 	xid1, seqID1 := readAndReply()
 
+	// Another sender draws an XID between the two sends. nextCallbackXID is
+	// package-level, so this is what production does whenever a second session
+	// sends a callback or probes its callback path; a probe on a session with no
+	// back-bound connection consumes its XID and returns without any I/O. The
+	// seqID assertion below is the subject: a counter shared with the XID makes
+	// the second seqID skip the value this draw took.
+	otherSender, _, _ := createTestBackchannelSender(t)
+	if err := otherSender.probeCallbackPath(context.Background()); err == nil {
+		t.Fatal("probe on a session with no back-bound connection must fail")
+	}
+
 	go func() {
 		recallOp := EncodeCBRecallOp(&types.Stateid4{Seqid: 2}, false, []byte{0x02})
 		_ = sender.sendCallback(context.Background(), CallbackRequest{
@@ -501,9 +521,11 @@ func TestBackchannelSender_SeqIDAndXIDAreIndependent(t *testing.T) {
 	if seqID2 != seqID1+1 {
 		t.Errorf("CB_SEQUENCE seqID must increment by exactly 1: seqID1=%d seqID2=%d (want %d)", seqID1, seqID2, seqID1+1)
 	}
-	// RPC XID increments by exactly 1, independently.
-	if xid2 != xid1+1 {
-		t.Errorf("RPC XID must increment by exactly 1: xid1=%d xid2=%d (want %d)", xid1, xid2, xid1+1)
+	// The RPC XID only has to advance. Exact succession is not a property of
+	// this counter: every sender in the process mints from it, so the gap
+	// between two of one sender's sends is whatever else drew in between.
+	if xid2 <= xid1 {
+		t.Errorf("RPC XID must advance between sends: xid1=%d xid2=%d", xid1, xid2)
 	}
 	// The two counters are genuinely independent: with the XID pre-skewed, the
 	// first XID and first seqID must not coincide.

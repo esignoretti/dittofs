@@ -270,8 +270,11 @@ func TestGCBelowThresholdNeedsForce(t *testing.T) {
 
 func TestGCCrashBeforeUnlinkOrphanSwept(t *testing.T) {
 	dir := t.TempDir()
-	cfg := Config{SegmentSize: minSegmentSize, ShardCount: 1}
-	s, err := Open(dir, cfg)
+	// The background repack loop is disabled: this test drives a pass that stops
+	// before unlinking via a package-level flag, so a concurrent loop pass would
+	// both consume the flag and change the segment count asserted below.
+	cfg := Config{SegmentSize: minSegmentSize, ShardCount: 1, GCInterval: -1}
+	s, err := openJournal(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +302,7 @@ func TestGCCrashBeforeUnlinkOrphanSwept(t *testing.T) {
 	_ = s.Close()
 
 	// Restart: recovery replays both segments (identical Version -> byte-identical).
-	r, err := Open(dir, cfg)
+	r, err := openJournal(dir, cfg)
 	if err != nil {
 		t.Fatalf("recovery after crash-before-unlink: %v", err)
 	}
@@ -507,4 +510,61 @@ func TestGCConcurrentWithWrites(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// repackedDiskBound sits between a seedRepackable store's on-disk bytes before
+// a repack (~1.2 MiB: keep + the dead "gone" record + trigger) and after one
+// (~500 KiB: keep + trigger). Comparing against it rather than against a
+// captured "before" keeps the assertions independent of when a background tick
+// lands relative to the seeding.
+const repackedDiskBound int64 = 1 << 20
+
+// A positive GCInterval drives the background repack loop, so a qualifying
+// segment is reclaimed with no explicit pass.
+func TestGCIntervalDrivesBackgroundRepack(t *testing.T) {
+	s := testStore(t, Config{SegmentSize: minSegmentSize, ShardCount: 1, GCInterval: 5 * time.Millisecond})
+	seedRepackable(t, s, true)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for s.diskBytes.Load() >= repackedDiskBound {
+		if time.Now().After(deadline) {
+			t.Fatalf("background GC never repacked the 70%%-dead segment: disk=%d, want < %d",
+				s.diskBytes.Load(), repackedDiskBound)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A negative GCInterval leaves the loop unstarted. That is what a test asserting
+// on what its own pass reclaimed needs: the loop drives the identical non-Force
+// pass, so while it runs the segment an explicit pass was going to take can be
+// gone before that pass looks.
+func TestGCIntervalNegativeDisablesBackgroundRepack(t *testing.T) {
+	s := testStore(t, Config{SegmentSize: minSegmentSize, ShardCount: 1, GCInterval: -1})
+
+	// Clock-free discriminator, asserted first: everything below is equally
+	// true of a loop that is off and of one running at the default interval,
+	// because the first tick is a whole interval away. Only withDefaults
+	// leaving a negative interval alone separates the two, and that line is
+	// the only one there not written as the house "<= 0 -> default".
+	if s.cfg.GCInterval > 0 {
+		t.Fatalf("negative GCInterval normalized to %v: the loop is running and "+
+			"nothing below tests the disable path", s.cfg.GCInterval)
+	}
+
+	seedRepackable(t, s, true)
+
+	// Far longer than the interval its sibling above repacks within.
+	time.Sleep(200 * time.Millisecond)
+	if got := s.diskBytes.Load(); got < repackedDiskBound {
+		t.Fatalf("disabled GC loop still repacked: disk=%d, want >= %d", got, repackedDiskBound)
+	}
+	// The segment really did qualify, so the bytes still on disk above are the
+	// loop being off rather than nothing having been reclaimable.
+	if _, err := s.gc(context.Background(), gcOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.diskBytes.Load(); got >= repackedDiskBound {
+		t.Fatalf("explicit pass did not repack: disk=%d, want < %d", got, repackedDiskBound)
+	}
 }
