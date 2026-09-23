@@ -39,8 +39,8 @@ on:
       - '**.jpg'
       - '**.svg'
   schedule:
-    # Nightly at 4 AM UTC.
-    - cron: '0 4 * * *'
+    # Nightly at 04:31 UTC, staggered from the other protocol suites.
+    - cron: '31 4 * * *'
   workflow_dispatch:
     inputs:
       baseline:
