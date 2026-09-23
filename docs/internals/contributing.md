@@ -104,15 +104,19 @@ go mod download
 ### Running
 
 ```bash
-# Run server with defaults (port 2049, INFO logging)
+# Run server with defaults (NFS port 12049, INFO logging)
 ./dfs start
 
 # Run with debug logging and custom settings
 DITTOFS_LOGGING_LEVEL=DEBUG ./dfs start
 
 # Use environment variables for quick config overrides
-DITTOFS_LOGGING_LEVEL=DEBUG DITTOFS_ADAPTERS_NFS_PORT=12049 ./dfs start
+DITTOFS_LOGGING_LEVEL=DEBUG DITTOFS_SHUTDOWN_TIMEOUT=60s ./dfs start
 ```
+
+Protocol adapters are stored in the control-plane database. After logging in
+with `dfsctl`, use `dfsctl adapter edit nfs --port 12049` to set the NFS port;
+`DITTOFS_ADAPTERS_*` variables do not configure adapters.
 
 ### Pre-commit Hooks
 

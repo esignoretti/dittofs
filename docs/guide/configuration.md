@@ -1144,27 +1144,10 @@ was matching on the old name.
 
 ### 7. Metadata Configuration
 
-Metadata configuration has two parts: filesystem capabilities (server config file) and store instances (managed via CLI).
-
-#### Filesystem Capabilities (config file)
-
-```yaml
-metadata:
-  # Filesystem capabilities and limits (applies to all stores)
-  filesystem_capabilities:
-    max_read_size: 1048576        # 1MB
-    preferred_read_size: 65536    # 64KB
-    max_write_size: 1048576       # 1MB
-    preferred_write_size: 65536   # 64KB
-    max_file_size: 9223372036854775807  # ~8EB
-    max_filename_len: 255
-    max_path_len: 4096
-    max_hard_link_count: 32767
-    supports_hard_links: true
-    supports_symlinks: true
-    case_sensitive: true
-    case_preserving: true
-```
+Metadata store instances are created through `dfsctl`; the server config file
+contains the global BadgerDB cache settings below. Filesystem capabilities and
+limits are supplied by the metadata store and protocol implementation, not by a
+config-file capabilities block.
 
 #### BadgerDB cache sizing (config file)
 
@@ -1396,55 +1379,21 @@ DittoFS supports a unified user management system for both NFS and SMB protocols
 
 1. **CLI commands** (`dfsctl user`, `dfsctl group`) - Recommended for initial setup
 2. **REST API** - For programmatic management and integrations
-3. **Config file** - For bootstrap configuration (imported on first run)
 
 Permission resolution follows a priority order: user explicit permissions > group permissions (highest wins) > share default.
 
-> **Note**: Users and groups defined in the config file are imported into the database on first run. After that, use CLI commands or the REST API to manage them.
+The server config bootstraps only the administrator through `admin` settings;
+it does not import top-level user or group lists. Create other accounts and
+memberships through the CLI or REST API.
 
 #### Users
 
-Define named users with credentials and permissions:
+Create named users through the CLI; the password is prompted interactively:
 
-```yaml
-users:
-  - username: "admin"
-    # Password hash (bcrypt). Generate with: htpasswd -bnBC 10 "" password | tr -d ':\n'
-    password_hash: "$2a$10$..."
-    enabled: true
-    uid: 1000        # Unix UID for NFS mapping
-    gid: 100         # Primary Unix GID
-    groups: ["admins"]  # Group membership (by name)
-    # Optional: explicit share permissions (override group permissions)
-    share_permissions:
-      /private: "admin"
-
-  - username: "editor"
-    password_hash: "$2a$10$..."
-    enabled: true
-    uid: 1001
-    gid: 101
-    groups: ["editors"]
-
-  - username: "viewer"
-    password_hash: "$2a$10$..."
-    enabled: true
-    uid: 1002
-    gid: 102
-    groups: ["viewers"]
+```bash
+dfsctl group create --name editors --gid 101
+dfsctl user create --username editor --uid 1001 --gid 101 --groups editors
 ```
-
-**User Fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `username` | string | Unique username for authentication |
-| `password_hash` | string | bcrypt password hash (cost 10 recommended) |
-| `enabled` | bool | Whether the user can authenticate |
-| `uid` | uint32 | Unix UID for NFS identity mapping |
-| `gid` | uint32 | Primary Unix GID |
-| `groups` | []string | Group names this user belongs to |
-| `share_permissions` | map | Per-share permissions (optional, overrides group) |
 
 **NFS Authentication**: NFS clients authenticate via AUTH_UNIX. The client's UID is matched against DittoFS user UIDs. If a match is found, the user's permissions are applied.
 
@@ -1452,58 +1401,21 @@ users:
 
 #### Groups
 
-Define groups with share-level permissions:
+Create a group, add members, and grant access to an existing share:
 
-```yaml
-groups:
-  - name: "admins"
-    gid: 100
-    share_permissions:
-      /export: "admin"
-      /archive: "admin"
-
-  - name: "editors"
-    gid: 101
-    share_permissions:
-      /export: "read-write"
-      /archive: "read-write"
-
-  - name: "viewers"
-    gid: 102
-    share_permissions:
-      /export: "read"
-      /archive: "read"
+```bash
+dfsctl group create --name viewers --gid 102
+dfsctl group add-user viewers editor
+dfsctl share permission grant /archive --group viewers --level read
 ```
-
-**Group Fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Unique group name |
-| `gid` | uint32 | Unix GID |
-| `share_permissions` | map | Per-share permissions for all group members |
 
 #### Guest Configuration
 
-Configure anonymous/unauthenticated access:
-
-```yaml
-guest:
-  enabled: true
-  uid: 65534        # nobody
-  gid: 65534        # nogroup
-  share_permissions:
-    /public: "read"
-```
-
-**Guest Fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `enabled` | bool | Allow guest/anonymous access |
-| `uid` | uint32 | Unix UID for guest users |
-| `gid` | uint32 | Unix GID for guest users |
-| `share_permissions` | map | Per-share permissions for guests |
+There is no top-level guest bootstrap section. Configure anonymous NFS identity
+mapping per export, for example with
+`dfsctl share nfs-config set /public --squash root_to_guest`. SMB guest sessions
+are governed by adapter authentication policy and share permissions. See
+[NFS access controls](nfs.md) and [SMB authentication](smb.md).
 
 #### Permission Levels
 
@@ -1520,19 +1432,12 @@ guest:
 2. **Group permissions**: Check all groups the user belongs to, use the highest permission level
 3. **Share default**: Fall back to the share's `default_permission` setting
 
-**Example:**
+**Example** (with the `viewers` group and `/archive` share already created):
 
-```yaml
-groups:
-  - name: "viewers"
-    share_permissions:
-      /archive: "read"
-
-users:
-  - username: "special-viewer"
-    groups: ["viewers"]
-    share_permissions:
-      /archive: "read-write"  # Overrides group's "read" permission
+```bash
+dfsctl user create --username special-viewer --groups viewers
+dfsctl share permission grant /archive --group viewers --level read
+dfsctl share permission grant /archive --user special-viewer --level read-write
 ```
 
 In this example, `special-viewer` gets `read-write` on `/archive` (user explicit), even though the `viewers` group only has `read`.
@@ -1586,353 +1491,122 @@ dfsctl share permission revoke /export --user alice
 
 ### 10. Protocol Adapters
 
-Configures protocol-specific settings:
+Protocol adapters and their settings live in the control-plane database. Log in
+with `dfsctl login`, then use `adapter enable`, `adapter disable`, and
+`adapter edit` for lifecycle and ports; use `adapter settings` for protocol tuning.
+These settings do not belong in the server YAML/TOML file and are not read from
+`DITTOFS_ADAPTERS_*` environment variables.
 
-**NFS Adapter**:
+```bash
+# Set listen ports (the default NFS/SMB ports are 12049/12445)
+dfsctl adapter edit nfs --port 12049
+dfsctl adapter edit smb --port 12445
 
-```yaml
-server:
-  shutdown_timeout: 30s
-
-  # Global rate limiting (applies to all adapters unless overridden)
-  rate_limiting:
-    enabled: false
-    requests_per_second: 5000    # Sustained rate limit
-    burst: 10000                  # Burst capacity (2x sustained recommended)
-
-adapters:
-  nfs:
-    enabled: true
-    port: 12049
-    max_connections: 0           # 0 falls back to 1024 (default cap)
-
-    # Grouped timeout configuration
-    timeouts:
-      read: 5m                   # Max time to read request
-      write: 30s                 # Max time to write response
-      idle: 5m                   # Max idle time between requests
-      shutdown: 30s              # Graceful shutdown timeout
-
-    metrics_log_interval: 5m     # Metrics logging interval (0 = disabled)
-
-    # Embedded portmapper (RFC 1057) for service discovery. Disabled by default.
-    # macOS/BSD NFSv3 lock clients query the portmapper on port 111 — bind it
-    # there (requires root / CAP_NET_BIND_SERVICE) for NFSv3 locking to work.
-    portmapper:
-      enabled: false             # Default: false
-      port: 10111                # Default: 10111 (set to 111 for macOS locking)
-
-    # UDP transport for the lock-manager protocols. Serves NLM/NSM/MOUNT over
-    # UDP (in addition to TCP) on the NFS port. Required for NFSv3 file locking
-    # from BSD/macOS clients (see docs/NFS.md). Disabled by default. NFS data
-    # operations are never served over UDP.
-    udp:
-      enabled: false             # Default: false
-
-    # Optional: override server-level rate limiting for this adapter
-    # rate_limiting:
-    #   enabled: true
-    #   requests_per_second: 10000
-    #   burst: 20000
+# Inspect persisted protocol settings
+dfsctl adapter settings nfs show
+dfsctl adapter settings smb show
 ```
 
-**SMB Adapter**:
+#### NFS settings migration
 
-```yaml
-adapters:
-  smb:
-    enabled: false            # Enable SMB2 protocol (default: false)
-    port: 12445               # Default SMB port (standard 445 requires root)
-    max_connections: 0        # 0 = unlimited
-    max_requests_per_connection: 100  # Concurrent requests per connection
+The old names below were nested under the removed NFS adapter config section.
+Timeout flags take seconds, rather than duration strings such as `90s`.
 
-    # Grouped timeout configuration
-    timeouts:
-      read: 5m                # Max time to read request
-      write: 30s              # Max time to write response
-      idle: 5m                # Max idle time between requests
-      shutdown: 30s           # Graceful shutdown timeout
+| Old name | Current command or status |
+| --- | --- |
+| `enabled`, `port` | `dfsctl adapter enable nfs`, `dfsctl adapter disable nfs`, or `dfsctl adapter edit nfs --port 12049` |
+| `max_connections` | `dfsctl adapter settings nfs update --max-connections 1024` |
+| `portmapper.enabled`, `portmapper.port` | `dfsctl adapter settings nfs update --portmapper-enabled --portmapper-port 10111` (restart the adapter to apply) |
+| `udp.enabled` | `dfsctl adapter settings nfs update --udp-enabled` (restart the adapter to apply) |
+| `v4_enabled` | No supported switch for NFSv4 alone; the enabled NFS adapter serves both NFSv3 and NFSv4. |
+| `delegations_enabled`, `max_delegations` | `dfsctl adapter settings nfs update --delegations-enabled --max-delegations 10000` |
+| `grace_period`, `lease_time` | `dfsctl adapter settings nfs update --grace-period 90 --lease-time 90` |
+| `timeouts.read`, `timeouts.write`, `timeouts.idle`, `timeouts.shutdown` | No corresponding transport-timeout CLI flags. The server's top-level `shutdown_timeout` controls server shutdown, not these adapter fields. |
+| `metrics_log_interval`, `rate_limiting.*` | No supported replacement in server config or adapter settings. Use the top-level [Prometheus metrics configuration](#metrics-prometheus) for observability. |
 
-    metrics_log_interval: 5m  # Metrics logging interval (0 = disabled)
+#### SMB settings migration
 
-    # Credit management configuration
-    # Credits control SMB2 flow control and client parallelism.
-    # Defaults match Samba (`smb2 max credits = 8192`, initial grant = 1)
-    # and Windows 2008R2+. See docs/SMB.md for the credit-accounting model
-    # and rationale.
-    credits:
-      strategy: echo            # fixed, echo, adaptive (default: echo)
-      min_grant: 1              # Minimum credits per response
-      max_grant: 8192           # Maximum credits per response
-      initial_grant: 1          # Floor when client requests 0 credits
-      max_session_credits: 8192 # Per-connection credit window cap
+The old names below were nested under the removed SMB adapter config section.
+Rows without a supported flag are explicitly marked. For keys without an
+exposed override, `adapter edit smb --config` is not a workaround.
 
-      # Adaptive strategy thresholds (ignored for fixed/echo)
-      load_threshold_high: 1000       # Start throttling above this load
-      load_threshold_low: 100         # Boost credits below this load
-      aggressive_client_threshold: 256 # Throttle clients with this many outstanding
+| Old name | Current command or status |
+| --- | --- |
+| `enabled`, `port` | `dfsctl adapter enable smb`, `dfsctl adapter disable smb`, or `dfsctl adapter edit smb --port 12445` |
+| `max_connections` | `dfsctl adapter settings smb update --max-connections 1024` |
+| `min_dialect`, `max_dialect` | `dfsctl adapter settings smb update --min-dialect SMB3.0 --max-dialect SMB3.1.1` |
+| `signing.enabled`, `signing.required` | `dfsctl adapter settings smb update --signing required`; modes are `disabled`, `enabled`, and `required`. SMB 3.1.1 still requires signing. |
+| `signing.preferred_algorithms` | No exposed override; algorithms are negotiated from built-in support. |
+| `encryption.encryption_mode` | No equivalent three-mode flag. `dfsctl adapter settings smb update --enable-encryption` can enable encryption support, but does not select a global `required` policy; see [encryption below](#smb3-encryption-configuration). |
+| `encryption.allowed_ciphers` | No exposed override; ciphers are negotiated from built-in support. |
+| `leases.enabled` | No exposed global lease toggle. |
+| `leases.directory_leases` | REST-only `directory_leasing_enabled` in `PATCH /api/v1/adapters/smb/settings`; no CLI flag. |
+| `leases.lease_break_timeout` | No SMB CLI override: lease breaks use a fixed **5-second** bound. `--oplock-break-timeout` controls traditional oplocks only. |
+| `durable_handles.enabled`, `durable_handles.max_handles_per_session` | No exposed equivalents. Durable-handle support requires a suitable metadata store. |
+| `durable_handles.default_timeout` | No server override; the runtime default/maximum is 300 seconds, and clients may request less. |
+| `durable_handles.scavenger_interval` | No exposed override; the built-in scan interval is 10 seconds. |
+| `timeouts.read`, `timeouts.write`, `timeouts.idle`, `timeouts.shutdown` | No corresponding transport-timeout CLI flags. `--session-timeout` is not a replacement for transport idle timeout. |
+| `max_requests_per_connection`, `metrics_log_interval` | No exposed overrides; the request limit is fixed at 100, and the old metrics-log setting is not consumed. |
+| `credits.strategy`, `credits.min_grant`, `credits.max_grant`, `credits.initial_grant`, `credits.max_session_credits` | No exposed overrides; built-in defaults are `echo`, 1, 8192, 1, and 8192, respectively. |
+| `credits.load_threshold_high`, `credits.load_threshold_low`, `credits.aggressive_client_threshold` | No exposed overrides; the default `echo` strategy does not use adaptive thresholds. |
+| `cross_protocol.delegation_recall_timeout`, `cross_protocol.anti_storm_ttl` | No SMB CLI overrides; see [cross-protocol coordination](#cross-protocol-coordination). |
+
+For example, require signing and allow SMB 3.x clients:
+
+```bash
+dfsctl adapter settings smb update --signing required \
+  --min-dialect SMB3.0 --max-dialect SMB3.1.1
 ```
-
-**SMB Credit Strategies:**
-
-| Strategy | Description | Use Case |
-|----------|-------------|----------|
-| `echo` | Grants what client requests (bounded by `MinGrant`/`MaxGrant`, clamped by window) | **Recommended, default** — matches Samba and MS-SMB2 3.3.1.2 |
-| `fixed` | Always grants `initial_grant` credits | Simple, predictable behavior |
-| `adaptive` | Scales grants by live load and client-outstanding factors | Throughput-focused; may grant more aggressively than clients expect |
-
-**SMB Credit Configuration Options:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `strategy` | `echo` | Credit grant strategy |
-| `min_grant` | `1` | Minimum credits per response |
-| `max_grant` | `8192` | Maximum credits per response |
-| `initial_grant` | `1` | Floor when client requests 0 credits (Samba-compatible) |
-| `max_session_credits` | `8192` | Per-connection credit window cap (Samba's `smb2 max credits`) |
-| `load_threshold_high` | `1000` | (adaptive only) Server load that triggers throttling |
-| `load_threshold_low` | `100` | (adaptive only) Server load that triggers boost |
-| `aggressive_client_threshold` | `256` | (adaptive only) Outstanding requests that trigger client throttling |
-
-> **Note**: Every response's credit grant is clamped to the connection's
-> remaining window capacity before being written, regardless of strategy.
-> This prevents the client's per-connection `cur_credits` counter from
-> overflowing — Samba's client hard-caps it at `uint16` max and rejects
-> overflowing responses with `NT_STATUS_INVALID_NETWORK_RESPONSE`
-> (see issue #378 and `docs/SMB.md` §Credit Flow Control).
 
 ### SMB3 Encryption Configuration
 
-SMB3 encryption provides confidentiality and integrity for all messages on a session using AEAD ciphers (AES-GCM or AES-CCM). Encryption is negotiated during NEGOTIATE (cipher selection for SMB 3.1.1), enforced per-session during SESSION_SETUP, and enforced per-share via the `encrypt_data` field in share configuration.
+The shipped adapter uses `preferred` encryption mode. The
+`--enable-encryption` flag enables support; setting it to `false` does not switch
+the running adapter to `disabled`. There is no CLI flag for selecting a global
+`required` mode.
 
-```yaml
-adapters:
-  smb:
-    encryption:
-      # Encryption mode controls server-wide encryption policy.
-      # "disabled"  - No encryption. Sessions and shares are unencrypted.
-      # "preferred" - Encryption is enabled for 3.x sessions that support it,
-      #               but unencrypted requests are still accepted (mixed model).
-      # "required"  - Only SMB 3.x clients with encryption can connect.
-      #               2.x clients are rejected. Unencrypted requests on encrypted
-      #               sessions return STATUS_ACCESS_DENIED.
-      encryption_mode: preferred  # disabled | preferred | required (default: preferred)
-
-      # Server cipher preference order (first = most preferred).
-      # Empty list means all ciphers are allowed in the default order.
-      # Valid cipher IDs: AES-256-GCM (0x0004), AES-256-CCM (0x0003),
-      #                   AES-128-GCM (0x0002), AES-128-CCM (0x0001)
-      # Default: [AES-256-GCM, AES-256-CCM, AES-128-GCM, AES-128-CCM]
-      allowed_ciphers: []
-```
-
-**Per-Share Encryption**: Individual shares can require encryption via the `encrypt_data` flag. When enabled, the server sets `SMB2_SHAREFLAG_ENCRYPT_DATA` in the TREE_CONNECT response, and clients must encrypt all traffic to that share.
+Require encrypted SMB traffic for a particular share with `--encrypt-data`:
 
 ```bash
-# Enable encryption for a specific share
 dfsctl share create --name /secure --metadata default \
   --block-store s3-remote --encrypt-data
 ```
 
-**Encryption Modes:**
-
-| Mode | Behavior | Use Case |
-|------|----------|----------|
-| `disabled` | No encryption for any session | Legacy clients, testing |
-| `preferred` | Encrypt 3.x sessions; allow unencrypted 2.x | Mixed environments (**default**) |
-| `required` | Reject 2.x clients; encrypt all 3.x sessions | High-security environments |
-
-> **Secure default:** As of v1.0.0 the shipped default is `preferred`, so SMB 3.x
-> sessions are encrypted out of the box while remaining wire-compatible with SMB 2.x
-> clients. Set `encryption_mode: required` to mandate encryption for sensitive
-> deployments (this rejects SMB 2.x clients, which cannot encrypt). If SMB is bound to
-> a non-loopback address with `encryption_mode: disabled`, `dfs` logs a startup WARN
-> because file data then traverses the network in cleartext. See
-> [docs/SECURITY.md](security.md#smb3-security-model) for the hardened template.
-
-**Enforcement Rules:**
-
-1. **SESSION_SETUP**: When mode is `preferred` or `required`, AEAD encryption keys are derived for SMB 3.x sessions. In `required` mode the `SMB2_SESSION_FLAG_ENCRYPT_DATA` flag is set in the response and every subsequent message on the session must be encrypted. In `preferred` mode the keys are available for per-share enforcement, but the session flag is **not** set — message encryption is only forced on trees connected to shares with `encrypt_data=true`.
-2. **Per-share (`encrypt_data=true`)**: encryption is forced on that tree **regardless of the global mode**. In `required` mode the unencrypted session is rejected at TREE_CONNECT. In `preferred` mode TREE_CONNECT succeeds, but every subsequent unencrypted request on the tree is denied with `STATUS_ACCESS_DENIED` (enforced by `checkEncryptionRequired`) — so plaintext access to an `encrypt_data` share is never actually allowed. The global mode only governs sessions to non-`encrypt_data` shares (mixed model in `preferred`).
-3. **Guest sessions**: Never encrypted (no session key for key derivation).
-4. **SMB 2.x clients**: Never encrypted (encryption requires SMB 3.0+). In `required` mode, 2.x clients are rejected at NEGOTIATE.
-
-> **Security Note**: For production environments handling sensitive data, set `encryption_mode: required` and enable `encrypt_data` on shares that hold confidential information.
+See the [SMB security model](security.md#smb3-security-model) for protocol-level
+enforcement and the distinction between session and per-share encryption.
 
 ### SMB3 Signing Configuration
 
-SMB3 signing provides message integrity using AES-CMAC (3.0+) or AES-GMAC (3.1.1), replacing the HMAC-SHA256 used in SMB 2.x. Signing keys are derived from the session key using SP800-108 KDF.
-
-```yaml
-adapters:
-  smb:
-    signing:
-      enabled: true       # Advertise signing capability (default: true)
-      required: false      # Require all clients to sign (default: false)
-      # Signing algorithm preference for 3.1.1 (SIGNING_CAPABILITIES context)
-      # Default: [AES-128-GMAC, AES-128-CMAC]
-      # AES-128-GMAC is fastest on hardware with AES-NI + CLMUL
-      preferred_algorithms: []
-```
-
-**Signing Configuration Options:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Advertise signing capability in NEGOTIATE |
-| `required` | `false` | Reject unsigned messages from established sessions |
-| `preferred_algorithms` | `[GMAC, CMAC]` | Algorithm preference for 3.1.1 negotiate context |
+Use `dfsctl adapter settings smb update --signing required` to require signing.
+`enabled` offers signing and `disabled` relaxes it for older dialects; SMB 3.1.1
+requires signing regardless of this setting. Signing algorithms are negotiated;
+there is no `preferred_algorithms` CLI flag.
 
 ### SMB3 Dialect Configuration
 
-Control which SMB dialects the server accepts:
-
-```yaml
-adapters:
-  smb:
-    # Minimum dialect the server will accept
-    # Set to "3.0" to reject legacy SMB2 clients
-    min_dialect: "2.0.2"     # "2.0.2" | "3.0" | "3.0.2" | "3.1.1"
-
-    # Maximum dialect the server will negotiate
-    max_dialect: "3.1.1"     # Default: highest supported
-```
+Use `--min-dialect` and `--max-dialect` on `dfsctl adapter settings smb update`,
+with names such as `SMB2.1`, `SMB3.0`, `SMB3.0.2`, and `SMB3.1.1`. The example
+above excludes SMB 2.x clients.
 
 ### SMB3 Lease Configuration
 
-Leases V2 and directory leasing configuration:
-
-```yaml
-adapters:
-  smb:
-    leases:
-      enabled: true              # Enable lease support (default: true)
-      directory_leases: true     # Enable directory leasing (default: true)
-      lease_break_timeout: 35s   # Time to wait for break acknowledgment (default: 35s)
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Enable SMB lease support |
-| `directory_leases` | `true` | Enable directory Read leasing |
-| `lease_break_timeout` | `35s` | Maximum wait for lease break acknowledgment |
+SMB lease breaks have a fixed 5-second bound. For **traditional oplocks**,
+`dfsctl adapter settings smb update --oplock-break-timeout 35` sets the wait in
+seconds (supported range: 5–120). This does not change lease-break timing.
+Directory leasing is controlled by the REST setting listed in the migration table.
 
 ### SMB3 Durable Handle Configuration
 
-Durable handle settings for session resilience:
-
-```yaml
-adapters:
-  smb:
-    durable_handles:
-      enabled: true                  # Enable durable handle support (default: true)
-      default_timeout: 60s           # Handle preservation timeout (default: 60s)
-      scavenger_interval: 10s        # Expired handle scan interval (default: 10s)
-      max_handles_per_session: 1000  # Maximum durable handles per session
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Enable durable handle V1/V2 support |
-| `default_timeout` | `60s` | How long to preserve disconnected handles |
-| `scavenger_interval` | `10s` | Background scan interval for expired handles |
-| `max_handles_per_session` | `1000` | Limit durable handles per session |
+Durable handles require a metadata store that implements durable-handle storage.
+The adapter does not expose the removed timeout, capacity, enable, or scavenger
+fields through the CLI or server config. The migration table records the current
+runtime timeout and scan interval.
 
 ### Cross-Protocol Coordination
 
-NFS/SMB cross-protocol coordination uses built-in defaults that are not
-currently configurable via YAML. The defaults are:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| Delegation recall timeout | `90s` | Maximum wait for NFS client to return delegation after CB_RECALL |
-| Anti-storm TTL | `30s` | Duration to suppress re-grants after a lease/delegation break |
-
-These are set programmatically via `Manager.SetDelegationRecallTimeout()` and
-`NewManagerWithTTL()` respectively.
-
-### Complete SMB3 Adapter Configuration Example
-
-```yaml
-adapters:
-  smb:
-    enabled: true
-    port: 12445
-    max_connections: 0          # 0 = unlimited
-    max_requests_per_connection: 100
-
-    # Dialect range
-    min_dialect: "3.0"          # Reject SMB2 clients
-    max_dialect: "3.1.1"
-
-    # Timeouts
-    timeouts:
-      read: 5m
-      write: 30s
-      idle: 5m
-      shutdown: 30s
-
-    # Credits
-    credits:
-      strategy: adaptive
-      min_grant: 16
-      max_grant: 8192
-      initial_grant: 256
-      max_session_credits: 65535
-
-    # Signing
-    signing:
-      enabled: true
-      required: true
-      preferred_algorithms: []  # Default: [GMAC, CMAC]
-
-    # Encryption
-    encryption:
-      encryption_mode: required
-      allowed_ciphers: []       # Default: all in preference order
-
-    # Leases
-    leases:
-      enabled: true
-      directory_leases: true
-      lease_break_timeout: 35s
-
-    # Durable Handles
-    durable_handles:
-      enabled: true
-      default_timeout: 60s
-      scavenger_interval: 10s
-      max_handles_per_session: 1000
-```
-
-### SMB3 Environment Variable Overrides
-
-All SMB3 settings can be overridden with environment variables:
-
-```bash
-# Encryption
-export DITTOFS_ADAPTERS_SMB_ENCRYPTION_ENCRYPTION_MODE=required
-
-# Signing
-export DITTOFS_ADAPTERS_SMB_SIGNING_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_SIGNING_REQUIRED=true
-
-# Dialect
-export DITTOFS_ADAPTERS_SMB_MIN_DIALECT=3.0
-
-# Leases
-export DITTOFS_ADAPTERS_SMB_LEASES_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_LEASES_DIRECTORY_LEASES=true
-export DITTOFS_ADAPTERS_SMB_LEASES_LEASE_BREAK_TIMEOUT=35s
-
-# Durable Handles
-export DITTOFS_ADAPTERS_SMB_DURABLE_HANDLES_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_DURABLE_HANDLES_DEFAULT_TIMEOUT=60s
-
-# Cross-Protocol
-export DITTOFS_ADAPTERS_SMB_CROSS_PROTOCOL_DELEGATION_RECALL_TIMEOUT=90s
-export DITTOFS_ADAPTERS_SMB_CROSS_PROTOCOL_ANTI_STORM_TTL=30s
-```
+Cross-protocol coordination uses programmatic defaults rather than SMB YAML or
+environment overrides. The delegation recall timeout is 90 seconds and the
+anti-storm TTL is 5 seconds; neither has an SMB adapter settings flag.
 
 #### Network discovery (mDNS / WS-Discovery)
 
@@ -1998,16 +1672,14 @@ advertiser (re)starts — toggle discovery off/on, or restart the adapter.
 
 ### 11. NFSv4 Configuration
 
-```yaml
-adapters:
-  nfs:
-    # NFSv4 settings
-    v4_enabled: true
-    delegations_enabled: true
-    max_delegations: 10000
-    grace_period: 90s
-    lease_time: 90s
+Manage NFSv4 settings through the running server after `dfsctl login`:
+
+```bash
+dfsctl adapter settings nfs update --delegations-enabled --max-delegations 10000 \
+  --grace-period 90 --lease-time 90
 ```
+
+The timeout flags above accept integer seconds.
 
 ### 12. Kerberos Configuration
 
@@ -2149,16 +1821,16 @@ identity:
   #
   # Env override: DITTOFS_IDENTITY_MACHINE_SID
   machine_sid: "S-1-5-21-1111111111-2222222222-3333333333"
-
-  # Identity mapping for NFSv4
-  idmap:
-    domain: example.com
-    # Static mappings
-    mappings:
-      - nfs_name: "user@EXAMPLE.COM"
-        local_uid: 1000
-        local_gid: 1000
 ```
+
+Map an authenticated Kerberos principal to an existing user through the
+control-plane identity mapping API. For the `editor` account created above:
+
+```bash
+dfsctl idmap add --principal editor@EXAMPLE.COM --username editor
+```
+
+This complements the Kerberos setup above; it does not enable Kerberos by itself.
 
 ### 14. Snapshot Scheduler
 
@@ -2596,7 +2268,7 @@ export DITTOFS_LOGGING_LEVEL=DEBUG
 export DITTOFS_LOGGING_FORMAT=json
 
 # Server
-export DITTOFS_SERVER_SHUTDOWN_TIMEOUT=60s
+export DITTOFS_SHUTDOWN_TIMEOUT=60s
 
 # Database (Control Plane)
 export DITTOFS_DATABASE_TYPE=sqlite
@@ -2616,51 +2288,23 @@ export DITTOFS_CONTROLPLANE_SECRET=your-secret-key-at-least-32-characters
 export DITTOFS_CONTROLPLANE_PPROF=false
 export DITTOFS_CONTROLPLANE_PPROF_MUTEX_RATE=100
 export DITTOFS_CONTROLPLANE_PPROF_BLOCK_RATE_NS=1000000
-# Server-level configuration
-export DITTOFS_SERVER_SHUTDOWN_TIMEOUT=60s
-
-# Global rate limiting
-export DITTOFS_SERVER_RATE_LIMITING_ENABLED=true
-export DITTOFS_SERVER_RATE_LIMITING_REQUESTS_PER_SECOND=10000
-export DITTOFS_SERVER_RATE_LIMITING_BURST=20000
-
-# Metadata
-export DITTOFS_METADATA_TYPE=badger
-
-# NFS adapter
-export DITTOFS_ADAPTERS_NFS_ENABLED=true
-export DITTOFS_ADAPTERS_NFS_PORT=12049
-export DITTOFS_ADAPTERS_NFS_MAX_CONNECTIONS=1000
-
-# NFSv3 locking (NLM/NSM) — opt-in; see docs/NFS.md
-export DITTOFS_ADAPTERS_NFS_UDP_ENABLED=false        # serve NLM/NSM/MOUNT over UDP
-export DITTOFS_ADAPTERS_NFS_PORTMAPPER_ENABLED=false # enable embedded portmapper
-export DITTOFS_ADAPTERS_NFS_PORTMAPPER_PORT=10111    # set to 111 for macOS locking
-
-# NFS timeouts
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_READ=5m
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_WRITE=30s
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_IDLE=5m
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_SHUTDOWN=30s
-
-# SMB adapter
-export DITTOFS_ADAPTERS_SMB_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_PORT=12445
-export DITTOFS_ADAPTERS_SMB_MAX_CONNECTIONS=1000
-
-# SMB credits
-export DITTOFS_ADAPTERS_SMB_CREDITS_STRATEGY=adaptive
-export DITTOFS_ADAPTERS_SMB_CREDITS_MIN_GRANT=16
-export DITTOFS_ADAPTERS_SMB_CREDITS_MAX_GRANT=8192
-export DITTOFS_ADAPTERS_SMB_CREDITS_INITIAL_GRANT=256
 
 # Start server with overrides
 DITTOFS_LOGGING_LEVEL=DEBUG ./dfs start
 ```
 
+Store instances and protocol adapters are managed through the control-plane
+API and `dfsctl`; their settings are persisted in the database.
+After logging in, use `dfsctl store metadata add` to create a metadata store,
+`dfsctl adapter edit nfs --port 12049` to set the NFS port, and
+`dfsctl adapter settings nfs show` or `dfsctl adapter settings smb show` to
+inspect protocol settings. See the [CLI reference](cli.md) for supported
+settings and update flags.
+
 ## Configuration Precedence
 
-Settings are applied in the following order (highest to lowest priority):
+Server settings are applied in the following order (highest to lowest priority).
+This precedence does not apply to stores or adapters managed through `dfsctl`:
 
 1. **Environment Variables** (`DITTOFS_*`) - Highest priority
 2. **Configuration File** (YAML/TOML)
@@ -2669,9 +2313,9 @@ Settings are applied in the following order (highest to lowest priority):
 Example:
 
 ```bash
-# config.yaml has port: 12049 (the DittoFS default)
-# Override it to the standard NFS port 2049 (binding <1024 requires root)
-DITTOFS_ADAPTERS_NFS_PORT=2049 ./dfs start
+# config.yaml has shutdown_timeout: 30s
+# Override the server shutdown timeout for this process
+DITTOFS_SHUTDOWN_TIMEOUT=60s ./dfs start
 ```
 
 ## Configuration Examples
@@ -2721,16 +2365,12 @@ logging:
   format: json
   output: /var/log/dittofs/server.log
 
-server:
-  shutdown_timeout: 30s
-  metrics:
-    enabled: true
-    port: 9090
+shutdown_timeout: 30s
 
-metadata:
-  filesystem_capabilities:
-    max_read_size: 1048576
-    max_write_size: 1048576
+metrics:
+  enabled: true
+  host: 127.0.0.1
+  port: 9090
 ```
 
 Then create stores, shares, and enable adapters via CLI:
