@@ -10,6 +10,7 @@ on:
       - 'pkg/**/*.go'
       - 'pkg/metadata/store/*/migrations/*.sql'
       - 'internal/**/*.go'
+      - 'internal/dfsbench/backend/smb.conf.tmpl'
       - 'go.mod'
       - 'go.sum'
       - 'bench/workloads/**'
