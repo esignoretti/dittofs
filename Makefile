@@ -44,8 +44,8 @@ vet:
 
 # Build both CLI binaries
 build:
-	go build -o dfs cmd/dfs/main.go
-	go build -o dfsctl cmd/dfsctl/main.go
+	go build -o dfs ./cmd/dfs
+	go build -o dfsctl ./cmd/dfsctl
 
 # Phase 12 perf gate (D-43): rand-read regression gate vs per-machine
 # microbench floor in test/e2e/BENCHMARKS.md. -benchtime=10s gives a

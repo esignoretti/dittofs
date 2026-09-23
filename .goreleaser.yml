@@ -12,7 +12,7 @@ before:
 
 builds:
   - id: dfs
-    main: ./cmd/dfs/main.go
+    main: ./cmd/dfs
     binary: dfs
 
     env:
@@ -36,7 +36,7 @@ builds:
       - -X main.builtBy=goreleaser
 
   - id: dfsctl
-    main: ./cmd/dfsctl/main.go
+    main: ./cmd/dfsctl
     binary: dfsctl
 
     env:
