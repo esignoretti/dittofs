@@ -45,8 +45,20 @@ func (m *RemoteSync) Flush(ctx context.Context, payloadID string) (*block.FlushR
 	// is what makes a local-only DrainRollups non-empty and clone/snapshot/
 	// restore resolve the file's chunks. Only report the soft condition when
 	// even the manifest substrate is missing.
+	//
+	// decision: this gate reads the wiring once and decides; flushFn takes its
+	// own snapshot a few lines down, so the two are separate critical sections.
+	// A setter landing between them makes the gate pass on a wired committer
+	// and the pass run with a nil one, which commitManifestRows reports as a
+	// hard error instead of the soft Finalized=false this gate documents. The
+	// gate is per-read, not per-pass, and it is worth a wrong error class
+	// because a nil committer still refuses to commit rather than claiming
+	// rows it never wrote. The setters may run on a serving share by contract,
+	// so the window is narrow rather than unreachable; no production caller
+	// re-wires one today, which is the whole of why it has never been hit.
+	// Fold the gate and the closure onto one snapshot the day one does.
 	if m.remoteStore == nil {
-		if m.blockCommitter == nil {
+		if _, _, committer, _ := m.wiring(); committer == nil {
 			return &block.FlushResult{Finalized: false}, nil
 		}
 	} else if !m.IsRemoteHealthy() {
@@ -99,6 +111,10 @@ func (m *RemoteSync) flushFn() (journal.FlushFunc, func(context.Context, journal
 	if params.Validate() != nil {
 		params = chunker.DefaultParams()
 	}
+	// One snapshot of the wired deps, taken under the lock the setters publish
+	// them with — see wiring for why a field-at-a-time read is not equivalent.
+	rbs, sealer, committer, hashStore := m.wiring()
+
 	// A tier with no flush shape of its own answers 0 for both and the
 	// defaults below stand in.
 	window, blockSize := m.local.UploadConcurrency(), m.local.BlockSize()
@@ -108,7 +124,14 @@ func (m *RemoteSync) flushFn() (journal.FlushFunc, func(context.Context, journal
 	if blockSize <= 0 {
 		blockSize = paramsBlockSize(params)
 	}
-	if m.remoteBlockStore != nil {
+	// Both, not just the store: the two are published by different setters, so
+	// (store wired, committer nil) is a legal snapshot even taken all at once,
+	// and engineBlockSink dereferences the committer unguarded —
+	// ManifestRowEndAfter and ReapSupersededManifest call straight through it
+	// on any run with a durable tail. This is the same conjunction carveActive
+	// is recomputed from. A store with no committer falls to the local-only
+	// sink below, which fails the pass honestly instead of panicking.
+	if rbs != nil && committer != nil {
 		// The syncer's own uploadLimiter is the window, shared by every
 		// concurrent pass rather than rebuilt per pass: blocks hold a slot from
 		// submit until CommitBlock returns, so at most Limit() uploads (and
@@ -116,7 +139,7 @@ func (m *RemoteSync) flushFn() (journal.FlushFunc, func(context.Context, journal
 		// semaphore here would nest inside the dispatcher's own window and make
 		// the PUTs in flight their product, which is both a bound nobody
 		// declared and a peak the controller cannot see.
-		sink := engineBlockSink{sealer: m.chunkSealer, rbs: m.remoteBlockStore, committer: m.blockCommitter, commitLocks: &carveCommitLocks{}, onPutInFlight: m.notePutInFlight, onBlockUploaded: m.noteBlockUploaded, onBlockCommitted: m.noteBlockCommitted}
+		sink := engineBlockSink{sealer: sealer, rbs: rbs, committer: committer, commitLocks: &carveCommitLocks{}, onPutInFlight: m.notePutInFlight, onBlockUploaded: m.noteBlockUploaded, onBlockCommitted: m.noteBlockCommitted}
 		// The dedup Skip hook consults the per-share synced-hash store: without
 		// it every flush treats every chunk as novel and uploads whole new
 		// blocks instead of landing manifest-only rows for content the remote
@@ -130,18 +153,22 @@ func (m *RemoteSync) flushFn() (journal.FlushFunc, func(context.Context, journal
 		if slots == nil {
 			slots = syncer.NewDynamicSemaphore(window)
 		}
-		return newFlushClosure(m.local, params, blockSize, engineDeduper{synced: m.syncedHashStore}, sink, slots)
+		return newFlushClosure(m.local, params, blockSize, engineDeduper{synced: hashStore}, sink, slots)
 	}
 	// Local-only (no remote block store): the flush cannot upload, but it must
 	// still populate the FileChunk manifest (and project File.Blocks) so a
 	// local-only DrainRollups is not a hard error and clone/snapshot/restore
-	// resolve the file's chunks. blockCommitter is nil only for the clone
-	// fixture, whose source has no dirty data so CommitBlock never fires.
+	// resolve the file's chunks. The committer reaches here nil on more than
+	// the clone fixture: SetSyncedHashStore clears it for any store that is
+	// not a blockCommitter, and it may be handed one on an already-serving
+	// share. That nil is not inert — CommitBlock fails the pass with "no
+	// transactional committer wired" rather than reporting rows it never
+	// wrote.
 	//
 	// This branch keeps a window of its own: uploadLimiter is an *upload*
 	// window sized by a controller chasing uplink goodput, and there is no
 	// uplink here to chase.
-	sink := localBlockSink{committer: m.blockCommitter, commitLocks: &carveCommitLocks{}}
+	sink := localBlockSink{committer: committer, commitLocks: &carveCommitLocks{}}
 	return newFlushClosure(m.local, params, blockSize, localDeduper{}, sink, syncer.NewDynamicSemaphore(window))
 }
 
@@ -170,6 +197,10 @@ func (m *RemoteSync) SyncNow(ctx context.Context) error {
 		return nil
 	}
 
+	// decision: the same per-read gate as Flush's. carveActive can go false
+	// between this check and the flushFn snapshot below, in which case the pass
+	// commits nothing instead of returning the honest "not wired" error. Wrong
+	// error class, not lost bytes — the sink still refuses the commit.
 	if !m.carveActive.Load() {
 		// A remote without the carve substrate cannot drain anything. Fail
 		// honestly when dirty bytes are pending rather than claiming durability.
