@@ -25,7 +25,6 @@ require (
 	github.com/jcmturner/gofork v1.7.6
 	github.com/jcmturner/gokrb5/v8 v8.4.4
 	github.com/manifoldco/promptui v0.9.0
-	github.com/mitchellh/mapstructure v1.5.0
 	github.com/oiweiwei/go-msrpc v1.5.5
 	github.com/oiweiwei/gokrb5.fork/v9 v9.0.8
 	github.com/oklog/ulid/v2 v2.1.2

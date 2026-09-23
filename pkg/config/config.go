@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	vipermapstructure "github.com/go-viper/mapstructure/v2"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/marmos91/dittofs/internal/bytesize"
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/adapter/nfs/identity"
@@ -19,7 +19,6 @@ import (
 	"github.com/marmos91/dittofs/pkg/controlplane/api"
 	"github.com/marmos91/dittofs/pkg/controlplane/store"
 	"github.com/marmos91/dittofs/pkg/identity/ldap"
-	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
@@ -821,11 +820,11 @@ func Load(configPath string) (*Config, error) {
 	// from removed config trees (e.g. the deleted `lock:`/`syncer:` sections or
 	// a `cache:` block) without hard-failing boot on an otherwise-valid config
 	// that still carries a legacy key (upgrade safety).
-	var md vipermapstructure.Metadata
+	var md mapstructure.Metadata
 	var cfg Config
 	if err := v.Unmarshal(&cfg,
 		viper.DecodeHook(configDecodeHooks()),
-		func(dc *vipermapstructure.DecoderConfig) { dc.Metadata = &md },
+		func(dc *mapstructure.DecoderConfig) { dc.Metadata = &md },
 	); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
