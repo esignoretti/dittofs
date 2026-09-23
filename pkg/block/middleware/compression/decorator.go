@@ -1,3 +1,5 @@
+// Package compression — the compression stage of a block middleware pipeline.
+// See README.md.
 package compression
 
 import (
@@ -7,64 +9,40 @@ import (
 	"io"
 
 	"github.com/marmos91/dittofs/pkg/block"
-	"github.com/marmos91/dittofs/pkg/block/remote"
+	"github.com/marmos91/dittofs/pkg/block/middleware"
 )
 
-// Decorator wraps a remote.RemoteStore and transparently compresses
-// block bodies on Put while decompressing on Get. The plaintext BLAKE3
-// remains the CAS key — dedup, GC, and verification semantics are
-// unchanged from the perspective of callers above the decorator.
+// Transform is the compression stage of a middleware pipeline. It compresses a
+// chunk body on the way out and decompresses it on the way back in.
 //
-// Compression is per-block adaptive: if the compressed body is not
-// strictly smaller than the plaintext, the decorator stores the raw
-// plaintext with no header. Get detects framed vs raw by checking the
-// 5-byte DFCMP magic prefix.
-type Decorator struct {
-	remote.Passthrough
-	// inner is the wrapped store, held separately because Passthrough keeps
-	// its own copy unexported to stay off this type's public surface.
-	inner remote.RemoteStore
+// Compression is per-block adaptive: if the compressed body is not strictly
+// smaller than the plaintext, the stage emits the raw plaintext with no header.
+// Open detects framed vs raw by the 5-byte DFCMP magic prefix, and passes an
+// unframed body through unchanged.
+//
+// The plaintext BLAKE3 remains the CAS key — this stage never touches the hash,
+// so dedup, GC and verification are unchanged above it.
+type Transform struct {
 	algo  Algo
 	codec codec
 }
 
-// NewRemote constructs a compression decorator wrapping inner. The
-// policy's algorithm is captured for the lifetime of the decorator.
-func NewRemote(inner remote.RemoteStore, p CompressionPolicy) (*Decorator, error) {
-	if inner == nil {
-		return nil, fmt.Errorf("compression: inner RemoteStore is nil")
-	}
+// NewTransform builds the compression stage. The policy's algorithm is captured
+// for the lifetime of the stage.
+func NewTransform(p CompressionPolicy) (*Transform, error) {
 	c, err := newCodec(p.Algo)
 	if err != nil {
 		return nil, err
 	}
-	return &Decorator{
-		Passthrough: remote.NewPassthrough(inner),
-		inner:       inner,
-		algo:        p.Algo,
-		codec:       c,
-	}, nil
+	return &Transform{algo: p.Algo, codec: c}, nil
 }
 
 // --- write path ---------------------------------------------------------
 
-// SealChunk applies this decorator's compression layer to plaintext, then
-// delegates inward so a decorated chain produces the fully-transformed wire
-// bytes for a packed block. Symmetric with ReadChunk: ReadChunk decompresses
-// after the inner layer decrypts, inverting this exactly.
-func (d *Decorator) SealChunk(ctx context.Context, hash block.ContentHash, plaintext []byte) ([]byte, error) {
-	wire, err := d.sealLayer(plaintext)
-	if err != nil {
-		return nil, err
-	}
-	return d.inner.SealChunk(ctx, hash, wire)
-}
-
-// sealLayer is the single source of this decorator's compression transform,
-// shared by Put and SealChunk. It compresses data and returns the framed
-// compressed body when that is strictly smaller than the input, otherwise the
-// raw plaintext (incompressible blocks skip the frame).
-func (d *Decorator) sealLayer(data []byte) ([]byte, error) {
+// Seal compresses data and returns the framed compressed body when that is
+// strictly smaller than the input, otherwise the raw plaintext — incompressible
+// bodies skip the frame, which is why Open must accept an unframed body.
+func (d *Transform) Seal(_ context.Context, _ block.ContentHash, data []byte) ([]byte, error) {
 	// Reserve the frame header up front and let the codec stream the compressed
 	// body straight after it, so the buffer already holds the wire form when the
 	// frame wins — no second allocate-and-copy of the whole body.
@@ -92,7 +70,10 @@ func (d *Decorator) sealLayer(data []byte) ([]byte, error) {
 
 // --- read path ----------------------------------------------------------
 
-func (d *Decorator) decode(raw []byte) ([]byte, error) {
+// Open decompresses a framed body and passes an unframed one through
+// unchanged: this stage skips its own frame whenever the body would not shrink,
+// so an unframed body is plaintext this stage wrote, not a foreign object.
+func (d *Transform) Open(_ context.Context, _ block.ContentHash, raw []byte) ([]byte, error) {
 	algo, origSize, body, framed, err := tryDecodeFrame(raw)
 	if !framed {
 		return raw, nil
@@ -129,26 +110,5 @@ func (d *Decorator) decode(raw []byte) ([]byte, error) {
 	return out, nil
 }
 
-// ReadChunk reads the chunk's compressed wire bytes from the inner store's
-// block object and decompresses them, returning the next layer's input (or the
-// engine's plaintext). A block stores each chunk's full self-framed compression
-// blob (or raw passthrough) verbatim, so decoding the chunk's [offset, length)
-// slice is identical to decoding its standalone object. No verification here —
-// the engine verifies the BLAKE3 after the full stack. hash is unused at this
-// layer.
-func (d *Decorator) ReadChunk(ctx context.Context, blockID string, offset, length int64, hash block.ContentHash) ([]byte, error) {
-	raw, err := d.inner.ReadChunk(ctx, blockID, offset, length, hash)
-	if err != nil {
-		return nil, err
-	}
-	return d.decode(raw)
-}
-
-// Compile-time interface assertions.
-var (
-	_ remote.RemoteStore       = (*Decorator)(nil)
-	_ remote.RemoteBlockStore  = (*Decorator)(nil)
-	_ remote.ChunkReader       = (*Decorator)(nil)
-	_ remote.ChunkSealer       = (*Decorator)(nil)
-	_ block.DurabilityReporter = (*Decorator)(nil)
-)
+// Compile-time interface assertion.
+var _ middleware.Transform = (*Transform)(nil)

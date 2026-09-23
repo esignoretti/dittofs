@@ -13,6 +13,7 @@ import (
 	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/block/engine"
 	bsmemory "github.com/marmos91/dittofs/pkg/block/local/memory"
+	"github.com/marmos91/dittofs/pkg/block/middleware"
 	"github.com/marmos91/dittofs/pkg/block/middleware/encryption"
 	"github.com/marmos91/dittofs/pkg/block/middleware/encryption/keyprovider"
 	remotememory "github.com/marmos91/dittofs/pkg/block/remote/memory"
@@ -59,7 +60,7 @@ func TestSnapshot_EncryptionInteraction(t *testing.T) {
 type encryptedFixture struct {
 	*orchestrationFixture
 	inner *remotememory.Store
-	enc   *encryption.EncryptedRemote
+	enc   *middleware.Pipeline
 }
 
 // newEncryptedFixture mirrors newOrchestrationFixture but interposes the
@@ -142,7 +143,7 @@ func newEncryptedFixture(t *testing.T) *encryptedFixture {
 // newEncryptedRemote builds an EncryptedRemote backed by a fresh local
 // passphrase-protected key file, wrapping inner. The key file + passphrase
 // are scoped to this test only.
-func newEncryptedRemote(t *testing.T, inner *remotememory.Store) *encryption.EncryptedRemote {
+func newEncryptedRemote(t *testing.T, inner *remotememory.Store) *middleware.Pipeline {
 	t.Helper()
 
 	const passphrase = "snapshot-encryption-e2e-passphrase"
@@ -165,11 +166,15 @@ func newEncryptedRemote(t *testing.T, inner *remotememory.Store) *encryption.Enc
 		t.Fatalf("NewProvider: %v", err)
 	}
 
-	enc, err := encryption.NewRemote(inner, encryption.EncryptionPolicy{
+	stage, err := encryption.NewTransform(encryption.EncryptionPolicy{
 		AEAD: encryption.AEADAES256GCM,
 	}, provider)
 	if err != nil {
-		t.Fatalf("encryption.NewRemote: %v", err)
+		t.Fatalf("encryption.NewTransform: %v", err)
+	}
+	enc, err := middleware.New(inner, stage)
+	if err != nil {
+		t.Fatalf("middleware.New: %v", err)
 	}
 	return enc
 }
