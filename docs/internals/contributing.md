@@ -144,6 +144,21 @@ go run ./test/spec-citations
 See `test/spec-citations/README.md` for what that check does and does not decide, and for how
 the section maps are refreshed when a spec revision is bumped.
 
+### Vulnerability checks
+
+Run `make vulncheck` from the repository root to scan both Go modules with a
+pinned version of [govulncheck](https://go.dev/doc/security/vuln/). Both scans
+run even if one fails; the command returns nonzero for findings or scan errors.
+Use `make vulncheck-main` or `make vulncheck-operator` to scan one module.
+
+This is an opt-in check and does not change CI or Git hooks. It needs network
+access to download the scanner and query the Go vulnerability database, and
+can use several GiB of memory. Results depend on the active Go toolchain,
+platform, build settings, and current database; tests are not included in the
+scan. Check `go version` when a report identifies standard-library issues.
+The initial Go 1.26.0 baseline reports standard-library vulnerabilities, so a
+nonzero result is expected until the compiler is updated and findings reviewed.
+
 ## Testing
 
 ### Unit Tests

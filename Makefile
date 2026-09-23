@@ -1,4 +1,4 @@
-.PHONY: setup-hooks check-hooks fmt lint vet build bench-phase12 build-bench bench-blockstore bench-all test-unit test-e2e test-posix test-smb-conformance test-all
+.PHONY: vulncheck vulncheck-main vulncheck-operator setup-hooks check-hooks fmt lint vet build bench-phase12 build-bench bench-blockstore bench-all test-unit test-e2e test-posix test-smb-conformance test-all
 
 # Configure git to use the project's hooks directory and make hooks
 # executable. Safe to re-run.
@@ -41,6 +41,22 @@ lint:
 # Run go vet
 vet:
 	go vet ./...
+
+# Keep scans opt-in: findings depend on the active compiler and live vulnerability database.
+GOVULNCHECK_VERSION ?= v1.8.0
+
+# Check both modules, even when the first scan reports vulnerabilities or fails.
+vulncheck:
+	@status=0; \
+	$(MAKE) vulncheck-main || status=1; \
+	$(MAKE) vulncheck-operator || status=1; \
+	exit $$status
+
+vulncheck-main:
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+vulncheck-operator:
+	cd k8s/dittofs-operator && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 # Build both CLI binaries
 build:
