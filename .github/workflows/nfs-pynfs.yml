@@ -163,18 +163,17 @@ jobs:
       - name: Setup Nix cache
         uses: ./.github/actions/nix-cache
         with:
-          # pynfs is built from source rather than substituted, which is the
-          # work this cache exists to absorb. Writes only on a push to develop
-          # or main.
-          push: ${{ github.event_name == 'push' }}
-          # Already realized below, and nothing else: naming a sibling suite
-          # would make this job compile it from source.
+          # Every cell uses the same pynfs derivation. One cell publishes it
+          # on a push to develop or main; the rest only read the shared cache.
+          push: ${{ github.event_name == 'push' && strategy.job-index == 0 }}
+          # Publish only this suite: naming a sibling suite would make this
+          # job realize an unrelated derivation too.
           paths: .#pynfs
-          # Empty unless the event is a trusted push: a step that merely does
-          # not use an input can still be read by the checked-out action.
-          access-key-id: ${{ github.event_name == 'push' && secrets.NIX_CACHE_ACCESS_KEY_ID || '' }}
-          secret-access-key: ${{ github.event_name == 'push' && secrets.NIX_CACHE_SECRET_ACCESS_KEY || '' }}
-          signing-key: ${{ github.event_name == 'push' && secrets.NIX_CACHE_SIGNING_KEY || '' }}
+          # Only the publishing cell receives credentials: an unused input
+          # can still be read by the checked-out action.
+          access-key-id: ${{ github.event_name == 'push' && strategy.job-index == 0 && secrets.NIX_CACHE_ACCESS_KEY_ID || '' }}
+          secret-access-key: ${{ github.event_name == 'push' && strategy.job-index == 0 && secrets.NIX_CACHE_SECRET_ACCESS_KEY || '' }}
+          signing-key: ${{ github.event_name == 'push' && strategy.job-index == 0 && secrets.NIX_CACHE_SIGNING_KEY || '' }}
 
       - name: Build pynfs
         run: |
