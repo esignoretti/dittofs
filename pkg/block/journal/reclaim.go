@@ -74,25 +74,34 @@ func (s *Store) retireSegment(sh *shard, seg *segmentMeta) (int64, error) {
 // the next recovery replays them and the file comes back. Requiring a record
 // excludes that segment, the same reason sealableActive requires one.
 //
-// decision: this covers the marker-ONLY segment and nothing more. A segment
-// holding one synced data record PLUS a marker reports 1 == 1, passes here,
-// and loses the marker exactly the same way — that hazard is open, predates
-// this predicate, and is not closed by it. The obvious widening (refuse any
-// segment holding a marker) is wrong: evictable is also the post-delete
-// reclaim gate via reclaimEmptied, so it would pin a full segment's payload
-// behind one 0-payload marker and make ErrLocalStoreFull reachable under
-// delete-heavy pressure. The fix is to carry markers forward on evict the way
-// repackSegment already does, which is more than a predicate can do.
+// The mixed case — one synced data record PLUS a marker, which reports 1 == 1
+// and passes here — is no longer a hazard, and is not handled by this
+// predicate. Both retire paths call carryMarkersForward first, so a marker
+// outlives the segment that carried it without pinning that segment's payload.
+// Widening this predicate to refuse any marker-bearing segment would have done
+// that pinning: it gates reclaimEmptied as well, so a full synced segment would
+// sit behind one 0-payload marker and make ErrLocalStoreFull reachable under
+// delete-heavy pressure.
 //
-// decision: excluding a marker-only segment makes it permanent, because
+// decision: excluding a marker-only segment still makes it permanent, because
 // pickVictim skips it too — deadBytes stays 0, so a repack would copy it into
 // an identical segment forever. The cost is that segment's tail plus its open
-// fd, so the real ceiling is RLIMIT_NOFILE, not disk. Withdraw it for a rule
-// that can prove a marker's records are all reclaimed — a store-wide minimum
-// live Version would do it — never for disk pressure alone.
+// fd, so the ceiling is RLIMIT_NOFILE, not disk. Now that both retire paths
+// carry markers forward, dropping the records clause would be safe for the
+// markers themselves; it is kept because it would also make every retire
+// re-append the whole accumulated marker set, charging a delete-heavy shard
+// O(markers) per delete. Withdraw it for a rule that lets a marker be dropped
+// rather than carried — a store-wide minimum live Version would do it — never
+// for disk pressure alone.
+//
+// A quarantined segment is refused outright. corrupt means a scan of its record
+// stream stopped short, so neither retire path can read the markers it has to
+// carry forward, and retiring it would drop them; pickVictim refuses it for the
+// mirror-image reason. The refusal is permanent until the store reopens, which
+// is what keeps a pass from re-claiming the same damaged segment forever.
 func evictable(seg *segmentMeta) bool {
-	return seg.sealed.Load() && !seg.busy.Load() && seg.records.Load() > 0 &&
-		seg.syncedRecords.Load() == seg.records.Load()
+	return seg.sealed.Load() && !seg.busy.Load() && !seg.corrupt.Load() &&
+		seg.records.Load() > 0 && seg.syncedRecords.Load() == seg.records.Load()
 }
 
 // pinned reports whether a live snapshot's watermark protects any record in seg:
@@ -166,6 +175,21 @@ func (s *Store) reclaimEmptied(sh *shard) error {
 	for _, seg := range victims {
 		if !seg.busy.CompareAndSwap(false, true) {
 			continue // claimed by a concurrent eviction/GC — it will retire it
+		}
+		// Same rule as eviction: a segment emptied of live payload can still
+		// hold the tombstone that emptied it, and retireSegment unlinks the
+		// file. Carry the markers to the active segment first. repackSegment
+		// needs no call here because it carries its victim's markers into the
+		// replacement target it is already writing.
+		if err := s.carryMarkersForward(sh, seg); err != nil {
+			seg.busy.Store(false)
+			if errors.Is(err, errTornRecord) {
+				// Quarantined: its bytes stay, evictable now refuses it, and the
+				// rest of this shard's dead segments are still worth reclaiming.
+				// Failing here instead would fail the Delete that drove the pass.
+				continue
+			}
+			return err
 		}
 		if _, err := s.retireSegment(sh, seg); err != nil {
 			seg.busy.Store(false)
