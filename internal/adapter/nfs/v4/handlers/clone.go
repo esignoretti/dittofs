@@ -29,14 +29,10 @@ import (
 //	};
 //
 // CLONE makes the destination file (CURRENT_FH) reference the same content as a
-// range of the source file (SAVED_FH) — a reflink. DittoFS's block store is
-// content-addressed with dedup, so a whole-file clone is a PURE METADATA op:
-// the destination inherits the source's ChunkRef list and the CAS RefCount is
-// bumped per unique hash. No data is read or written, even on S3 — O(1).
-// Copy-on-write is intrinsic: a later WRITE to either file produces new CAS
-// blocks under a new hash, leaving the other file's content untouched. This is
-// the same engine.CopyPayload refcount path the SMB server-side-copy IOCTLs
-// build on (CLAUDE.md: one clone primitive, both protocols — common.CloneWholeFile).
+// range of the source file (SAVED_FH). common.CloneWholeFile shares the source's
+// content-addressed blocks on remote-backed shares, through engine.CopyPayload.
+// A later WRITE creates new blocks without changing the other file's content.
+// Local-only shares materialize the bytes into the destination's own journal.
 //
 // SAVED_FH is the source and CURRENT_FH is the destination, exactly like COPY
 // (RFC 7862 Section 15.2): the client issues SAVEFH on the source before PUTFH
@@ -170,11 +166,17 @@ func (h *Handler) handleClone(ctx *types.CompoundContext, reader io.Reader) *typ
 	// partial/offset sub-range clones fall in that bucket here (the dominant
 	// `cp --reflink` path is always whole-file). Validate offsets/count fit
 	// before deciding so a malformed sub-request still gets NFS4ERR_INVAL.
+	// Replacing a longer destination would also be a partial-range operation:
+	// its existing tail lies outside this request and must not be truncated.
+	// decision: reject longer destinations on both tiers for one CLONE
+	// capability ceiling. Local copies preserve a tail appended after their
+	// validation; that does not offer arbitrary partial-range cloning here.
+	// Lift this restriction when both paths support replacing partial ranges.
 	if srcOffset > srcFile.Size || (count != 0 && srcOffset+count > srcFile.Size) {
 		return cloneErr(types.NFS4ERR_INVAL)
 	}
 	wholeFile := srcOffset == 0 && dstOffset == 0 && (count == 0 || count == srcFile.Size)
-	if !wholeFile {
+	if !wholeFile || dstFile.Size > srcFile.Size {
 		logger.Debug("NFSv4.2 CLONE sub-range not supported",
 			"srcOffset", srcOffset, "dstOffset", dstOffset, "count", count, "client", ctx.ClientAddr)
 		return cloneErr(types.NFS4ERR_NOTSUPP)
@@ -191,13 +193,13 @@ func (h *Handler) handleClone(ctx *types.CompoundContext, reader io.Reader) *typ
 		return cloneErr(types.NFS4ERR_SERVERFAULT)
 	}
 
-	// CloneWholeFile drains the source's pending rollups and re-reads its CAS
-	// manifest before copying, so a freshly-written (not-yet-rolled-up) source
-	// clones its real content instead of zeros.
+	// Recheck the range after draining the source, alongside the manifest
+	// replacement. A destination that grew since the checks above must keep
+	// its tail rather than being silently truncated to the source's size.
 	if err := common.CloneWholeFile(
 		ctx.Context, blockStore, store, nil,
 		srcHandle, dstHandle,
-		dstFile.PayloadID,
+		dstFile.PayloadID, count,
 	); err != nil {
 		logger.Debug("NFSv4.2 CLONE failed", "error", err, "client", ctx.ClientAddr)
 		return cloneErr(types.StatusForErr(err))

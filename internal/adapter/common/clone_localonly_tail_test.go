@@ -3,6 +3,8 @@ package common
 import (
 	"bytes"
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/marmos91/dittofs/pkg/block"
@@ -60,22 +62,10 @@ func writeAndSeal(t *testing.T, ctx context.Context, bs *engine.Store, payloadID
 	}
 }
 
-// TestMaterializeLocalClone_KeepsNothingPastTheSourcesSize pins the half of the
-// clone contract the local-only path used to leave undone.
-//
-// That path copies real bytes over [0, srcSize) and lets the write path
-// supersede the destination's own intervals by version. Superseding is not
-// clipping, so a destination that was longer than the source keeps everything
-// past srcSize — interval, manifest row and all. The size stamped on the
-// destination hides it from every read that clamps, which is why it stays
-// invisible until something grows the file: a grown region owes zeros, and the
-// destination would serve the bytes the clone was supposed to take away.
-//
-// The assertions are on both tiers deliberately. Clipping only the local tier
-// would leave a row claiming bytes the file no longer has, and the two tiers
-// disagreeing about who owns a range is its own defect — one that reads as a
-// mosaic rather than as a clean stale read.
-func TestMaterializeLocalClone_KeepsNothingPastTheSourcesSize(t *testing.T) {
+// CopyPayload's local fallback deliberately shares the whole-source clone
+// contract. It refuses an initially longer destination rather than offering a
+// range copy, and leaves both the local content and manifest intact.
+func TestCopyPayloadLocal_RejectsLongerDestination(t *testing.T) {
 	ctx := context.Background()
 	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
 	bs, _ := newLocalOnlyTestEngine(t, &fakeCoordinator{}, ms)
@@ -89,47 +79,39 @@ func TestMaterializeLocalClone_KeepsNothingPastTheSourcesSize(t *testing.T) {
 	writeAndSeal(t, ctx, bs, "tail-src-pid", source)
 	writeAndSeal(t, ctx, bs, "tail-dst-pid", replaced)
 
-	if err := CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, "tail-dst-pid"); err != nil {
-		t.Fatalf("CloneWholeFile: %v", err)
+	before, err := ms.GetFile(ctx, dstHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRows := mustListChunks(t, ctx, ms, "tail-dst-pid")
+	err = CopyPayload(ctx, bs, ms, nil, srcHandle, dstHandle, "tail-src-pid", "tail-dst-pid")
+	var storeErr *metadata.StoreError
+	if !errors.As(err, &storeErr) || storeErr.Code != metadata.ErrNotSupported {
+		t.Errorf("copy error = %v, want unsupported whole-file replacement", err)
+	}
+	after, err := ms.GetFile(ctx, dstHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size != dstSize || !reflect.DeepEqual(after.Blocks, before.Blocks) {
+		t.Errorf("rejected copy changed destination size/manifest: size=%d want=%d", after.Size, dstSize)
+	}
+	afterRows := mustListChunks(t, ctx, ms, "tail-dst-pid")
+	if !reflect.DeepEqual(afterRows, beforeRows) {
+		t.Error("rejected copy changed destination chunk rows")
+	}
+	back := make([]byte, dstSize)
+	if _, err := bs.ReadAt(ctx, "tail-dst-pid", back, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back[:srcSize], replaced[:srcSize]) {
+		t.Error("rejected copy overwrote the destination prefix")
+	}
+	if !bytes.Equal(back[srcSize:], replaced[srcSize:]) {
+		t.Error("rejected copy discarded the destination tail")
 	}
 
-	// The tail is the defect: past the source's size the destination must hold
-	// nothing, so the block store zero-fills it the way it does any range a file
-	// never had.
-	tail := make([]byte, dstSize-srcSize)
-	if _, err := bs.ReadAt(ctx, "tail-dst-pid", tail, srcSize); err != nil {
-		t.Fatalf("ReadAt(dst) past the source's size: %v", err)
-	}
-	if bytes.Equal(tail, replaced[srcSize:]) {
-		t.Error("past the source's size the destination still serves the content the clone replaced")
-	}
-	if !bytes.Equal(tail, make([]byte, len(tail))) {
-		t.Errorf("past the source's size the destination served %x…, want zeros", tail[:8])
-	}
-
-	// The control: the clip must take the tail and nothing else. Without this a
-	// clip that emptied the destination outright would pass the assertion above.
-	head := make([]byte, srcSize)
-	if _, err := bs.ReadAt(ctx, "tail-dst-pid", head, 0); err != nil {
-		t.Fatalf("ReadAt(dst) over the copied range: %v", err)
-	}
-	if !bytes.Equal(head, source) {
-		t.Error("the destination does not hold the content the clone gave it")
-	}
-
-	// The other tier: no row may go on claiming bytes the file no longer has.
-	for _, r := range mustListChunks(t, ctx, ms, "tail-dst-pid") {
-		off, ok := block.ParseChunkOffset(r.ID)
-		if !ok {
-			continue
-		}
-		if end := off + uint64(r.DataSize); end > srcSize {
-			t.Errorf("row %s claims [%d, %d), past the destination's new size %d", r.ID, off, end, srcSize)
-		}
-	}
-
-	// The source is a bystander: the clip is the destination's, and reading the
-	// source back proves the fixture is not simply broken for every payload.
+	// The source is unchanged too; it must still read back intact.
 	srcBack := make([]byte, srcSize)
 	if _, err := bs.ReadAt(ctx, "tail-src-pid", srcBack, 0); err != nil {
 		t.Fatalf("ReadAt(src): %v", err)
@@ -139,9 +121,8 @@ func TestMaterializeLocalClone_KeepsNothingPastTheSourcesSize(t *testing.T) {
 	}
 }
 
-// TestMaterializeLocalClone_GrowsWithoutClipping is the other direction, and
-// what keeps the clip from ever being the thing that loses content: a source
-// longer than the destination grows it, and every copied byte must survive.
+// A source longer than the destination remains a supported whole-file clone:
+// it grows the destination, and every copied byte must survive.
 func TestMaterializeLocalClone_GrowsWithoutClipping(t *testing.T) {
 	ctx := context.Background()
 	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
@@ -155,7 +136,7 @@ func TestMaterializeLocalClone_GrowsWithoutClipping(t *testing.T) {
 	writeAndSeal(t, ctx, bs, "grow-src-pid", source)
 	writeAndSeal(t, ctx, bs, "grow-dst-pid", bytes.Repeat([]byte{0x44}, dstSize))
 
-	if err := CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, "grow-dst-pid"); err != nil {
+	if err := CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, "grow-dst-pid", 0); err != nil {
 		t.Fatalf("CloneWholeFile: %v", err)
 	}
 

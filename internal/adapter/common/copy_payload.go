@@ -52,11 +52,13 @@ func CopyPayload(
 	// would carry rows whose bytes live only in the source's journal, so a read
 	// zero-fills). Materialize real bytes into the destination's own journal
 	// instead; remote shares keep the O(1) reflink below.
+	// This fallback shares whole-file clone bounds: an initially longer
+	// destination is rejected, not truncated. It is not a general range copy.
 	if !blockStore.HasRemoteStore() {
 		if err := blockStore.DrainRollups(ctx); err != nil {
 			return fmt.Errorf("CopyPayload: drain source rollups: %w", err)
 		}
-		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcFileHandle, dstFileHandle, dstPayloadID)
+		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcFileHandle, dstFileHandle, dstPayloadID, 0)
 	}
 
 	srcFile, err := metadataStore.GetFile(ctx, srcFileHandle)

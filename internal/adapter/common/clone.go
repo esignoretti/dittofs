@@ -12,42 +12,17 @@ import (
 	"github.com/marmos91/dittofs/pkg/metadata"
 )
 
-// CloneWholeFile performs a whole-file NFSv4.2 CLONE / SMB duplicate-extents
-// reflink: the destination inherits the source's entire content by referencing
-// the same content-addressed blocks. It is O(1) — engine.CopyPayload bumps the
-// CAS RefCount once per unique source hash, no data is read or written, even on
-// S3. This is the canonical `cp --reflink` case and the single cross-protocol
-// clone primitive (SMB FSCTL_DUPLICATE_EXTENTS_TO_FILE can adopt it without a
-// second engine).
+// CloneWholeFile clones the entire source into the destination at offset zero.
+// A zero count uses the source's current size; otherwise count must still match
+// that size after draining pending rollups. Destinations with an existing tail
+// beyond the source are unsupported, and a tail added during a local copy is
+// preserved rather than truncated.
 //
-// Copy-on-write is intrinsic to the content-addressed store: a later WRITE to
-// either file produces new CAS blocks under a new hash, leaving the other side
-// untouched.
-//
-// The manifest side is atomic in one metadata transaction:
-//   - engine.CopyPayload's per-hash IncrementRefCount UPDATEs are bound to the
-//     txn (via metadata.WithTx) so they commit/roll back together with the
-//     destination UpdateAttrs. An error from inside the txn commits nothing —
-//     no partial dstFileAttr, no leaked RefCount bumps.
-//   - discardStaleDestination and cache.InvalidateFile run POST-txn, after the
-//     commit. An error out of the discard is therefore an error on a copy whose
-//     manifest is already durable — see its own comment for why it is still
-//     reported rather than swallowed.
-//
-// CLONE copies the source's CAS block manifest (FileAttr.Blocks). A freshly
-// written source whose bytes are still in the append log / in-memory buffer has
-// an empty or partial manifest — the rollup into CAS is asynchronous — so this
-// helper first calls blockStore.DrainRollups to force every dirty payload into
-// CAS and persist its FileAttr.Blocks, then re-reads the source's manifest
-// INSIDE the txn. Without the drain the clone would reference no blocks and read
-// back as zeros: silent data loss when cloning un-rolled-up data (the CLONE twin
-// of #1481). Re-reading the source post-drain (rather than trusting a manifest
-// the caller fetched before the drain) closes the TOCTOU where the copy would
-// otherwise capture the stale, pre-rollup empty manifest.
-//
-// blockStore and metadataStore MUST be the per-share stores resolved for the
-// destination handle; the caller is responsible for confirming src and dst live
-// in the same share and for stateid/permission/type checks.
+// Remote-backed copies replace the manifest and update refcounts in one
+// metadata transaction, then discard the destination's replaced local content.
+// Local-only copies materialize bytes into the destination's own journal.
+// Both stores must belong to the same share; callers check handles, types,
+// stateids and permissions before entering this helper.
 func CloneWholeFile(
 	ctx context.Context,
 	blockStore *engine.Store,
@@ -55,6 +30,7 @@ func CloneWholeFile(
 	cache CacheInvalidator,
 	srcHandle, dstHandle metadata.FileHandle,
 	dstPayloadID metadata.PayloadID,
+	count uint64,
 ) error {
 	// Force the source's pending writes into CAS + the FileChunk manifest before
 	// we copy it. DrainRollups bypasses the stabilization window and persists
@@ -72,7 +48,7 @@ func CloneWholeFile(
 	// real bytes into the destination's own journal instead. Remote shares keep
 	// the O(1) reflink below (their shared blocks are cold-hydratable).
 	if !blockStore.HasRemoteStore() {
-		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcHandle, dstHandle, dstPayloadID)
+		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcHandle, dstHandle, dstPayloadID, count)
 	}
 
 	selfClone := false
@@ -99,10 +75,9 @@ func CloneWholeFile(
 		// Self-clone (source and destination share a payload) is a no-op: cloning
 		// a payload onto itself would IncrementRefCount on hashes the same payload
 		// already owns, inflating the count with no offsetting reference. The
-		// caller should reject this earlier, but guard here too — this helper is
-		// the shared cross-protocol primitive and must stay safe on its own. The
-		// destination content is unchanged, so the post-txn cache invalidation is
-		// skipped too.
+		// caller also short-circuits this case, but the helper must remain safe
+		// when called directly. The destination is unchanged, so post-txn cache
+		// invalidation is skipped too.
 		if srcFile.PayloadID == dstPayloadID {
 			selfClone = true
 			return nil
@@ -111,6 +86,12 @@ func CloneWholeFile(
 		dstFile, err := tx.GetFile(ctx, dstHandle)
 		if err != nil {
 			return fmt.Errorf("fetch dst file: %w", err)
+		}
+		// The caller's pre-drain sizes can be stale. Keep this check in the
+		// transaction that replaces the manifest so a destination grown before
+		// this snapshot cannot lose its tail, including on transaction retries.
+		if err := validateWholeCloneRange(srcFile.Size, dstFile.Size, count); err != nil {
+			return err
 		}
 
 		newBlocks, err := blockStore.CopyPayload(txCtx, string(srcFile.PayloadID), string(dstPayloadID), srcFile.Blocks)
@@ -156,6 +137,16 @@ func CloneWholeFile(
 	// their entries warm (nil removedHashes => key off dstPayloadID only).
 	if cache != nil {
 		cache.InvalidateFile(dstPayloadID, nil)
+	}
+	return nil
+}
+
+func validateWholeCloneRange(srcSize, dstSize, count uint64) error {
+	if count > srcSize {
+		return &metadata.StoreError{Code: metadata.ErrInvalidArgument, Message: "clone range exceeds the source size"}
+	}
+	if (count != 0 && count != srcSize) || dstSize > srcSize {
+		return &metadata.StoreError{Code: metadata.ErrNotSupported, Message: "clone would require a partial manifest replacement"}
 	}
 	return nil
 }
@@ -247,6 +238,7 @@ func materializeLocalClone(
 	cache CacheInvalidator,
 	srcHandle, dstHandle metadata.FileHandle,
 	dstPayloadID metadata.PayloadID,
+	count uint64,
 ) error {
 	// Re-read the source AFTER the caller's DrainRollups so Size and the source
 	// journal intervals reflect the fully-materialized post-rollup view.
@@ -259,6 +251,13 @@ func materializeLocalClone(
 	// destination content is unchanged, so skip the copy and the cache drop.
 	if srcFile.PayloadID == dstPayloadID {
 		return nil
+	}
+	dstFile, err := metadataStore.GetFile(ctx, dstHandle)
+	if err != nil {
+		return fmt.Errorf("materialize clone: fetch dst file: %w", err)
+	}
+	if err := validateWholeCloneRange(srcFile.Size, dstFile.Size, count); err != nil {
+		return err
 	}
 
 	// Copy the source bytes into the destination payload's own journal, chunked
@@ -301,48 +300,15 @@ func materializeLocalClone(
 		return fmt.Errorf("materialize clone: drain dst rollups: %w", err)
 	}
 
-	// The copy wrote only [0, srcSize). Whatever the destination held past that
-	// is still there: the write path supersedes by version, it does not clip, so
-	// a destination that was longer than the source keeps its tail. The size
-	// stamped below hides it from every read that clamps — until something grows
-	// the file again, and the destination serves bytes it is supposed to have
-	// lost where a grown region owes zeros. That is the size-down whose tail
-	// nothing reclaims, which ReclaimTruncatedBlocks exists to stop for every
-	// protocol that shrinks a file; this path shrinks one and never drove it.
-	//
-	// Truncate is what clips all of it: it narrows a row that straddles the new
-	// size, reaps by exact "{payloadID}/{offset}" identity any row starting past
-	// it, and clips the local tier's intervals. The narrow is the load-bearing
-	// half here, not the reap — the overwrite re-marks the surviving fragment
-	// dirty, so the carve above emits one row spanning the copied content and
-	// the tail rather than leaving a separate row for the tail to reap. A reap
-	// keyed on offsets the copy did not take over would find nothing to do.
-	//
-	// It runs after the carve, so it clips the manifest the carve just wrote,
-	// and before the size below, so nothing observes a size the content no
-	// longer matches. The returned list is dropped for the same reason
-	// ReclaimTruncatedBlocks drops it: Truncate reprojects File.Blocks from the
-	// rows that survived, and the transaction below re-reads them.
-	dstPre, err := metadataStore.GetFile(ctx, dstHandle)
-	if err != nil {
-		return fmt.Errorf("materialize clone: fetch dst file: %w", err)
-	}
-	if srcFile.Size < dstPre.Size {
-		if _, err := blockStore.Truncate(ctx, string(dstPayloadID), dstPre.Blocks, srcFile.Size); err != nil {
-			return fmt.Errorf("materialize clone: clip dst past the source's size: %w", err)
-		}
-	}
-
-	// Block-level WriteAt does not set File.Size / Mtime / Ctime — stamp them on
-	// the destination to match the source and record the content change. The
-	// carve above already populated File.Blocks, so re-read inside the txn and
-	// leave it intact.
+	// Re-read the destination in the final transaction. A peer may have
+	// appended after validation; only the copied prefix belongs to this
+	// operation, so neither its bytes nor this size update may remove the tail.
 	err = metadataStore.WithTransaction(ctx, func(tx metadata.Transaction) error {
 		dstFile, err := tx.GetFile(ctx, dstHandle)
 		if err != nil {
 			return fmt.Errorf("fetch dst file: %w", err)
 		}
-		dstFile.Size = srcFile.Size
+		dstFile.Size = max(dstFile.Size, srcFile.Size)
 		dstFile.Mtime = time.Now()
 		dstFile.Ctime = dstFile.Mtime // content change is also a metadata change
 		if err := tx.UpdateAttrs(ctx, dstFile); err != nil {

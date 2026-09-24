@@ -104,7 +104,7 @@ func TestCloneWholeFile_LocalOnly_MaterializesContent(t *testing.T) {
 	}
 
 	// CLONE over a local-only share.
-	if err := common.CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, metadata.PayloadID(dstPID)); err != nil {
+	if err := common.CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, metadata.PayloadID(dstPID), 0); err != nil {
 		t.Fatalf("CloneWholeFile: %v", err)
 	}
 
