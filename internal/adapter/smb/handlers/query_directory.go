@@ -14,12 +14,8 @@ import (
 	"github.com/marmos91/dittofs/pkg/metadata/acl"
 )
 
-// maxDirectoryReadBytes is the maximum number of bytes to request from the
-// metadata store when reading directory entries. This limits memory usage
-// for directories with many entries. 1MB allows listing directories with
-// approximately 5000 entries (estimated at ~200 bytes per entry average).
-// Actual entry sizes vary with filename length; entries with long filenames
-// will be larger. This is a per-request limit, not a per-connection limit.
+// maxDirectoryReadBytes bounds each metadata page. QUERY_DIRECTORY consumes
+// every page before sorting its matches; this is not a total listing limit.
 const maxDirectoryReadBytes uint32 = 1048576
 
 // ============================================================================
@@ -391,14 +387,34 @@ func (h *Handler) QueryDirectory(ctx *SMBHandlerContext, req *QueryDirectoryRequ
 	// drop out, new entries that sort after the cursor appear in subsequent
 	// pages. Mirrors Samba's source3/smbd/dir.c. Required by smb2.dir.fixed
 	// (#728) where one handle deletes files mid-enumeration on another.
-	page, err := metaSvc.ReadDirectory(authCtx, openFile.MetadataHandle, 0, maxDirectoryReadBytes)
-	if err != nil {
-		logger.Debug("QUERY_DIRECTORY: failed to read directory", "path", openFile.Name().Path, "error", err)
-		return &QueryDirectoryResponse{SMBResponseBase: SMBResponseBase{Status: types.StatusForErr(err)}}, nil
+	// ponytail: materialize all matching pages for the global case-insensitive
+	// sort. Backend cursors order raw names, so sorting individual pages would
+	// skip or misorder entries. An indexed folded-name iterator can replace this
+	// if profiling justifies changing the metadata enumeration contract.
+	var filteredEntries []metadata.DirEntry
+	var cookie uint64
+	seenCookies := map[uint64]struct{}{0: {}}
+	for {
+		page, err := metaSvc.ReadDirectory(authCtx, openFile.MetadataHandle, cookie, maxDirectoryReadBytes)
+		if err != nil {
+			logger.Debug("QUERY_DIRECTORY: failed to read directory", "path", openFile.Name().Path, "error", err)
+			return &QueryDirectoryResponse{SMBResponseBase: SMBResponseBase{Status: types.StatusForErr(err)}}, nil
+		}
+		if page.HasMore {
+			// Cookie expiry can restart a later page at the beginning. Reject
+			// any repeated continuation, not only an immediately stuck cursor.
+			if _, seen := seenCookies[page.NextCookie]; seen {
+				logger.Error("QUERY_DIRECTORY: metadata page did not advance", "path", openFile.Name().Path)
+				return &QueryDirectoryResponse{SMBResponseBase: SMBResponseBase{Status: types.StatusInternalError}}, nil
+			}
+			seenCookies[page.NextCookie] = struct{}{}
+		}
+		filteredEntries = append(filteredEntries, filterDirEntries(page.Entries, req.FileName)...)
+		if !page.HasMore {
+			break
+		}
+		cookie = page.NextCookie
 	}
-
-	// Filter entries by search pattern.
-	filteredEntries := filterDirEntries(page.Entries, req.FileName)
 
 	// Refs #532: when the share advertises SMB2_SHARE_CAP_ACCESS_BASED_DIRECTORY_ENUM
 	// (per MS-SMB2 §2.2.10), hide entries the caller cannot read. Mirrors
