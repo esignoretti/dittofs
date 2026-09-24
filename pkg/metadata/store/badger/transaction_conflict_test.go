@@ -30,6 +30,12 @@ func TestWithTransaction_RetryExhaustedConflictIsWrapped(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
+	// The closure below conflicts on every attempt, so left alone it would sit
+	// out the whole backpressure budget. Cap the attempts instead: what is under
+	// test is how an exhausted conflict is classified, not which of the two
+	// bounds exhausted it.
+	defer SetMaxTransactionRetriesForTest(3)()
+
 	ctx := t.Context()
 	hotKey := []byte("itest:hotkey")
 
@@ -70,7 +76,7 @@ func TestWithTransaction_RetryExhaustedConflictIsWrapped(t *testing.T) {
 	}
 
 	// MUST be recognizable as an mderrors conflict (this is what
-	// mapObjectIDConflict / isObjectIDConflict rely on).
+	// mapObjectIDConflict relies on).
 	if !mderrors.IsConflictError(txErr) {
 		t.Fatalf("retry-exhausted conflict not recognized as mderrors conflict: %v", txErr)
 	}
