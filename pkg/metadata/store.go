@@ -120,7 +120,8 @@ type Files interface {
 	GetXattr(ctx context.Context, handle FileHandle, name string) ([]byte, bool, error)
 
 	// SetXattr writes the xattr value into the inline backing when it fits
-	// (<= XattrInlineMaxBytes); a larger value returns ErrXattrTooLarge.
+	// (<= XattrInlineMaxBytes) and the file's whole set still fits
+	// XattrTotalMaxBytes; either bound exceeded returns ErrXattrTooLarge.
 	SetXattr(ctx context.Context, handle FileHandle, name string, value []byte) error
 
 	// RemoveXattr removes the named xattr from the inline backing. Returns

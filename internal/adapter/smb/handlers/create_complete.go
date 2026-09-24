@@ -302,6 +302,11 @@ func (h *Handler) completeCreateAfterBreak(ctx *SMBHandlerContext, d *createDraf
 			}
 			if muts := eaMutationsFromEntries(entries); len(muts) > 0 {
 				metaSvc := h.Registry.GetMetadataService()
+				// decision: a refused chain leaves the file created with no EAs
+				// and still reports the open as succeeding, because the entity is
+				// already committed here and unwinding it is a delete this
+				// handler does not own. Withdraw it once the chain can be applied
+				// before the create commits.
 				if _, setErr := metaSvc.SetFileAttributes(authCtx, fileHandle, &metadata.SetAttrs{EAMutations: muts}); setErr != nil {
 					logger.Debug("CREATE: failed to apply EA_BUFFER", "path", baseName, "error", setErr)
 				} else if updated, getErr := metaSvc.GetFile(authCtx.Context, fileHandle); getErr == nil {
