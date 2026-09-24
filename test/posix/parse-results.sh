@@ -42,6 +42,30 @@ if grep -q "could not find pjdfstest" "$OUTPUT_FILE"; then
     exit 1
 fi
 
+# A plan mismatch or bailout invalidates the run even when its test name is
+# on the known-failures list. Such a test can exit zero without a failed
+# assertion, so neither Wstat nor Failed alone proves the TAP stream completed.
+if grep -qiE '^[[:space:]]*(Parse errors:|Bail out!|Bailout called\.)' "$OUTPUT_FILE"; then
+    echo -e "${RED}ERROR: incomplete TAP — parse error or bailout; no verdict.${NC}"
+    exit 1
+fi
+
+# Both footer lines must be present at the end. A truncated report can already
+# contain every known failure, or even the success marker, before prove prints
+# its final result. Blank lines after the footer do not change its meaning.
+PROVE_RESULT="$(awk '
+    /^[[:space:]]*$/ { next }
+    { previous = last; last = $0 }
+    END {
+        if (previous ~ /^Files=[1-9][0-9]*, Tests=[0-9]+,/ &&
+            last ~ /^Result: (PASS|FAIL)$/) print last
+    }
+' "$OUTPUT_FILE")"
+if [[ -z "$PROVE_RESULT" ]]; then
+    echo -e "${RED}ERROR: prove did not finish — missing or incomplete result footer.${NC}"
+    exit 1
+fi
+
 kf_load "$KNOWN_FAILURES_FILE"
 echo "Loaded ${KF_COUNT} known failure pattern(s) from $(basename "${KNOWN_FAILURES_FILE:-<none>}")"
 
@@ -98,6 +122,11 @@ while IFS= read -r line; do
     done
     $dup || FAILING_FILES+=("$rel")
 done < <(printf '%s\n' "$SUMMARY_BLOCK")
+
+if [[ "$PROVE_RESULT" == "Result: FAIL" && ${#FAILING_FILES[@]} -eq 0 ]]; then
+    echo -e "${RED}ERROR: prove failed but no failing test files could be graded.${NC}"
+    exit 1
+fi
 
 # --------------------------------------------------------------------------
 # Grade.

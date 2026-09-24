@@ -131,6 +131,9 @@ jobs:
       - name: Test the shared known-failures parser
         run: ./test/common/known-failures_test.sh
 
+      - name: Test the POSIX grader
+        run: ./test/posix/parse-results_test.sh
+
       - name: Test the smbtorture grader
         run: ./test/smb-conformance/smbtorture/parse-results_test.sh
 
