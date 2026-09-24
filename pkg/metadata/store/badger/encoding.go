@@ -35,7 +35,8 @@ import (
 // Data Type             Prefix   Key Format                              Value Type
 // ==================================================================================
 // File Data             "f:"     f:<uuid>                               File attrs (binary; JSON read-fallback)
-// File Manifest         "fm:"    fm:<uuid>                              []block.ChunkRef (JSON)
+// File Manifest         "fm:"    fm:<uuid>:<seq>                        []block.ChunkRef (JSON, one segment)
+// File Manifest (legacy) "fm:"    fm:<uuid>                              []block.ChunkRef (JSON, whole list)
 // Parent Relationships  "p:"     p:<childUUID>                          parentUUID (bytes)
 // Children Map          "c:"     c:<parentUUID>:<childName>             childUUID (bytes)
 // Child Name (reverse)  "cn:"    cn:<parentUUID>:<childUUID>            child name (bytes)
@@ -71,20 +72,66 @@ func keyFile(id uuid.UUID) []byte {
 	return []byte(prefixFile + id.String())
 }
 
-// keyFileManifest generates the block-manifest key: "fm:<uuid>". The manifest
-// (File.Blocks) lives here rather than in the f: attribute blob so an attr-only
-// write (chmod/utimes/close/rename/xattr) does not rewrite the chunk list.
+// keyFileManifest generates the legacy whole-list manifest key: "fm:<uuid>".
+// The manifest (File.Blocks) lives outside the f: attribute blob so an
+// attr-only write (chmod/utimes/close/rename/xattr) does not rewrite the chunk
+// list.
+//
+// New writes go to the segmented keys below; this one survives so a store
+// written before segmentation still reads, and so the first write of such a
+// file can retire it.
 func keyFileManifest(id uuid.UUID) []byte {
 	return []byte(prefixFileManifest + id.String())
 }
 
-// encodeManifest serializes a block manifest for the fm:<uuid> value. JSON keeps
+// manifestSegmentRefs bounds how many ChunkRefs one manifest value carries.
+//
+// The bound exists to keep every value below Badger's ValueThreshold (1 MiB).
+// A value at or above it is appended to the value log instead of living inline
+// in the LSM, and value-log space is reclaimed only by a GC pass that picks
+// files from discard statistics — which are produced solely by LSM compaction.
+// A manifest big enough to reach the value log writes ~1 MiB of garbage per
+// commit against ~50 bytes of LSM pressure, so compaction never runs often
+// enough to tell Badger the garbage exists and the value log grows without
+// bound. A field capture reached 245 GiB of value log against 0.15 GiB of live
+// LSM data this way.
+//
+// A ChunkRef is fixed-shape, so its encoded size has a real worst case: the
+// hash is always "blake3:<64 hex>", and the two integers and the omitempty
+// start_offset are longest at their maximum values. That is 156 bytes against
+// ~108 for a typical ref, so 4096 refs is ~471 KiB typically and ~628 KiB at
+// worst — 61% of the threshold. The worst-case bound breaks around 6600 refs,
+// not at some comfortable distance above this value, and nothing checks it at
+// run time: give ChunkRef a variable-length field and the bound is gone with
+// only this comment to notice.
+const manifestSegmentRefs = 4096
+
+// keyFileManifestPrefix is the scan prefix for one file's manifest segments:
+// "fm:<uuid>:". The UUID is fixed-width, so this cannot collide with another
+// file's segments or with the legacy whole-list key.
+//
+// decision: no production path scans this prefix — reads and deletes walk
+// sequences from zero instead, which is cheaper and cannot splice across a
+// hole. It stays for the tests, which need the opposite property: a scan sees
+// a segment left behind past the end of the list, and walking cannot.
+func keyFileManifestPrefix(id uuid.UUID) []byte {
+	return []byte(prefixFileManifest + id.String() + ":")
+}
+
+// keyFileManifestSegment generates the key for one manifest segment:
+// "fm:<uuid>:<8 hex>". The sequence is zero-padded and fixed-width so a prefix
+// scan returns segments in offset order without sorting.
+func keyFileManifestSegment(id uuid.UUID, seq int) []byte {
+	return fmt.Appendf(nil, "%s%s:%08x", prefixFileManifest, id.String(), seq)
+}
+
+// encodeManifest serializes a block manifest for a manifest value. JSON keeps
 // it self-describing and matches the bytes the legacy embedded field carried.
 func encodeManifest(blocks []block.ChunkRef) ([]byte, error) {
 	return json.Marshal(blocks)
 }
 
-// decodeManifest parses an fm:<uuid> value back into a block manifest.
+// decodeManifest parses a manifest value back into a block manifest.
 func decodeManifest(b []byte) ([]block.ChunkRef, error) {
 	var blocks []block.ChunkRef
 	if err := json.Unmarshal(b, &blocks); err != nil {
