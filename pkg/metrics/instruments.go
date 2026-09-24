@@ -105,20 +105,39 @@ func newInstruments(reg *prometheus.Registry) *instruments {
 
 		backpressureTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: Namespace, Subsystem: "localstore", Name: "backpressure_total",
-			Help: "Times a write stalled waiting for the local cache to free space.",
+			Help: "Times a local-store append (client write or cold-read fault-in) stalled waiting for space.",
 		}),
 		backpressureWaitSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: Namespace, Subsystem: "localstore", Name: "backpressure_wait_seconds",
-			Help:    "Duration a write stalled under local-cache backpressure, in seconds.",
-			Buckets: prometheus.DefBuckets,
+			Help: "Duration an append stalled under local-store backpressure, in seconds.",
+			// Explicit rather than DefBuckets, whose 10s ceiling is below the
+			// stall this store permits, and rather than an exponential span,
+			// which puts the whole give-up range in one bucket. The boundaries
+			// track the regimes: sub-millisecond when an eviction clears the gate
+			// with nothing to carve, tens of milliseconds per dirty-pinned poll,
+			// seconds when the eviction waits out a carve pass, and then 30 and 60
+			// as boundaries because those are the give-up budgets themselves (the
+			// store's default and the server config's). An append that gives up on
+			// either of those lands in a finite bucket, and 20s, 45s and
+			// nearly-gave-up are told apart rather than summed into one.
+			//
+			// Two stalls still land in +Inf, and the boundaries do not pretend
+			// otherwise: one under a backpressure_max_wait configured above 90s,
+			// and one that outruns any budget because the deadline is refreshed on
+			// every observed drain, so an append merely outpacing a live syncer is
+			// not bounded by it at all. Both leave only _sum and _count carrying
+			// the observation. Widening for them would cost resolution across the
+			// range that is not rare; revisit if a deployment routinely configures
+			// a longer budget.
+			Buckets: []float64{0.001, 0.005, 0.025, 0.1, 0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90},
 		}),
 		evictionsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: Namespace, Subsystem: "localstore", Name: "evictions_total",
-			Help: "Local-cache CAS chunks evicted to reclaim space.",
+			Help: "Local-store segments evicted under disk pressure to reclaim space.",
 		}),
 		evictedBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: Namespace, Subsystem: "localstore", Name: "evicted_bytes_total",
-			Help: "Bytes reclaimed by local-cache eviction.",
+			Help: "Bytes reclaimed by local-store eviction under disk pressure.",
 		}),
 
 		gcRuns: factory(prometheus.CounterOpts{
@@ -270,8 +289,10 @@ func (m *Metrics) RecordAuth(protocol, mechanism string, ok bool) {
 	}
 }
 
-// RecordBackpressure records one write stall under local-cache backpressure and
-// the duration it waited for space.
+// RecordBackpressure records one append stalled under local-store backpressure
+// and the duration it waited for space. The append is a client write or a
+// cold-read fault-in: both land in the same local store and meet the same
+// capacity gate.
 func (m *Metrics) RecordBackpressure(d time.Duration) {
 	if m == nil {
 		return
@@ -280,8 +301,10 @@ func (m *Metrics) RecordBackpressure(d time.Duration) {
 	m.in.backpressureWaitSeconds.Observe(d.Seconds())
 }
 
-// RecordEviction records one evicted local-cache chunk and the bytes it
-// reclaimed. Cheap (two atomic Incs) — safe on the write hot path.
+// RecordEviction records one local-store segment evicted under disk pressure and
+// the bytes it reclaimed. The operator drain reclaims segments too and is
+// deliberately not counted here, so a step in this counter always means the
+// store was short of space. Cheap (two atomic Incs) — safe on the write hot path.
 func (m *Metrics) RecordEviction(bytes int64) {
 	if m == nil {
 		return

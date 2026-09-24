@@ -44,13 +44,17 @@ type EvictResult struct {
 // set smaller than the segment-roll threshold otherwise sits entirely in the
 // never-sealed active segment, where nothing can reclaim it.
 func (s *Store) Evict(ctx context.Context, targetBytes int64) (EvictResult, error) {
-	return s.evict(ctx, targetBytes)
+	return s.evict(ctx, targetBytes, false)
 }
 
 // evict is the shared eviction loop. Its force-seal fall-through is bounded to
 // one pass per call, and sealableActive keeps it from touching an active
 // holding unsynced records.
-func (s *Store) evict(ctx context.Context, targetBytes int64) (EvictResult, error) {
+//
+// pressure says the caller is the write-path capacity gate rather than the
+// operator drain, and only sets whether the reclaim is metered — see the
+// observation below.
+func (s *Store) evict(ctx context.Context, targetBytes int64, pressure bool) (EvictResult, error) {
 	if err := ctx.Err(); err != nil {
 		return EvictResult{}, err
 	}
@@ -95,6 +99,26 @@ func (s *Store) evict(ctx context.Context, targetBytes int64) (EvictResult, erro
 		}
 		res.SegmentsEvicted++
 		res.BytesFreed += freed
+		// decision: only a reclaim the capacity gate drove is counted. Three other
+		// callers reach a segment unlink — repackSegment and dropVictim (repack.go),
+		// reclaimEmptied (reclaim.go) — and so does this loop under Evict, the
+		// operator drain. None of them says anything about disk pressure: a repack
+		// relocates bytes and keeps them warm, a post-delete reclaim frees bytes
+		// nobody holds, and the drain reclaims the whole resident set of an idle
+		// store on request. Counting any of them puts a step into evictions_total
+		// on a store that was never short of space, which is what a rate() alert
+		// on it reads as pressure. The cost is that a drain's reclaim is invisible
+		// to the metric; withdraw this only for a counter that carries a reason
+		// label, never by widening the unlabelled one.
+		//
+		// It also sits after the error return above, so a reclaim whose unlink
+		// failed is not counted although its intervals are already demoted and its
+		// segment already out of the index. That under-reports rather than
+		// over-reports, and the appender gets the error, so the operator learns of
+		// it from the failed write rather than from a counter.
+		if pressure {
+			s.recordEviction(freed)
+		}
 		if targetBytes <= 0 || res.BytesFreed >= targetBytes {
 			return res, nil
 		}
@@ -479,9 +503,39 @@ func (s *Store) ensureSpace(ctx context.Context, needed int64) error {
 	deadline := time.Now().Add(s.cfg.EvictMaxWait)
 	lastUnsynced := s.unsynced.Load()
 	warned := false
+	// decision: the observation hangs off entering the loop, not off the gate
+	// check and not off the backoff. Recording on a check would count every
+	// append on an idle store, since the gate is consulted on all of them.
+	// Recording on the backoff would count only the dirty-pinned poll and drop
+	// the longest stalls there are: an eviction that succeeds holds the appender
+	// across evictSegment's flushMu, which waits out the shard's whole carve pass,
+	// uploads included, and then clears the gate without ever reaching the
+	// backoff. Loop entry means the cap was genuinely met, so every iteration of
+	// it is time the appender was held, and the window runs from there to the
+	// return. Withdraw only if the gate stops meaning "no room".
+	//
+	// The price of that choice: a share sitting at MaxLocalBytes with a healthy
+	// syncer steps the counter on roughly every append that trips the gate, each
+	// one an eviction cleared in well under a millisecond. A nonzero rate is
+	// therefore ordinary steady state, not an incident, and the counter alone
+	// does not distinguish the two — the wait histogram is what separates the
+	// sub-millisecond eviction from the append that waited out the give-up
+	// budget. Alert on the duration, not on the count.
+	var stallStart time.Time
+	defer func() {
+		if !stallStart.IsZero() {
+			s.recordBackpressure(time.Since(stallStart))
+		}
+	}()
 	for s.diskBytes.Load()+needed > s.cfg.MaxLocalBytes {
+		// Ahead of the stamp: an append arriving with an already-cancelled context
+		// leaves without waiting for anything, and a zero-length observation is
+		// still an observation.
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if stallStart.IsZero() {
+			stallStart = time.Now()
 		}
 		overage := s.diskBytes.Load() + needed - s.cfg.MaxLocalBytes
 		// evict's force-seal fall-through is what makes the cap reachable at all:
@@ -492,7 +546,7 @@ func (s *Store) ensureSpace(ctx context.Context, needed int64) error {
 		// own dirty bytes: sealableActive refuses any active still holding an
 		// unsynced record, so a sustained writer's segment stays put and
 		// backpressures.
-		res, err := s.evict(ctx, overage)
+		res, err := s.evict(ctx, overage, true)
 		if err != nil {
 			return err
 		}
