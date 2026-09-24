@@ -531,9 +531,11 @@ func errUnplaceableRow(payloadID, suffix string, off uint64) error {
 // for payloadID — the row with the largest chunkOffset <= off whose range
 // [chunkOffset, chunkOffset+DataSize) contains off — or (nil, nil) for a sparse
 // hole, an empty payload, or a read past EOF. This is the read hot path: a
-// keys-only scan of the fb-file:{payloadID}: secondary index finds the covering
-// offset without materializing the whole manifest (no per-row Get, no JSON
-// unmarshal, no sort), then two point Gets fetch the winning row.
+// keys-only scan of the fb-file:{payloadID}: secondary index finds the largest
+// candidate, then two point Gets fetch its row. A covered read needs no per-row
+// Get, JSON unmarshal or sort of the rest of the manifest. If that candidate
+// does not cover off, a second scan collects earlier starts once and tries them
+// in descending numeric order without repeating the index scan for every row.
 //
 // Largest-start only decides anything if rows overlap, which a truncate followed
 // by a re-carving write can produce: the narrowed survivor starts before the row
@@ -553,48 +555,62 @@ func errUnplaceableRow(payloadID, suffix string, off uint64) error {
 // not make a whole payload unreadable. This mirrors block.FindRowCoveringOffset, the
 // walk used by the backends with no such index.
 //
-// ponytail: O(n) keys-only scan per candidate, and only an overlap yields more
-// than one candidate; upgrade to a big-endian fb-off index for a true O(log n)
-// reverse-seek only if profiling at real N still shows it.
+// ponytail: a covered read still scans O(n) keys; a hole or nested overlap adds
+// O(n log n) sorting and at most O(n) row loads. A numeric offset index could
+// avoid the full scans, but would require migrating the existing decimal keys.
 func (s *BadgerMetadataStore) GetFileChunkAtOffset(_ context.Context, payloadID string, off uint64) (*metadata.FileChunk, error) {
 	var result *metadata.FileChunk
 	err := s.db.View(func(txn *badger.Txn) error {
-		for limit := off; ; {
-			bestOff, found, unplaceable := scanChunkIndexOffsets(txn, payloadID,
-				func(cand, best uint64, have bool) bool {
-					return cand <= limit && (!have || cand > best)
-				})
-			// A hole, unless an unplaceable row leaves it in doubt.
-			uncovered := func() error {
-				if unplaceable == "" {
-					return nil
-				}
-				return errUnplaceableRow(payloadID, unplaceable, off)
-			}
-			if !found {
-				return uncovered()
-			}
-
-			fc, ferr := loadFileChunkAtIndexOffset(txn, payloadID, bestOff)
+		bestOff, found, unplaceable := scanChunkIndexOffsets(txn, payloadID,
+			func(cand, best uint64, have bool) bool {
+				return cand <= off && (!have || cand > best)
+			})
+		loadCovering := func(start uint64) error {
+			fc, ferr := loadFileChunkAtIndexOffset(txn, payloadID, start)
 			if ferr != nil {
 				return ferr
 			}
 			// Covering guard keyed on the row's OWN start offset (the source of
 			// truth), not the index key, so an inconsistent index can't serve a
 			// neighbour chunk's bytes into a hole. off-abs is overflow-free since
-			// the scan guarantees abs <= off.
+			// the guard checks off >= abs before subtracting.
 			if fc != nil {
 				abs, ok := blockpkg.ParseChunkOffset(fc.ID)
 				if ok && off >= abs && off-abs < uint64(fc.DataSize) {
 					result = fc
-					return nil
 				}
 			}
-			if bestOff == 0 {
-				return uncovered() // no earlier start left to try
-			}
-			limit = bestOff - 1
+			return nil
 		}
+		if found {
+			if err := loadCovering(bestOff); err != nil || result != nil {
+				return err
+			}
+			if bestOff > 0 {
+				// Dense hits return above without allocating a candidate list. A
+				// sparse hole can reject every earlier row, so collect those starts
+				// once rather than doing a full keys-only scan per rejection.
+				var earlier []uint64
+				scanChunkIndexOffsets(txn, payloadID, func(cand, _ uint64, _ bool) bool {
+					if cand < bestOff {
+						earlier = append(earlier, cand)
+					}
+					return false // collect candidates; no single winner in this scan
+				})
+				sort.Slice(earlier, func(i, j int) bool { return earlier[i] > earlier[j] })
+				for _, start := range earlier {
+					if err := loadCovering(start); err != nil || result != nil {
+						return err
+					}
+				}
+			}
+		}
+		// A hole, unless an unplaceable row leaves it in doubt. Both scans use
+		// the same transaction, so the first scan's malformed suffix still holds.
+		if unplaceable != "" {
+			return errUnplaceableRow(payloadID, unplaceable, off)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -606,7 +622,7 @@ func (s *BadgerMetadataStore) GetFileChunkAtOffset(_ context.Context, payloadID 
 // chunkOffset >= off for payloadID — the next data boundary at or after a sparse
 // hole — or (nil, nil) when no chunk starts at or after off (a read past the last
 // chunk). The read path uses it to skip a hole straight to the next chunk in one
-// indexed keys-only scan instead of probing byte by byte. Same index, cost model,
+// indexed keys-only scan instead of probing byte by byte. Same index parsing
 // and stale-index-as-absent semantics as GetFileChunkAtOffset. No covering guard:
 // the successor is returned regardless of whether it contains off.
 //
