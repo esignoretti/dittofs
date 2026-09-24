@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,15 +11,6 @@ import (
 	"testing"
 	"time"
 )
-
-// captureWarnings returns a *slog.Logger writing into a buffer and an accessor
-// for what was logged.
-func captureWarnings(t *testing.T) (*slog.Logger, func() string) {
-	t.Helper()
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	return log, buf.String
-}
 
 // reopen closes s and opens a fresh Store over the same directory, exercising
 // the recovery path. cfg only overrides s's Logger and Clock; every other
@@ -338,11 +328,12 @@ func TestOrphanSweepSparesYoung(t *testing.T) {
 }
 
 // TestSealedSegmentWithNoValidRecords builds a sealed segment whose record
-// stream is unreadable garbage and asserts recovery completes instead of
-// panicking, skips the segment, leaves its file on disk even past the orphan age
-// gate, warns about it, and serves the store's real data untouched.
+// stream is unreadable garbage and asserts recovery refuses it without
+// panicking or removing it, even past the orphan age gate. Quarantining the
+// damaged segment allows the intact data to be recovered unchanged.
 func TestSealedSegmentWithNoValidRecords(t *testing.T) {
-	dir := t.TempDir()
+	// Exercise a path whose separators or name need escaping when quoted.
+	dir := filepath.Join(t.TempDir(), "journal\\data")
 	s, err := openJournal(dir, Config{ShardCount: 1})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -372,31 +363,36 @@ func TestSealedSegmentWithNoValidRecords(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	logger, warned := captureWarnings(t)
-
-	r, err := openJournal(dir, Config{ShardCount: 1, Logger: logger})
+	r, err := openJournal(dir, Config{ShardCount: 1})
+	if err == nil {
+		_ = r.Close()
+		t.Fatal("recovery accepted a sealed segment with no valid records")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", s.segPath(badID))) {
+		t.Fatalf("error must identify the damaged segment: %v", err)
+	}
+	for _, guidance := range []string{"server stopped", "consistent backup", "quarantine", "missing or stale file data", fmt.Sprintf("%q", s.segPath(badID)+".quarantine")} {
+		if !strings.Contains(err.Error(), guidance) {
+			t.Errorf("error must include operator guidance %q: %v", guidance, err)
+		}
+	}
+	got, err := os.ReadFile(s.segPath(badID))
 	if err != nil {
-		t.Fatalf("reopen over damaged sealed segment: %v", err)
+		t.Fatalf("damaged sealed segment must be left in place: %v", err)
+	}
+	if !bytes.Equal(got, seg) {
+		t.Fatal("recovery changed the damaged sealed segment")
+	}
+	if err := os.Rename(s.segPath(badID), s.segPath(badID)+".quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	r, err = openJournal(dir, Config{ShardCount: 1})
+	if err != nil {
+		t.Fatalf("reopen after quarantine: %v", err)
 	}
 	defer func() { _ = r.Close() }()
-
-	if !strings.Contains(warned(), "zero valid records") {
-		t.Fatalf("expected a warning naming the damaged sealed segment, got %q", warned())
-	}
-	if _, err := os.Stat(r.segPath(badID)); err != nil {
-		t.Fatalf("damaged sealed segment must be left in place, got: %v", err)
-	}
 	if got := readAll(t, r, "f", len("real-data")); string(got) != "real-data" {
 		t.Fatalf("real data lost: %q", got)
-	}
-	// The skipped segment is attached to no shard.
-	for _, sh := range r.shards {
-		if _, ok := sh.sealed[badID]; ok {
-			t.Fatalf("damaged segment %d was attached to a shard", badID)
-		}
-		if sh.active != nil && sh.active.id == badID {
-			t.Fatalf("damaged segment %d was adopted as an active segment", badID)
-		}
 	}
 }
 

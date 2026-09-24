@@ -6,6 +6,7 @@ This guide covers common issues and their solutions when working with DittoFS.
 
 - [Connection Issues](#connection-issues)
 - [Mount Issues](#mount-issues)
+  - [A share cannot open: corrupt sealed journal segment](#a-share-cannot-open-corrupt-sealed-journal-segment)
   - [SMB mount permission denied (macOS)](#smb-mount-permission-denied-macos)
 - [Permission Issues](#permission-issues)
 - [File Handle Issues](#file-handle-issues)
@@ -80,6 +81,27 @@ mount.nfs: Connection timed out
    ```
 
 ## Mount Issues
+
+### A share cannot open: corrupt sealed journal segment
+
+An error beginning `journal: sealed segment ... is corrupt` means the journal
+could not read all records from a segment that had already been committed. The
+share refuses to open rather than silently treating missing records as empty
+file ranges. The error identifies the segment and the offset where scanning
+stopped; the damaged file is left untouched.
+
+Stop the server and preserve the journal and metadata before attempting
+recovery. Prefer restoring a consistent backup. If you explicitly accept the
+risk of missing or stale file data, quarantine the named segment by renaming it
+to the `.seg.quarantine` path shown in the error, then retry opening the share.
+That suffix keeps it out of the journal scan while retaining its bytes for
+offline recovery. Do not delete the damaged file.
+
+Quarantine is not data recovery: the segment may contain the only copy of
+unuploaded data, or deletion and truncation records whose absence can expose
+older contents. Do not resume client access until the affected data has been
+recovered or verified. An incomplete append in an active, unsealed segment is
+different; the journal still discards its torn tail automatically.
 
 ### Invalid file system
 

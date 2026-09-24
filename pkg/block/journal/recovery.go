@@ -47,11 +47,11 @@ func scanSegmentIDs(dir string) ([]uint64, error) {
 }
 
 // recover rebuilds in-memory state from the segments already on disk. Sealed
-// segments are trusted via their header's sealed bit ("header is truth") and
-// only replayed; the one active (unsealed) segment per shard is tail-scanned and
-// its torn tail truncated. All valid records feed a fresh interval index — order
-// does not matter because insert resolves overlaps by Version — and the global
-// LSN resumes at max(observed Version)+1.
+// segments must replay completely; the one active (unsealed) segment per shard
+// may have an incomplete append, so its torn tail is truncated. All valid
+// records feed a fresh interval index — order does not matter because insert
+// resolves overlaps by Version — and the global LSN resumes at
+// max(observed Version)+1.
 //
 // The phases run in the order below; each is a method on recoveryState, which
 // carries the tables being rebuilt between them.
@@ -206,20 +206,24 @@ func (r *recoveryState) loadSegment(id uint64) error {
 	// CRC-coincidence torn header from making the scanner trust a bogus length.
 	recs, validUpTo := scanValidRecords(fd, s.cfg.SegmentSize, s.cfg.SegmentSize)
 
-	if sealed && len(recs) == 0 {
-		// No write path can produce this: sealing fsyncs the records before it
-		// sets the sealed bit, and every seal is gated on the segment already
-		// holding a record. A sealed header over a record stream that scans
-		// empty therefore means the bytes under it were damaged after the fact.
-		// Skip the segment — no record names its shard, so there is nothing to
-		// attach it to — but leave the file on disk rather than sweeping it:
-		// nothing in the rebuilt index points into it, so unlinking it would
-		// destroy the only remaining copy of whatever payload is still down
-		// there.
-		_ = fd.Close()
-		r.s.log.Warn("journal: sealed segment scans as zero valid records (damaged first record), skipping it; left in place for inspection",
-			"segment_path", path)
-		return nil
+	if sealed {
+		info, err := fd.Stat()
+		if err != nil {
+			_ = fd.Close()
+			return fmt.Errorf("journal: stat sealed segment %q: %w", path, err)
+		}
+		// Sealing fsyncs every record before publishing the sealed bit. An
+		// unreadable suffix is therefore damaged committed data, not a torn
+		// append that can be discarded. Replaying just the valid prefix would
+		// present the missing records as unwritten holes, including intact
+		// records after the damage. Refuse the open and preserve the file.
+		if len(recs) == 0 || validUpTo != info.Size() {
+			_ = fd.Close()
+			return fmt.Errorf("journal: sealed segment %q is corrupt at offset %d (size %d): %w; "+
+				"with the server stopped, restore a consistent backup or quarantine this file as %q "+
+				"(quarantine can leave missing or stale file data)",
+				path, validUpTo, info.Size(), errTornRecord, path+".quarantine")
+		}
 	}
 
 	m := &segmentMeta{id: id, createdAt: createdAt, fd: fd}

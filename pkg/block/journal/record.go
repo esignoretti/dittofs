@@ -133,9 +133,10 @@ func decodeHeader(buf []byte) (recordHeader, error) {
 
 // errTornRecord marks a record that fails structural validation: bad magic,
 // header CRC, an implausible PayloadLen, a payload that runs past the written
-// bytes, or a body CRC mismatch. A recovery tail-scan stops at the first
-// torn record and truncates there. A clean end-of-data (nothing left to read)
-// surfaces as io.EOF, distinct from corruption.
+// bytes, or a body CRC mismatch. It can mean an incomplete active append or
+// damage to previously sealed data. Recovery truncates an active tail at the
+// first invalid record, but rejects an incomplete sealed-segment scan. A clean
+// end-of-data (nothing left to read) surfaces as io.EOF, distinct from corruption.
 var errTornRecord = errors.New("journal: torn record")
 
 // CorruptRangeError reports that a verified warm read found on-disk corruption:

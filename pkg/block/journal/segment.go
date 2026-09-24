@@ -22,8 +22,8 @@ import (
 //	28   4     HeaderCRC32 covers bytes [0,28)
 //	32   32    Reserved
 //
-// The header is the source of truth on recovery: a set sealed bit means the
-// segment is immutable and trusted without a full tail re-scan.
+// The header is the source of truth on recovery: a set sealed bit means every
+// record was committed, so an incomplete scan is corruption, not a torn append.
 const (
 	segHeaderSize      = 64
 	segHeaderCRCCovers = 28
@@ -217,12 +217,19 @@ func fsyncDir(dir string) error {
 	return d.Close()
 }
 
-// sealInPlace makes an appended-into segment immutable: fsync its record bytes,
-// set the on-disk sealed bit, then fsync again.
+// sealInPlace makes an appended-into segment immutable: truncate to its
+// published tail, fsync its record bytes, set the sealed bit, then fsync again.
 // Durability boundary: data is fsynced BEFORE the sealed bit so recovery never
 // trusts a header whose records did not reach disk. The caller moves it into the
 // sealed set. Used both by rotation and by GC when it seals a repack target.
 func (m *segmentMeta) sealInPlace() error {
+	// A failed append can extend the file without publishing a record. A
+	// shorter successful retry overwrites its head but leaves an unowned
+	// suffix. Only complete records advance tail, so discard that suffix
+	// before making the sealed header's durability promise.
+	if err := m.fd.Truncate(m.tail.Load()); err != nil {
+		return fmt.Errorf("journal: truncate before seal: %w", err)
+	}
 	if err := m.fd.Sync(); err != nil {
 		return fmt.Errorf("journal: fsync before seal: %w", err)
 	}
