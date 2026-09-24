@@ -13,7 +13,7 @@
 #
 # Exit codes:
 #   0  All failures are known (or no failures)
-#   >0 Number of NEW unexpected failing test files
+#   >0 Number of NEW unexpected failing test files, capped at 254
 #   1  Missing/unparseable output (no Test Summary, pjdfstest didn't run)
 #
 # Usage:
@@ -181,4 +181,5 @@ else
     echo -e "${GREEN}${BOLD}RESULT: All failures are known. CI green.${NC}"
 fi
 
-exit "$NEW_FAILURES"
+# Keep the full count above; an eight-bit exit status would wrap 256 to success.
+exit "$((NEW_FAILURES > 254 ? 254 : NEW_FAILURES))"

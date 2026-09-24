@@ -9,7 +9,7 @@
 #
 # Exit codes:
 #   0  All failures are known (or no failures)
-#   >0 Number of new unexpected failures
+#   >0 Number of new unexpected failures, capped at 254
 #   1  Missing TRX file or no results
 #
 # Usage:
@@ -211,5 +211,5 @@ else
     echo ""
 fi
 
-# Exit with count of new failures (0 = success)
-exit "$NEW_FAILURES"
+# Keep the full count above; an eight-bit exit status would wrap 256 to success.
+exit "$((NEW_FAILURES > 254 ? 254 : NEW_FAILURES))"

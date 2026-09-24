@@ -137,6 +137,12 @@ jobs:
       - name: Test the smbtorture grader
         run: ./test/smb-conformance/smbtorture/parse-results_test.sh
 
+      - name: Install the TRX parser
+        run: sudo apt-get update && sudo apt-get install -y xmlstarlet
+
+      - name: Test grader exit-status boundaries
+        run: ./test/conformance/grader-exit-status_test.sh
+
       - name: Test the conformance admission lease
         run: ./test/smb-conformance/compose-env_test.sh
 
