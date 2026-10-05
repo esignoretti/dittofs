@@ -11,6 +11,7 @@ configuration, and lease/durable-handle behaviour as seen from clients.
 
 - [Supported Dialects](#supported-dialects)
 - [Mounting SMB Shares](#mounting-smb-shares)
+  - To mount at boot, see [Mount at boot](persistent-mounts.md).
 - [Encryption](#encryption)
 - [Signing](#signing)
 - [Leases and Durable Handles](#leases-and-durable-handles)
