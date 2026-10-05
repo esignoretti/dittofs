@@ -148,12 +148,12 @@ dfsctl adapter enable nfs
 # Linux
 sudo mkdir -p /mnt/nfs
 sudo mount -t nfs -o tcp,port=12049,mountport=12049 localhost:/export /mnt/nfs
+echo "Hello DittoFS!" > /mnt/nfs/hello.txt
 
 # macOS
 mkdir -p /tmp/nfs
 sudo mount -t nfs -o tcp,port=12049,mountport=12049,resvport,nolock localhost:/export /tmp/nfs
-
-echo "Hello DittoFS!" > /mnt/nfs/hello.txt
+echo "Hello DittoFS!" > /tmp/nfs/hello.txt
 ```
 
 Writes land in the share's journal first and sync to S3 in the background. More mount
