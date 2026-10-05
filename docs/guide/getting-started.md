@@ -192,4 +192,5 @@ signing are in the [SMB guide](smb.md).
 - [Choosing stores](choosing-stores.md) — metadata and block store trade-offs.
 - [Identity: AD / LDAP / Kerberos](identity.md) — connect to a directory service.
 - [Snapshots](snapshots.md), [Quotas](quotas.md), [Encryption](encryption.md).
+- [Mount at boot](persistent-mounts.md): make NFS and SMB mounts survive a reboot.
 - [Troubleshooting](troubleshooting.md) — when a mount or permission won't cooperate.
