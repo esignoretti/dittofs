@@ -187,10 +187,10 @@ signing are in the [SMB guide](smb.md).
 
 ## Next steps
 
-- [Configuration](configuration.md) — every config key and flag, with defaults.
-- [CLI reference](cli.md) — every `dfs` and `dfsctl` command.
-- [Choosing stores](choosing-stores.md) — metadata and block store trade-offs.
-- [Identity: AD / LDAP / Kerberos](identity.md) — connect to a directory service.
+- [Configuration](configuration.md): every config key and flag, with defaults.
+- [CLI reference](cli.md): every `dfs` and `dfsctl` command.
+- [Choosing stores](choosing-stores.md): metadata and block store trade-offs.
+- [Identity: AD / LDAP / Kerberos](identity.md): connect to a directory service.
 - [Snapshots](snapshots.md), [Quotas](quotas.md), [Encryption](encryption.md).
 - [Mount at boot](persistent-mounts.md): make NFS and SMB mounts survive a reboot.
-- [Troubleshooting](troubleshooting.md) — when a mount or permission won't cooperate.
+- [Troubleshooting](troubleshooting.md): when a mount or permission won't cooperate.
