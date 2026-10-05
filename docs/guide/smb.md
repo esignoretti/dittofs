@@ -11,7 +11,6 @@ configuration, and lease/durable-handle behaviour as seen from clients.
 
 - [Supported Dialects](#supported-dialects)
 - [Mounting SMB Shares](#mounting-smb-shares)
-  - To mount at boot, see [Mount at boot](persistent-mounts.md).
 - [Encryption](#encryption)
 - [Signing](#signing)
 - [Leases and Durable Handles](#leases-and-durable-handles)
@@ -265,6 +264,8 @@ smbclient //localhost/export -p 12445 -U testuser -c "ls"
 smbclient //localhost/export -p 12445 -U testuser -c "get file.txt"
 smbclient //localhost/export -p 12445 -U testuser -c "put localfile.txt"
 ```
+
+To mount a share automatically at boot, see [Mount at boot](persistent-mounts.md).
 
 ---
 
