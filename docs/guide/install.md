@@ -348,15 +348,17 @@ RBAC, and Helm chart configuration.
 
 Removing DittoFS takes three steps:
 
-1. Stop the server
-2. Remove the binaries
-3. (optionally) delete the data. Removing the binaries never deletes your data.
+1. Stop the server.
+2. Remove the binaries.
+3. Optionally, delete the data.
 
-Before you start, if you use BadgerDB metadata stores and plan to delete
-their data, note their paths while the server is still running:
+Removing the binaries never deletes your data.
+
+Before you start, if you plan to delete metadata stores, note their
+configuration while the server is still running:
 
 ```bash
-dfsctl store metadata list -o json   # see config.path for each badger store
+dfsctl store metadata list -o json   # config.path for local stores, connection settings for PostgreSQL
 ```
 
 ### 1. Stop the server and unmount shares
@@ -390,10 +392,13 @@ dfs stop
 | Arch Linux | `sudo pacman -R dfs` (add `dfsctl` if you installed it) |
 | Scoop | `scoop uninstall dfs dfsctl` |
 | Docker | `docker rm -f dittofs && docker rmi marmos91c/dittofs:latest` |
-| Docker Compose | `docker compose down --rmi local` |
+| Docker Compose | `docker compose down && docker rmi dittofs:compose` |
+| Source build | delete the `dfs` and `dfsctl` binaries you built, and the clone |
+| Kubernetes operator | see the [operator uninstall guide](../../k8s/dittofs-operator/docs/INSTALL.md#uninstallation) |
 
-If you installed the old Homebrew formula (v0.11.1), use
-`brew uninstall marmos91/tap/dfs marmos91/tap/dfsctl` instead.
+If you installed the Homebrew formula instead of the cask (the README
+command, without `--cask`), use
+`brew uninstall marmos91/tap/dfs marmos91/tap/dfsctl`.
 
 > **Note:** removing the `.deb` also removes `/usr/local/bin` if it is left
 > empty. Recreate it with `sudo mkdir -p /usr/local/bin` if other tools need it.
@@ -415,7 +420,9 @@ scoop bucket rm marmos91
 ### 3. Remove data (optional)
 
 > **Warning:** This cannot be undone. It deletes your configuration, users,
-> shares, and any file data that has not reached the block store.
+> shares, file metadata, and any file data that has not reached the block
+> store. Objects already in a remote block store remain, but without their
+> metadata they are unusable.
 
 **Server run by your user** (quick install script, Homebrew, source build):
 
@@ -447,9 +454,9 @@ sudo systemctl daemon-reload
 
 **Everywhere:**
 
-- BadgerDB metadata stores: the directory you passed as `--db-path` to
-  `dfsctl store metadata add` (the `config.path` you noted before stopping
-  the server).
+- Local metadata stores (for example BadgerDB): the directory you passed as
+  `--db-path` to `dfsctl store metadata add` (the `config.path` you noted
+  before stopping the server).
 - `dfsctl` credentials: `~/.config/dfsctl/config.json` (Windows:
   `%APPDATA%\dfsctl\config.json`), for each user who ran `dfsctl login`.
 - Client leftovers: `~/.smbcredentials`, mount point directories, and any
@@ -460,12 +467,13 @@ sudo systemctl daemon-reload
 ```bash
 docker volume rm dittofs-metadata dittofs-blocks dittofs-state dittofs-cache
 # or, with Compose
-docker compose down -v --rmi local
+docker compose down -v
 ```
 
 The single-container setup also bind-mounts `~/.config/dittofs/config.yaml`
 from the host; remove it as shown above.
 
-**Remote block stores:** data in remote stores such as S3 buckets is not
+**Remote storage:** data in remote block stores such as S3 buckets, and in
+PostgreSQL databases used for the control plane or for metadata, is not
 touched by any step above. Delete it on the storage side if you no longer
 need it.
