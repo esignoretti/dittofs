@@ -454,9 +454,8 @@ sudo systemctl daemon-reload
 
 **Everywhere:**
 
-- Local metadata stores (for example BadgerDB): the directory you passed as
-  `--db-path` to `dfsctl store metadata add` (the `config.path` you noted
-  before stopping the server).
+- Local metadata stores: the BadgerDB directory or SQLite database file named
+  by the `config.path` you noted before stopping the server.
 - `dfsctl` credentials: `~/.config/dfsctl/config.json` (Windows:
   `%APPDATA%\dfsctl\config.json`), for each user who ran `dfsctl login`.
 - Client leftovers: `~/.smbcredentials`, mount point directories, and any
@@ -474,6 +473,8 @@ The single-container setup also bind-mounts `~/.config/dittofs/config.yaml`
 from the host; remove it as shown above.
 
 **Remote storage:** data in remote block stores such as S3 buckets, and in
-PostgreSQL databases used for the control plane or for metadata, is not
-touched by any step above. Delete it on the storage side if you no longer
-need it.
+externally managed PostgreSQL databases used for the control plane or for
+metadata, is not touched by any step above. Delete it on the storage side if
+you no longer need it. The Compose `postgres-backend` database is different:
+it lives in the `dittofs-postgres` volume and is deleted by
+`docker compose down -v`.
