@@ -89,6 +89,18 @@ func (r *RuntimeExporter) Resolve(ctx context.Context, name string) (*Export, er
 	if err != nil {
 		return nil, ErrUnknownExport
 	}
+	// A disabled share is being quiesced, and no new client may enter it.
+	//
+	// decision: the gate belongs here because the handshake is the only point
+	// at which NBD admits a client; NFS MOUNT, SMB TREE_CONNECT and the NFSv4
+	// share-entry check each refuse a disabled share when access is
+	// established, and the write path that follows does not re-consult the
+	// flag. The refusal is reported as an unknown export rather than as an
+	// error of its own, because the export name is client-supplied and the
+	// server must not tell a client whether a share exists but is quiesced.
+	if !sh.Enabled {
+		return nil, ErrUnknownExport
+	}
 
 	// The handshake has no client identity, so the resolution runs as the
 	// configured synthetic identity. ShareReadOnly is deliberately not set:
@@ -158,6 +170,16 @@ func (r *RuntimeExporter) List(ctx context.Context) ([]string, error) {
 
 	var names []string
 	for _, share := range r.rt.ListShares() {
+		sh, err := r.rt.GetShare(share)
+		if err != nil {
+			return nil, err
+		}
+		// A disabled share is skipped for the same reason Resolve refuses it:
+		// advertising an export the server would then refuse to resolve is a
+		// worse answer than not advertising it.
+		if !sh.Enabled {
+			continue
+		}
 		root, err := r.rt.GetRootHandle(share)
 		if err != nil {
 			return nil, err
