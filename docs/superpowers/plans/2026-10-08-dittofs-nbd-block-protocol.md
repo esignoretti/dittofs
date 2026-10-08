@@ -853,6 +853,10 @@ authCtx := &metadata.AuthContext{
 
 A missing share, a missing `volumes` directory, or a missing file all map to `ErrUnknownExport` — the export name is client-supplied and the server must not distinguish "no such share" from "no such volume" on the wire.
 
+**A disabled share is refused too.** `Resolve` returns `ErrUnknownExport` for a share whose `Enabled` flag is false, and `List` skips such a share rather than advertising a volume that `Resolve` would then refuse. `Share.Enabled` is the DB-row `shares.enabled` flag (`pkg/controlplane/runtime/shares/service.go:26-29`: *"Disabled shares reject new MOUNT / TREE_CONNECT and in-flight operations"*), and `DisableShare` flips it synchronously before a restore begins so that no adapter admits a new client into the restore window. Every other adapter enforces it at establishment — `internal/adapter/nfs/mount/handlers/mount.go:114` (`MountErrAccess`), `internal/adapter/smb/handlers/tree_connect.go:119` (`STATUS_NETWORK_NAME_DELETED`), `internal/adapter/nfs/v4/handlers/helpers.go:226` (`NFS4ERR_STALE`) — and `ServeHandshake`/`Resolve` is the only such point NBD has. The write path that follows does not re-consult the flag, so a client admitted here would keep writing through the restore window. The refusal is reported as an unknown export for the same reason the missing-share case is: the server must not tell a client whether a share exists but is quiesced.
+
+**The fixture must set `Enabled: true`.** `AddShare` copies the flag verbatim from `ShareConfig` (`pkg/controlplane/runtime/shares/lifecycle.go:548`) and nothing defaults it, so a share built without it is disabled and the exporter refuses to resolve it.
+
 `decision:` resolution happens at handshake only, never on the hot path. The size is fixed at creation, so a re-resolve would only re-read a value that cannot change; holding a file handle across a restart is exactly what §2.2 of the spec avoids.
 
 - [ ] **Step 6: Implement `volume_test.go`'s runtime case**
@@ -867,8 +871,12 @@ func TestRuntimeExporter_ResolvesVolumeFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	const share = "/export"
+	// Enabled: true because AddShare copies the flag verbatim and nothing
+	// defaults it; a share built without it is disabled, which the exporter now
+	// refuses to resolve.
 	if err := rt.AddShare(context.Background(), &runtime.ShareConfig{
 		Name: share, MetadataStore: "nbd-meta", BlockStoreID: bsID,
+		Enabled:           true,
 		DefaultPermission: string(models.PermissionReadWrite),
 		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
 	}); err != nil {
@@ -922,10 +930,79 @@ func TestRuntimeExporter_ResolvesVolumeFile(t *testing.T) {
 	if got.Handle == nil {
 		t.Fatal("resolved export has no file handle; the write path cannot call PrepareWrite without one")
 	}
+	// The handle must be the volume file's own, not the share root's and not
+	// the volumes directory's: PrepareWrite/CommitWrite derive the payload ID
+	// from it, so either of the other two would address different bytes.
+	if !bytes.Equal(got.Handle, createdHandle) {
+		t.Fatalf("export handle = %q, want the volume file's handle %q", got.Handle, createdHandle)
+	}
+}
+
+// TestRuntimeExporter_DisabledShareIsRefusedAndUnlisted pins both halves of the
+// disabled-share gate: the handshake is the only point at which NBD admits a
+// client, so a share being quiesced must be neither resolvable nor advertised.
+func TestRuntimeExporter_DisabledShareIsRefusedAndUnlisted(t *testing.T) {
+	rt, bsID := testruntime.NewWithShareStore(t)
+	store := badgertest.NewInMemory(t)
+	if err := rt.RegisterMetadataStore("nbd-meta", store); err != nil {
+		t.Fatal(err)
+	}
+	const share = "/export"
+	if err := rt.AddShare(context.Background(), &runtime.ShareConfig{
+		Name: share, MetadataStore: "nbd-meta", BlockStoreID: bsID,
+		Enabled:           true,
+		DefaultPermission: string(models.PermissionReadWrite),
+		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := rt.GetRootHandle(share)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaSvc := rt.GetMetadataService()
+	authCtx := &metadata.AuthContext{
+		Context:  context.Background(),
+		Identity: &metadata.Identity{UID: ptr(uint32(1000)), GID: ptr(uint32(1000))},
+	}
+	vols, _, err := metaSvc.CreateDirectory(authCtx, root, "volumes", &metadata.FileAttr{Mode: 0o755})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volsHandle, err := metadata.EncodeFileHandle(vols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := metaSvc.CreateFile(authCtx, volsHandle, "boot", &metadata.FileAttr{Mode: 0o644}); err != nil {
+		t.Fatal(err)
+	}
+
+	ex := NewRuntimeExporter(rt, Identity{UID: 65534, GID: 65534})
+	if _, err := ex.Resolve(context.Background(), "/export/boot"); err != nil {
+		t.Fatalf("Resolve on an enabled share: %v", err)
+	}
+	if names, err := ex.List(context.Background()); err != nil {
+		t.Fatalf("List on an enabled share: %v", err)
+	} else if len(names) != 1 || names[0] != "/export/boot" {
+		t.Fatalf("List on an enabled share = %v, want [/export/boot]", names)
+	}
+
+	if err := rt.SetEnabledForTesting(share, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ex.Resolve(context.Background(), "/export/boot"); !errors.Is(err, ErrUnknownExport) {
+		t.Fatalf("Resolve on a disabled share: got %v, want ErrUnknownExport", err)
+	}
+	if names, err := ex.List(context.Background()); err != nil {
+		t.Fatalf("List on a disabled share: %v", err)
+	} else if len(names) != 0 {
+		t.Fatalf("List on a disabled share = %v, want no exports", names)
+	}
 }
 ```
 
-Add one test helper in this file: `func ptr[T any](v T) *T { return &v }`.
+Add one test helper in this file: `func ptr[T any](v T) *T { return &v }`. This file's imports must also include `"bytes"` (the `Handle` comparison) and `"errors"` (the `errors.Is` check on the disabled-share refusal).
 
 Convert a `*metadata.File` to a handle with **`metadata.EncodeFileHandle(file)`** (`pkg/metadata/types.go:53`) — the same call `internal/adapter/nfs/v4/handlers/create.go:344` and `lookup.go:105` make, and the reason those adapters never need a handle-minting helper.
 
