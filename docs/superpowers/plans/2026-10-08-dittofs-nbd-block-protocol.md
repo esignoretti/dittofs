@@ -14,7 +14,7 @@
 
 - **Target tree:** `origin/develop` @ `4dae5562`. All line citations below are verified against it.
 - **Go module:** `github.com/marmos91/dittofs`, `go 1.26.0`.
-- **No new dependencies.** The codec is hand-rolled; the test client is `github.com/pojntfx/go-nbd`'s `pkg/client` only if it is already in `go.mod` — if it is not, integration tests drive the codec through `net.Pipe` with the in-repo encoder, and the differential oracle (Task 7) provides the independent check.
+- **No new dependencies.** The codec is hand-rolled; the test client is `github.com/pojntfx/go-nbd`'s `pkg/client` only if it is already in `go.mod` — if it is not, integration tests drive the codec over a loopback TCP socket with the in-repo encoder (never `net.Pipe`, which is synchronous and unbuffered: a server `Write` blocks until the reader consumes every byte, so a test that reads a header and stops hangs instead of failing), and the differential oracle (Task 7) provides the independent check.
 - **Commit messages:** never name AI tooling, never add `Co-Authored-By` for AI. Concise. Sign with `git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S` (plain `-S` fails: `gpg.format` is unset).
 - **Adapter type string:** `"nbd"`. **Default port:** `10809`.
 - **Transmission flags advertised:** exactly `HAS_FLAGS` (0), `READ_ONLY` (1, conditionally), `SEND_FLUSH` (2), `SEND_FUA` (3), `SEND_TRIM` (5), `SEND_WRITE_ZEROES` (6). Nothing else.
@@ -115,7 +115,7 @@ Inputs and conditions the spec implies but whose tests no single task obviously 
 | `internal/adapter/nbd/handshake_test.go` | Option sequences, malformed input. |
 | `internal/adapter/nbd/connection_test.go` | Dispatch, serialization, shutdown, timeouts. |
 | `internal/adapter/nbd/volume_test.go` | Export resolution against a real runtime. |
-| `internal/adapter/nbd/integration_test.go` | Real `engine.Store`, real bytes, end to end over `net.Pipe`. |
+| `internal/adapter/nbd/integration_test.go` | Real `engine.Store`, real bytes, end to end over a loopback TCP socket. |
 | `pkg/adapter/nbd/adapter_test.go` | Lifecycle, config validation, bind gate. |
 | `pkg/adapter/nbd/healthcheck_test.go` | Status mapping. |
 
@@ -350,7 +350,13 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 
 - [ ] **Step 1: Write the failing handshake tests**
 
-Create `internal/adapter/nbd/handshake_test.go`. Drive both sides over `net.Pipe`.
+Create `internal/adapter/nbd/handshake_test.go`. Drive both sides over a
+**loopback TCP socket**, via the `pipe(t)` helper the block below defines — **not**
+`net.Pipe()`. `net.Pipe` is synchronous and unbuffered: a server `Write` blocks until the
+reader has consumed every byte, so a test that reads a reply header and stops before the
+payload leaves the server blocked and the test hangs until the Go test timeout instead of
+failing. Several tests below do exactly that. A loopback socket buffers in the kernel, so
+the server finishes its reply whether or not the test reads it.
 
 ```go
 package nbd
@@ -389,6 +395,48 @@ func newFakeExporter() *fakeExporter {
 	return &fakeExporter{exports: map[string]*Export{
 		"/export/boot": {Name: "/export/boot", Size: 1 << 30, PayloadID: "payload-1"},
 	}}
+}
+
+// pipe returns a connected pair over a loopback TCP socket.
+//
+// net.Pipe would be simpler and is wrong here: it is synchronous and
+// unbuffered, so a server Write blocks until the reader has consumed every
+// byte. These tests deliberately read a reply header and assert on it without
+// draining the payload that follows, which leaves the server blocked forever
+// and turns a test that should fail loudly into one that hangs until the Go
+// test timeout. A loopback socket buffers in the kernel, so a server can
+// finish a reply the test has not read yet.
+func pipe(t *testing.T) (server, client net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	type accepted struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan accepted, 1)
+	go func() {
+		c, err := ln.Accept()
+		ch <- accepted{c, err}
+	}()
+
+	client, err = net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	a := <-ch
+	if a.err != nil {
+		t.Fatalf("accept: %v", a.err)
+	}
+	t.Cleanup(func() {
+		client.Close()
+		a.conn.Close()
+	})
+	return a.conn, client
 }
 
 // readGreeting consumes NBDMAGIC, IHAVEOPT and the 16-bit handshake flags, and
@@ -450,9 +498,7 @@ func goPayload(name string, infos ...uint16) []byte {
 }
 
 func TestHandshake_GreetingAdvertisesFixedNewstyle(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	done := make(chan error, 1)
 	go func() {
@@ -474,9 +520,7 @@ func TestHandshake_GreetingAdvertisesFixedNewstyle(t *testing.T) {
 }
 
 func TestHandshake_GoReturnsExportInfoThenAck(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	got := make(chan *Export, 1)
 	go func() {
@@ -489,7 +533,7 @@ func TestHandshake_GoReturnsExportInfoThenAck(t *testing.T) {
 	}()
 
 	readGreeting(t, client)
-	sendClientFlags(t, client, 1) // NBD_FLAG_C_FIXED_NEWSTYLE
+	sendClientFlags(t, client, 1)                                 // NBD_FLAG_C_FIXED_NEWSTYLE
 	sendOption(t, client, OptGO, goPayload("/export/boot", 0, 3)) // NBD_INFO_EXPORT, NBD_INFO_BLOCK_SIZE
 
 	// NBD_INFO_EXPORT is mandatory before a successful ACK.
@@ -528,9 +572,7 @@ func TestHandshake_GoReturnsExportInfoThenAck(t *testing.T) {
 }
 
 func TestHandshake_UnknownExportIsRepErrUnknown(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	go func() { _, _ = ServeHandshake(context.Background(), server, newFakeExporter()) }()
 
@@ -548,9 +590,7 @@ func TestHandshake_UnknownExportIsRepErrUnknown(t *testing.T) {
 }
 
 func TestHandshake_StartTLSIsUnsupported(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	go func() { _, _ = ServeHandshake(context.Background(), server, newFakeExporter()) }()
 
@@ -579,9 +619,7 @@ func TestHandshake_StartTLSIsUnsupported(t *testing.T) {
 // Review Focus 1: a name length that claims more bytes than the option carried.
 // The naive read is make([]byte, nameLen) followed by a slice of the payload.
 func TestHandshake_GoNameLengthExceedsOptionData(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	go func() { _, _ = ServeHandshake(context.Background(), server, newFakeExporter()) }()
 
@@ -606,9 +644,7 @@ func TestHandshake_GoNameLengthExceedsOptionData(t *testing.T) {
 // Review Focus 1, second shape: the option header's own data length is absurd.
 // The server must not allocate what the client asked for.
 func TestHandshake_HugeOptionLengthRejected(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	go func() { _, _ = ServeHandshake(context.Background(), server, newFakeExporter()) }()
 
@@ -630,9 +666,7 @@ func TestHandshake_HugeOptionLengthRejected(t *testing.T) {
 }
 
 func TestHandshake_ExportNameLegacyPath(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	got := make(chan *Export, 1)
 	go func() {
@@ -666,9 +700,7 @@ func TestHandshake_ExportNameLegacyPath(t *testing.T) {
 }
 
 func TestHandshake_ListEnumeratesVolumes(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	go func() { _, _ = ServeHandshake(context.Background(), server, newFakeExporter()) }()
 
@@ -695,8 +727,7 @@ func TestHandshake_ListEnumeratesVolumes(t *testing.T) {
 }
 
 func TestHandshake_AbortIsAckedAndConnectionClosed(t *testing.T) {
-	server, client := net.Pipe()
-	defer client.Close()
+	server, client := pipe(t)
 
 	done := make(chan error, 1)
 	go func() {
@@ -726,9 +757,7 @@ func TestHandshake_AbortIsAckedAndConnectionClosed(t *testing.T) {
 }
 
 func TestHandshake_UnsupportedOptionIsRefused(t *testing.T) {
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	server, client := pipe(t)
 
 	go func() { _, _ = ServeHandshake(context.Background(), server, newFakeExporter()) }()
 
