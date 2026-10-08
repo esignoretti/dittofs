@@ -336,6 +336,7 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
   - `type Export struct { Name string; Size uint64; PayloadID metadata.PayloadID; Handle metadata.FileHandle; ReadOnly bool }` — `Handle` is what the write path needs for `PrepareWrite`/`CommitWrite`; it is resolved once at handshake and held for the connection's life.
   - `type Exporter interface { Resolve(ctx context.Context, name string) (*Export, error); List(ctx context.Context) ([]string, error) }`
   - `var ErrUnknownExport = errors.New("nbd: unknown export")`
+  - `type Identity struct { UID, GID uint32 }` — the configured synthetic identity (spec §4.7). Declared here, not in Task 4, because `NewRuntimeExporter` below takes one: the handshake needs it to build the `AuthContext` that `metadata.Service.Lookup` requires, so this task's own commit cannot compile without it. An earlier draft declared it in Task 4 and left this task uncompilable until Task 4 landed.
   - `func ServeHandshake(ctx context.Context, conn net.Conn, ex Exporter) (*Export, error)` — writes the greeting, haggles options, returns the resolved export with the transmission phase ready to begin. Returns `ErrUnknownExport`-wrapped errors only through the wire; a client that names no valid export ends with the connection closed by this function.
   - `func (e *Export) TransmissionFlags() TransmissionFlags`
   - `type RuntimeExporter struct { rt *runtime.Runtime; id Identity; volumesDir string }`
@@ -931,15 +932,13 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 - Test: `pkg/adapter/nbd/adapter_test.go`, `pkg/adapter/nbd/healthcheck_test.go`
 
 **Interfaces:**
-- Consumes: Task 2's `ServeHandshake`, `RuntimeExporter`, `Exporter`; Task 4's `Handler`, `StoreResolver`, `Identity`, `Timeouts` (so Task 3's `Serve` is written against interfaces Task 4 provides — the two tasks touch different files and the signature is fixed here).
+- Consumes: Task 2's `ServeHandshake`, `RuntimeExporter`, `Exporter`, `Identity`. **Nothing from Task 4.** An earlier draft had this task's `Serve` build the `nbd.Handler`, which made this task's commit uncompilable until Task 4 landed; the wiring now lives in Task 4's Step 6, where every symbol it names already exists. This task binds and delegates.
 - Produces:
-  - `type TimeoutsConfig struct { Read, Write, Idle, Shutdown time.Duration }`
+  - `type TimeoutsConfig struct { Read, Write, Idle, Shutdown time.Duration }` — the operator-facing four-timer config. The wire layer's three-timer `nbd.Timeouts` and the `timeouts()` narrowing accessor belong to Task 4, which is where they are first needed; this task only stores the config.
   - `type Config struct { Enabled bool; Port int; BindAddress string; MaxConnections int; MaxMessageSize int; Timeouts TimeoutsConfig; AllowRemoteBind bool; DefaultExport string; UID uint32; GID uint32 }`
-  - `func (c *Config) timeouts() nbd.Timeouts` — adapts `TimeoutsConfig` (four fields) to `nbd.Timeouts` (three), dropping `Shutdown` which the base adapter owns. It is unexported because only the adapter's own `Serve` calls it, and it is the *only* place the two timeout vocabularies meet.
   - `const DefaultPort = 10809`
-  - `func (a *Adapter) Handler() *nbd.Handler` — exported only because the tests are external (`package nbd_test`); it is how `TestServe_ClientDisconnectDoesNotStopTheAdapter` and Task 4's integration tests reach the wired handler. Document it as test-facing.
   - `func (c *Config) applyDefaults()`, `func (c *Config) validate() error`
-  - `type Adapter struct { *adapter.BaseAdapter; config Config; ... }`
+  - `type Adapter struct { *adapter.BaseAdapter; config Config; runtime *runtime.Runtime }` — no `handler` field in this task; Task 4's Step 6 adds it together with the wiring. Declaring it here is what made an earlier draft uncompilable on its own.
   - `func New(config Config) *Adapter`
   - `func (a *Adapter) Serve(ctx context.Context) error`
   - `func (a *Adapter) Stop(ctx context.Context) error`
@@ -1155,29 +1154,18 @@ Mirror `pkg/adapter/smb/config.go:63` and its `applyDefaults` at `:311`. Default
 
 `validate()` returns an error when `Port < 0 || Port > 65535`. `New` panics on a `validate()` error, matching `pkg/adapter/smb/adapter.go:176`.
 
-Also add the accessor Step 5b uses:
-
-```go
-// timeouts narrows the adapter's four configured durations to the three the
-// wire layer needs. Shutdown is deliberately not here: the base adapter owns
-// the drain deadline, and the handler's job during drain is to answer
-// ErrESHUTDOWN, not to run its own timer.
-func (c *Config) timeouts() nbd.Timeouts {
-	return nbd.Timeouts{Read: c.Timeouts.Read, Write: c.Timeouts.Write, Idle: c.Timeouts.Idle}
-}
-```
-
 - [ ] **Step 4: Implement `adapter.go`**
 
 `New` calls `applyDefaults()`, `validate()` (panic on error), then `adapter.NewBaseAdapter(adapter.BaseConfig{BindAddress, Port, MaxConnections, ShutdownTimeout: Timeouts.Shutdown}, "nbd")`.
 
-`SetRuntime(rt any)` type-asserts to `*runtime.Runtime` and builds the `RuntimeExporter`.
+`SetRuntime(rt any)` type-asserts to `*runtime.Runtime` and stores it. It must **not** build the exporter or the handler: `nbd.NewHandler` and `nbd.Identity` are declared by Task 4, so referencing them here would leave this task's own commit uncompilable. Task 4's Step 6 adds the wiring. This task's job is the lifecycle, the bind gate, and the control-plane registration.
 
 `Serve(ctx)`:
-1. **The bind gate, before anything binds.** `if netutil.IsNonLoopbackHost(a.config.BindAddress) && !a.config.AllowRemoteBind { return fmt.Errorf(...) }`. The error text must contain `allow_remote_bind`. `netutil.IsNonLoopbackHost` (`pkg/netutil/netutil.go:15`) returns false for `127.0.0.1`, `::1`, `[::1]`, `localhost`, and **true for an empty string** (it falls through the switch, `net.ParseIP("")` is nil, and the non-IP branch assumes off-host). That is the behaviour the gate wants — an empty `BindAddress` binds all interfaces, so it must be refused without the opt-in — and it needs no special case. Say so in a comment, because the next reader will not check the fall-through.
-2. `return a.ServeWithFactory(ctx, a, nil, nil)`.
+1. **The bind gate, before anything binds.** `if netutil.IsNonLoopbackHost(a.config.BindAddress) && !a.config.AllowRemoteBind { return fmt.Errorf(...) }`. The error text must contain `allow_remote_bind`. `netutil.IsNonLoopbackHost` (`pkg/netutil/netutil.go:15`) returns false for `127.0.0.1`, `::1`, `[::1]`, `localhost`, and **true for an empty string** (it falls through the switch, `net.ParseIP("")` is nil, and the non-IP branch assumes off-host). That is the behaviour the gate wants — an empty `BindAddress` binds all interfaces, so it must be refused without the opt-in — and it needs no special case. Say so in a comment, because the next reader will not check the fall-through. The gate runs **before** the runtime is consulted, which is what `TestServe_RefusesRemoteBindEvenWithNoRuntime` pins; Task 4's Step 6 preserves that order when it fills in the body.
+2. `if a.runtime == nil { return errors.New("nbd: SetRuntime was not called before Serve") }`.
+3. `return a.ServeWithFactory(ctx, a, nil, nil)`.
 
-`NewConnection(conn net.Conn) adapter.ConnectionHandler` returns `nbd.NewConn(a.handler, conn)` — the wrapper from Task 4, which exists because `adapter.ConnectionHandler.Serve` takes only a context. In this task that type does not exist yet, so the stub returns a minimal type implementing `Serve(ctx context.Context)` that reads the greeting and closes, letting the lifecycle tests pass; **Task 4 replaces it** with the real wrapper. (Task 4 lists `pkg/adapter/nbd/adapter.go` under Modify for exactly this reason — the wiring step is written here because the adapter is the only place that can do it, and it lands with the handler it wires.)
+`NewConnection(conn net.Conn) adapter.ConnectionHandler` returns a minimal per-connection type implementing `Serve(ctx context.Context)` that reads the greeting and closes, so the lifecycle tests pass. It exists because `adapter.ConnectionHandler.Serve` takes only a context (`pkg/adapter/base.go:38`), so the socket has to be bound at construction. **Task 4's Step 6 replaces this stub** with `return nbd.NewConn(a.handler, conn)`, the same shape as `pkg/adapter/smb/adapter.go:717`. (Task 4 lists `pkg/adapter/nbd/adapter.go` under Modify for exactly this reason.)
 
 `Stop` delegates to `a.BaseAdapter.Stop(ctx)`.
 
@@ -1190,62 +1178,6 @@ func (a *Adapter) Healthcheck(ctx context.Context) health.Report
 `!a.config.Enabled` → `StatusDisabled` with message `"NBD adapter is disabled in config"`. Otherwise delegate to `a.BaseAdapter.Healthcheck(ctx)`. `StatusDegraded` is added in Task 4, when there is a resolvable-export failure to report — until then there is nothing that can degrade.
 
 Note `BaseAdapter.Healthcheck` already reports `StatusUnhealthy` once shutdown is initiated but `Serve` has not returned (`pkg/adapter/healthcheck.go:39`), so the drain path needs no help here.
-
-- [ ] **Step 5b: Wire the adapter to the wire layer (replaces Step 4's `Serve` body)**
-
-The adapter is the only place that knows about both halves — the runtime and the wire layer — so this is where the two seams meet. It must import `internal/adapter/nbd`, which is legal (both are in-repo and `internal/adapter/nbd` does not import `pkg/adapter/nbd`, so there is no cycle).
-
-```go
-type Adapter struct {
-	*adapter.BaseAdapter
-	config  Config
-	runtime *runtime.Runtime
-	handler *nbd.Handler      // built lazily in Serve, once the runtime is set
-}
-
-func (a *Adapter) SetRuntime(rt any) {
-	r, ok := rt.(*runtime.Runtime)
-	if !ok {
-		panic(fmt.Sprintf("nbd: SetRuntime wants *runtime.Runtime, got %T", rt))
-	}
-	a.runtime = r
-}
-
-func (a *Adapter) Serve(ctx context.Context) error {
-	if a.runtime == nil {
-		return errors.New("nbd: SetRuntime was not called before Serve")
-	}
-	exporter := nbd.NewRuntimeExporter(a.runtime, nbd.Identity{UID: a.config.UID, GID: a.config.GID})
-	resolver := func(ctx context.Context, exp *nbd.Export) (nbd.BlockStore, error) {
-		return common.ResolveForWrite(ctx, a.runtime, exp.Handle)
-	}
-	draining := func() bool {
-		select {
-		case <-a.BaseAdapter.Shutdown:
-			return true
-		default:
-			return false
-		}
-	}
-	a.handler = nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
-		nbd.Identity{UID: a.config.UID, GID: a.config.GID}, a.config.timeouts(), draining)
-	return a.ServeWithFactory(ctx, a, nil, nil)
-}
-
-func (a *Adapter) NewConnection(conn net.Conn) adapter.ConnectionHandler {
-	return a.handler
-}
-```
-
-Three things this shape gets right and one it makes explicit:
-
-- **`NewConnection` returns a small per-connection wrapper, not the shared handler.** `adapter.ConnectionHandler.Serve` takes only a context (`pkg/adapter/base.go:38`), so the socket must be bound at construction — `return nbd.NewConn(a.handler, conn)`, the same shape as `pkg/adapter/smb/adapter.go:717`. The handler itself is shared and stateless; `Conn` carries nothing but the socket and the handler pointer, so there is no per-connection protocol state to leak.
-- **The resolver returns `*engine.Store` as `nbd.BlockStore` implicitly** — `common.ResolveForWrite` returns the concrete type, which satisfies the interface. No adapter.
-- **`Serve` builds the handler once, before the listener exists**, so a `nil` runtime or a bad config fails as a startup error rather than as a failed first connection.
-- **`SetRuntime` panics on the wrong type**, matching the documented contract of `pkg/adapter/base.go:185` (*"must be a `*runtime.Runtime` or it panics"*) and the constructor-panics-on-invalid-config precedent at `pkg/adapter/smb/adapter.go:176`.
-- **`preAccept` stays `nil`** — see Step 4's note; there is nothing checkable at the TCP layer for a protocol that names its export inside the handshake.
-
-`Config` therefore needs `UID`/`GID` fields (the synthetic identity, spec §4.7) and a `timeouts() nbd.Timeouts` accessor. Add both in Step 3.
 
 - [ ] **Step 6: Wire the control plane**
 
@@ -1292,16 +1224,15 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 
 **Files:**
 - Create: `internal/adapter/nbd/connection.go`, `internal/adapter/nbd/handlers_read.go`
-- Modify: `internal/adapter/common/write_payload.go` (`CommitBlockStore` parameter widened to the new `Committer` interface — a type-only change, no behaviour change; every existing call site passes `*engine.Store` and keeps compiling), `internal/adapter/common/normalize.go` (`normalizeBlockStoreError` exported as `NormalizeBlockStoreError`), `internal/adapter/common/{doc.go,read_payload.go,write_payload.go}`, `internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go` (the rename's seven call sites — mechanical, but the build breaks until all of them land together), `pkg/adapter/nbd/adapter.go` (the `NewConnection` stub from Task 3's Step 4 is replaced here with `return nbd.NewConn(a.handler, conn)`), `pkg/adapter/nbd/healthcheck.go` (add `Degraded`)
+- Modify: `internal/adapter/common/write_payload.go` (`CommitBlockStore` parameter widened to the new `Committer` interface — a type-only change, no behaviour change; every existing call site passes `*engine.Store` and keeps compiling), `internal/adapter/common/normalize.go` (`normalizeBlockStoreError` exported as `NormalizeBlockStoreError`), `internal/adapter/common/{doc.go,read_payload.go,write_payload.go}`, `internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go` (the rename's seven call sites — mechanical, but the build breaks until all of them land together), `pkg/adapter/nbd/adapter.go` (Step 6 replaces Task 3's `Serve` body and `NewConnection` stub with the real wiring), `pkg/adapter/nbd/config.go` (Step 6 adds `Config.timeouts()`), `pkg/adapter/nbd/healthcheck.go` (Step 7 adds `Degraded`)
 
-**Task 3 must land first**, because both tasks modify `pkg/adapter/nbd/adapter.go`. They touch different functions — Task 3 writes the stub, this task replaces its body — so the second edit is a one-line substitution rather than a conflict.
+**Task 3 must land first**, because both tasks modify `pkg/adapter/nbd/adapter.go`. Task 3 writes the lifecycle, the bind gate and the stubs; this task's Step 6 replaces the two stub bodies. They touch different functions, so the second edit is a substitution rather than a conflict.
 - Test: `internal/adapter/nbd/connection_test.go`, `internal/adapter/nbd/integration_test.go`, `internal/adapter/common/write_payload_test.go` (only if one does not already cover `CommitBlockStore`)
 
 **Interfaces:**
-- Consumes: Task 2's `Export`/`Exporter`, Task 3's `Config` (timeouts).
+- Consumes: Task 2's `Export`/`Exporter`/`Identity`, Task 3's `Config` (timeouts), `Adapter`.
 - Produces:
-  - `type Timeouts struct { Read, Write, Idle time.Duration }` — the subset of the adapter's config the wire layer needs, so `internal/adapter/nbd` does not import `pkg/adapter/nbd`. `Idle` bounds a connection that has completed a handshake but sends nothing; `Read` bounds a single request header or payload, so it must be the *shorter* of the two or a stalled client is held open by the wrong timer.
-  - `type Identity struct { UID, GID uint32 }` — the configured synthetic identity (spec §4.7).
+  - `type Timeouts struct { Read, Write, Idle time.Duration }` — declared here, in `connection.go`. `Read` bounds one request header or payload; `Idle` bounds a connection that has completed its handshake but sends nothing, so `Read` must be the *shorter* of the two or a stalled client is held open by the wrong timer. Task 3 stores the operator-facing `TimeoutsConfig` (four fields); Step 6 below adds `Config.timeouts()` to narrow four to these three, dropping `Shutdown` because the base adapter owns the drain deadline.
   - `type StoreResolver func(ctx context.Context, exp *Export) (BlockStore, error)` — a function type rather than a method on `Handler`, so the dispatch tests can inject a fake store. The production implementation wraps `common.ResolveForWrite` (below), so `internal/adapter/nbd` never imports `pkg/controlplane/runtime`.
   - `type BlockStore interface { ReadAt(...); WriteAt(...); PunchHole(...); Flush(...); LocalDurable() bool; RemoteDurable() bool; RequireDurableCommit() bool }` — the four I/O methods plus the three durability accessors, so `commit` can call `common.CommitBlockStore` without the concrete `*engine.Store`. `*engine.Store` satisfies all seven (`pkg/block/engine/readwrite.go:21`, `:87`, `:286`; `pkg/block/engine/flush.go:534`; `pkg/block/engine/engine.go:388`, `:397`, `:406`).
   - `type Handler struct { exporter Exporter; stores StoreResolver; meta *metadata.Service; id Identity; timeouts Timeouts; draining func() bool; degraded atomic.Int64 }`
@@ -1618,7 +1549,84 @@ func mapError(err error) NBDError
 
 Use `errors.Is` throughout, and put the original error in a log line at Debug for expected classes and Error otherwise, per CLAUDE.md invariant 6.
 
-- [ ] **Step 6: Add `Degraded` to the healthcheck**
+- [ ] **Step 6: Wire the adapter to the wire layer**
+
+This step exists here, not in Task 3, because it is the first point at which every symbol it names exists: `nbd.Handler`, `nbd.NewHandler`, `nbd.BlockStore`, `nbd.StoreResolver`, and `nbd.Timeouts` are all declared by this task. Task 3 deliberately left `Serve`'s body and `NewConnection` as stubs so that its own commit compiles; this step replaces both.
+
+The adapter is the only place that knows about both halves — the runtime and the wire layer — so this is where the two seams meet. It must import `internal/adapter/nbd`, which is legal (both are in-repo and `internal/adapter/nbd` does not import `pkg/adapter/nbd`, so there is no cycle).
+
+```go
+type Adapter struct {
+	*adapter.BaseAdapter
+	config  Config
+	runtime *runtime.Runtime
+	handler *nbd.Handler // built once in Serve, before the listener exists
+}
+
+func (a *Adapter) SetRuntime(rt any) {
+	r, ok := rt.(*runtime.Runtime)
+	if !ok {
+		panic(fmt.Sprintf("nbd: SetRuntime wants *runtime.Runtime, got %T", rt))
+	}
+	a.runtime = r
+}
+
+func (a *Adapter) Serve(ctx context.Context) error {
+	if netutil.IsNonLoopbackHost(a.config.BindAddress) && !a.config.AllowRemoteBind {
+		return fmt.Errorf("nbd: refusing to bind %q without allow_remote_bind; NBD has no authentication beyond optional TLS, so a remotely reachable export hands every byte of the volume to anyone who can reach the port", a.config.BindAddress)
+	}
+	if a.runtime == nil {
+		return errors.New("nbd: SetRuntime was not called before Serve")
+	}
+	id := nbd.Identity{UID: a.config.UID, GID: a.config.GID}
+	exporter := nbd.NewRuntimeExporter(a.runtime, id)
+	resolver := func(ctx context.Context, exp *nbd.Export) (nbd.BlockStore, error) {
+		return common.ResolveForWrite(ctx, a.runtime, exp.Handle)
+	}
+	draining := func() bool {
+		select {
+		case <-a.BaseAdapter.Shutdown:
+			return true
+		default:
+			return false
+		}
+	}
+	a.handler = nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
+		id, a.config.timeouts(), draining)
+	return a.ServeWithFactory(ctx, a, nil, nil)
+}
+
+func (a *Adapter) NewConnection(conn net.Conn) adapter.ConnectionHandler {
+	return nbd.NewConn(a.handler, conn)
+}
+
+// Handler exposes the wired handler to the external test package, which needs
+// it to drive a connection without a listener.
+func (a *Adapter) Handler() *nbd.Handler { return a.handler }
+```
+
+Also add to `pkg/adapter/nbd/config.go` the accessor this step calls:
+
+```go
+// timeouts narrows the adapter's four configured durations to the three the
+// wire layer needs. Shutdown is deliberately not here: the base adapter owns
+// the drain deadline, and the handler's job during drain is to answer
+// ErrESHUTDOWN, not to run its own timer.
+func (c *Config) timeouts() nbd.Timeouts {
+	return nbd.Timeouts{Read: c.Timeouts.Read, Write: c.Timeouts.Write, Idle: c.Timeouts.Idle}
+}
+```
+
+Five things this shape gets right, and one it makes explicit:
+
+- **`NewConnection` returns a small per-connection wrapper, not the shared handler.** `adapter.ConnectionHandler.Serve` takes only a context (`pkg/adapter/base.go:38`), so the socket must be bound at construction — `return nbd.NewConn(a.handler, conn)`, the same shape as `pkg/adapter/smb/adapter.go:717`. The handler itself is shared and stateless; `Conn` carries nothing but the socket and the handler pointer, so there is no per-connection protocol state to leak.
+- **The resolver returns `*engine.Store` as `nbd.BlockStore` implicitly** — `common.ResolveForWrite` returns the concrete type, which satisfies the interface. No adapter.
+- **`Serve` builds the handler once, before the listener exists**, so a `nil` runtime or a bad config fails as a startup error rather than as a failed first connection.
+- **The bind gate runs first, before the runtime is consulted**, which is what `TestServe_RefusesRemoteBindEvenWithNoRuntime` in Task 3 pins. Keep that ordering when you move the body.
+- **`SetRuntime` panics on the wrong type**, matching the documented contract of `pkg/adapter/base.go:185` (*"must be a `*runtime.Runtime` or it panics"*) and the constructor-panics-on-invalid-config precedent at `pkg/adapter/smb/adapter.go:176`.
+- **`preAccept` stays `nil`** — there is nothing checkable at the TCP layer for a protocol that names its export inside the handshake.
+
+- [ ] **Step 7: Add `Degraded` to the healthcheck**
 
 Add a counter the connection path increments on a failed export resolution or block-store resolution, and have `Healthcheck` report `StatusDegraded` when it is nonzero since the last probe. Message: `"NBD adapter is serving but N export resolutions have failed"`. Keep the probe cheap — read the counter and reset it, no I/O.
 
@@ -1640,7 +1648,7 @@ func (a *Adapter) Healthcheck(ctx context.Context) health.Report {
 
 The `Disabled` branch and the final delegation are the same shape as `pkg/adapter/nfs/healthcheck.go`; only the `Degraded` branch is new, and it must come **before** the delegation because `BaseAdapter.Healthcheck` has no way to know about a counter it does not own. `TakeDegraded` is called on every probe, so the count is "since the last probe" — say so in the field's doc, because a reader will otherwise assume it is cumulative.
 
-- [ ] **Step 7: Write the integration test**
+- [ ] **Step 8: Write the integration test**
 
 Create `internal/adapter/nbd/integration_test.go`. This is the first test over a **real** `engine.Store`, and it is where the durability contract gets pinned.
 
@@ -1669,16 +1677,16 @@ func TestIntegration_ReadNeverWrittenRangeIsZeros(t *testing.T) {
 }
 ```
 
-- [ ] **Step 8: Run the tests and confirm they pass**
+- [ ] **Step 9: Run the tests and confirm they pass**
 
 Run: `go test ./internal/adapter/nbd/ -race -v`
 Expected: PASS.
 
-- [ ] **Step 9: Verify the bounds checks actually bite**
+- [ ] **Step 10: Verify the bounds checks actually bite**
 
 Comment out the overflow check in `handleRead`, run `go test ./internal/adapter/nbd/ -run TestConnection_OffsetPlusLengthOverflowIsEIO -v`, and confirm it fails on the assertion. Restore. Repeat for the exact-end check: change `>` to `>=` and confirm `TestConnection_ReadAtExactEndIsServed` fails.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add internal/adapter/nbd/ pkg/adapter/nbd/
