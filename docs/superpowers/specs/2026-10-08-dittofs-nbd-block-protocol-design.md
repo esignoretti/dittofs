@@ -149,6 +149,22 @@ pkg/adapter/nbd/               adapter lifecycle
 `volume.go` is the only file that talks to the runtime. This mirrors the existing
 `internal/adapter/smb/handlers/` vs `pkg/adapter/smb/` split.
 
+The wire layer's boundary is a small interface, not `*engine.Store`, for one reason:
+the dispatch tests must be able to drive failure modes the engine cannot be made to
+produce on demand (a read error, a flush that reports `Finalized: false`). The interface
+carries the four I/O methods (`ReadAt`, `WriteAt`, `PunchHole`, `Flush`) plus the three
+durability accessors (`LocalDurable`, `RemoteDurable`, `RequireDurableCommit`) that the
+shared commit rule reads. `*engine.Store` satisfies all seven unchanged.
+
+One consequence worth naming, because it is the seam where a shortcut would be tempting:
+`common.WriteToBlockStore` and `common.CommitBlockStore` take `*engine.Store` concretely.
+The commit rule is the one that **must** stay shared — it is the durability decision, and
+a second copy is how the NBD path drifts from NFS COMMIT and SMB Flush — so
+`CommitBlockStore`'s store parameter widens to an interface. The read and write helpers
+are not widened: the wire handlers call `ReadAt`/`WriteAt` directly on a
+deadline-wrapped context and route errors through one `mapError`, which reproduces the
+two lines those helpers add without forcing a third interface.
+
 ### 3.3 Control-plane registration
 
 Four touch points, each following an existing pattern:
@@ -273,15 +289,26 @@ The command flags below are honored only where advertised; see §4.2.
 | `NBD_CMD_READ` | 0 | `engine.Store.ReadAt(ctx, payloadID, buf, offset)` |
 | `NBD_CMD_WRITE` | 1 | `PrepareWrite` → `engine.Store.WriteAt` → `CommitWrite` |
 | `NBD_CMD_DISC` | 2 | Drain in-flight, close. **No reply** |
-| `NBD_CMD_FLUSH` | 3 | `common.CommitBlockStore(ctx, bs, payloadID)` |
+| `NBD_CMD_FLUSH` | 3 | `common.CommitBlockStore(ctx, bs, payloadID)` (parameter widened to an interface; see §3.2) |
 | `NBD_CMD_TRIM` | 4 | `engine.Store.PunchHole` |
-| `NBD_CMD_CACHE` | 5 | Not advertised → `NBD_ENOTSUP` (95) |
+| `NBD_CMD_CACHE` | 5 | Not advertised → `NBD_EINVAL` (22); see the note below |
 | `NBD_CMD_WRITE_ZEROES` | 6 | `engine.Store.PunchHole` |
 | `NBD_CMD_BLOCK_STATUS` | 7 | Phase 4 only |
 
-Command flags: `NBD_CMD_FLAG_FUA` (bit 0) is honored on `WRITE`, `WRITE_ZEROES`, and
-`TRIM`. `NO_HOLE` (1), `DF` (2), `REQ_ONE` (3), `FAST_ZERO` (4) are not advertised; a
-command carrying one returns `NBD_ENOTSUP`.
+Command flags: `NBD_CMD_FLAG_FUA` (bit 0) is valid on **all** commands once
+`NBD_FLAG_SEND_FUA` is advertised — the spec: *"the server MUST accept all commands with
+this bit set (even by ignoring the bit)"*, and *"existing clients are known to set this
+bit on other commands"*. So a `READ` carrying FUA is accepted and the bit is ignored (a
+read writes nothing, so there is nothing to persist); it is **not** an error.
+
+`NO_HOLE` (1) is the opposite case: the spec says *"The server MUST support the use of
+this flag if it advertises `NBD_FLAG_SEND_WRITE_ZEROES`"*, and we do advertise that. So
+`NO_HOLE` on `WRITE_ZEROES` is accepted and honored — it is the client asking that the
+range be genuinely allocated rather than left sparse. `DF` (2), `REQ_ONE` (3), and
+`FAST_ZERO` (4) are not advertised and cannot appear: a request carrying one is a client
+bug, and because `DF`/`REQ_ONE` are documented as applicable only to commands we do not
+advertise, `NBD_EINVAL` is the answer (`NBD_ENOTSUP` is reserved by the spec for
+`FAST_ZERO`).
 
 #### READ
 
@@ -307,11 +334,18 @@ Reuses the three-step sequence the NFS and SMB handlers already use —
 `internal/adapter/nfs/v4/handlers/write.go:63` documents it as *"Delegates to
 MetadataService.PrepareWrite+CommitWrite and BlockStore.WriteAt."*
 
-Bounds-check **before touching anything**: `offset + length > exportSize` → `NBD_EINVAL`
-(22). The spec: *"the client MUST NOT use a length which, when added to offset, would
-exceed the export size. The server SHOULD report an NBD_EINVAL error if the client's
-request is not aligned to advertised minimum block size boundaries or would exceed the
-export size."*
+Bounds-check **before touching anything**: `offset + length > exportSize` → `NBD_ENOSPC`
+(28), **not** `NBD_EINVAL`. The spec: *"The server SHOULD return `NBD_ENOSPC` if it
+receives a write request including one or more sectors beyond the size of the device.
+... It SHOULD return `NBD_EINVAL` if it receives a read or trim request including one or
+more sectors beyond the size of the device."* The distinction is deliberate — a write
+past the end means the client's view of the device is too large, which is a space
+problem; a read or trim past the end is a malformed request.
+
+Note this makes the check an *error*, not a growth: the export size is fixed at creation
+(§4.4), so a `WRITE` past the end is refused rather than extending the file. The client's
+own constraint is the stronger one: *"the client MUST NOT use a length which, when added
+to offset, would exceed the export size."*
 
 #### FLUSH
 
@@ -397,25 +431,50 @@ bottleneck. For a boot disk backed by a local journal, it very likely will not b
 
 | Condition | NBD error |
 |---|---|
-| Out of range, misaligned, unknown command, unknown flag | `NBD_EINVAL` (22) |
-| Known-but-unadvertised command or flag | `NBD_ENOTSUP` (95) |
+| Misaligned, unknown command, unknown or inapplicable flag | `NBD_EINVAL` (22) |
+| Zero-length `READ`, `WRITE`, `TRIM`, or `WRITE_ZEROES` | `NBD_EINVAL` (22) |
+| `READ` or `TRIM` beyond the export size | `NBD_EINVAL` (22) |
+| `WRITE` beyond the export size | `NBD_ENOSPC` (28) |
 | Read unservable honestly (cold after hydrate, integrity failure) | `NBD_EIO` (5) |
 | `ErrNotDurableYet` from a FLUSH or FUA | `NBD_EIO` (5) |
-| `offset + length` wraps | `NBD_EOVERFLOW` (75) |
+| `offset + length` wraps | `NBD_EIO` (5) |
 | Quota exhausted | `NBD_ENOSPC` (28) |
 | Write to a read-only share | `NBD_EPERM` (1) |
 | Shutdown in progress | `NBD_ESHUTDOWN` (108) |
 | `engine.ErrStoreClosed` otherwise | `NBD_EIO` (5) |
+
+Three entries here are narrower than they first look, and each is deliberate:
+
+- **`NBD_EOVERFLOW` is not in the table.** The spec: *"The server SHOULD NOT return
+  `NBD_EOVERFLOW` except as documented in response to `NBD_CMD_READ` when
+  `NBD_CMD_FLAG_DF` is supported, or when a command without payload requests a length
+  larger than an advertised maximum payload length."* We support neither case, so an
+  overflowing `offset + length` — reachable, since both fields are client-supplied — is
+  `NBD_EIO`. It is not a range error the client can act on; it is a request that cannot
+  be interpreted at all.
+- **`NBD_ENOTSUP` is not in the table either.** The spec: *"The server SHOULD NOT return
+  `NBD_ENOTSUP` except as documented in response to `NBD_CMD_WRITE_ZEROES` when
+  `NBD_CMD_FLAG_FAST_ZERO` is supported."* We do not advertise `SEND_FAST_ZERO`, so a
+  command we do not implement is `NBD_EINVAL` — the value the spec names twice
+  (*"The server SHOULD return `NBD_EINVAL` if it receives an unknown command"*, and the
+  same for an unknown flag).
+- **`NBD_ESHUTDOWN` is used deliberately.** It is the protocol's way of saying
+  "reconnect", which is exactly the signal the kernel's dead-connection timeout is
+  waiting for (§6.2). A graceful DittoFS restart should answer new commands with
+  `NBD_ESHUTDOWN` during drain, so the client pauses instead of erroring the device.
 
 `ClassifyBlockStoreError` (`internal/adapter/common/errclassify.go:31`) already maps
 `engine.ErrStoreClosed` → `merrs.ErrStaleHandle` and everything else → `merrs.ErrIOError`;
 the NBD mapping layers protocol values on top of that classification rather than
 duplicating it.
 
-**`NBD_ESHUTDOWN` is used deliberately.** It is the protocol's way of saying "reconnect",
-which is exactly the signal the kernel's dead-connection timeout is waiting for (§6.2). A
-graceful DittoFS restart should answer new commands with `NBD_ESHUTDOWN` during drain, so
-the client pauses instead of erroring the device.
+The zero-length row is worth stating because the spec declines to: for all four commands
+it says only *"the client SHOULD NOT request a [read/write/trim/write zeroes] length of 0;
+the behavior of a server on such a request is unspecified although the server SHOULD NOT
+disconnect."* One uniform answer — `NBD_EINVAL` — is chosen over a per-command table
+because no correct client sends a zero-length block request, the spec leaves the choice
+open, and a rule nobody has to remember is a rule nobody gets wrong. The connection
+stays usable, which is the one part the spec does require.
 
 ### 4.7 Identity
 
@@ -629,11 +688,20 @@ Table-driven byte fixtures: handshake option sequences, header encode/decode, er
 replies, and the flag-negotiation matrix.
 
 The valuable cases are the negative ones:
-- `WRITE_ZEROES` sent when it was not advertised → `NBD_ENOTSUP`
+- `WRITE_ZEROES` sent when it was not advertised → `NBD_EINVAL`
 - `TRIM` on a read-only export → `NBD_EPERM`
-- `offset + length` overflowing → `NBD_EOVERFLOW`
+- `offset + length` overflowing → `NBD_EIO`
 - `GO` for an unknown export → `NBD_REP_ERR_UNKNOWN`
-- a command carrying an unadvertised flag → `NBD_ENOTSUP`
+- an unknown command, or a flag not documented as applicable to that command → `NBD_EINVAL`
+- a zero-length `READ`, `WRITE`, `TRIM`, or `WRITE_ZEROES` → `NBD_EINVAL`, with the
+  connection still usable afterwards
+- `NBD_CMD_FLAG_FUA` on a `READ` → accepted, bit ignored (*"the server MUST accept all
+  commands with this bit set (even by ignoring the bit)"*), where refusing it would break
+  real clients
+- `NBD_CMD_FLAG_NO_HOLE` on a `WRITE_ZEROES` → accepted, because *"The server MUST support
+  the use of this flag if it advertises `NBD_FLAG_SEND_WRITE_ZEROES`"*
+- a rejected `WRITE` whose payload is still in flight → the payload is drained and a
+  following command on the same connection succeeds (the desync case)
 - `STARTTLS` → `NBD_REP_ERR_UNSUP` (and the connection is not left in a half-negotiated
   state)
 
@@ -738,7 +806,7 @@ qemu-system-aarch64 -M virt -cpu host -m 2G \
 |---|---|---|
 | 0 | Codec + handshake, no storage | `qemu-img info` negotiates and reports the right size; `nbdinfo` sees the advertised flags |
 | 1 | READ + WRITE + FLUSH over a real share | `mkfs.ext4` on `/dev/nbd0` in a guest, mount, write files, `sync`, unmount, remount |
-| 2 | TRIM, WRITE_ZEROES, FUA, read-only shares, bind gate | `fstrim` returns freed space; read-only export rejects writes with `NBD_EPERM`; non-loopback bind without opt-in refuses to start |
+| 2 | TRIM, WRITE_ZEROES, FUA, read-only shares, bind gate | `fstrim` returns freed space; read-only export rejects writes with `NBD_EPERM`; non-loopback bind without opt-in refuses to start (including an empty `BindAddress`) |
 | 3 | Crash harness | SIGKILL mid-write → restart → guest I/O resumes inside the dead-conn window; host-side fsck clean |
 | 4 | `BLOCK_STATUS` + `base:allocation` + structured replies | `qemu-img map` matches `DataExtents`; a lost range reports as data, not hole |
 
@@ -784,11 +852,16 @@ For the implementation, in the order the checks become meaningful:
 - [ ] `go build ./...` and `make test-unit` clean
 - [ ] `qemu-img info nbd://host:10809/vol` reports the created size
 - [ ] `nbdinfo --has structured-reply` false in v1; advertised flags match §4.2 exactly
-- [ ] A `WRITE_ZEROES` sent without advertisement is refused with `NBD_ENOTSUP`
+- [ ] A `WRITE_ZEROES` sent without advertisement is refused with `NBD_EINVAL`
 - [ ] FLUSH with `requireDurable` and an unhealthy remote returns `NBD_EIO`
 - [ ] FLUSH with `CommitAck: journal` and an fs local store returns success
 - [ ] `mkfs.ext4` + mount + write + `sync` + unmount + remount in a KVM guest
 - [ ] SIGKILL mid-write → restart → guest I/O resumes; host-side fsck clean
-- [ ] Non-loopback bind without `allow_remote_bind` refuses to start
+- [ ] Non-loopback bind without `allow_remote_bind` refuses to start, including an empty `BindAddress`
+- [ ] A `READ` carrying `NBD_CMD_FLAG_FUA` is served, not refused
+- [ ] A rejected `WRITE` with its payload still in flight leaves the connection synchronized
+- [ ] A zero-length `READ`, `WRITE`, `TRIM`, or `WRITE_ZEROES` returns `NBD_EINVAL` and the connection stays usable
+- [ ] A `WRITE` past the export end returns `NBD_ENOSPC`; `READ`/`TRIM` past the end return `NBD_EINVAL`
+- [ ] `nbdinfo --map` is unavailable in v1 by design (no structured replies, no `BLOCK_STATUS`)
 - [ ] The volume is readable as a plain file over NFS (the B1 property)
 - [ ] `docs/guide/cli.md` regenerated; `test/required-tests.sh` unaffected
