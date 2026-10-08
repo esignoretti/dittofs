@@ -1154,7 +1154,15 @@ func serveWithRuntime(t *testing.T, cfg nbd.Config) (*nbd.Adapter, chan error) {
 }
 
 func TestServe_AllowsLoopbackBind(t *testing.T) {
-	for _, bind := range []string{"127.0.0.1", "::1", "localhost"} {
+	// "::1" is deliberately absent and "[::1]" stands in for it. BaseAdapter
+	// builds its listen address as fmt.Sprintf("%s:%d", BindAddress, Port)
+	// (pkg/adapter/base.go:216), so a BARE IPv6 literal yields "::1:0" and
+	// net.Listen rejects it with "too many colons in address"; the bracketed
+	// form is what binds. That is a property of the shared base adapter, not
+	// something this task changes, so the test does not assert a capability the
+	// code lacks. Both spellings pass netutil.IsNonLoopbackHost as loopback, so
+	// the gate admits either — only the listen address differs.
+	for _, bind := range []string{"127.0.0.1", "[::1]", "localhost"} {
 		t.Run(bind, func(t *testing.T) {
 			cfg := minimalConfig()
 			cfg.BindAddress = bind
@@ -1167,8 +1175,13 @@ func TestServe_AllowsLoopbackBind(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("listener was never ready")
 			}
-			if a.Port() == 0 {
-				t.Fatal("Port() is 0 after ListenerReady; the adapter did not publish the bound port")
+			// GetListenerAddr, not Port. Port() returns the CONFIGURED port
+			// (pkg/adapter/base.go:598 is "return b.Config.Port") and nothing ever
+			// writes the bound port back into Config, so Port() is legitimately 0
+			// whenever the test asked for an ephemeral one. GetListenerAddr reports
+			// the socket's real address, and it blocks on listenerReady too.
+			if a.GetListenerAddr() == "" {
+				t.Fatal("GetListenerAddr is empty after ListenerReady; the adapter did not bind a listener")
 			}
 		})
 	}
@@ -1216,7 +1229,9 @@ func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
 		t.Fatal("listener was never ready")
 	}
 
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(a.Port()))
+	// Dial the socket's real address rather than the configured port: this test
+	// asks for an ephemeral port, and Port() reports the configured value.
+	addr := a.GetListenerAddr()
 	for range 3 {
 		conn, err := net.Dial("tcp", addr)
 		if err != nil {
@@ -1247,7 +1262,7 @@ func TestControlPlane_DefaultPortKnowsNBD(t *testing.T) {
 }
 ```
 
-Add the missing imports (`io`, `strconv`) at the top.
+Add the missing import (`io`) at the top.
 
 - [ ] **Step 2: Run it and confirm it fails**
 
