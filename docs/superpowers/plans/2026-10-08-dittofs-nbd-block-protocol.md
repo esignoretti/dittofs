@@ -1764,6 +1764,8 @@ func newIntegrationFixture(t *testing.T) (*runtime.Runtime, string, *engine.Stor
 
 Use `testruntime.NewWithShareStore(t)` (`internal/adapter/testruntime/runtime.go:53`), register a metadata store, `AddShare` with `BlockStoreID`, create `volumes/boot`, set its size, and return the runtime, the export name, and `rt.GetBlockStoreForShare(share)`. The journal root comes from `testruntime.New`, so the local tier is an fs store — which is what makes `LocalDurable()` true and the FLUSH assertions below meaningful.
 
+**The fixture must pass `Enabled: true` in its `ShareConfig`.** `AddShare` copies the flag verbatim (`pkg/controlplane/runtime/shares/lifecycle.go:548`) and nothing defaults it, so a share built without it is disabled — and the exporter now refuses to resolve a disabled share (`internal/adapter/nbd/volume.go`). Every handler test in this task resolves its export through that gate, so omitting the field fails the whole task with a mystery `ErrUnknownExport` that names nothing about the real cause. Production is unaffected: the DB column defaults true (`pkg/controlplane/models/share.go:41`, `gorm:"default:true"`) and `init.go:314` propagates it, so this is a fixture-only trap.
+
 ```go
 func TestIntegration_ReadAfterWriteOverRealStore(t *testing.T) {
 	// 64 KiB of deterministic non-zero bytes written through the handler's
