@@ -374,6 +374,12 @@ func (m *RemoteSync) readChunkVerified(ctx context.Context, loc block.ChunkLocat
 // its own S3 GET. That shared budget is what keeps total remote concurrency
 // bounded when the readahead window overlaps demand.
 func (m *RemoteSync) fetchBlock(ctx context.Context, payloadID string, blockIdx uint64) error {
+	release, err := m.admission.enter(ctx, payloadID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	if !m.canProcess(ctx) {
 		return ErrClosed
 	}
