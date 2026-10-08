@@ -51,7 +51,7 @@ func pipe(t *testing.T) (server, client net.Conn) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	type accepted struct {
 		conn net.Conn
@@ -72,8 +72,8 @@ func pipe(t *testing.T) (server, client net.Conn) {
 		t.Fatalf("accept: %v", a.err)
 	}
 	t.Cleanup(func() {
-		client.Close()
-		a.conn.Close()
+		_ = client.Close()
+		_ = a.conn.Close()
 	})
 	return a.conn, client
 }
@@ -150,7 +150,7 @@ func TestHandshake_GreetingAdvertisesFixedNewstyle(t *testing.T) {
 		t.Fatalf("handshake flags %#x do not set NBD_FLAG_FIXED_NEWSTYLE (bit 0)", flags)
 	}
 	// The server must not proceed before reading client flags.
-	client.Close()
+	_ = client.Close()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
