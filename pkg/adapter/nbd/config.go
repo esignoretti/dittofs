@@ -126,12 +126,12 @@ func (c *Config) applyDefaults() {
 }
 
 // validate reports whether the configuration describes an adapter that can be
-// built. It runs after applyDefaults, so a zero port here is one the operator
-// asked for explicitly rather than an omitted field.
+// built. It has exactly one caller, New, which runs applyDefaults immediately
+// before it, so a port here is always in range or too large: applyDefaults
+// rewrites anything <= 0 to DefaultPort, which makes a negative port
+// unreachable rather than merely unlikely.
 func (c *Config) validate() error {
-	// Port 0 is valid: it asks the OS for an ephemeral port, which is what the
-	// lifecycle tests use.
-	if c.Port < 0 || c.Port > 65535 {
+	if c.Port > 65535 {
 		return fmt.Errorf("invalid port %d: must be 0-65535", c.Port)
 	}
 	return nil

@@ -74,8 +74,30 @@ func TestServe_RefusesRemoteBindEvenWithNoRuntime(t *testing.T) {
 	}
 }
 
+// freePort asks the kernel for an unused port and releases it, so a listener
+// test binds somewhere real instead of colliding on DefaultPort. Port 0 cannot
+// be used for this: applyDefaults rewrites it to DefaultPort before the
+// listener is created (config.go:102).
+//
+// No t.Parallel in this file, so there is no window between releasing the port
+// and the test rebinding it.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
 // Serve needs a runtime once it gets past the gate, so the listener tests use
 // the real fixture. This also exercises SetRuntime, which nothing else does.
+//
+// The returned done channel carries Serve's result for the test body to read.
+// Cleanup waits on a separate served channel rather than on done, so a test
+// that already consumed the result does not leave cleanup blocking for its
+// full timeout and then reporting a second, bogus error for the same cause.
 func serveWithRuntime(t *testing.T, cfg nbd.Config) (*nbd.Adapter, chan error) {
 	t.Helper()
 	rt, _ := testruntime.NewWithShareStore(t)
@@ -83,11 +105,15 @@ func serveWithRuntime(t *testing.T, cfg nbd.Config) (*nbd.Adapter, chan error) {
 	a.SetRuntime(rt)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- a.Serve(ctx) }()
+	served := make(chan struct{})
+	go func() {
+		done <- a.Serve(ctx)
+		close(served)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-done:
+		case <-served:
 		case <-time.After(5 * time.Second):
 			t.Error("Serve did not return after context cancellation")
 		}
@@ -108,7 +134,7 @@ func TestServe_AllowsLoopbackBind(t *testing.T) {
 		t.Run(bind, func(t *testing.T) {
 			cfg := minimalConfig()
 			cfg.BindAddress = bind
-			cfg.Port = 0 // ephemeral: the test must not need a fixed free port
+			cfg.Port = freePort(t)
 			a, done := serveWithRuntime(t, cfg)
 			select {
 			case <-a.ListenerReady():
@@ -118,10 +144,10 @@ func TestServe_AllowsLoopbackBind(t *testing.T) {
 				t.Fatal("listener was never ready")
 			}
 			// GetListenerAddr, not Port. Port() returns the CONFIGURED port
-			// (pkg/adapter/base.go:598 is "return b.Config.Port") and nothing ever
-			// writes the bound port back into Config, so Port() is legitimately 0
-			// whenever the test asked for an ephemeral one. GetListenerAddr reports
-			// the socket's real address, and it blocks on listenerReady too.
+			// (pkg/adapter/base.go:598 is "return b.Config.Port"), and the
+			// configured port is what the test asked for, so it says nothing about
+			// whether a socket came up. GetListenerAddr reports the socket's real
+			// address, and it blocks on listenerReady too.
 			if a.GetListenerAddr() == "" {
 				t.Fatal("GetListenerAddr is empty after ListenerReady; the adapter did not bind a listener")
 			}
@@ -133,7 +159,7 @@ func TestServe_AllowsNonLoopbackWithOptIn(t *testing.T) {
 	cfg := minimalConfig()
 	cfg.BindAddress = "0.0.0.0"
 	cfg.AllowRemoteBind = true
-	cfg.Port = 0
+	cfg.Port = freePort(t)
 	a, done := serveWithRuntime(t, cfg)
 	select {
 	case <-a.ListenerReady():
@@ -163,7 +189,7 @@ func TestStop_IsIdempotent(t *testing.T) {
 // the shared helper keeps every listener test on one construction path.
 func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
 	cfg := minimalConfig()
-	cfg.Port = 0
+	cfg.Port = freePort(t)
 	a, done := serveWithRuntime(t, cfg)
 	select {
 	case <-a.ListenerReady():
@@ -171,8 +197,9 @@ func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
 		t.Fatal("listener was never ready")
 	}
 
-	// Dial the socket's real address rather than the configured port: this test
-	// asks for an ephemeral port, and Port() reports the configured value.
+	// Dial the socket's real address rather than the configured port: the
+	// configured port is a hint the test handed to the adapter, and the address
+	// the socket actually got is what a client has to dial.
 	addr := a.GetListenerAddr()
 	for range 3 {
 		conn, err := net.Dial("tcp", addr)
