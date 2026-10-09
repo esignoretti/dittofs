@@ -14,7 +14,7 @@ import (
 
 // The block store was closed under an in-flight op (share removed/hot-reloaded
 // mid-transfer): the reply must draw NFS4ERR_STALE via the payload choke
-// point's normalization (normalizeBlockStoreError in internal/adapter/common),
+// point's normalization (NormalizeBlockStoreError in internal/adapter/common),
 // not the literal NFS4ERR_IO the handlers used to return. Each test
 // closes the per-share store after setup, then drives the handler and asserts
 // the wire status.

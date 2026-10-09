@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
+	"sync/atomic"
 
+	"github.com/marmos91/dittofs/internal/adapter/common"
+	nbd "github.com/marmos91/dittofs/internal/adapter/nbd"
 	"github.com/marmos91/dittofs/pkg/adapter"
 	"github.com/marmos91/dittofs/pkg/controlplane/runtime"
 	"github.com/marmos91/dittofs/pkg/netutil"
@@ -31,6 +33,16 @@ type Adapter struct {
 	// shares. Set by SetRuntime before Serve, which refuses to start without
 	// it.
 	runtime *runtime.Runtime
+
+	// handler is built once in Serve, before the listener exists, and read by
+	// NewConnection and Healthcheck — both of which run on other goroutines.
+	// An atomic pointer, not a plain field: Serve runs in its own goroutine
+	// (pkg/controlplane/runtime/adapters/service.go:611) while Healthcheck is
+	// reached from an HTTP handler
+	// (internal/controlplane/api/handlers/adapters.go:240) via
+	// Runtime.AdapterChecker, so a plain field is a data race the race detector
+	// reports on any probe that lands during startup.
+	handler atomic.Pointer[nbd.Handler]
 }
 
 // New returns an adapter for config with the defaults applied.
@@ -100,6 +112,31 @@ func (a *Adapter) Serve(ctx context.Context) error {
 		return errors.New("nbd: SetRuntime was not called before Serve")
 	}
 
+	// The wire handler is built once, before the listener exists, so a bad
+	// configuration fails as a startup error rather than as a failed first
+	// connection.
+	id := nbd.Identity{UID: a.config.UID, GID: a.config.GID}
+	exporter := nbd.NewRuntimeExporter(a.runtime, id)
+	// The store resolver wraps common.ResolveForWrite rather than reimplementing
+	// resolution, so the wire layer holds a function and never the runtime. It
+	// returns *engine.Store as nbd.BlockStore implicitly.
+	resolver := func(ctx context.Context, exp *nbd.Export) (nbd.BlockStore, error) {
+		return common.ResolveForWrite(ctx, a.runtime, exp.Handle)
+	}
+	// draining reads the base adapter's shutdown signal rather than keeping a
+	// flag of its own, so the two can never disagree. Shutdown is a promoted
+	// field on the embedded base adapter, so the selector is redundant.
+	draining := func() bool {
+		select {
+		case <-a.Shutdown:
+			return true
+		default:
+			return false
+		}
+	}
+	a.handler.Store(nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
+		id, a.config.timeouts(), draining))
+
 	return a.ServeWithFactory(ctx, a, nil, nil)
 }
 
@@ -113,41 +150,11 @@ func (a *Adapter) Stop(ctx context.Context) error {
 
 // NewConnection returns the handler for one accepted TCP connection. It
 // implements [adapter.ConnectionFactory].
+//
+// The socket is bound here rather than on the shared handler because
+// [adapter.ConnectionHandler.Serve] takes only a context; the handler itself is
+// shared and stateless, so the wrapper carries nothing but the socket and the
+// handler pointer.
 func (a *Adapter) NewConnection(conn net.Conn) adapter.ConnectionHandler {
-	return &nbdConn{conn: conn}
-}
-
-// nbdGreeting is the 18-byte server greeting: the NBDMAGIC and IHAVEOPT magics
-// followed by the handshake flag word (fixed-newstyle | no-zeroes).
-//
-// The wire layer writes the same bytes in its own writeGreeting, which is
-// unexported; a placeholder is not a reason to widen that package's API, so
-// the bytes are restated here and go away with the placeholder.
-var nbdGreeting = []byte{
-	'N', 'B', 'D', 'M', 'A', 'G', 'I', 'C',
-	'I', 'H', 'A', 'V', 'E', 'O', 'P', 'T',
-	0x00, 0x03,
-}
-
-// nbdConn is a placeholder connection handler: it greets the client, drains
-// whatever the client sends, and closes. It serves no commands.
-//
-// decision: this exists only so the adapter lifecycle is exercisable end to
-// end before the wire layer is wired in — the accept path, the per-connection
-// goroutine, and the shutdown drain are all shared with the real handler, and
-// the real handler replaces this type without changing any of them.
-type nbdConn struct {
-	conn net.Conn
-}
-
-// Serve greets the client and then waits for it to hang up. The base adapter
-// interrupts the blocking read on shutdown, so the drain does not outlive the
-// adapter.
-func (c *nbdConn) Serve(_ context.Context) {
-	defer func() { _ = c.conn.Close() }()
-
-	if _, err := c.conn.Write(nbdGreeting); err != nil {
-		return
-	}
-	_, _ = io.Copy(io.Discard, c.conn)
+	return nbd.NewConn(a.handler.Load(), conn)
 }

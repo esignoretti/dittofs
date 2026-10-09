@@ -26,7 +26,7 @@
 // / StatusForErr — the single source of truth per protocol, with a full
 // enum-walk test per package. The SMB LOCK path uses StatusForLock /
 // StatusForLockErr (lock-vs-general divergence, MS-SMB2 3.3.5.14).
-// Block-store errors are classified here: normalizeBlockStoreError wraps
+// Block-store errors are classified here: NormalizeBlockStoreError wraps
 // every error leaving ReadFromBlockStore / WriteToBlockStore /
 // CommitBlockStore as a *merrs.StoreError (stale-handle for a closed
 // store, I/O for everything else, original preserved as Cause), and

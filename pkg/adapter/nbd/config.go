@@ -3,6 +3,8 @@ package nbd
 import (
 	"fmt"
 	"time"
+
+	nbd "github.com/marmos91/dittofs/internal/adapter/nbd"
 )
 
 // DefaultPort is the port the NBD adapter binds when none is configured. It is
@@ -135,4 +137,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("invalid port %d: must be 0-65535", c.Port)
 	}
 	return nil
+}
+
+// timeouts narrows the adapter's four configured durations to the three the
+// wire layer needs. Shutdown is deliberately not here: the base adapter owns
+// the drain deadline, and the handler's job during drain is to answer
+// ErrESHUTDOWN, not to run its own timer.
+func (c *Config) timeouts() nbd.Timeouts {
+	return nbd.Timeouts{Read: c.Timeouts.Read, Write: c.Timeouts.Write, Idle: c.Timeouts.Idle}
 }

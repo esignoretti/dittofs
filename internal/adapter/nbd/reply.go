@@ -36,12 +36,6 @@ func writeOptionError(w io.Writer, opt Option, typ OptionReplyType) error {
 
 // writeSimpleReply writes a transmission-phase reply header with no payload,
 // which is how every command except READ and BLOCK_STATUS answers.
-//
-// The transmission phase is where the first caller lives; this is declared here
-// because the reply helpers belong together, not because the handshake sends
-// one.
-//
-//nolint:unused // first caller is the transmission-phase dispatcher
 func writeSimpleReply(w io.Writer, cookie uint64, nbdErr NBDError) error {
 	r := &Reply{Magic: simpleReplyMagic, Error: nbdErr, Cookie: cookie}
 	return r.Encode(w)
