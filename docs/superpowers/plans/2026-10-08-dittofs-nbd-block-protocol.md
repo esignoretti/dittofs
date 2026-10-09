@@ -1320,20 +1320,32 @@ and add `createNBDAdapter`, modelled on `createSMBAdapter` at `:950`: resolve `p
 Run: `go test ./pkg/adapter/nbd/ ./pkg/controlplane/models/ ./cmd/... -v`
 Expected: PASS.
 
-- [ ] **Step 8: Regenerate the CLI docs**
+- [ ] **Step 8: Check whether the CLI docs need regenerating**
 
-Run: `go run ./cmd/dfs docs --output docs/guide/cli.md` (check the exact invocation in CLAUDE.md's "Frequent commands" before running).
-Expected: `docs/guide/cli.md` updated; `git diff --stat` shows it.
+The generator is `go run ./cmd/gendocs` (`CLAUDE.md:96`: *"`docs/guide/cli.md` is generated from the Cobra command trees by `cmd/gendocs`. Never hand-edit it"*). There is no `dfs docs` subcommand.
+
+**This task changes no CLI surface, so expect no diff.** Its changes to `cmd/dfs/commands/start.go` add `createNBDAdapter` and a `case "nbd":` arm — adapter construction, not a command or flag. Confirm that before concluding anything:
+
+```bash
+git diff cmd/dfs/commands/start.go | grep -E '^\+.*(cobra|Flags\(\)|Command\{|Use:)'
+```
+
+No output means no command definition or flag changed, so `docs/guide/cli.md` is legitimately unchanged and **you must not stage it or manufacture a diff**. If that grep *does* print something, run `go run ./cmd/gendocs` and stage the result.
 
 - [ ] **Step 9: Run the full unit suite and build**
 
 Run: `go build ./... && make test-unit`
-Expected: both clean. `make test-unit` is `go test -race ./...` — the lifecycle tests must be race-clean.
+
+`make test-unit` is `go test -race ./...` and takes ~16 minutes on this machine. Expect five `panic: test timed out after 10m0s` failures — `internal/adapter/nfs/v3/handlers`, `internal/adapter/smb/handlers`, `pkg/block/chunker`, `pkg/block/engine`, `pkg/block/middleware/encryption` — which are **environmental, not regressions**: concurrent per-package SQLite `AutoMigrate` (`pkg/controlplane/store/gorm.go:433`) and `blake3.CompressEigentree` under `-race` starve each other past the deadline. Verified by running the same packages on the base commit with `-p 1`: `pkg/block/engine` still times out unmodified, and `pkg/block/middleware/encryption` passes serially in 198s. None of the five imports anything this task changed.
+
+The honest evidence for this task is the scoped run: `go test -race ./pkg/adapter/nbd/... ./pkg/controlplane/models/... ./cmd/...`. Do not run the full `./...` twice to re-confirm an environmental result. Note there is no `timeout(1)` on this machine — use `go test -timeout 240s` for a bound.
+
+`go build ./...` must be clean, and the lifecycle tests must be race-clean in the scoped run.
 
 - [ ] **Step 10: Commit**
 
 ```bash
-git add pkg/adapter/nbd/ pkg/controlplane/models/adapter.go cmd/dfs/commands/start.go docs/guide/cli.md
+git add pkg/adapter/nbd/ pkg/controlplane/models/adapter.go cmd/dfs/commands/start.go
 git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "feat(nbd): adapter lifecycle, control-plane registration, bind gate"
 ```
 
