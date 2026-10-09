@@ -72,6 +72,8 @@ Inputs and conditions the spec implies but whose tests no single task obviously 
 4. **A known command carrying a flag it does not accept.** `NBD_CMD_FLAG_NO_HOLE` on `WRITE` (it is documented only for `WRITE_ZEROES`), or `DF`/`REQ_ONE`/`FAST_ZERO` on anything. A reasonable person expects a refusal, because silently ignoring a flag means reporting success for a guarantee that was never provided — the same failure shape as `SEND_FLUSH` unadvertised-but-implied. Note the two exceptions the spec forces: `FUA` is valid on *every* command once `SEND_FUA` is advertised (*"the server MUST accept all commands with this bit set (even by ignoring the bit)"*), and `NO_HOLE` **must** be supported on `WRITE_ZEROES` because we advertise `SEND_WRITE_ZEROES`.
 5. **A connection that sends a partial header and stalls.** A reasonable person expects the connection to be closed once `Timeouts.Read` elapses, with no unbounded buffer growth in the meantime.
 6. **A rejected `WRITE` whose payload is still in flight.** The client always sends `length` bytes after a `WRITE` header — the spec states it unconditionally, with no exemption for requests the server intends to refuse. A reasonable person expects a rejected write to leave the connection usable; the failure mode is that the unconsumed payload is parsed as the next request header, and the client sees a protocol error on some later, unrelated command. Highest-value item in the list because the symptom is remote from the cause. The drain must use `io.CopyN(io.Discard, ...)`, never `make([]byte, length)`, or a declared 4 GiB length becomes a 4 GiB allocation.
+7. **A panic inside a connection handler.** The base adapter's accept loop has no `recover` (`grep -rn "recover()" pkg/adapter/base.go` returns nothing) and it invokes the handler on a bare goroutine (`pkg/adapter/base.go:373`), so an unrecovered panic does not kill the connection — it kills the process, taking every NFS and SMB connection with it. A reasonable person expects a malformed request from one client to cost that client's connection and nothing else, and both sibling adapters recover for exactly this reason: NFS at `pkg/adapter/nfs/connection.go:420` (deferred at `:111`), SMB at `pkg/adapter/smb/connection.go:474`. Pinned by `TestConn_PanicInHandlerDoesNotKillTheProcess` in Task 4.
+8. **A store resolution that fails after the handshake succeeded.** The export is resolved during the handshake, but the block store is resolved *after* it (Task 4 Step 3, items 1 and 2), so a share removed, disabled, or reloaded in between leaves a connection whose export is valid and whose store is gone. A reasonable person expects the connection to end rather than to serve reads from a nil store, and expects the operator to be able to see that it happened — which is what the `Degraded` counter is for. Pinned by `TestConnection_FailedStoreResolutionDegradesAndCounts` in Task 4.
 
 ---
 
@@ -1313,7 +1315,7 @@ Mirror `pkg/adapter/smb/config.go:63` and its `applyDefaults` at `:311`. Default
 2. `if a.runtime == nil { return errors.New("nbd: SetRuntime was not called before Serve") }`.
 3. `return a.ServeWithFactory(ctx, a, nil, nil)`.
 
-`NewConnection(conn net.Conn) adapter.ConnectionHandler` returns a minimal per-connection type implementing `Serve(ctx context.Context)` that reads the greeting and closes, so the lifecycle tests pass. It exists because `adapter.ConnectionHandler.Serve` takes only a context (`pkg/adapter/base.go:38`), so the socket has to be bound at construction. **Task 4's Step 6 replaces this stub** with `return nbd.NewConn(a.handler, conn)`, the same shape as `pkg/adapter/smb/adapter.go:717`. (Task 4 lists `pkg/adapter/nbd/adapter.go` under Modify for exactly this reason.)
+`NewConnection(conn net.Conn) adapter.ConnectionHandler` returns a minimal per-connection type implementing `Serve(ctx context.Context)` that reads the greeting and closes, so the lifecycle tests pass. It exists because `adapter.ConnectionHandler.Serve` takes only a context (`pkg/adapter/base.go:38`), so the socket has to be bound at construction. **Task 4's Step 6 replaces this stub** with `return nbd.NewConn(a.handler.Load(), conn)`, the same shape as `pkg/adapter/smb/adapter.go:717`. (Task 4 lists `pkg/adapter/nbd/adapter.go` under Modify for exactly this reason.)
 
 `Stop` delegates to `a.BaseAdapter.Stop(ctx)`.
 
@@ -1384,7 +1386,7 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 
 **Files:**
 - Create: `internal/adapter/nbd/connection.go`, `internal/adapter/nbd/handlers_read.go`
-- Modify: `internal/adapter/common/write_payload.go` (`CommitBlockStore` parameter widened to the new `Committer` interface — a type-only change, no behaviour change; every existing call site passes `*engine.Store` and keeps compiling), `internal/adapter/common/normalize.go` (`normalizeBlockStoreError` exported as `NormalizeBlockStoreError`), `internal/adapter/common/{doc.go,read_payload.go,write_payload.go}`, `internal/adapter/nfs/v4/handlers/content_errmap_wiring_test.go` (the rename's seven call sites — mechanical, but the build breaks until all of them land together), `pkg/adapter/nbd/adapter.go` (Step 6 replaces Task 3's `Serve` body and `NewConnection` stub with the real wiring), `pkg/adapter/nbd/config.go` (Step 6 adds `Config.timeouts()`), `pkg/adapter/nbd/healthcheck.go` (Step 7 adds `Degraded`)
+- Modify: `internal/adapter/common/write_payload.go` (`CommitBlockStore` parameter widened to the new `Committer` interface — a type-only change, no behaviour change; every existing call site passes `*engine.Store` and keeps compiling), `internal/adapter/common/normalize.go` (`normalizeBlockStoreError` exported as `NormalizeBlockStoreError`), `internal/adapter/common/{doc.go,read_payload.go,write_payload.go}` (the rename's four call sites: `read_payload.go:60`, `write_payload.go:68`, `:122`, `:171`), `pkg/adapter/nbd/adapter.go` (Step 6 replaces Task 3's `Serve` body and `NewConnection` stub with the real wiring), `pkg/adapter/nbd/config.go` (Step 6 adds `Config.timeouts()`), `pkg/adapter/nbd/healthcheck.go` (Step 7 adds `Degraded`)
 
 **Task 3 must land first**, because both tasks modify `pkg/adapter/nbd/adapter.go`. Task 3 writes the lifecycle, the bind gate and the stubs; this task's Step 6 replaces the two stub bodies. They touch different functions, so the second edit is a substitution rather than a conflict.
 - Test: `internal/adapter/nbd/connection_test.go`, `internal/adapter/nbd/integration_test.go`, `internal/adapter/common/write_payload_test.go` (only if one does not already cover `CommitBlockStore`)
@@ -1397,7 +1399,7 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
   - `type BlockStore interface { ReadAt(...); WriteAt(...); PunchHole(...); Flush(...); LocalDurable() bool; RemoteDurable() bool; RequireDurableCommit() bool }` — the four I/O methods plus the three durability accessors, so `commit` can call `common.CommitBlockStore` without the concrete `*engine.Store`. `*engine.Store` satisfies all seven (`pkg/block/engine/readwrite.go:21`, `:87`, `:286`; `pkg/block/engine/flush.go:534`; `pkg/block/engine/engine.go:388`, `:397`, `:406`).
   - `type Handler struct { exporter Exporter; stores StoreResolver; meta *metadata.Service; id Identity; timeouts Timeouts; draining func() bool; degraded atomic.Int64 }`
   - `func NewHandler(exporter Exporter, stores StoreResolver, meta *metadata.Service, id Identity, timeouts Timeouts, draining func() bool) *Handler` — `draining` is a closure over `a.BaseAdapter.Shutdown` from the adapter in Task 3; passing it as a function rather than the base adapter keeps `internal/adapter/nbd` free of any `pkg/adapter` import.
-  - `func (h *Handler) serve(ctx context.Context, conn net.Conn) error` — unexported, because it is the test entry point, not the framework's. `type Conn struct { handler *Handler; conn net.Conn }` plus `func NewConn(h *Handler, conn net.Conn) *Conn` and `func (c *Conn) Serve(ctx context.Context)` satisfy `adapter.ConnectionHandler` (`pkg/adapter/base.go:38`, `Serve(ctx)` with no `net.Conn`); the pattern matches `pkg/adapter/smb/connection.go:64`.
+  - `func (h *Handler) serve(ctx context.Context, conn net.Conn) error` — unexported, because it is the test entry point, not the framework's. `type Conn struct { handler *Handler; conn net.Conn }` plus `func NewConn(h *Handler, conn net.Conn) *Conn` and `func (c *Conn) Serve(ctx context.Context)` satisfy `adapter.ConnectionHandler` (`pkg/adapter/base.go:38`, `Serve(ctx)` with no `net.Conn`); the pattern matches `pkg/adapter/smb/connection.go:64`. `Conn.Serve` **must recover panics** — the base adapter's accept loop does not, so an unrecovered panic kills the process rather than the connection (see the code block below).
   - `func (h *Handler) authContext(ctx context.Context, exp *Export) *metadata.AuthContext` — builds the synthetic-identity `AuthContext` from `h.id`, and sets `ShareReadOnly: exp.ReadOnly`. The body is fully determined by those two facts plus the SMB precedent at `internal/adapter/smb/handlers/auth_helper.go:50`:
 
 ```go
@@ -1432,14 +1434,35 @@ type Conn struct {
 
 func NewConn(h *Handler, conn net.Conn) *Conn { return &Conn{handler: h, conn: conn} }
 
+// Serve runs one connection and recovers panics.
+//
+// The recover is not defensive habit: the base adapter's accept loop has none
+// (grep recover pkg/adapter/base.go returns nothing) and it invokes this on a
+// bare goroutine (pkg/adapter/base.go:373), so an unrecovered panic here takes
+// down the whole DittoFS process — every NFS and SMB connection with it. Both
+// sibling adapters recover for the same reason and in the same place: NFS at
+// pkg/adapter/nfs/connection.go:420 (handleConnectionClose, deferred at :111)
+// and SMB at pkg/adapter/smb/connection.go:474. Log at Error, not Debug: a
+// panic is unexpected by definition (CLAUDE.md invariant 6), and it is the
+// only trace of why the connection died.
 func (c *Conn) Serve(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in NBD connection handler",
+				"remote", c.conn.RemoteAddr(), "error", r, "stack", string(debug.Stack()))
+		}
+	}()
 	if err := c.handler.serve(ctx, c.conn); err != nil && ctx.Err() == nil {
 		logger.Debug("NBD connection ended", "remote", c.conn.RemoteAddr(), "error", err)
 	}
 }
 ```
 
-`Adapter.NewConnection` (`pkg/adapter/nbd/adapter.go`) becomes `return nbd.NewConn(a.handler, conn)`. The unexported `func (h *Handler) serve(ctx context.Context, conn net.Conn) error` is what the dispatch tests call directly, so they keep the `error` return and never need the wrapper.
+`Adapter.NewConnection` (`pkg/adapter/nbd/adapter.go`) becomes `return nbd.NewConn(a.handler.Load(), conn)`. The unexported `func (h *Handler) serve(ctx context.Context, conn net.Conn) error` is what the dispatch tests call directly, so they keep the `error` return and never need the wrapper.
+
+**The `handler` field is an `atomic.Pointer[nbd.Handler]`, so `pkg/adapter/nbd/adapter.go` needs `sync/atomic` in its imports.** The pointer is not a stylistic choice: `Serve` stores it on the accept-loop goroutine (`pkg/controlplane/runtime/adapters/service.go:611` starts `adp.Serve` inside `go func()`) while `Healthcheck` loads it from the API handler's goroutine (`internal/controlplane/api/handlers/adapters.go:240` → `Runtime.AdapterChecker` → `adp.Healthcheck`). A plain field is a data race the detector reports on any probe that lands during startup.
+
+**`internal/adapter/nbd/connection.go` needs two imports for that recover block, and neither is obvious:** `github.com/marmos91/dittofs/internal/logger` (a *package*, called as `logger.Error(...)` — the same import `internal/adapter/nfs/v4/handlers/write.go:16` and `internal/adapter/smb/handlers/auth_helper.go:9` use; there is no package-level `logger` variable in `internal/adapter/nbd`) and `runtime/debug` for `debug.Stack()`, as `pkg/adapter/nfs/connection.go:10` does. Without the second, the panic log says what happened but not where, which is the half that matters for a bug that only fires on a client's malformed request.
 
 - [ ] **Step 1: Write the failing connection tests**
 
@@ -1506,7 +1529,7 @@ go build ./... && go test ./internal/adapter/common/ ./internal/adapter/nfs/... 
 
 Expected: clean. A type-only widening that breaks a call site means the call site was passing something that is not `*engine.Store`, which is worth knowing before writing new code against it.
 
-`storeFake` must also implement the three durability accessors — returning `true, true, false` for the happy path, so `commit` takes the `localDurable` fast path. The tests that need `ErrNotDurableYet` set them to `false, false, true`. `Handler` takes a `StoreResolver`, and the production resolver is built over **`common.ResolveForWrite`** — do not write a new resolution path.
+`storeFake` must also implement the three durability accessors — returning `true, true, false` for the happy path, so `commit` takes the `localDurable` fast path. The tests that need `ErrNotDurableYet` set them to `false, false, true`. It also needs a `panicOnRead bool` field, so `TestConn_PanicInHandlerDoesNotKillTheProcess` can drive a panic from below the dispatcher; when set, `ReadAt` panics instead of returning. `Handler` takes a `StoreResolver`, and the production resolver is built over **`common.ResolveForWrite`** — do not write a new resolution path.
 
 `internal/adapter/common/resolve.go:15` already declares the seam:
 
@@ -1537,6 +1560,8 @@ Two acceptable resolutions, in order of preference:
 
 **Resolve once per connection, not per command.** The handle is fixed for the connection's life, so a per-command resolution would decode a handle and take a lock on every 4 KiB read.
 
+**Use the `pipe(t)` helper for these tests, and do not redefine it.** `connection_test.go` is `package nbd` (internal), the same package as `handshake_test.go`, so the helper declared there (`func pipe(t *testing.T) (server, client net.Conn)`, plan line 411) is already in scope — a second declaration is a redeclaration error. It exists because `net.Pipe` is synchronous and unbuffered: several of these tests read a reply header and assert on it without draining the payload that follows, which with `net.Pipe` leaves the server blocked forever and turns a test that should fail loudly into one that hangs until the Go test timeout (the full reasoning is at plan lines 403-410, where the helper is defined). If you find yourself wanting `net.Pipe` here, read that comment first.
+
 Tests:
 
 ```go
@@ -1547,6 +1572,8 @@ func TestConnection_UnimplementedCommandIsEINVAL(t *testing.T)
 func TestConnection_WriteIsEINVALBeforeTask5(t *testing.T) // replaced in Task 5
 func TestConnection_ErrorsCarryTheCookie(t *testing.T)
 func TestConnection_DiscClosesWithoutReply(t *testing.T)
+func TestConn_PanicInHandlerDoesNotKillTheProcess(t *testing.T)
+func TestConnection_FailedStoreResolutionDegradesAndCounts(t *testing.T)
 ```
 
 Assertions that matter, spelled out:
@@ -1614,6 +1641,47 @@ func TestConnection_UnadvertisedFlagIsEINVAL(t *testing.T) {
 func TestConnection_PartialHeaderTimesOut(t *testing.T) {
 	// Timeouts.Read = 200ms. Write 4 bytes, then block. Expect Serve to return
 	// within ~1s with a timeout error, and no reply on the wire.
+}
+```
+
+**Review Focus 7 and 8:**
+
+```go
+// The base adapter's accept loop has no recover (pkg/adapter/base.go:373 runs
+// the handler on a bare goroutine), so a panic that escapes here does not kill
+// the connection — it kills the process, and with it every NFS and SMB
+// connection. Both sibling adapters recover for this reason: NFS at
+// pkg/adapter/nfs/connection.go:420, SMB at pkg/adapter/smb/connection.go:474.
+//
+// A fake store whose ReadAt panics is the cheapest way to reach the recover:
+// the panic originates below the dispatcher, exactly where a real one would
+// (a nil map, a slice bounds error in a handler, a bad type assertion on a
+// store the engine returned).
+func TestConn_PanicInHandlerDoesNotKillTheProcess(t *testing.T) {
+	// storeFake with panicOnRead set. Drive a full handshake and one READ
+	// through Conn.Serve (not handler.serve — the recover lives on Conn).
+	// Run Serve on a goroutine and assert it RETURNS within ~2s.
+	//
+	// The assertion is "it came back", and that is sufficient: if the recover
+	// is missing the panic unwinds the goroutine and the test binary dies, so
+	// the failure mode is a crashed package rather than a failed assertion.
+	// Do NOT wrap the call in a recover() in the test itself — that would make
+	// the test pass whether or not Conn.Serve has one.
+}
+
+// The store is resolved after the handshake, so a resolver that fails is the
+// only way to reach this path deterministically: the window between the
+// handshake ACK and the resolution is a few microseconds on the server's own
+// goroutine, so no external test can land a share-removal inside it.
+func TestConnection_FailedStoreResolutionDegradesAndCounts(t *testing.T) {
+	// NewHandler with a StoreResolver returning a sentinel error and a fake
+	// exporter whose Resolve succeeds. Drive one full handshake, then assert in
+	// this order:
+	//   1. serve returned a non-nil error (the connection ends)
+	//   2. h.TakeDegraded() == 1
+	//   3. a second h.TakeDegraded() == 0
+	// The order matters: asserting the consumption first would pass on a
+	// counter that was never incremented.
 }
 ```
 
@@ -1720,7 +1788,14 @@ type Adapter struct {
 	*adapter.BaseAdapter
 	config  Config
 	runtime *runtime.Runtime
-	handler *nbd.Handler // built once in Serve, before the listener exists
+	// handler is built once in Serve, before the listener exists, and read by
+	// NewConnection and Healthcheck — both of which run on other goroutines.
+	// An atomic pointer, not a plain field: Serve runs in its own goroutine
+	// (pkg/controlplane/runtime/adapters/service.go:611) while Healthcheck is
+	// reached from an HTTP handler (internal/controlplane/api/handlers/adapters.go:240)
+	// via Runtime.AdapterChecker, so a plain field is a data race the race
+	// detector reports on any probe that lands during startup.
+	handler atomic.Pointer[nbd.Handler]
 }
 
 func (a *Adapter) SetRuntime(rt any) {
@@ -1728,6 +1803,9 @@ func (a *Adapter) SetRuntime(rt any) {
 	if !ok {
 		panic(fmt.Sprintf("nbd: SetRuntime wants *runtime.Runtime, got %T", rt))
 	}
+	// The base adapter keeps its own reference for the shared accept loop,
+	// which reaches it for connection metrics (pkg/adapter/base.go:359, :387).
+	a.BaseAdapter.SetRuntime(rt)
 	a.runtime = r
 }
 
@@ -1751,18 +1829,14 @@ func (a *Adapter) Serve(ctx context.Context) error {
 			return false
 		}
 	}
-	a.handler = nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
-		id, a.config.timeouts(), draining)
+	a.handler.Store(nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
+		id, a.config.timeouts(), draining))
 	return a.ServeWithFactory(ctx, a, nil, nil)
 }
 
 func (a *Adapter) NewConnection(conn net.Conn) adapter.ConnectionHandler {
-	return nbd.NewConn(a.handler, conn)
+	return nbd.NewConn(a.handler.Load(), conn)
 }
-
-// Handler exposes the wired handler to the external test package, which needs
-// it to drive a connection without a listener.
-func (a *Adapter) Handler() *nbd.Handler { return a.handler }
 ```
 
 Also add to `pkg/adapter/nbd/config.go` the accessor this step calls:
@@ -1779,7 +1853,7 @@ func (c *Config) timeouts() nbd.Timeouts {
 
 Five things this shape gets right, and one it makes explicit:
 
-- **`NewConnection` returns a small per-connection wrapper, not the shared handler.** `adapter.ConnectionHandler.Serve` takes only a context (`pkg/adapter/base.go:38`), so the socket must be bound at construction — `return nbd.NewConn(a.handler, conn)`, the same shape as `pkg/adapter/smb/adapter.go:717`. The handler itself is shared and stateless; `Conn` carries nothing but the socket and the handler pointer, so there is no per-connection protocol state to leak.
+- **`NewConnection` returns a small per-connection wrapper, not the shared handler.** `adapter.ConnectionHandler.Serve` takes only a context (`pkg/adapter/base.go:38`), so the socket must be bound at construction — `return nbd.NewConn(a.handler.Load(), conn)`, the same shape as `pkg/adapter/smb/adapter.go:717`. The handler itself is shared and stateless; `Conn` carries nothing but the socket and the handler pointer, so there is no per-connection protocol state to leak.
 - **The resolver returns `*engine.Store` as `nbd.BlockStore` implicitly** — `common.ResolveForWrite` returns the concrete type, which satisfies the interface. No adapter.
 - **`Serve` builds the handler once, before the listener exists**, so a `nil` runtime or a bad config fails as a startup error rather than as a failed first connection.
 - **The bind gate runs first, before the runtime is consulted**, which is what `TestServe_RefusesRemoteBindEvenWithNoRuntime` in Task 3 pins. Keep that ordering when you move the body.
@@ -1790,15 +1864,15 @@ Five things this shape gets right, and one it makes explicit:
 
 Add a counter the connection path increments on a failed export resolution or block-store resolution, and have `Healthcheck` report `StatusDegraded` when it is nonzero since the last probe. Message: `"NBD adapter is serving but N export resolutions have failed"`. Keep the probe cheap — read the counter and reset it, no I/O.
 
-The counter lives on `Handler` (`h.degraded`), but `Healthcheck` is on `Adapter` in the other package, so the adapter needs a read-and-reset accessor: `func (h *Handler) TakeDegraded() int64` using `h.degraded.Swap(0)`. `Swap` rather than `Load` then `Store` — two steps let a concurrent increment vanish between them. `Adapter.Healthcheck` calls it only when `a.handler != nil` (before `Serve` there is nothing to ask):
+The counter lives on `Handler` (`h.degraded`), but `Healthcheck` is on `Adapter` in the other package, so the adapter needs a read-and-reset accessor: `func (h *Handler) TakeDegraded() int64` using `h.degraded.Swap(0)`. `Swap` rather than `Load` then `Store` — two steps let a concurrent increment vanish between them. `Adapter.Healthcheck` calls it only when the handler exists (before `Serve` there is nothing to ask):
 
 ```go
 func (a *Adapter) Healthcheck(ctx context.Context) health.Report {
 	if !a.config.Enabled {
 		return health.Report{Status: health.StatusDisabled, Message: "NBD adapter is disabled in config", CheckedAt: time.Now().UTC()}
 	}
-	if a.handler != nil {
-		if n := a.handler.TakeDegraded(); n > 0 {
+	if h := a.handler.Load(); h != nil {
+		if n := h.TakeDegraded(); n > 0 {
 			return health.Report{Status: health.StatusDegraded, Message: fmt.Sprintf("NBD adapter is serving but %d export resolutions have failed", n), CheckedAt: time.Now().UTC()}
 		}
 	}
@@ -1807,6 +1881,45 @@ func (a *Adapter) Healthcheck(ctx context.Context) health.Report {
 ```
 
 The `Disabled` branch and the final delegation are the same shape as `pkg/adapter/nfs/healthcheck.go`; only the `Degraded` branch is new, and it must come **before** the delegation because `BaseAdapter.Healthcheck` has no way to know about a counter it does not own. `TakeDegraded` is called on every probe, so the count is "since the last probe" — say so in the field's doc, because a reader will otherwise assume it is cumulative.
+
+**The `handler` field must be an `atomic.Pointer[nbd.Handler]`** (Step 6), and this is the step that proves it: `Serve` stores it on the accept-loop goroutine while `Healthcheck` loads it from the API handler's goroutine. A plain field races — verified with a probe reproducing this exact shape under `-race`, which reported `WARNING: DATA RACE` between the `Serve` write and the `Healthcheck` read. `NewConnection` also loads it, and that runs on the accept goroutine, so the atomic is what makes the read legal there too.
+
+**Add a test for the `Degraded` branch, and put it where it can actually be written.** The counter has two halves — an increment on a failed store resolution (`connection.go`) and a read-and-reset on a probe (`pkg/adapter/nbd/healthcheck.go`) — and neither is exercised by the two existing healthcheck tests, which only cover the `Disabled` and pre-`Serve` paths.
+
+The increment half is tested in **`internal/adapter/nbd/connection_test.go`** (`package nbd`), not in the external healthcheck test, and the reason is structural rather than stylistic: the increment happens in `serve` **between** `ServeHandshake` and the store resolution (`Step 3` items 1 and 2), and that window is not reachable from outside — a client sees the handshake ACK, and the resolution runs microseconds later on the server goroutine, so no external test can land a share-removal inside it. The internal test does not need to: it injects a `StoreResolver` that fails directly.
+
+```go
+// The store resolution happens after the handshake, so a resolver that fails
+// is the only way to reach this path without racing the server's own goroutine.
+func TestConnection_FailedStoreResolutionDegradesAndCounts(t *testing.T) {
+	// NewHandler with a StoreResolver returning a sentinel error, and a fake
+	// exporter whose Resolve succeeds. Drive one full handshake, then assert:
+	//   - serve returned an error (the connection ends)
+	//   - h.TakeDegraded() == 1
+	//   - a SECOND call to h.TakeDegraded() == 0 (the probe consumes the count)
+	// Assert in that order, so the test cannot pass by the counter never having
+	// been incremented at all.
+}
+```
+
+The probe half is tested in **`pkg/adapter/nbd/healthcheck_test.go`** (`package nbd_test`), which reaches the counter only through the exported surface — `Adapter.Healthcheck`. Do **not** add a `Handler()` accessor to `Adapter` to reach in: it was considered and rejected as dead surface, since nothing in Tasks 4–8 needs it, and the increment half is already covered internally. Drive it through the real path instead:
+
+```go
+// The Degraded branch needs the handler to exist, so this test starts Serve.
+// It does not need a failed resolution: removing the share after the handshake
+// is not reachable from here (see connection_test.go's note), so the count is
+// produced by the only external lever there is — resolving an export that does
+// not exist, which is a handshake failure rather than a store failure and does
+// NOT increment. That is the point: this test pins the OBSERVABLE contract,
+// that a probe with a zero count reports healthy, and leaves the increment to
+// the internal test.
+func TestNBDAdapter_Healthcheck_NotDegradedWithoutFailures(t *testing.T) {
+	// New(config), SetRuntime, start Serve on a cancellable ctx and wait for
+	// ListenerReady. Probe twice; expect neither probe to be StatusDegraded.
+	// A probe must not invent degradation, and TakeDegraded on a fresh handler
+	// must not block or panic.
+}
+```
 
 - [ ] **Step 8: Write the integration test**
 
@@ -1828,9 +1941,44 @@ func TestIntegration_ReadAfterWriteOverRealStore(t *testing.T) {
 }
 
 func TestIntegration_ReadEvictedButManifestCoveredRange(t *testing.T) {
-	// Write, Flush, evict the local range, then READ. Expect real bytes, not
-	// zeros and not an error: this is the hydrate path
+	// Write, then make the bytes evictable, then evict, then READ. Expect real
+	// bytes, not zeros and not an error: this is the hydrate path
 	// (pkg/block/engine/read_internal.go:56).
+	//
+	// The eviction step is not "write then Flush". Verified with a probe against
+	// this exact fixture: after WriteAt + Flush, DrainLocalSynced evicts NOTHING
+	// (SegmentsEvicted=0), because the share's journal is durable
+	// (pkg/block/journal/store.go:365 sets durable true by default) and
+	// RequireDurableCommit is false, so Flush returns early at
+	// pkg/block/engine/flush.go:554 with {Finalized: false} and never drains the
+	// remote. The bytes stay dirty, and journal.Evict skips any segment holding
+	// a dirty record (pkg/block/journal/evict.go:36) — so the range is still
+	// local, the read is a warm local read, and the test passes without ever
+	// exercising the hydrate path it exists to prove.
+	//
+	// DrainAllUploads is what makes the bytes evictable: it force-flushes every
+	// dirty range to the remote and waits for the uploads to settle. Probe
+	// result with it in place: SegmentsEvicted=1, BytesFreed=65676.
+	//
+	// So the sequence is: WriteAt, DrainAllUploads, DrainLocalSynced, and ASSERT
+	// the eviction actually happened before reading:
+	//
+	//	ev, err := bs.DrainLocalSynced(ctx)
+	//	if err != nil { t.Fatal(err) }
+	//	if ev.SegmentsEvicted == 0 {
+	//		t.Fatalf("nothing was evicted, so this test cannot exercise the hydrate path: %+v", ev)
+	//	}
+	//
+	// That assertion is the whole test's reason for existing. Without it a
+	// fixture change that keeps the bytes local turns this into a test that
+	// passes while proving nothing — which is worse than no test, because it
+	// reads as coverage.
+	//
+	// The remote is the fixture's `memory` block store (remotememory), whose
+	// durability type-default is FALSE (pkg/block/remote/memory/store.go:51-53),
+	// so RemoteDurable() reports false and a require-durable commit could not be
+	// satisfied here. That is fine for this test: DrainAllUploads does not read
+	// the durability flag, it drains the uploads.
 }
 
 func TestIntegration_ReadNeverWrittenRangeIsZeros(t *testing.T) {
@@ -1838,6 +1986,8 @@ func TestIntegration_ReadNeverWrittenRangeIsZeros(t *testing.T) {
 	// Error == 0.
 }
 ```
+
+**Do not expect the eviction test to be satisfied by `Flush` alone, and do not "fix" it by setting `RequireDurableCommit` to true.** The early return at `pkg/block/engine/flush.go:554` is deliberate — its comment records that the synchronous path *"turned every FILE_SYNC/DATA_SYNC WRITE into an inline S3 PutObject the reply waited on: multi-second per-op stalls at ~3% CPU"* — and flipping the flag to make a test's setup convenient would both change the durability contract under test and slow every write. `DrainAllUploads` is the supported way to make bytes evictable on demand.
 
 - [ ] **Step 9: Run the tests and confirm they pass**
 
@@ -2365,6 +2515,9 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 4 — `TestConnection_ReadWithFUAFlagSucceeds` passes, and fails when `READ` rejects any non-zero flag word.
 - [ ] Task 4 — `TestConnection_ReadZeroLengthIsEINVAL` and `TestConnection_UnimplementedCommandIsEINVAL` pass (the latter answers `EINVAL`, not `ENOTSUP`).
 - [ ] Task 4 — `TestConnection_PartialHeaderTimesOut` passes.
+- [ ] Task 4 — `TestConn_PanicInHandlerDoesNotKillTheProcess` passes, and fails (by crashing the test binary, not by an assertion) when the `recover` is removed from `Conn.Serve`.
+- [ ] Task 4 — `TestConnection_FailedStoreResolutionDegradesAndCounts` passes, and `h.TakeDegraded()` returns 0 on the second call.
+- [ ] Task 4 — the `handler` field is an `atomic.Pointer`, and `go test -race` reports no race between `Serve` and `Healthcheck` (drive a probe while a connection is being accepted).
 - [ ] Task 5 — `TestConnection_WriteZeroLengthIsEINVAL` passes and the connection is still usable afterwards.
 - [ ] Task 5 — `TestConnection_RejectedWriteKeepsTheStreamSynchronized` passes, and fails when the payload drain is removed.
 - [ ] Task 5 — `TestConnection_WriteWithFUAIsDurableBeforeReply` passes, and fails when `commit` is moved after the reply.
