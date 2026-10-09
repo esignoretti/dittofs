@@ -1215,14 +1215,14 @@ func TestStop_IsIdempotent(t *testing.T) {
 
 // The adapter must not treat a per-connection failure as fatal: Serve returning
 // before cancellation makes DittoServer stop every other adapter.
+//
+// The runtime comes from serveWithRuntime rather than being wired inline:
+// Serve refuses to bind without one, so a listener test cannot skip it. Using
+// the shared helper keeps every listener test on one construction path.
 func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
 	cfg := minimalConfig()
 	cfg.Port = 0
-	a := nbd.New(cfg)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- a.Serve(ctx) }()
+	a, done := serveWithRuntime(t, cfg)
 	select {
 	case <-a.ListenerReady():
 	case <-time.After(5 * time.Second):
@@ -1240,7 +1240,7 @@ func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
 		// Read the greeting, then hang up mid-handshake.
 		buf := make([]byte, 18)
 		_, _ = io.ReadFull(conn, buf)
-		conn.Close()
+		_ = conn.Close()
 	}
 
 	select {
@@ -1248,8 +1248,6 @@ func TestServe_ClientDisconnectDoesNotStopTheAdapter(t *testing.T) {
 		t.Fatalf("Serve returned after client disconnects: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	cancel()
-	<-done
 }
 
 func TestControlPlane_DefaultPortKnowsNBD(t *testing.T) {
