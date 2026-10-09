@@ -79,8 +79,10 @@ func TestServe_RefusesRemoteBindEvenWithNoRuntime(t *testing.T) {
 // be used for this: applyDefaults rewrites it to DefaultPort before the
 // listener is created (config.go:102).
 //
-// No t.Parallel in this file, so there is no window between releasing the port
-// and the test rebinding it.
+// No test in this package runs in parallel, so nothing in this package competes
+// for the port. The window is real but narrow: the deferred Close releases it
+// before this returns, and a foreign listener would have to be handed the same
+// ephemeral port in between.
 func freePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
