@@ -1349,7 +1349,7 @@ Expected: PASS.
 
 - [ ] **Step 8: Check whether the CLI docs need regenerating**
 
-The generator is `go run ./cmd/gendocs` (`CLAUDE.md:96`: *"`docs/guide/cli.md` is generated from the Cobra command trees by `cmd/gendocs`. Never hand-edit it"*). There is no `dfs docs` subcommand.
+The generator is `go run ./cmd/gendocs` (`CLAUDE.md:96`: *"`docs/guide/cli.md` is generated from the Cobra command trees by `cmd/gendocs`. Never hand-edit it"*). An earlier draft of this step named a `docs` subcommand on the `dfs` binary; the CLI has none.
 
 **This task changes no CLI surface, so expect no diff.** Its changes to `cmd/dfs/commands/start.go` add `createNBDAdapter` and a `case "nbd":` arm — adapter construction, not a command or flag. Confirm that before concluding anything:
 
