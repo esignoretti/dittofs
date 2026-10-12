@@ -10,9 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// requireAccessDenied asserts that err is a permission-denied (EACCES) failure
-// and specifically NOT the EIO regression (#1449) where export-gate denials on
-// NFSv3 surfaced as "input/output error".
+// requireAccessDenied asserts that err is a permission-denied (EACCES) failure.
+// An export-gate denial must surface as EACCES, never as "input/output error".
 func requireAccessDenied(t *testing.T, err error, what string) {
 	t.Helper()
 	require.Error(t, err, "%s should be denied", what)
@@ -20,5 +19,5 @@ func requireAccessDenied(t *testing.T, err error, what string) {
 	assert.Contains(t, msg, "permission denied",
 		"%s should fail with EACCES, got: %v", what, err)
 	assert.NotContains(t, msg, "input/output error",
-		"%s must not surface EIO for a permission denial (#1449), got: %v", what, err)
+		"%s must not surface EIO for a permission denial, got: %v", what, err)
 }

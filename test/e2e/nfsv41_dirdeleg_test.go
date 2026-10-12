@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -21,9 +22,11 @@ import (
 // NFSv4.1 Directory Delegation E2E Tests
 // =============================================================================
 //
-// These tests check that a directory delegation is granted and that a change
-// made by another client queues a CB_NOTIFY to its holder, for each mutation
-// type: entry added, removed, renamed, and attribute changed.
+// These tests check that a directory delegation is granted and that its holder
+// learns of a change made by another client, for each mutation type: entry
+// added, removed, renamed, and attribute changed. A holder that asked for that
+// notification type must get a CB_NOTIFY; one that did not must have the
+// delegation recalled.
 //
 // The holder is a v4.1 mount, which reads the directory to provoke a
 // GET_DIR_DELEGATION. The mutating client is a v4.0 mount: two v4.1 mounts of
@@ -33,15 +36,24 @@ import (
 
 var (
 	getDirDelegationOp  = regexp.MustCompile(`op_name=GET_DIR_DELEGATION`)
-	dirDelegGranted     = regexp.MustCompile(`Directory delegation granted`)
+	dirDelegGranted     = regexp.MustCompile(`Directory delegation granted[^\n]*notification_mask=0x([0-9a-f]+)`)
 	cbNotifyQueued      = regexp.MustCompile(`CB_NOTIFY queued`)
-	dirDelegReturnedRev = regexp.MustCompile(`op_name=DELEGRETURN|Delegation revoked with the client's state`)
+	dirDelegReturnedRev = regexp.MustCompile(`op_name=DELEGRETURN status=0\b|Delegation revoked with the client's state`)
+)
+
+// Notification type bit numbers (RFC 8881 §20.4, notify_type4).
+const (
+	notifyChangeChildAttrs = 0
+	notifyRemoveEntry      = 2
+	notifyAddEntry         = 3
+	notifyRenameEntry      = 4
 )
 
 // dirDelegFixture is a holder mount with a directory delegation and a second,
 // distinct client that mutates the directory.
 type dirDelegFixture struct {
 	sp         *helpers.ServerProcess
+	notifMask  uint64 // notification types the holder asked for
 	holder     *framework.Mount
 	holderDir  string
 	otherDir   string
@@ -85,9 +97,13 @@ func setupDirDelegation(t *testing.T, dirName string, files ...string) *dirDeleg
 	}
 	require.True(t, waitForLog(t, sp, readdirSince, dirDelegGranted, 1, 2*time.Second),
 		"server should grant the directory delegation the client asked for")
+	m := dirDelegGranted.FindStringSubmatch(extractNewLogs(readdirSince, readLogFile(t, sp)))
+	mask, err := strconv.ParseUint(m[1], 16, 32)
+	require.NoError(t, err, "parse notification mask %q", m[1])
 
 	return &dirDelegFixture{
 		sp:         sp,
+		notifMask:  mask,
 		holder:     holder,
 		holderDir:  holderDir,
 		otherDir:   otherDir,
@@ -95,11 +111,18 @@ func setupDirDelegation(t *testing.T, dirName string, files ...string) *dirDeleg
 	}
 }
 
-// requireNotified requires a CB_NOTIFY queued after the fixture's snapshot.
-func (f *dirDelegFixture) requireNotified(t *testing.T, what string) {
+// requireNotified requires the holder to learn of a change of type notifyType
+// made by another client: through CB_NOTIFY when it asked for that type, or
+// through a recall of the delegation when it did not.
+func (f *dirDelegFixture) requireNotified(t *testing.T, what string, notifyType uint) {
 	t.Helper()
-	require.True(t, waitForLog(t, f.sp, f.mutateFrom, cbNotifyQueued, 1, 5*time.Second),
-		"%s by another client should queue a CB_NOTIFY to the delegation holder", what)
+	if f.notifMask&(1<<notifyType) != 0 {
+		require.True(t, waitForLog(t, f.sp, f.mutateFrom, cbNotifyQueued, 1, 5*time.Second),
+			"%s by another client should queue a CB_NOTIFY to the delegation holder", what)
+		return
+	}
+	require.True(t, waitForLog(t, f.sp, f.mutateFrom, cbRecallSent, 1, 5*time.Second),
+		"%s by another client should recall a delegation that asked for no such notification", what)
 }
 
 // =============================================================================
@@ -115,7 +138,7 @@ func TestNFSv41DirDelegationEntryAdded(t *testing.T) {
 	f := setupDirDelegation(t, helpers.UniqueTestName("dirdeleg_add"))
 
 	framework.WriteFile(t, filepath.Join(f.otherDir, "added_file.txt"), []byte("new file via client 2"))
-	f.requireNotified(t, "creating an entry")
+	f.requireNotified(t, "creating an entry", notifyAddEntry)
 
 	framework.WaitForFile(t, filepath.Join(f.holderDir, "added_file.txt"), 5*time.Second)
 	assert.Contains(t, framework.ListDir(t, f.holderDir), "added_file.txt",
@@ -137,7 +160,7 @@ func TestNFSv41DirDelegationEntryRemoved(t *testing.T) {
 	target := filepath.Join(f.otherDir, "to_remove.txt")
 	framework.WaitForFile(t, target, 5*time.Second)
 	require.NoError(t, os.Remove(target), "other client: should delete file")
-	f.requireNotified(t, "removing an entry")
+	f.requireNotified(t, "removing an entry", notifyRemoveEntry)
 
 	framework.WaitForDirEntryCount(t, f.holderDir, 0, 5*time.Second)
 	assert.Empty(t, framework.ListDir(t, f.holderDir), "holder should see the directory empty")
@@ -159,7 +182,7 @@ func TestNFSv41DirDelegationEntryRenamed(t *testing.T) {
 	framework.WaitForFile(t, src, 5*time.Second)
 	require.NoError(t, os.Rename(src, filepath.Join(f.otherDir, "renamed_file.txt")),
 		"other client: should rename file")
-	f.requireNotified(t, "renaming an entry")
+	f.requireNotified(t, "renaming an entry", notifyRenameEntry)
 
 	framework.WaitForFile(t, filepath.Join(f.holderDir, "renamed_file.txt"), 5*time.Second)
 	entries := framework.ListDir(t, f.holderDir)
@@ -184,7 +207,7 @@ func TestNFSv41DirDelegationAttrChanged(t *testing.T) {
 	target := filepath.Join(f.otherDir, "attr_test.txt")
 	framework.WaitForFile(t, target, 5*time.Second)
 	require.NoError(t, os.Chmod(target, 0755), "other client: should chmod file")
-	f.requireNotified(t, "changing an entry's mode")
+	f.requireNotified(t, "changing an entry's mode", notifyChangeChildAttrs)
 
 	holderFile := filepath.Join(f.holderDir, "attr_test.txt")
 	require.True(t, framework.WaitFor(5*time.Second, func() bool {

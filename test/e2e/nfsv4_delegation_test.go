@@ -23,8 +23,7 @@ import (
 // mounts and assert on the server log lines that record each event, since no
 // delegation metric is exported.
 //
-// Two conditions decide whether the case can happen at all, and each test
-// skips, naming the condition, when it does not hold:
+// Each test arranges the two conditions a delegation case needs:
 //
 //   - The server grants a delegation only once a CB_NULL probe of the client's
 //     callback path has succeeded. A v4.0 client's callback address is the local
@@ -166,12 +165,19 @@ func testDelegationRecall(t *testing.T, holderVers, otherVers string) {
 	require.NoError(t, err, "other client: write open should succeed once the delegation is returned")
 	defer g.Close()
 
-	// The server answers the conflicting OPEN with NFS4ERR_DELAY until the
-	// holder returns the delegation, so both have happened by the time the
-	// open succeeds.
+	// The server must answer the conflicting OPEN with NFS4ERR_DELAY, recall
+	// the delegation, and let the OPEN through only after the holder returns
+	// it, so the log carries those events in that order.
 	recallLogs := extractNewLogs(recallSince, readLogFile(t, sp))
-	assert.Regexp(t, cbRecallSent, recallLogs, "a conflicting write open should recall the holder's delegation")
-	assert.Regexp(t, delegReturned, recallLogs, "the holder should return the delegation before the open succeeds")
+	delayAt := firstIndex(recallLogs, regexp.MustCompile(`delegation conflict, returning NFS4ERR_DELAY file=`+regexp.QuoteMeta(fileName)))
+	recallAt := firstIndex(recallLogs, cbRecallSent)
+	returnAt := firstIndex(recallLogs, delegReturned)
+	openAt := firstIndex(recallLogs, regexp.MustCompile(`NFSv4 OPEN successful file=`+regexp.QuoteMeta(fileName)))
+	require.GreaterOrEqual(t, delayAt, 0, "the conflicting OPEN should first get NFS4ERR_DELAY")
+	require.GreaterOrEqual(t, recallAt, 0, "a conflicting write open should recall the holder's delegation")
+	require.GreaterOrEqual(t, returnAt, 0, "the holder should return the delegation")
+	require.GreaterOrEqual(t, openAt, 0, "the conflicting OPEN should eventually succeed")
+	assert.Less(t, returnAt, openAt, "the conflicting OPEN should succeed only after the delegation is returned")
 
 	got, err := os.ReadFile(other.FilePath(fileName))
 	require.NoError(t, err, "other client: should read file")
@@ -270,6 +276,14 @@ func mountForDelegations(t *testing.T, port int, vers string) *framework.Mount {
 	return framework.MountNFSWithVersion(t, port, vers)
 }
 
+// firstIndex returns the offset of re's first match in logs, or -1.
+func firstIndex(logs string, re *regexp.Regexp) int {
+	if loc := re.FindStringIndex(logs); loc != nil {
+		return loc[0]
+	}
+	return -1
+}
+
 // grepLines returns the lines of logs that re matches.
 func grepLines(logs string, re *regexp.Regexp) string {
 	var out []string
@@ -298,16 +312,17 @@ func waitForLog(t *testing.T, sp *helpers.ServerProcess, since string, re *regex
 }
 
 // requireCallbackPathsUp waits for n successful CB_NULL probes logged after
-// since and skips the test, naming the cause, when a probe fails or none
-// completes: without a verified callback path the server grants no
-// delegations, so there is nothing for the caller to observe.
+// since and fails the test, naming the cause, when a probe fails or none
+// completes. With the v4.1 backchannel riding the fore channel and v4.0 mounted
+// through a non-loopback address, nothing on the host stops the probe, so a
+// failure is the server's.
 func requireCallbackPathsUp(t *testing.T, sp *helpers.ServerProcess, since string, n int) {
 	t.Helper()
 	if waitForLog(t, sp, since, cbNullSucceeded, n, 10*time.Second) {
 		return
 	}
 	if line := cbNullFailed.FindString(extractNewLogs(since, readLogFile(t, sp))); line != "" {
-		t.Skipf("server cannot reach the client's callback path, so it grants no delegations: %s", strings.TrimSpace(line))
+		t.Fatalf("server cannot reach the client's callback path, so it grants no delegations: %s", strings.TrimSpace(line))
 	}
-	t.Skipf("no CB_NULL probe of the client's callback path succeeded within 10s; the server grants no delegations without one")
+	t.Fatalf("no CB_NULL probe of the client's callback path succeeded within 10s; the server grants no delegations without one")
 }
