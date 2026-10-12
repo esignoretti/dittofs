@@ -335,14 +335,78 @@ development machine is macOS arm64 (Apple silicon).
 | Half | Status on this host | Why |
 | --- | --- | --- |
 | `boot-qemu.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses cleanly without kernel/initramfs/volume |
-| `boot-qemu.sh` live boot off NBD | **not run** | needs an aarch64 kernel + initramfs, which nothing here builds; fetch one and boot on a Linux host or on this host via `hvf` |
+| `boot-qemu.sh` live boot off NBD | **PROVEN on this host, 2026-10-12** | see the recorded run below; a real aarch64 kernel booted via `hvf` and the guest's ext4 root was the DittoFS export |
 | `crash-restart.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses on Darwin naming the missing Linux block layer, and refuses without a `master` `nbd-client`, root, netlink, init netns, or a provisioned volume |
-| `crash-restart.sh` crash/reconnect verdict | **not run here** | Linux-only; the recipe above is the one measured end to end against a live DittoFS, and it must be re-recorded on a Linux host with a `master`-built `nbd-client` |
+| `crash-restart.sh` crash/reconnect verdict | **the mechanism was PROVEN manually, not by this script** | the recipe was run by hand inside a Linux container (`--network=host`, Docker Desktop's kernel has `CONFIG_BLK_DEV_NBD=y`) against a live DittoFS: with `-persist -T 60` a read stayed blocked at t=4s/8s/12s, the server returned at t=16s, and the read completed `exit=0 elapsed=14s` returning the pre-crash bytes with `Successfully reconnected after 4 attempts` in the client log. The **script** has not been run end to end; it needs a Linux host with root and a `master`-built `nbd-client` |
 | Host-side `fsck` after the crash | **not run here** | follows the crash run; needs the Linux host |
 
-A recorded run belongs here once the Linux half exists: the `dead_conn_timeout`
-value, the measured restart time, the guest's I/O behaviour, and the host-side
-`fsck` verdict. Until then, treat the crash half as **unverified on this host**.
+The crash half's **premise** is therefore established (the kernel pauses and the
+client reconnects), but its **scripted form** is unverified here: the
+`dead_conn_timeout` value the script prints, its restart-latency assertion and
+its `fsck` step all still need a Linux host. Do not read the manual result as a
+pass for `crash-restart.sh`.
+
+## A recorded end-to-end boot (real kernel client, real DittoFS)
+
+This is the strongest evidence in the repo for the whole design: it is the only
+run where a **real Linux kernel's block layer** drives DittoFS through NBD, and
+it is stronger than both the differential oracle (which swaps the block layer for
+an in-package fake) and the `qemu-io` transcript (which is userspace).
+
+**Setup.** Host: macOS arm64, QEMU 11.1.2, `-accel hvf`. Guest kernel: Alpine
+`linux-virt` 6.6.142 (`CONFIG_BLK_DEV_NBD=m`, `CONFIG_EXT4_FS=m`), taken from the
+`linux-virt` apk so the modules match its `vermagic` exactly. Initramfs: static
+busybox + `nbd.ko` + `ext4.ko` and its dependency chain
+(`crc16`, `libcrc32c`, `crc32c_generic`, `mbcache`, `jbd2`), plus `virtio_net.ko`
+with `failover`/`net_failover` and `virtio_mmio.ko` for the NIC. Server: the real
+`dfs` process with the NBD adapter on 10809 and a 16384-sector (8 MiB) volume.
+
+**The dependency chain is worth recording**, because every one of these failed
+before the next step could run, each with a message that names the *symptom*
+rather than the missing module:
+
+| Failure | Cause |
+| --- | --- |
+| `nbd-client: can't open '/dev/nbd0': No such device or address` | `nbd.ko` not loaded — `modprobe` is useless in this initramfs (no `modules.dep`); `insmod` each module by path |
+| `mount: /root: No such file or directory` | `virtio_net.ko` not loaded, so there is no NIC; it needs `net_failover` → `failover` first |
+| `EXT4-fs (nbd0): Cannot load crc32c driver` | `crc32c_generic` (+ `libcrc32c`) missing; ext4 mounts read-only or not at all without it |
+| `nbd: unknown export` | the volume does not exist, is owned by the wrong identity, or the share grant is `none` — see the four causes above |
+
+**First boot** (`--mkfs`): `mke2fs -t ext4 /dev/nbd0` succeeded **through NBD**,
+the filesystem mounted r/w, `hello.txt` was written and `sync`ed, and the guest
+unmounted cleanly. The kernel reported:
+
+```
+EXT4-fs (nbd0): mounted filesystem a251cff1-ae05-43d3-8558-10b6791ae3bb r/w with ordered data mode.
+df: /dev/nbd0  3.5M  152.0K  2.8M  5% /root
+```
+
+**Second boot** (fresh VM, **no `mkfs`**): the same filesystem UUID came back and
+the file was still there:
+
+```
+EXT4-fs (nbd0): mounted filesystem a251cff1-ae05-43d3-8558-10b6791ae3bb r/w with ordered data mode.
+ls /root: hello.txt lost+found
+READBACK hello.txt: [written-by-the-kernel-client]
+```
+
+**Why the second boot is the load-bearing one.** The first boot proves the
+handshake, READ, WRITE, FLUSH and the block-size negotiation are all correct
+enough for `mkfs` and `mount`. The second proves the bytes are **durable** — a
+different VM process, a different kernel instance, no page cache shared with the
+first, reading back a filesystem that the first boot created. It also proves the
+8 MiB export size is reported correctly to the kernel, since ext4 sized itself
+from `nbd0`'s sector count and would have failed on a wrong one.
+
+Corroborated server-side without going through NBD at all: reading offset 1024
+over a **fresh** `qemu-io` connection shows the ext4 superblock with magic
+`53 ef` at offset 1080 (`9f 38 cd 6a` UUID, matching the `a251cff1` prefix the
+kernel printed).
+
+**What this run does NOT cover.** The crash/reconnect half (`crash-restart.sh`)
+is Linux-only and was not run here; its recipe is recorded above and must be
+re-run on a Linux host with a `master`-built `nbd-client`. The boot above uses
+the *release* kernel's NBD driver, not `dead_conn_timeout`.
 
 ## Interpreting a divergence
 
