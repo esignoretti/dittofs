@@ -19,10 +19,13 @@ import (
 
 // Timeouts bounds the three waits one NBD connection has.
 //
-// Read bounds reading one request header or payload. Idle bounds a connection
-// that has completed its handshake but sends nothing, so Read must be the
-// shorter of the two or a stalled client is held open by the wrong timer. Write
-// bounds writing one reply. The zero value of any field means no bound.
+// Idle bounds the wait for the next request header: a connection that has
+// completed its handshake and sends nothing, or stops part-way through a header,
+// is held only that long. Read bounds finishing a request that has already
+// started — the payload read in handleWrite — so it is armed afresh once a
+// header has been parsed. Write bounds writing one reply. The zero value of any
+// field means no bound, which is why Idle cannot be folded into Read: zero is a
+// sentinel for "no idle timeout", not a duration.
 type Timeouts struct {
 	Read  time.Duration
 	Write time.Duration
@@ -200,7 +203,24 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 		// the short deadline in place is what lets an idle connection close
 		// inside the drain window.
 		if !h.draining() {
-			if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
+			// Idle bounds the wait for a header; Read bounds finishing a request
+			// that has already started (the payload read in handleWrite). At the
+			// defaults both are 5m, so the distinction only shows for an operator
+			// who separates them — which is exactly when the field's own doc has
+			// to be true rather than nearly true.
+			//
+			// decision: the two are separate arms rather than a min(). Idle == 0
+			// means "no idle timeout", so a min() would turn an unset Idle into an
+			// immediate timeout; the guard has to be independent, which is the
+			// shape NFS uses at pkg/adapter/nfs/connection.go:312. A consequence is
+			// that an operator who sets Idle > Read gets an idle wait longer than
+			// the read budget, and that is the intended reading: Read is a budget
+			// for finishing work, not a ceiling on waiting for a client.
+			budget := h.timeouts.Read
+			if h.timeouts.Idle > 0 {
+				budget = h.timeouts.Idle
+			}
+			if err := conn.SetReadDeadline(time.Now().Add(budget)); err != nil {
 				return err
 			}
 		}
@@ -253,12 +273,21 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 				return err
 			}
 
+		case CmdTrim:
+			if err := h.handleTrim(ctx, bs, exp, req, conn); err != nil {
+				return err
+			}
+
+		case CmdWriteZeroes:
+			if err := h.handleWriteZeroes(ctx, bs, exp, req, conn); err != nil {
+				return err
+			}
+
 		default:
-			// Every command the adapter advertises but does not yet serve
-			// (TRIM, WRITE_ZEROES, CACHE, BLOCK_STATUS) and every value the spec
-			// does not define. An unimplemented command is an invalid command:
-			// NBD_ENOTSUP is reserved by the spec for WRITE_ZEROES with
-			// FAST_ZERO, which the adapter does not advertise.
+			// Every command the adapter does not serve (CACHE, BLOCK_STATUS) and
+			// every value the spec does not define. An unimplemented command is an
+			// invalid command: NBD_ENOTSUP is reserved by the spec for WRITE_ZEROES
+			// with FAST_ZERO, which the adapter does not advertise.
 			if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
 				return err
 			}

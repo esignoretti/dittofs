@@ -29,9 +29,10 @@ const (
 
 // TimeoutsConfig groups the operator-facing timers for an NBD connection.
 type TimeoutsConfig struct {
-	// Read is the maximum duration for reading a complete request from a
-	// client. It bounds a client that has completed its handshake but then
-	// stalls mid-request.
+	// Read is the maximum duration for finishing a request that has already
+	// started: once a request header has been parsed, this bounds reading its
+	// payload. The wait for a header is bounded by Idle instead, because a
+	// client that has sent nothing is idle rather than slow.
 	Read time.Duration `mapstructure:"read"`
 
 	// Write is the maximum duration for writing a reply to a client. It
@@ -39,7 +40,9 @@ type TimeoutsConfig struct {
 	Write time.Duration `mapstructure:"write"`
 
 	// Idle is the maximum duration a connection may remain idle between
-	// requests before the adapter closes it. 0 means no idle timeout.
+	// requests before the adapter closes it. It bounds the wait for a request
+	// header, so a client that stops part-way through one is also covered. 0
+	// means no idle timeout.
 	Idle time.Duration `mapstructure:"idle"`
 
 	// Shutdown is the maximum duration to wait for in-flight connections to

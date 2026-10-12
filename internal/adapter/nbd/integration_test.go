@@ -3,6 +3,7 @@ package nbd
 import (
 	"bytes"
 	"context"
+	"net"
 	"testing"
 
 	"github.com/marmos91/dittofs/internal/adapter/common"
@@ -409,5 +410,140 @@ func TestIntegration_WriteThenFlushThenReadBackByteExact(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("READ returned %d bytes that do not match what was written", len(got))
+	}
+}
+
+// manifestBytes is the number of payload bytes the file's block list
+// references. It is the observable a punch moves: metadata.Service.PunchHole
+// prunes file.Blocks and persists the pruned manifest, and that pruning is the
+// reclaim.
+func manifestBytes(file *metadata.File) uint64 {
+	var total uint64
+	for _, b := range file.Blocks {
+		total += uint64(b.Size)
+	}
+	return total
+}
+
+// integrationManifest reads the volume's manifest through the metadata service,
+// which is how a test sees what a punch pruned.
+func integrationManifest(t *testing.T, rt *runtime.Runtime, exp *Export) *metadata.File {
+	t.Helper()
+	file, err := rt.GetMetadataService().GetFile(context.Background(), exp.Handle)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	return file
+}
+
+// integrationWriteFixtureBytes writes size bytes of incompressible-looking data
+// into the fixture's volume through the handler and returns the handler's
+// connection so the caller can drive the next command on it.
+//
+// The manifest is populated before returning, and asserted to be populated:
+// Flush alone is not enough — with a durable local store it returns before the
+// remote drain (pkg/block/engine/flush.go:554), so file.Blocks is still empty
+// and a punch would have nothing to prune. A test written without
+// DrainAllUploads passes for the wrong reason.
+func integrationWriteFixtureBytes(t *testing.T, f *writeVolumeFixture, size int) (net.Conn, chan error) {
+	t.Helper()
+	h := f.newHandler(t, f.bs)
+	client, done := serveHandler(t, h, f.exp.Name)
+
+	want := make([]byte, size)
+	rng := uint32(0x9e3779b9)
+	for i := range want {
+		rng ^= rng << 13
+		rng ^= rng >> 17
+		rng ^= rng << 5
+		want[i] = byte(rng)
+	}
+	if rep := writeThroughClient(t, client, 0, want, 0); rep.Error != 0 {
+		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
+	}
+	if rep := flushThroughClient(t, client); rep.Error != 0 {
+		t.Fatalf("FLUSH reply error = %d, want 0", rep.Error)
+	}
+	ctx := context.Background()
+	if err := f.bs.DrainAllUploads(ctx); err != nil {
+		t.Fatalf("DrainAllUploads: %v", err)
+	}
+	if got := len(integrationManifest(t, f.rt, f.exp).Blocks); got == 0 {
+		t.Fatal("the manifest is empty after Flush and DrainAllUploads, so a punch has nothing to prune")
+	}
+	return client, done
+}
+
+// TestIntegration_TrimFreesAndReadsZero is TRIM over a real engine.Store: the
+// punched range reads back as zeros and the manifest shrinks.
+//
+// The manifest is asserted rather than the extent map on purpose. The punch
+// zero-overwrites the range through the local append log, so the local tier
+// keeps reporting an interval over it, and DataExtents over-reports by
+// documented contract (pkg/block/engine/dataextents.go:41, "may over-report data
+// but must never under-report it"). Asserting that DataExtents stops reporting
+// the punched range is unsatisfiable. The manifest is the observable: it is what
+// the reclaim prunes.
+func TestIntegration_TrimFreesAndReadsZero(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	client, _ := integrationWriteFixtureBytes(t, f, 1<<20)
+
+	before := integrationManifest(t, f.rt, f.exp)
+
+	// The export is exactly 1 MiB, so the punch covers the whole device and
+	// contains the single chunk the fixture's write produced. An out-of-range
+	// punch is refused (and has its own tests), so the range is the export's.
+	if rep := trimThroughClient(t, client, 0, 1<<20, 0); rep.Error != 0 {
+		t.Fatalf("TRIM reply error = %d, want 0", rep.Error)
+	}
+
+	after := integrationManifest(t, f.rt, f.exp)
+	if len(after.Blocks) >= len(before.Blocks) {
+		t.Fatalf("manifest has %d blocks after the punch, want fewer than the %d before it",
+			len(after.Blocks), len(before.Blocks))
+	}
+	if got, was := manifestBytes(after), manifestBytes(before); got >= was {
+		t.Fatalf("manifest references %d bytes after the punch, want fewer than the %d before it", got, was)
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x7a, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ of the trimmed range returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(got, make([]byte, 4096)) {
+		t.Fatal("READ of the trimmed range did not return zeros")
+	}
+}
+
+// TestIntegration_WriteZeroesDoesNotMaterializeChunks is the assertion that
+// keeps WRITE_ZEROES from becoming a zero-buffer WriteAt. On a
+// content-addressed store that call MATERIALIZES a real zero chunk, so a
+// filesystem's discard path would allocate storage instead of freeing it — the
+// reference library's bug. The manifest must shrink, not grow.
+func TestIntegration_WriteZeroesDoesNotMaterializeChunks(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	client, _ := integrationWriteFixtureBytes(t, f, 1<<20)
+
+	before := integrationManifest(t, f.rt, f.exp)
+
+	if rep := writeZeroesThroughClient(t, client, 0, 1<<20, 0); rep.Error != 0 {
+		t.Fatalf("WRITE_ZEROES reply error = %d, want 0", rep.Error)
+	}
+
+	after := integrationManifest(t, f.rt, f.exp)
+	if len(after.Blocks) >= len(before.Blocks) {
+		t.Fatalf("manifest has %d blocks after WRITE_ZEROES, want fewer than the %d before it: a zero-buffer WriteAt would materialize a new chunk",
+			len(after.Blocks), len(before.Blocks))
+	}
+	if got, was := manifestBytes(after), manifestBytes(before); got >= was {
+		t.Fatalf("manifest references %d bytes after WRITE_ZEROES, want fewer than the %d before it", got, was)
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x7b, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ of the zeroed range returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(got, make([]byte, 4096)) {
+		t.Fatal("READ of the zeroed range did not return zeros")
 	}
 }

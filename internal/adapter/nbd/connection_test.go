@@ -34,9 +34,11 @@ type storeFake struct {
 	readErr  error
 	writeErr error
 	flushErr error
+	punchErr error
 	reads    int
 	writes   int
 	flushes  int
+	punches  int
 
 	localDurable   bool
 	remoteDurable  bool
@@ -103,6 +105,10 @@ func (s *storeFake) WriteAt(_ context.Context, id string, currentBlocks []block.
 }
 
 func (s *storeFake) PunchHole(_ context.Context, id string, currentBlocks []block.ChunkRef, off, length uint64) ([]block.ChunkRef, error) {
+	s.punches++
+	if s.punchErr != nil {
+		return currentBlocks, s.punchErr
+	}
 	b := s.data[id]
 	for i := off; i < off+length && i < uint64(len(b)); i++ {
 		b[i] = 0
@@ -132,9 +138,21 @@ const testExportName = "/export/boot"
 const testPayloadID = "p1"
 
 // testExport is the export the fixture resolves: a volume of size bytes whose
-// data lives at testPayloadID.
+// data lives at testPayloadID. It is writable; readOnlyExport is the read-only
+// variant.
 func testExport(size uint64) *Export {
 	return &Export{Name: testExportName, Size: size, PayloadID: testPayloadID}
+}
+
+// readOnlyExport is testExport with the export-level read-only ceiling set.
+//
+// A second constructor rather than a mutation of testExport's return value:
+// tests share the value they build, so a test that flipped the flag on a shared
+// export would change what every other test resolves.
+func readOnlyExport(size uint64) *Export {
+	exp := testExport(size)
+	exp.ReadOnly = true
+	return exp
 }
 
 // exporterFor returns an exporter that resolves testExportName to exp. It
@@ -693,10 +711,16 @@ func flagName(f CommandFlags) string {
 // A client that sends a partial header and stalls must not hold the connection
 // open forever, and must not make the server allocate for a length it never
 // sent.
+//
+// Idle is the timer that bounds this wait: the connection has been silent since
+// the four bytes went out, so the arm that covers the wait for a header is the
+// Idle one. It is set below Read so the test would still fail if the arm read
+// Read — see TestConnection_IdleDeadlineClosesASilentConnection for the same
+// split with nothing sent at all.
 func TestConnection_PartialHeaderTimesOut(t *testing.T) {
 	st := newStoreFake()
 	h := newTestHandler(st, testExport(8192),
-		Timeouts{Read: 200 * time.Millisecond, Write: 5 * time.Second, Idle: 5 * time.Second})
+		Timeouts{Read: 5 * time.Second, Write: 5 * time.Second, Idle: 200 * time.Millisecond})
 	server, client := pipe(t)
 	done := serveConn(h, server)
 	completeHandshake(t, client, testExportName)
@@ -1122,4 +1146,336 @@ func TestConnection_FlushOnReadOnlyExportIsPermitted(t *testing.T) {
 	if st.flushes != 1 {
 		t.Fatalf("the store saw %d flushes, want 1", st.flushes)
 	}
+}
+
+// trimThroughClient sends one TRIM and returns the reply. TRIM carries no
+// payload, so there is nothing to send after the header.
+func trimThroughClient(t *testing.T, client net.Conn, offset uint64, length uint32, flags CommandFlags) *Reply {
+	t.Helper()
+	sendRequest(t, client, &Request{
+		Type: CmdTrim, Flags: flags, Cookie: 0x71, Offset: offset, Length: length,
+	})
+	return readReplyHeader(t, client)
+}
+
+// writeZeroesThroughClient sends one WRITE_ZEROES and returns the reply. Like
+// TRIM it carries no payload.
+func writeZeroesThroughClient(t *testing.T, client net.Conn, offset uint64, length uint32, flags CommandFlags) *Reply {
+	t.Helper()
+	sendRequest(t, client, &Request{
+		Type: CmdWriteZeroes, Flags: flags, Cookie: 0x72, Offset: offset, Length: length,
+	})
+	return readReplyHeader(t, client)
+}
+
+// A read-only export refuses a TRIM with NBD_EPERM. The export still advertises
+// SEND_TRIM while read-only — handshake.go sets it unconditionally and only adds
+// READ_ONLY — so this is not a client violating the advertisement; it is the
+// case the spec's error list names explicitly: "it SHOULD return NBD_EPERM if it
+// receives a write or trim request on a read-only export".
+func TestConnection_TrimIsEPERMOnReadOnlyExport(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	if rep := trimThroughClient(t, client, 0, 4096, 0); rep.Error != ErrEPERM {
+		t.Fatalf("TRIM on a read-only export reply error = %d, want ErrEPERM (%d)", rep.Error, uint32(ErrEPERM))
+	}
+	if st.punches != 0 {
+		t.Fatalf("the store saw %d punches for a refused TRIM", st.punches)
+	}
+}
+
+// The trimmed range reads back as zeros and the range before it is untouched.
+// It needs the real-metadata fixture: the handler calls h.meta.PunchHole, and
+// newTestHandler passes nil for meta.
+func TestConnection_TrimThenReadIsZeros(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
+
+	want := make([]byte, 8192)
+	for i := range want {
+		want[i] = byte(i%251) + 1
+	}
+	if rep := writeThroughClient(t, client, 0, want, 0); rep.Error != 0 {
+		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
+	}
+
+	if rep := trimThroughClient(t, client, 4096, 4096, 0); rep.Error != 0 {
+		t.Fatalf("TRIM reply error = %d, want 0", rep.Error)
+	}
+	if st.punches != 1 {
+		t.Fatalf("the store saw %d punches, want 1", st.punches)
+	}
+
+	rep, kept := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x73, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ below the trimmed range returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(kept, want[:4096]) {
+		t.Fatal("READ below the trimmed range did not return the bytes that were written")
+	}
+
+	rep, trimmed := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x74, Offset: 4096, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ of the trimmed range returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(trimmed, make([]byte, 4096)) {
+		t.Fatal("READ of the trimmed range did not return zeros")
+	}
+}
+
+// A TRIM whose length runs past the export end is refused, not clamped. The
+// spec: "it SHOULD return NBD_EINVAL if it receives a read or trim request
+// including one or more sectors beyond the size of the device." READ already
+// answers EINVAL past the end, and the same condition deserves the same answer.
+func TestConnection_TrimPastEndIsEINVAL(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	// 4096 bytes starting at 4096 ends exactly at the export end and is
+	// permitted; one byte more is the smallest out-of-range request.
+	if rep := trimThroughClient(t, client, 4096, 4097, 0); rep.Error != ErrEINVAL {
+		t.Fatalf("TRIM past the export end reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
+	}
+	if st.punches != 0 {
+		t.Fatalf("the store saw %d punches for a request past the export end", st.punches)
+	}
+}
+
+// An offset at or past the export end is refused on its own check. It is
+// asserted separately because it is the case a subtraction-based clamp
+// underflows on: end-offset with end == size and offset > size wraps to a value
+// near 2^64, which the engine's overflow guard then reports as a confusing
+// "punch range overflow" instead of the right answer.
+func TestConnection_TrimOffsetPastEndIsEINVAL(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	if rep := trimThroughClient(t, client, 8192, 100, 0); rep.Error != ErrEINVAL {
+		t.Fatalf("TRIM at the export end reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
+	}
+	if rep := trimThroughClient(t, client, 10000, 100, 0); rep.Error != ErrEINVAL {
+		t.Fatalf("TRIM past the export end reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
+	}
+	if st.punches != 0 {
+		t.Fatalf("the store saw %d punches for an out-of-range TRIM", st.punches)
+	}
+}
+
+// WRITE_ZEROES past the end is NBD_ENOSPC, not EINVAL: the spec gives it its own
+// rule — "The server SHOULD return NBD_ENOSPC if it receives a write zeroes
+// request including one or more sectors beyond the size of the device."
+func TestConnection_WriteZeroesPastEndIsENOSPC(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	if rep := writeZeroesThroughClient(t, client, 4096, 4097, 0); rep.Error != ErrENOSPC {
+		t.Fatalf("WRITE_ZEROES past the export end reply error = %d, want ErrENOSPC (%d)", rep.Error, uint32(ErrENOSPC))
+	}
+	if st.punches != 0 {
+		t.Fatalf("the store saw %d punches for a request past the export end", st.punches)
+	}
+}
+
+// NO_HOLE must be accepted, not rejected: "The server MUST support the use of
+// this flag if it advertises NBD_FLAG_SEND_WRITE_ZEROES", and the adapter does.
+// It is the client asking that the range be genuinely allocated rather than left
+// sparse, and PunchHole already zero-overwrites rather than leaving a hole, so
+// honouring it takes no extra work. Refusing it would break a MUST on the
+// strength of the rule that makes NO_HOLE invalid on WRITE.
+func TestConnection_WriteZeroesWithNoHoleIsAccepted(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
+
+	if rep := writeZeroesThroughClient(t, client, 0, 4096, FlagNoHole); rep.Error != 0 {
+		t.Fatalf("WRITE_ZEROES with NBD_CMD_FLAG_NO_HOLE reply error = %d, want 0", rep.Error)
+	}
+	if st.punches != 1 {
+		t.Fatalf("the store saw %d punches, want 1", st.punches)
+	}
+}
+
+// A zero-length TRIM is NBD_EINVAL, the same answer READ, WRITE and
+// WRITE_ZEROES give. TRIM carries no payload either way, so the connection must
+// stay usable for the next command.
+func TestConnection_TrimZeroLengthIsEINVAL(t *testing.T) {
+	st := newStoreFake()
+	st.data[testPayloadID] = make([]byte, 4096)
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	if rep := trimThroughClient(t, client, 0, 0, 0); rep.Error != ErrEINVAL {
+		t.Fatalf("zero-length TRIM reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
+	}
+	if st.punches != 0 {
+		t.Fatalf("the store saw %d punches for a zero-length request", st.punches)
+	}
+
+	// The READ proves the zero-length path left the stream where it found it: a
+	// handler that drained a payload it never received would consume this
+	// header.
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x75, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ after a zero-length TRIM returned error %d; the zero-length path consumed the next header", rep.Error)
+	}
+	if len(got) != 4096 {
+		t.Fatalf("READ after a zero-length TRIM returned %d bytes, want 4096", len(got))
+	}
+}
+
+// A zero-length WRITE_ZEROES is NBD_EINVAL, matching READ and WRITE. No payload
+// either way, so the connection must stay usable.
+func TestConnection_WriteZeroesZeroLengthIsEINVAL(t *testing.T) {
+	st := newStoreFake()
+	st.data[testPayloadID] = make([]byte, 4096)
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	if rep := writeZeroesThroughClient(t, client, 0, 0, 0); rep.Error != ErrEINVAL {
+		t.Fatalf("zero-length WRITE_ZEROES reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
+	}
+	if st.punches != 0 {
+		t.Fatalf("the store saw %d punches for a zero-length request", st.punches)
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x76, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ after a zero-length WRITE_ZEROES returned error %d; the zero-length path consumed the next header", rep.Error)
+	}
+	if len(got) != 4096 {
+		t.Fatalf("READ after a zero-length WRITE_ZEROES returned %d bytes, want 4096", len(got))
+	}
+}
+
+// The assertion that keeps WRITE_ZEROES from becoming a zero-buffer WriteAt: on
+// a content-addressed store that call MATERIALIZES real zero chunks, so a
+// filesystem's discard path would allocate storage instead of freeing it. The
+// punches/writes counters are the guard, and the read back is what proves the
+// range is zeros either way.
+func TestConnection_WriteZeroesThenReadIsZeros(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	// Pre-populated rather than written through the handler, so st.writes stays
+	// zero for a reason the assertion can see: a WRITE_ZEROES that went through
+	// WriteAt would increment it.
+	nonzero := make([]byte, 4096)
+	for i := range nonzero {
+		nonzero[i] = byte(i%251) + 1
+	}
+	st.data[string(f.exp.PayloadID)] = nonzero
+
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
+
+	if rep := writeZeroesThroughClient(t, client, 0, 4096, 0); rep.Error != 0 {
+		t.Fatalf("WRITE_ZEROES reply error = %d, want 0", rep.Error)
+	}
+	if st.punches != 1 {
+		t.Fatalf("the store saw %d punches, want 1", st.punches)
+	}
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes, want 0: WRITE_ZEROES must punch, not write a zero buffer", st.writes)
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x77, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ of the zeroed range returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(got, make([]byte, 4096)) {
+		t.Fatal("READ of the zeroed range did not return zeros")
+	}
+}
+
+// WRITE_ZEROES is a write, so a read-only export refuses it.
+func TestConnection_WriteZeroesOnReadOnlyExportIsEPERM(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	if rep := writeZeroesThroughClient(t, client, 0, 4096, 0); rep.Error != ErrEPERM {
+		t.Fatalf("WRITE_ZEROES on a read-only export reply error = %d, want ErrEPERM (%d)", rep.Error, uint32(ErrEPERM))
+	}
+	if st.punches != 0 {
+		t.Fatalf("the store saw %d punches for a refused WRITE_ZEROES", st.punches)
+	}
+}
+
+// Read-only means writes are refused, not that the device is unusable: a client
+// mounting a read-only export still reads it.
+func TestConnection_ReadOnReadOnlyExportSucceeds(t *testing.T) {
+	want := make([]byte, 4096)
+	for i := range want {
+		want[i] = byte(i%251) + 1
+	}
+	st := newStoreFake()
+	st.data[testPayloadID] = want
+
+	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x78, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ on a read-only export returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("READ on a read-only export did not return the stored bytes")
+	}
+}
+
+// A WRITE on a read-only export is NBD_EPERM, checked before the range and the
+// store: a read-only export refuses the write wherever it lands. The payload
+// still goes out and is still drained, so the connection stays synchronized.
+func TestConnection_WriteOnReadOnlyExportIsEPERM(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, readOnlyExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	if rep := writeThroughClient(t, client, 0, make([]byte, 4096), 0); rep.Error != ErrEPERM {
+		t.Fatalf("WRITE on a read-only export reply error = %d, want ErrEPERM (%d)", rep.Error, uint32(ErrEPERM))
+	}
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a refused request", st.writes)
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x79, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ after a refused WRITE returned error %d; the refused payload was read as the next request header", rep.Error)
+	}
+	if len(got) != 4096 {
+		t.Fatalf("READ after a refused WRITE returned %d bytes, want 4096", len(got))
+	}
+}
+
+// Idle bounds the wait for a request header, so a connection that completes its
+// handshake and then sends nothing is closed by the Idle timer.
+//
+// The values are the point: Idle is SHORTER than Read, so the test fails if the
+// arm reads Read instead. With Idle == Read or Idle > Read it would pass whether
+// or not the arm exists — which is why the committed
+// TestConnection_PartialHeaderTimesOut (Idle 5s / Read 200ms) cannot catch the
+// missing arm.
+func TestConnection_IdleDeadlineClosesASilentConnection(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192),
+		Timeouts{Read: 5 * time.Second, Write: 5 * time.Second, Idle: 200 * time.Millisecond})
+	client, done := serveHandler(t, h, testExportName)
+
+	// Silence from here: the handshake is complete and no request follows.
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil after the idle timeout; a silent connection must end")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not return within 2s of a 200ms idle timeout: Timeouts.Idle is not armed")
+	}
+	_ = client.Close()
 }
