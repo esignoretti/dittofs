@@ -736,7 +736,7 @@ func TestConnection_PartialHeaderTimesOut(t *testing.T) {
 			t.Fatal("serve returned nil after a partial header; a stalled client must end the connection")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("serve did not return within 2s of a 200ms read timeout")
+		t.Fatal("serve did not return within 2s of a 200ms idle timeout: Timeouts.Idle is not armed")
 	}
 	assertNoPayload(t, client, 100*time.Millisecond)
 }
@@ -1010,6 +1010,41 @@ func TestConnection_WriteTruncatedPayloadIsAnError(t *testing.T) {
 	if st.writes != 0 {
 		t.Fatalf("the store saw %d writes for a payload the server never fully received", st.writes)
 	}
+}
+
+// The payload read must be bounded by Read, not by whatever budget the header
+// read left behind on the connection.
+//
+// The fixture is the INVERSE of the header test: Read is short and Idle is long,
+// so a payload read that inherited the header's Idle budget is still waiting at
+// 1s. The client is deliberately NOT closed — closing it makes the read return on
+// EOF, which is why the committed TestConnection_WriteTruncatedPayloadIsAnError
+// (equal budgets, and it closes) passes with the arm deleted.
+func TestConnection_PayloadReadIsBoundedByRead(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192),
+		Timeouts{Read: 200 * time.Millisecond, Write: 5 * time.Second, Idle: 5 * time.Second})
+	client, done := serveHandler(t, h, testExportName)
+
+	// A header declaring 4096 bytes of payload, then 100 of them, then silence on
+	// an open connection: only a deadline can end this read.
+	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 16, Offset: 0, Length: 4096})
+	if _, err := client.Write(make([]byte, 100)); err != nil {
+		t.Fatalf("write partial payload: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil after a partial payload; the read must fail")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve did not return within 1s of a 200ms read timeout: the payload read is not bounded by Timeouts.Read")
+	}
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a payload the server never fully received", st.writes)
+	}
+	_ = client.Close()
 }
 
 // FUA is the assertion that makes the flag mean something: the spec says the
@@ -1297,6 +1332,26 @@ func TestConnection_WriteZeroesWithNoHoleIsAccepted(t *testing.T) {
 
 	if rep := writeZeroesThroughClient(t, client, 0, 4096, FlagNoHole); rep.Error != 0 {
 		t.Fatalf("WRITE_ZEROES with NBD_CMD_FLAG_NO_HOLE reply error = %d, want 0", rep.Error)
+	}
+	if st.punches != 1 {
+		t.Fatalf("the store saw %d punches, want 1", st.punches)
+	}
+}
+
+// A TRIM whose block-store punch fails reaches the client as NBD_EIO, mapped by
+// mapError from whatever the store returned. It is a real path rather than a
+// hypothetical one: engine.Store.PunchHole is the call that fails when the local
+// store is closed underneath a live connection, and the metadata punch that
+// precedes it would have succeeded, so nothing else reports the failure.
+func TestConnection_TrimPunchFailureIsEIO(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	st.punchErr = errors.New("boom")
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
+
+	if rep := trimThroughClient(t, client, 0, 4096, 0); rep.Error != ErrEIO {
+		t.Fatalf("TRIM with a failing store punch reply error = %d, want ErrEIO (%d)", rep.Error, uint32(ErrEIO))
 	}
 	if st.punches != 1 {
 		t.Fatalf("the store saw %d punches, want 1", st.punches)
