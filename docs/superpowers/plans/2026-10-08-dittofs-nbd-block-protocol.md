@@ -3149,7 +3149,28 @@ Two harness requirements the spec calls non-negotiable, both of which the script
 1. **A clean `umount` is not evidence.** The script must SIGKILL the server; it must refuse to pass if the guest unmounted cleanly, because that never exercises the barrier.
 2. **Restart inside the dead-connection window.** The kernel's `dead_conn_timeout` (commit `560bc4b399`, `NBD_ATTR_DEAD_CONN_TIMEOUT`) pauses in-flight requests rather than failing them — but a window over ~120 s trips the hung-task detector, so the script must measure and print the actual restart time and fail if it exceeds the configured window.
 
-`-timeout` and `-persist` are **not** this mechanism — `-timeout` sets `NBD_SET_TIMEOUT` (per-request) and `-persist` is `nbd-client`'s own reconnect loop. The script must configure `dead_conn_timeout` explicitly and say so, because conflating the three is a documented real-world failure.
+**THE MECHANISM, CORRECTED — `-T` alone does NOT reconnect, and this is the error the first draft of this step made.** Read from `drivers/block/nbd.c` and `nbd-client.c` on `master`:
+
+```
+wait_for_reconnect()                      nbd.c:1101-1114
+    if (!config->dead_conn_timeout) return 0;      <- no window => fail IMMEDIATELY
+    wait_event_timeout(config->conn_wait,
+        DISCONNECTED || live_connections > 0,
+        dead_conn_timeout)                          <- waits for USERSPACE to act
+
+grep -c nbd_reconnect_socket drivers/block/nbd.c   => 0   <- kernel never reconnects
+```
+
+`live_connections` is incremented **only** by userspace netlink operations (`nbd_add_socket` `:1339`, `nbd_genl_reconfigure` `:1401`). The kernel notices the dead link in `nbd_mark_nsock_dead` (`:307-330`), multicasts `NBD_CMD_LINK_DEAD`, and then **waits for a client to hand it a new socket**. So the two settings do different jobs and the harness needs **both**:
+
+| Setting | What it does | What it does *not* do |
+|---|---|---|
+| `-T <seconds>` | sets the kernel's patience before failing in-flight I/O | reconnect anything |
+| `-p` / `--persist` | runs the client's monitor: `NBD_CMD_LINK_DEAD` → `reconnect_with_backoff` → `netlink_reconfigure` → `NBD_CMD_RECONFIGURE` | set the window (it supplies a 30 s default, which `-T` overrides) |
+
+**`-p` alone gives a 30 s window and reconnects. `-T` alone gives a window and then `BLK_STS_IOERR`.** The script must pass both, and must not describe `-p` as "not this mechanism" — it is the *only* thing that performs the reconnect.
+
+**And `-p` does not daemonize**, which the initramfs script must account for: the persist branch returns before `daemon(0,0)` (`nbd-client.c:1571` returns `persist_mode_main(...)`, `:1580` is the daemon call). Run in the foreground it never returns and `switch_root` is never reached; it must be backgrounded. (Backgrounding is safe across `switch_root`: busybox's `delete_contents` unlinks the initramfs files to free RAM and does **not** kill processes.)
 
 **How to configure it, exactly, and the trap in the obvious spelling.**
 
@@ -3172,10 +3193,11 @@ On 3.26.1 there is no way to set `dead_conn_timeout` at all: the flag does not e
 **3.27.1 is not usable either, for a different and more confusing reason.** Its `nbd-client.c:1548` gates the persist monitoring loop on `cur_client->persist_mode`, but the CLI sets `cur_client->persist` (`args.c:186-188`, `client->persist = true`), and **nothing in the tree ever assigns `persist_mode = true`** — verified exhaustively across `nbd-client.c`, `args.c`, `args.h`, `nbdclt.h`, `nbd.h`, `cliserv.h`. The only two writes to it are `= false`, inside the ioctl path that the netlink path returns before reaching. So on 3.27.1 `-p` is *still* ignored, and because the loop never starts, the kernel never receives `NBD_CMD_RECONFIGURE` — the device pauses for `dead_conn_timeout` and then returns `BLK_STS_IOERR` with nothing to reconnect it. That is precisely the silent-failure class this design exists to eliminate, one layer down. (Upstream fixed it on `master` by testing `cur_client->persist` at both sites; the fix postdates 3.27.1.)
 
 **What the script must therefore do, and it must do it as a pre-flight check rather than in the README:**
-1. Parse `nbd-client --version` and **refuse below 3.27.1**, naming the version found and the distribution packages that carry it. A version gate is legitimate here because the alternative is a crash test that reports success for the wrong reason.
-2. On 3.27.1 exactly, **do not rely on `-p`**. `-T` works there and is the only lever that does: it sets `dead_conn_timeout` directly through netlink (`args.c:198` → `nbd-client.c:190-191`). But since the reconnect loop cannot start, the window must be sized to **survive the restart inside a single `dead_conn_timeout`** rather than expecting the kernel to pause and then resume. The script must state which of the two regimes it is in.
-3. **Assert the mechanism took effect rather than assuming it**, which is now more than a netlink-availability probe: read the value back. `dead_conn_timeout` is not exposed through sysfs (`drivers/block/nbd.c` creates only `pid_attr` and `backend_attr`), so there is no read-back path — which means the honest check is behavioural: SIGKILL the server, confirm the guest's I/O **blocks** rather than erroring immediately, and fail if it errors. That observation is the assertion, and it distinguishes "the window is set" from "the flag was passed".
-4. The README must say plainly that `-p` is broken on both 3.26.1 and 3.27.1, so nobody "fixes" the harness by adding it back.
+1. **Require a `nbd-client` built from `master` (or any commit after `eac55e0b06fe`, 2026-08-30).** Not a version floor — a *build* requirement, because **no release can reconnect at all**: 3.27.0 and 3.27.1 have `-T` but gate the persist loop on a field nothing sets, and everything ≤3.26.1 has no `-T` and returns from the netlink path before reaching the loop. The script must check for the capability rather than the number, and must name the required commit in its refusal, because a version floor of "3.27.1 or newer" would pass on exactly the two broken releases.
+2. **Pass BOTH `-T <seconds>` and `-p`.** They are not alternatives: `-T` sets how long the kernel waits, `-p` is what actually hands it a new socket when the wait expires. Passing `-T` alone pauses the I/O for the full window and then returns `BLK_STS_IOERR`, which reads exactly like a DittoFS failure and is not one. The script must print both flags in its own output so the transcript says which regime ran.
+3. **Assert the mechanism took effect rather than assuming it.** `dead_conn_timeout` is not exposed through sysfs (`drivers/block/nbd.c` creates only `pid_attr` and `backend_attr`), so there is no read-back path — the honest check is behavioural: SIGKILL the server, confirm the guest's I/O **blocks** rather than erroring immediately, and confirm it **resumes** when the server returns. Blocking alone proves only that `-T` reached the kernel; resuming is what proves `-p` did. Both halves are the assertion.
+4. **`-p` must be backgrounded in the initramfs**, and the script must say why: the persist branch returns before the daemon call (`nbd-client.c:1571` vs `:1580`), so a foreground `-p` never returns and `switch_root` is never reached. Backgrounding survives `switch_root` — busybox's `delete_contents` unlinks the initramfs files to free memory and does not kill processes.
+5. The README must say plainly that **no released `nbd-client` can reconnect** and that the harness needs a `master` build, so nobody "fixes" the harness by adding `-p` back to a release and reporting a mystery I/O error.
 
 - [ ] **Step 3: Extend `test/nbd/README.md`**
 
@@ -3250,7 +3272,10 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 8 — the guest's `nbd-client` line names the export (`-N export/boot`) and mounts `/dev/nbd0`, not `/dev/nbd0p1`. Measured: omitting `-N` makes `nbd-client` send an **empty** export name (`nbd-client.c:1504-1505`), which `RuntimeExporter.Resolve` refuses (`sep <= 0` → `ErrUnknownExport`) — probe result `nbd: unknown export`, reported to the client as a handshake failure that never mentions the flag. And nothing in the path writes a partition table, so a `p1` suffix fails with `no such device` after the handshake and `mkfs` have both already succeeded.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
 - [ ] Task 8 — the crash rig sets `dead_conn_timeout` with `-T`/`--dead-timeout` and fails when netlink is unavailable, rather than silently running the ioctl path where the option is parsed and ignored.
-- [ ] Task 8 — the crash rig **refuses `nbd-client` below 3.27.1** (3.26.1 has no `-T` at all) and **does not pass `-p` on 3.27.1**, where the persist loop is gated on `persist_mode`, a field nothing ever sets. Measured: `-p` is silently ignored on both 3.26.1 and 3.27.1. And the window is asserted **behaviourally** — SIGKILL the server, confirm the guest's I/O blocks rather than erroring immediately — because `dead_conn_timeout` has no sysfs read-back (only `pid_attr` and `backend_attr` exist).
+- [ ] Task 8 — the crash rig requires a `nbd-client` **built from `master`** (after `eac55e0b06fe`, 2026-08-30) and checks the *capability*, not a version number: **no release can reconnect**. 3.27.0/3.27.1 gate the persist loop on `persist_mode`, which nothing ever sets true (the `-p` flag sets `persist`); ≤3.26.1 has no `-T` and returns from the netlink path before reaching the loop. Measured across every tag. A version floor of "3.27.1 or newer" would pass on exactly the two broken releases.
+- [ ] Task 8 — the crash rig passes **both** `-T <seconds>` and `-p`, because they do different jobs: `-T` sets how long the kernel waits (`wait_for_reconnect`, `nbd.c:1101-1114`, keyed on `live_connections > 0`), and `-p` is the only thing that hands the kernel a new socket (`reconnect_with_backoff` → `netlink_reconfigure` → `NBD_CMD_RECONFIGURE`). The kernel has **no** reconnect of its own (`grep -c nbd_reconnect_socket drivers/block/nbd.c` → 0). Passing `-T` alone pauses the I/O for the full window and then returns `BLK_STS_IOERR`, which reads like a DittoFS failure and is not one. A second process cannot substitute: `nbd_genl_connect` returns `-EBUSY` (`"nbd%d already in use"`) while the device is configured.
+- [ ] Task 8 — the window is asserted **behaviourally and in both directions** — SIGKILL the server, confirm the guest's I/O *blocks* rather than erroring (that is `-T`), and confirm it *resumes* when the server returns (that is `-p`) — because `dead_conn_timeout` has no sysfs read-back (`drivers/block/nbd.c` creates only `pid_attr` and `backend_attr`). Blocking alone passes with a broken `-p`.
+- [ ] Task 8 — the initramfs script backgrounds `nbd-client -p`, because the persist branch returns before the daemon call (`nbd-client.c:1571` vs `:1580`), so a foreground `-p` never returns and `switch_root` is never reached.
 - [ ] Task 8 — `mkfs.ext4` + mount + write + `sync` + unmount + remount in a KVM guest.
 - [ ] Task 8 — SIGKILL mid-write → restart → guest I/O resumes inside the dead-connection window; host-side `fsck` clean.
 - [ ] The volume is readable as a plain file over NFS (the B1 property, spec §2.2).

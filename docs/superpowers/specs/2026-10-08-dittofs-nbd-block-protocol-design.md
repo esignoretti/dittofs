@@ -599,26 +599,26 @@ the outage if the server returns inside the window.
    blocks the submitting thread, and `BLK_MQ_F_BLOCKING` leaves it in an uninterruptible
    wait — a `dead_conn_timeout` over ~120 s trips the detector. **Plan for 30–60 s, not
    600 s.**
-2. **`-timeout` and `-persist` are not this mechanism.** `-timeout` sets
-   `NBD_SET_TIMEOUT` (per-request; kernel 2.6.24+, `NBD_SET_TIMEOUT` ioctl). `-persist`
-   is `nbd-client`'s own reconnect loop. Conflating them is a real failure mode: a
-   reported case with `-persist -timeout 600 -connections 4` still went read-only on
-   server restart.
-3. **`-persist` is broken on every released `nbd-client`, and the version gate is not
-   optional.** The mechanism above requires `-T`/`--dead-timeout` to reach the kernel
-   through netlink, and only `master` and the **3.27.1** tag can do that. Measured by
-   fetching each tag's `nbd-client.c` and `args.c`:
+2. **`-timeout` is a third, unrelated knob.** `-timeout` sets `NBD_SET_TIMEOUT` (per-request;
+   kernel 2.6.24+, `NBD_SET_TIMEOUT` ioctl) — it bounds one request, not the reconnect
+   window. `-persist` *is* part of this mechanism, and item 4 is where that is spelled out;
+   the short version is that `-persist` performs the reconnect and `-T` sets how long the
+   kernel waits for it. A reported case with `-persist -timeout 600 -connections 4` still
+   went read-only on server restart, which is the failure that makes the distinction worth
+   stating: `-timeout` looks like the reconnect knob and is not one.
+3. **`-T`/`--dead-timeout` does not exist before 3.27.0, and no release can reconnect at
+   all.** See item 4 — the two facts are one finding and are stated together there.
 
    | | 3.26.1 | 3.27.1 | master |
    |---|---|---|---|
    | `-T`/`--dead-timeout` | **absent** | present (`args.c:76`, `:198`) | present |
-   | `NBD_ATTR_DEAD_CONN_TIMEOUT` sent | **never** | behind a gate nothing opens | yes |
-   | persist over netlink | **no — `-p` ignored** | **no — same bug** | yes |
+   | `NBD_ATTR_DEAD_CONN_TIMEOUT` sent | **never** | yes | yes |
+   | persist monitoring loop reachable | **no — netlink returns first** | **no — gate reads `persist_mode`, which nothing sets** | yes |
 
-   **3.26.1** (Debian bookworm `1:3.26.1-6.1`, Ubuntu 24.04 `1:3.26.1-2`) has no `-T` at
-   all, and its netlink path does `netlink_configure(...); return 0;` — it never reaches
-   the ioctl reconnect loop, so `-p` is parsed, stored and silently ignored whenever
-   netlink is available (the default).
+   The two broken mechanisms differ. **3.26.1** (Debian bookworm `1:3.26.1-6.1`, Ubuntu
+   24.04 `1:3.26.1-2`) has no `-T` at all, and its netlink path does
+   `netlink_configure(...); return 0;` — it never reaches the ioctl reconnect loop, so `-p`
+   is parsed, stored and silently ignored whenever netlink is available (the default).
 
    **3.27.1** (Debian trixie/sid `1:3.27.1-4`) gates the persist monitoring loop on
    `cur_client->persist_mode` (`nbd-client.c:1548`), while the CLI sets
@@ -628,15 +628,73 @@ the outage if the server returns inside the window.
    the ioctl path the netlink path returns before reaching. So the loop never starts, the
    kernel never receives `NBD_CMD_RECONFIGURE`, and a dead connection pauses for
    `dead_conn_timeout` and then returns `BLK_STS_IOERR` with nothing to reconnect it.
-   Upstream fixed this on `master`; the fix postdates 3.27.1.
+4. **`-T` sets the window; it does NOT reconnect. Nothing in any release reconnects.**
+   This is the correction that matters most, because the mechanism above is only half the
+   story and the missing half is the half that makes the guest resume.
 
-   The harness must therefore **refuse `nbd-client` below 3.27.1**, must **not pass `-p`
-   on 3.27.1** (where `-T` is the only lever that works, and the restart must fit inside a
-   single window rather than expecting pause-then-resume), and must **assert the window
-   behaviourally** — SIGKILL the server and confirm guest I/O *blocks* rather than erroring.
-   There is no read-back path to check instead: `dead_conn_timeout` is not exposed through
-   sysfs (`drivers/block/nbd.c` creates only `pid_attr` and `backend_attr`).
-4. **Restart must re-bind the same port and serve the same export name, size, and bytes.**
+   The kernel never reconnects on its own — there is no `nbd_reconnect_socket` anywhere in
+   `drivers/block/nbd.c`. What it does is *wait for userspace*:
+
+   ```c
+   static int wait_for_reconnect(struct nbd_device *nbd)      /* nbd.c:1101-1114 */
+   {
+       if (!config->dead_conn_timeout)
+           return 0;                                          /* no window: fail now */
+       if (!wait_event_timeout(config->conn_wait,
+                   test_bit(NBD_RT_DISCONNECTED, &config->runtime_flags) ||
+                   atomic_read(&config->live_connections) > 0,
+                   config->dead_conn_timeout))
+           return 0;
+       return !test_bit(NBD_RT_DISCONNECTED, &config->runtime_flags);
+   }
+   ```
+
+   `live_connections` is incremented **only** by userspace netlink operations
+   (`nbd_add_socket` `:1339`, `nbd_genl_reconfigure` `:1401`). The kernel notices the dead
+   link in `nbd_mark_nsock_dead` (`:307-330`), multicasts `NBD_CMD_LINK_DEAD`, and waits
+   for a client to hand it a fresh socket. So `-T` and `-p` do different jobs:
+
+   | Setting | What it does | What it does *not* do |
+   |---|---|---|
+   | `-T <seconds>` | sets the kernel's patience before failing in-flight I/O | reconnect anything |
+   | `-p` / `--persist` | runs the monitor: `NBD_CMD_LINK_DEAD` → `reconnect_with_backoff` → `netlink_reconfigure` → `NBD_CMD_RECONFIGURE` | set the window (it supplies a 30 s default, which `-T` overrides) |
+
+   **Both are required, and `-p` is the only thing that performs the reconnect** — so the
+   earlier instruction not to treat `-persist` as part of this mechanism was wrong, and the
+   failure it produces is the worst kind: `-T` alone gives a window, the I/O pauses for its
+   full length, and then the device returns `BLK_STS_IOERR` with no reconnect ever attempted.
+
+   **No released `nbd-client` can do this.** Measured across every tag:
+
+   | Tag | `-T` | `-p` | Reconnects |
+   |---|---|---|---|
+   | 3.25, 3.26, 3.26.1 | **absent** | parsed, then ignored on the netlink path | **no** |
+   | 3.27.0, 3.27.1 | present | **gate reads `persist_mode`, which nothing ever sets true** | **no** |
+   | `master` | present | gate reads `persist` | yes |
+
+   The `persist`/`persist_mode` confusion was introduced in 3.27.0 and fixed on
+   `master` by `bed84a3687d2` "Fix persist/persist_mode confusion" (2026-08-30) —
+   *"We somehow ended up with two variables for persist mode, checking one in some
+   locations and the other in others. That can't work."* — which is followed by
+   `eac55e0b06fe` "Implement -persist handling for netlink mode". 3.27.1 was tagged
+   2026-04-09, four months **before** the fix, so **no release contains it**. The previous
+   release line cannot substitute either: ≤3.26.1 has no `-T` at all, and its netlink path
+   does `netlink_configure(...); return 0;` without ever reaching the ioctl reconnect loop.
+
+   **Consequence for the harness, and it is not optional:** the crash rig cannot be built
+   on a released `nbd-client`. It needs one built from `master` (or any commit after
+   `eac55e0b06fe`), and the script must **refuse a released version by name** rather than
+   reporting a mystery `BLK_STS_IOERR` as a DittoFS failure. A second process cannot
+   substitute: `nbd_genl_connect` returns `-EBUSY` (`"nbd%d already in use"`) while the
+   device is configured, and only `NBD_CMD_RECONFIGURE` — which no released client sends —
+   can hand the kernel a new socket.
+5. **`-p` does not daemonize, which the initramfs script must account for.** The persist
+   branch returns before the daemon call (`nbd-client.c:1571` returns
+   `persist_mode_main(...)`; `:1580` is `daemon(0,0)`). Run in the foreground it never
+   returns and `switch_root` is never reached, so it must be backgrounded. Backgrounding is
+   safe across `switch_root`: busybox's `delete_contents` unlinks the initramfs files to
+   free memory and does **not** kill processes.
+6. **Restart must re-bind the same port and serve the same export name, size, and bytes.**
 
 ---
 
