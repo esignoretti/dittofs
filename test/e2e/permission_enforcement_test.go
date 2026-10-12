@@ -198,7 +198,10 @@ func testNoAccessUserCannotRead(t *testing.T, cli *helpers.CLIRunner, smbPort in
 	}
 
 	// The share default is "none", so TREE_CONNECT answers STATUS_ACCESS_DENIED.
-	_, err = framework.MountSMBWithError(t, smbPort, creds)
+	denied, err := framework.MountSMBWithError(t, smbPort, creds)
+	if denied != nil {
+		denied.Cleanup()
+	}
 	requireSMBMountDenied(t, err, "no-access user")
 
 	// The same credentials mount once the user is granted read, so the denial
@@ -280,7 +283,10 @@ func testUserRemovedFromGroupLosesPermissions(t *testing.T, cli *helpers.CLIRunn
 	// The user's only grant came from the group, so the remount falls back to
 	// the "none" default. The successful mount above, with the same
 	// credentials, rules out a login failure.
-	_, err = framework.MountSMBWithError(t, smbPort, creds)
+	denied, err := framework.MountSMBWithError(t, smbPort, creds)
+	if denied != nil {
+		denied.Cleanup()
+	}
 	requireSMBMountDenied(t, err, "user removed from group")
 
 	t.Log("ENF-03: User removed from group loses permissions - PASSED")

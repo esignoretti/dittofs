@@ -69,6 +69,7 @@ func mountNFSv40WithKerberos(t *testing.T, port int, export, secFlavor string) *
 	// directories t.TempDir creates.
 	mountPoint, err := os.MkdirTemp("/tmp", "dittofs-e2e-krb-v4-")
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(mountPoint) })
 	require.NoError(t, os.Chmod(mountPoint, 0o755))
 
 	// CRITICAL: Use vers=4.0 explicitly, never vers=4
@@ -166,7 +167,7 @@ func TestNFSv4KerberosExtended(t *testing.T) {
 	for _, u := range []krbV4User{krbAlice, krbBob} {
 		// The DittoFS password is never used: these users authenticate to the
 		// KDC. It only has to satisfy the server's password policy.
-		_, err = runner.CreateUser(u.principal, "kerberos-only-user", helpers.WithUID(u.uid))
+		_, err = runner.CreateUser(u.principal, "kerberos-only-user", helpers.WithUID(u.serverUID))
 		require.NoError(t, err, "create user %s", u.principal)
 		require.NoError(t, runner.GrantUserPermission("/krb-v4", u.principal, "read-write"),
 			"grant read-write to %s", u.principal)
@@ -203,16 +204,16 @@ func TestNFSv4KerberosExtended(t *testing.T) {
 		// alice's grant opens the share, so the denial below is about the
 		// principal and not about a share nobody can write.
 		controlFile := mount.FilePath("authz_control.txt")
-		require.NoError(t, framework.WriteFileAsUID(t, krbAlice.uid, krbAlice.uid, controlFile, []byte("ok")),
+		require.NoError(t, framework.WriteFileAsUID(t, krbAlice.localUID, krbAlice.localUID, controlFile, []byte("ok")),
 			"alice (granted read-write) should write")
 
 		// A read that succeeds proves unauthorized_user holds a working GSS
 		// context; a missing ticket would also surface as "permission denied".
-		got, err := framework.ReadFileAsUID(t, krbUnauthorized.uid, krbUnauthorized.uid, controlFile)
+		got, err := framework.ReadFileAsUID(t, krbUnauthorized.localUID, krbUnauthorized.localUID, controlFile)
 		require.NoError(t, err, "unauthorized_user should read under the share's read default")
 		assert.Equal(t, "ok", string(got))
 
-		err = framework.WriteFileAsUID(t, krbUnauthorized.uid, krbUnauthorized.uid,
+		err = framework.WriteFileAsUID(t, krbUnauthorized.localUID, krbUnauthorized.localUID,
 			mount.FilePath("unauthorized_test.txt"), []byte("should fail"))
 		requireAccessDenied(t, err, "unmapped principal write")
 	})
@@ -223,7 +224,7 @@ func TestNFSv4KerberosExtended(t *testing.T) {
 		mount := mountNFSv40WithKerberos(t, nfsPort, "/krb-v4", "krb5")
 
 		testFile := mount.FilePath("alice_ownership.txt")
-		require.NoError(t, framework.WriteFileAsUID(t, krbAlice.uid, krbAlice.uid, testFile, []byte("Alice's file")),
+		require.NoError(t, framework.WriteFileAsUID(t, krbAlice.localUID, krbAlice.localUID, testFile, []byte("Alice's file")),
 			"alice should be able to create a file")
 
 		// alice@REALM resolves to the DittoFS user alice, uid 1001; the file the
@@ -232,7 +233,7 @@ func TestNFSv4KerberosExtended(t *testing.T) {
 		require.NoError(t, err, "should stat alice's file")
 		st, ok := info.Sys().(*syscall.Stat_t)
 		require.True(t, ok, "stat should expose syscall.Stat_t")
-		assert.Equal(t, krbAlice.uid, st.Uid, "file should be owned by alice's mapped uid")
+		assert.Equal(t, krbAlice.serverUID, st.Uid, "file should be owned by alice's DittoFS uid")
 	})
 
 	t.Run("MultiFlavorV4", func(t *testing.T) {
@@ -251,11 +252,11 @@ func TestNFSv4KerberosExtended(t *testing.T) {
 				// Create file
 				testFile := mount.FilePath(fmt.Sprintf("multi_flavor_%s.txt", flavor))
 				testData := fmt.Sprintf("Data protected by %s with vers=4.0", flavor)
-				err := framework.WriteFileAsUID(t, krbAlice.uid, krbAlice.uid, testFile, []byte(testData))
+				err := framework.WriteFileAsUID(t, krbAlice.localUID, krbAlice.localUID, testFile, []byte(testData))
 				require.NoError(t, err, "%s: should create file", flavor)
 
 				// Read back and verify
-				content, err := framework.ReadFileAsUID(t, krbAlice.uid, krbAlice.uid, testFile)
+				content, err := framework.ReadFileAsUID(t, krbAlice.localUID, krbAlice.localUID, testFile)
 				require.NoError(t, err, "%s: should read file", flavor)
 				assert.Equal(t, testData, string(content),
 					"%s: content should round-trip correctly", flavor)
@@ -317,18 +318,18 @@ func TestNFSv4KerberosExtended(t *testing.T) {
 		mount := mountNFSv40WithKerberos(t, nfsPort, "/krb-v4", "krb5")
 
 		aliceFile := mount.FilePath("concurrent_v4_alice.txt")
-		require.NoError(t, framework.WriteFileAsUID(t, krbAlice.uid, krbAlice.uid, aliceFile, []byte("From Alice (vers=4.0)")),
+		require.NoError(t, framework.WriteFileAsUID(t, krbAlice.localUID, krbAlice.localUID, aliceFile, []byte("From Alice (vers=4.0)")),
 			"alice should create file")
 
 		bobFile := mount.FilePath("concurrent_v4_bob.txt")
-		require.NoError(t, framework.WriteFileAsUID(t, krbBob.uid, krbBob.uid, bobFile, []byte("From Bob (vers=4.0)")),
+		require.NoError(t, framework.WriteFileAsUID(t, krbBob.localUID, krbBob.localUID, bobFile, []byte("From Bob (vers=4.0)")),
 			"bob should create file")
 
-		got, err := framework.ReadFileAsUID(t, krbAlice.uid, krbAlice.uid, bobFile)
+		got, err := framework.ReadFileAsUID(t, krbAlice.localUID, krbAlice.localUID, bobFile)
 		require.NoError(t, err, "alice should read bob's file")
 		assert.Equal(t, "From Bob (vers=4.0)", string(got))
 
-		got, err = framework.ReadFileAsUID(t, krbBob.uid, krbBob.uid, aliceFile)
+		got, err = framework.ReadFileAsUID(t, krbBob.localUID, krbBob.localUID, aliceFile)
 		require.NoError(t, err, "bob should read alice's file")
 		assert.Equal(t, "From Alice (vers=4.0)", string(got))
 	})
@@ -492,35 +493,45 @@ func installSystemKeytabV4(t *testing.T, kdc *framework.KDCHelper) {
 	kdc.KinitWithKeytab(t, fmt.Sprintf("nfs/%s", hostname), kdc.KeytabPath())
 }
 
-// krbV4User is a test principal paired with the local uid whose processes act
-// as it. The uid doubles as the gid.
+// krbV4User is a test principal, the local uid whose processes act as it, and
+// the uid of its DittoFS user (zero when it has none). The local uid only
+// selects the credential cache rpc.gssd reads; what the server sees is the
+// principal. Local uids are drawn from a range no real account uses, so the
+// caches they name are not anyone's credentials. The local uid doubles as the
+// gid.
 type krbV4User struct {
 	principal string
 	password  string
-	uid       uint32
+	localUID  uint32
+	serverUID uint32
 }
 
 var (
-	krbAlice = krbV4User{"alice", "alice123", 1001}
-	krbBob   = krbV4User{"bob", "bob123", 1002}
+	krbAlice = krbV4User{"alice", "alice123", 61001, 1001}
+	krbBob   = krbV4User{"bob", "bob123", 61002, 1002}
 	// No DittoFS user of this name: the server resolves it to nobody.
-	krbUnauthorized = krbV4User{"unauthorized_user", "unauth123", 4002}
+	krbUnauthorized = krbV4User{"unauthorized_user", "unauth123", 61003, 0}
 )
 
 // kinitAsLocalUID gets u a ticket in the credential cache rpc.gssd consults for
-// u.uid. rpc.gssd serves root from the machine keytab and every other uid from
-// a FILE cache named krb5cc_<uid> under /tmp that the uid owns, so only file
-// operations run as u.uid (framework.*AsUID) act as u's principal.
+// u.localUID. rpc.gssd serves root from the machine keytab and every other uid
+// from a FILE cache named krb5cc_<uid> under /tmp that the uid owns, so only
+// file operations run as u.localUID (framework.*AsUID) act as u's principal.
+// It skips rather than overwrite a cache that already exists.
 func kinitAsLocalUID(t *testing.T, kdc *framework.KDCHelper, u krbV4User) {
 	t.Helper()
 
-	ccPath := fmt.Sprintf("/tmp/krb5cc_%d", u.uid)
+	ccPath := fmt.Sprintf("/tmp/krb5cc_%d", u.localUID)
+	if _, err := os.Lstat(ccPath); err == nil {
+		t.Skipf("%s already exists; not overwriting another credential cache", ccPath)
+	}
 	cmd := exec.Command("kinit", "-c", ccPath, fmt.Sprintf("%s@%s", u.principal, kdc.Realm()))
 	cmd.Env = append(os.Environ(), "KRB5_CONFIG="+kdc.Krb5ConfigPath())
 	cmd.Stdin = strings.NewReader(u.password + "\n")
 	output, err := cmd.CombinedOutput()
-	require.NoError(t, err, "kinit %s failed: %s", u.principal, string(output))
 	t.Cleanup(func() { _ = os.Remove(ccPath) })
+	require.NoError(t, err, "kinit %s failed: %s", u.principal, string(output))
 
-	require.NoError(t, os.Chown(ccPath, int(u.uid), int(u.uid)), "chown credential cache for uid %d", u.uid)
+	require.NoError(t, os.Chown(ccPath, int(u.localUID), int(u.localUID)),
+		"chown credential cache for uid %d", u.localUID)
 }

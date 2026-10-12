@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -37,8 +38,8 @@ import (
 // internal/adapter/nfs/v4/handlers.
 
 var (
-	createSessionOp  = regexp.MustCompile(`op_name=CREATE_SESSION`)
-	destroySessionOp = regexp.MustCompile(`op_name=DESTROY_SESSION`)
+	createSessionOp  = regexp.MustCompile(`op_name=CREATE_SESSION status=0\b`)
+	destroySessionOp = regexp.MustCompile(`op_name=DESTROY_SESSION status=0\b`)
 )
 
 // =============================================================================
@@ -143,18 +144,26 @@ func TestNFSv41IOSurvivesPacketLoss(t *testing.T) {
 		data[i] = byte(i % 251)
 	}
 
-	writeErr := make(chan error, 1)
-	go func() { writeErr <- writeSyncReadBack(filePath, data) }()
-
-	time.Sleep(100 * time.Millisecond)
-
-	ruleArgs := []string{"OUTPUT", "-p", "tcp", "--dport", fmt.Sprintf("%d", nfsPort), "-j", "DROP"}
+	// The rule goes in before the I/O starts, so the fsync cannot complete
+	// until the rule is removed; the packet counter proves traffic hit it.
+	comment := fmt.Sprintf("dittofs-e2e-drop-%d", nfsPort)
+	ruleArgs := []string{"OUTPUT", "-p", "tcp", "--dport", fmt.Sprintf("%d", nfsPort),
+		"-m", "comment", "--comment", comment, "-j", "DROP"}
 	out, err := exec.Command("iptables", append([]string{"-A"}, ruleArgs...)...).CombinedOutput()
 	require.NoError(t, err, "add iptables DROP rule: %s", string(out))
 	removeRule := func() { _ = exec.Command("iptables", append([]string{"-D"}, ruleArgs...)...).Run() }
 	t.Cleanup(removeRule)
 
+	writeErr := make(chan error, 1)
+	go func() { writeErr <- writeSyncReadBack(filePath, data) }()
+
 	time.Sleep(500 * time.Millisecond)
+	select {
+	case err := <-writeErr:
+		t.Fatalf("I/O finished while every packet to the server was dropped (err=%v)", err)
+	default:
+	}
+	assert.Positive(t, droppedPackets(t, comment), "the DROP rule should have dropped packets to the server")
 	removeRule()
 
 	select {
@@ -163,6 +172,26 @@ func TestNFSv41IOSurvivesPacketLoss(t *testing.T) {
 	case <-time.After(60 * time.Second):
 		t.Fatal("write did not complete within 60s of the packet loss ending")
 	}
+}
+
+// droppedPackets returns the packet counter of the OUTPUT rule tagged with
+// comment.
+func droppedPackets(t *testing.T, comment string) int64 {
+	t.Helper()
+	out, err := exec.Command("iptables", "-L", "OUTPUT", "-v", "-x", "-n").CombinedOutput()
+	require.NoError(t, err, "list iptables OUTPUT: %s", string(out))
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "/* "+comment+" */") {
+			continue
+		}
+		fields := strings.Fields(line)
+		require.NotEmpty(t, fields)
+		n, err := strconv.ParseInt(fields[0], 10, 64)
+		require.NoError(t, err, "parse packet counter in %q", line)
+		return n
+	}
+	t.Fatalf("no iptables OUTPUT rule tagged %q:\n%s", comment, out)
+	return 0
 }
 
 // =============================================================================
