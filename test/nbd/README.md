@@ -398,6 +398,31 @@ first, reading back a filesystem that the first boot created. It also proves the
 8 MiB export size is reported correctly to the kernel, since ext4 sized itself
 from `nbd0`'s sector count and would have failed on a wrong one.
 
+**This was then re-run through `boot-qemu.sh` itself** (not a hand-rolled QEMU
+line), with the artifacts above, against the same live server — the script's own
+gate chain passed, its launch line was identical in substance, and the guest
+reported the same filesystem UUID and the same `hello.txt` contents. So the rig
+is not merely syntactically valid: it works.
+
+**A defect this run exposed in the script's own gate.** The initramfs check used
+`gzip -dc -- "$initramfs" | grep -aq 'nbd-client'` under `set -o pipefail`. That
+is a **false negative**: `grep -q` exits at the first match, `gzip` dies of
+SIGPIPE, and the pipeline's status becomes **141** even though the string was
+found — so the script refused *every* initramfs, valid or not, with a message
+telling the operator to rebuild the file they had just built correctly.
+Measured on a valid archive:
+
+```
+gzip -dc x.cpio.gz | grep -aq nbd-client >/dev/null   -> status 141  (refused)
+gzip -dc x.cpio.gz | grep -a  nbd-client >/dev/null   -> status 0    (correct)
+gzip -dc x.cpio.gz | grep -a  <absent>   >/dev/null   -> status 1    (correct)
+```
+
+Dropping `-q` makes `grep` read to EOF, so no SIGPIPE arises. Note the tempting
+alternative — capturing the stream into a variable first — does **not** work: a
+cpio archive is full of NUL bytes, and a 3.6 MB listing came back as an empty
+string, making both checks report MISSING.
+
 Corroborated server-side without going through NBD at all: reading offset 1024
 over a **fresh** `qemu-io` connection shows the ext4 superblock with magic
 `53 ef` at offset 1080 (`9f 38 cd 6a` UUID, matching the `a251cff1` prefix the
