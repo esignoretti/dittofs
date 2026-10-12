@@ -21,9 +21,8 @@
 // mounts".
 //
 // Every trigger takes a second root, peerRoot: a mount of the same share made
-// by another client or identity. Most triggers ignore it; the ones that need
-// a second actor on the share (a foreign remover, a file owned by someone
-// else) use it.
+// by another protocol, and so by another identity. Most triggers ignore it;
+// one that needs a file owned by someone else seeds it there.
 package helpers
 
 import (
@@ -35,6 +34,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TriggerResult captures the syscall.Errno observed from a kernel file
@@ -192,34 +192,6 @@ func TriggerErrInvalidArgument(t *testing.T, mountRoot, _ string) TriggerResult 
 	return newResult(err)
 }
 
-// TriggerErrStaleHandle holds a file open through mountRoot, removes it
-// through peerRoot — a mount of the same share by a different client — and
-// then fstat()s the held descriptor. The remove comes from a client the
-// mountRoot client does not know about, so it cannot silly-rename the file
-// away, and the next GETATTR names a handle the server no longer resolves:
-// NFS3ERR_STALE → ESTALE. Removing through the same mount would not do it:
-// a client keeping its own fd after unlink is valid POSIX.
-func TriggerErrStaleHandle(t *testing.T, mountRoot, peerRoot string) TriggerResult {
-	t.Helper()
-	name := UniqueTestName("stale") + ".txt"
-	path := filepath.Join(mountRoot, name)
-	if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
-		t.Fatalf("TriggerErrStaleHandle: seed create failed: %v", err)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatalf("TriggerErrStaleHandle: open failed: %v", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	if err := os.Remove(filepath.Join(peerRoot, name)); err != nil {
-		t.Fatalf("TriggerErrStaleHandle: remove through peer mount failed: %v", err)
-	}
-
-	_, err = f.Stat()
-	return newResult(err)
-}
-
 // TriggerErrNoSpace writes past the share's byte quota. mountRoot must be a
 // mount of a share whose quota is smaller than the 4 MiB written here. Both
 // kernel clients may buffer the write, so the error is taken from whichever
@@ -273,16 +245,11 @@ func TriggerErrAccessDenied(t *testing.T, readOnlyGrantRoot, _ string) TriggerRe
 	return newResult(err)
 }
 
-// TriggerErrPermissionDenied seeds a file through peerRoot — a mount owned by
-// an identity that may write the share — then chmods it through mountRoot,
-// whose identity neither owns the file nor is root on the server. Changing
-// the mode of a file you do not own is EPERM in POSIX (NFS3ERR_PERM). SMB has
-// no EPERM: the same refusal reaches the cifs client as STATUS_ACCESS_DENIED
-// → EACCES.
-//
-// The mode drops every write bit because that is the only mode change the
-// cifs client sends without POSIX extensions — it sets the DOS read-only
-// attribute; a mode that keeps a write bit is a client-side no-op.
+// TriggerErrPermissionDenied seeds a file through peerRoot — a mount of the
+// same share by another identity — then sets its timestamps to an explicit
+// value through mountRoot. Over NFS only the owner may set explicit times,
+// so the server refuses it: NFS3ERR_PERM → EPERM. Over SMB the same call is
+// authorized by the open handle instead, so this trigger is NFS-only.
 func TriggerErrPermissionDenied(t *testing.T, mountRoot, peerRoot string) TriggerResult {
 	t.Helper()
 	name := UniqueTestName("eperm") + ".txt"
@@ -292,7 +259,8 @@ func TriggerErrPermissionDenied(t *testing.T, mountRoot, peerRoot string) Trigge
 	}
 	t.Cleanup(func() { _ = os.Remove(seed) })
 
-	err := os.Chmod(filepath.Join(mountRoot, name), 0444)
+	past := time.Unix(1_000_000_000, 0)
+	err := os.Chtimes(filepath.Join(mountRoot, name), past, past)
 	return newResult(err)
 }
 
