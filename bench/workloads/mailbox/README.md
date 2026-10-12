@@ -183,6 +183,13 @@ To compare bucket usage with the live file sizes, set
 `gc.compaction_live_ratio` (for example `0.5`), wait out the grace period, run
 `dfsctl store block gc <share>`, and measure after that.
 
+To skip the wait, stop the scenario, drain the uploads (repeat
+`dfsctl system drain-uploads` until `dfsctl store block stats` reports 0
+pending remote bytes), then run
+`dfsctl store block gc <share> --grace-period 0`. It reaps the orphans
+without waiting out the grace period. Its help describes it as meant for tests
+and one-off cleanups.
+
 ## Running scenarios together
 
 Real load is a mix. Two useful pairs, started as two `run.sh` commands in
