@@ -114,9 +114,9 @@ func writeSyncReadBack(path string, content []byte) error {
 // Test 2: I/O Survives Packet Loss
 // =============================================================================
 
-// TestNFSv41IOSurvivesPacketLoss drops the client's packets to the server for
-// 500ms in the middle of a 10MB write and requires the write and fsync to
-// complete with the data intact. A DROP stalls TCP rather than breaking the
+// TestNFSv41IOSurvivesPacketLoss writes and fsyncs the first half of a 10MB
+// file, drops the client's packets to the server for 500ms while the second
+// half is written and fsynced, and requires the file to read back intact. A DROP stalls TCP rather than breaking the
 // connection, so the client retransmits on the same connection.
 func TestNFSv41IOSurvivesPacketLoss(t *testing.T) {
 	if testing.Short() {
@@ -146,8 +146,17 @@ func TestNFSv41IOSurvivesPacketLoss(t *testing.T) {
 		data[i] = byte(i % 251)
 	}
 
-	// The rule goes in before the I/O starts, so the fsync cannot complete
-	// until the rule is removed; the packet counter proves traffic hit it.
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR, 0644)
+	require.NoError(t, err, "create file")
+	defer f.Close()
+	half := len(data) / 2
+	_, err = f.Write(data[:half])
+	require.NoError(t, err, "write first half")
+	require.NoError(t, f.Sync(), "fsync first half")
+
+	// The rule goes in before the second half is written, so its fsync cannot
+	// complete until the rule is removed; the packet counter proves traffic hit
+	// it.
 	comment := fmt.Sprintf("dittofs-e2e-drop-%d", nfsPort)
 	ruleArgs := []string{"OUTPUT", "-p", "tcp", "--dport", fmt.Sprintf("%d", nfsPort),
 		"-m", "comment", "--comment", comment, "-j", "DROP"}
@@ -157,12 +166,18 @@ func TestNFSv41IOSurvivesPacketLoss(t *testing.T) {
 	t.Cleanup(removeRule)
 
 	writeErr := make(chan error, 1)
-	go func() { writeErr <- writeSyncReadBack(filePath, data) }()
+	go func() {
+		if _, err := f.Write(data[half:]); err != nil {
+			writeErr <- fmt.Errorf("write second half: %w", err)
+			return
+		}
+		writeErr <- f.Sync()
+	}()
 
 	time.Sleep(500 * time.Millisecond)
 	select {
 	case err := <-writeErr:
-		t.Fatalf("I/O finished while every packet to the server was dropped (err=%v)", err)
+		t.Fatalf("fsync finished while every packet to the server was dropped (err=%v)", err)
 	default:
 	}
 	assert.Positive(t, droppedPackets(t, comment), "the DROP rule should have dropped packets to the server")
@@ -170,10 +185,14 @@ func TestNFSv41IOSurvivesPacketLoss(t *testing.T) {
 
 	select {
 	case err := <-writeErr:
-		require.NoError(t, err, "write across the packet loss should complete with the data intact")
+		require.NoError(t, err, "the second half should write and fsync across the packet loss")
 	case <-time.After(60 * time.Second):
-		t.Fatal("write did not complete within 60s of the packet loss ending")
+		t.Fatal("fsync did not complete within 60s of the packet loss ending")
 	}
+
+	got, err := os.ReadFile(filePath)
+	require.NoError(t, err, "read back")
+	assert.True(t, bytes.Equal(data, got), "file should read back intact (%d bytes, want %d)", len(got), len(data))
 }
 
 // droppedPackets returns the packet counter of the OUTPUT rule tagged with

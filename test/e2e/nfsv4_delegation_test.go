@@ -35,8 +35,9 @@ import (
 //     client owners, so the recall tests pair one of each.
 //
 // Revocation after an unanswered recall is not covered here: the kernel client
-// always answers CB_RECALL. TestRecallTimer_FiresRevocation covers it in
-// internal/adapter/nfs/v4/state.
+// always answers CB_RECALL. The revocation timer itself is covered by
+// TestRecallTimer_FiresRevocation in internal/adapter/nfs/v4/state, which arms
+// it directly rather than through a sent recall.
 
 var (
 	cbNullSucceeded = regexp.MustCompile(`CB_NULL succeeded`)

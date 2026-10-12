@@ -517,13 +517,19 @@ var (
 // u.localUID. rpc.gssd serves root from the machine keytab and every other uid
 // from a FILE cache named krb5cc_<uid> under /tmp that the uid owns, so only
 // file operations run as u.localUID (framework.*AsUID) act as u's principal.
-// It skips rather than overwrite a cache that already exists.
+// The local uids are reserved for this test, so an existing cache owned by
+// that uid is one a killed run left behind and is replaced; a cache owned by
+// anyone else fails the test rather than be overwritten.
 func kinitAsLocalUID(t *testing.T, kdc *framework.KDCHelper, u krbV4User) {
 	t.Helper()
 
 	ccPath := fmt.Sprintf("/tmp/krb5cc_%d", u.localUID)
-	if _, err := os.Lstat(ccPath); err == nil {
-		t.Skipf("%s already exists; not overwriting another credential cache", ccPath)
+	if fi, err := os.Lstat(ccPath); err == nil {
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || st.Uid != u.localUID || !fi.Mode().IsRegular() {
+			t.Fatalf("%s exists and is not a cache this test left behind; not overwriting it", ccPath)
+		}
+		require.NoError(t, os.Remove(ccPath), "remove stale credential cache %s", ccPath)
 	}
 	cmd := exec.Command("kinit", "-c", ccPath, fmt.Sprintf("%s@%s", u.principal, kdc.Realm()))
 	cmd.Env = append(os.Environ(), "KRB5_CONFIG="+kdc.Krb5ConfigPath())
