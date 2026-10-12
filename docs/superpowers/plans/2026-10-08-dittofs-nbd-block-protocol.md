@@ -2539,14 +2539,22 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
   metadata gap below. This is the one functional change in Task 7; everything
   else is test scaffolding. It is here rather than in a new task because the gap
   was found while building the instrument and should be closed with it — **not**
-  because the oracle would have caught it. **It would not have.** Measured: with
-  `commit` mutated back to `CommitBlockStore` (the metadata half dropped), the
-  oracle's differential test still PASSES (`ok ... 1.037s`) while
-  `TestIntegration_FlushPersistsPendingMetadata` fails. `qemu-io flush` prints
-  the same line against both servers whether or not the flush persisted
-  anything, because the oracle compares transcripts, not durability. The
-  regression test is the only thing that covers this, which is why Step 0 must
-  add one.
+  because the oracle would have caught it. **It would not have.** Measured, three
+  mutations, each reverted immediately:
+
+  | Mutation | Oracle (`TestOracle_Differential`) | Regression test |
+  |---|---|---|
+  | `commit` → `CommitBlockStore` (metadata half dropped) | **PASSES** (`ok 1.745s`) | FAILS |
+  | `handleFlush` → always `ErrEINVAL` | FAILS | FAILS |
+  | `handleFlush` → skip the commit, keep the EINVAL check | **PASSES** (`ok 1.496s`) | FAILS |
+
+  The oracle catches a FLUSH that answers *wrongly* — an error code, a length
+  check removed — and misses one that answers `0` without doing anything, because
+  `qemu-io flush` prints the same line against both servers whether or not the
+  flush persisted anything. The oracle compares transcripts, not durability.
+  `TestIntegration_FlushPersistsPendingMetadata` is what covers the gap, which is
+  why Step 0 must add it — and why the checklist row for Step 0 asserts the
+  *regression test* fails, not the oracle.
 - Modify: nothing else. `test/required-tests.json` is deliberately **not** touched:
   `test/required-tests.sh` runs `go test` for every name in the manifest, and
   the Tier A oracle needs a QEMU install, so listing it there would make the
