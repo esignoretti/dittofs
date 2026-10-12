@@ -40,7 +40,7 @@ import (
 // it directly rather than through a sent recall.
 
 var (
-	cbNullSucceeded = regexp.MustCompile(`CB_NULL succeeded`)
+	cbNullSucceeded = regexp.MustCompile(`CB_NULL succeeded.*\bclient_id=(\S+)`)
 	cbNullFailed    = regexp.MustCompile(`CB_NULL failed[^\n]*`)
 	delegGranted    = regexp.MustCompile(`Delegation granted`)
 	cbRecallSent    = regexp.MustCompile(`CB_RECALL (\(v4\.1\) )?sent successfully`)
@@ -168,7 +168,9 @@ func testDelegationRecall(t *testing.T, holderVers, otherVers string) {
 
 	// The server must answer the conflicting OPEN with NFS4ERR_DELAY, recall
 	// the delegation, and let the OPEN through only after the holder returns
-	// it, so the log carries those events in that order.
+	// it. Only return-before-OPEN is ordered: the recall goes out from its own
+	// goroutine and is logged once the client replies, so its line can land
+	// before or after the NFS4ERR_DELAY and DELEGRETURN lines.
 	recallLogs := extractNewLogs(recallSince, readLogFile(t, sp))
 	delayAt := firstIndex(recallLogs, regexp.MustCompile(`delegation conflict, returning NFS4ERR_DELAY file=`+regexp.QuoteMeta(fileName)))
 	recallAt := firstIndex(recallLogs, cbRecallSent)
@@ -312,18 +314,30 @@ func waitForLog(t *testing.T, sp *helpers.ServerProcess, since string, re *regex
 	}
 }
 
-// requireCallbackPathsUp waits for n successful CB_NULL probes logged after
-// since and fails the test, naming the cause, when a probe fails or none
-// completes. With the v4.1 backchannel riding the fore channel and v4.0 mounted
+// requireCallbackPathsUp waits until n distinct clients have passed a CB_NULL
+// probe logged after since, and fails the test, naming the cause, when a probe
+// fails or too few complete. It counts client IDs rather than lines because a
+// v4.1 client re-probes when its callback parameters change. With the v4.1 backchannel riding the fore channel and v4.0 mounted
 // through a non-loopback address, nothing on the host stops the probe, so a
 // failure is the server's.
 func requireCallbackPathsUp(t *testing.T, sp *helpers.ServerProcess, since string, n int) {
 	t.Helper()
-	if waitForLog(t, sp, since, cbNullSucceeded, n, 10*time.Second) {
-		return
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		logs := extractNewLogs(since, readLogFile(t, sp))
+		clients := map[string]bool{}
+		for _, m := range cbNullSucceeded.FindAllStringSubmatch(logs, -1) {
+			clients[m[1]] = true
+		}
+		if len(clients) >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			if line := cbNullFailed.FindString(logs); line != "" {
+				t.Fatalf("server cannot reach the client's callback path, so it grants no delegations: %s", strings.TrimSpace(line))
+			}
+			t.Fatalf("%d of %d clients passed a CB_NULL probe of their callback path within 10s; the server grants no delegations without one", len(clients), n)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if line := cbNullFailed.FindString(extractNewLogs(since, readLogFile(t, sp))); line != "" {
-		t.Fatalf("server cannot reach the client's callback path, so it grants no delegations: %s", strings.TrimSpace(line))
-	}
-	t.Fatalf("no CB_NULL probe of the client's callback path succeeded within 10s; the server grants no delegations without one")
 }
