@@ -579,6 +579,12 @@ This is the mechanism that makes "DittoFS respawns and cache comes back online" 
 work, and it is a kernel feature rather than a DittoFS one — which is why it constrains
 the harness.
 
+**It is also two mechanisms, not one, and the second one is broken in every release.** The
+kernel pauses in-flight I/O for `dead_conn_timeout` and then waits for *userspace* to hand
+it a new socket; `nbd-client`'s persist mode is what does the handing. §6.1 covers the
+kernel half and the rest of §6.2 the client half — including the version trap that comes
+with it, which is the reason the crash rig needs a `master` build rather than a release.
+
 ### 6.1 The dead-connection timeout
 
 Commit `560bc4b399` ("nbd: handle dead connections") added `dead_conn_timeout`, settable
