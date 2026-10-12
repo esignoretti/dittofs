@@ -1786,8 +1786,11 @@ func mapError(err error) NBDError
 - `common.ErrNotDurableYet` → `ErrEIO`. `internal/adapter/nbd` importing `internal/adapter/common` is safe and verified: `go list -deps ./internal/adapter/common` includes nothing from `internal/adapter/nbd`, so there is no cycle. (This is the same direction the NFS and SMB handlers import in.)
 - `merrs.ErrNoSpace` → `ErrENOSPC`
 - `merrs.ErrPermissionDenied` → `ErrEPERM`
+- **`merrs.ErrAccessDenied` → `ErrEPERM` as well, and this arm is not optional.** These are two different codes and only one of them was in the first draft of this list. `ErrPermissionDenied` is POSIX `EPERM` — *"the operation requires ownership or root privileges"* (`pkg/metadata/errors/errors.go:29-32`) — while `ErrAccessDenied` is POSIX `EACCES`, *"permission bit violations"*, *"used when the caller lacks the required read/write/execute permission bits"* (`:22-25`). **The metadata permission funnel returns `ErrAccessDenied`**, at `pkg/metadata/auth_permissions.go:510` and `:539` (`&StoreError{Code: ErrAccessDenied, Message: "write permission denied"}`). So a write refused by POSIX mode bits — the single most likely permission refusal this adapter will ever see — falls through to the default arm and is reported to the client as `NBD_EIO`. The client's filesystem then sees an I/O error on a write it was not permitted to make, which is a hardware-failure report for an authorization decision. Map both codes to `ErrEPERM`; NBD has one permission error and both mean "you may not do this".
 - `context.Canceled`, `context.DeadlineExceeded` → `ErrESHUTDOWN`
 - default → `ErrEIO`
+
+The `ErrAccessDenied` arm needs a test, and it cannot be written against a fake store — the error is produced by the metadata service, not the block store. Drive it through a real metadata service: create the volume file as one identity, then have the handler write as a different one whose mode bits forbid it, and assert `ErrEPERM`. A fixture that creates the volume with the same identity the handler writes as will pass vacuously, because `ApplyOwnerDefaults` (`pkg/metadata/validation.go:465`) sets the file's owner to the creating identity and the owner always has the mode bits it wrote.
 
 **Order matters where the causes overlap.** `engine.ErrStoreClosed` and the `merrs` pair are tested before the `context` pair, because a store failure wrapped in a cancellation should report the store failure — the operator needs to know the store is gone, not that a context expired. `errors.Is` walks the whole wrap chain, so a single `err` can match several cases; the first match wins.
 
@@ -2077,6 +2080,10 @@ func newWriteTestHandler(t *testing.T, st BlockStore, exp *Export) *Handler
 ```
 
 Build it the way `integrationHandler` does (`internal/adapter/nbd/integration_test.go:96`): a `runtime.Runtime` from `testruntime.NewWithShareStore(t)` with one share and one metadata store, `rt.GetMetadataService()` for the service, and `exp.Handle` set to a real volume file's handle — a volume file created under the share's root with `CreateFile` and then sized with `SetFileAttributes`, because `ApplyCreateDefaults` zeroes the size (`pkg/metadata/validation.go:492`). Reuse the fixture that `integration_test.go` already builds if it can be factored into a helper both files call; do not build a second one that drifts.
+
+**The fixture must create the volume as the same identity the handler writes as, and getting this wrong costs an afternoon.** `ApplyOwnerDefaults` (`pkg/metadata/validation.go:465`) assigns the new file the *creating* identity's UID/GID, and `createEntry` calls it at `pkg/metadata/file_create.go:389`; the mode bits you pass are then evaluated against whoever writes. A fixture that creates the volume as one identity and builds the handler with another produces `AccessDenied: write permission denied` from `PrepareWrite` on every happy-path test, and the error names the mode bits rather than the identity mismatch — so it reads as a permissions bug in the adapter. Create with the handler's identity; `RootAttr` on the share is a third, unrelated value and does not decide file ownership. Verified against a real runtime: create as UID 0 + write as 65534 on a 0644 file → `AccessDenied: write permission denied`; create as 65534 + write as 65534 → `PrepareWrite OK`.
+
+Keep one test with the mismatch, deliberately: it is the only coverage for the `ErrAccessDenied` → `ErrEPERM` arm of `mapError`.
 
 Tests whose assertions are *rejections* need no metadata (the handler returns before touching it), so they may keep `newTestHandler`. Tests that must reach `Error == 0` on a WRITE cannot.
 
@@ -2640,6 +2647,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 5 — `TestConnection_WriteZeroLengthIsEINVAL` passes and the connection is still usable afterwards.
 - [ ] Task 5 — `TestConnection_RejectedWriteKeepsTheStreamSynchronized` passes, and fails when the payload drain is removed.
 - [ ] Task 5 — `TestConnection_WriteWithFUAIsDurableBeforeReply` passes, and fails when `commit` is moved after the reply.
+- [ ] Task 5 — a WRITE refused by POSIX mode bits reaches the client as `ErrEPERM`, not `ErrEIO`. The metadata funnel returns `merrs.ErrAccessDenied` (`pkg/metadata/auth_permissions.go:510`, `:539`), a different code from `ErrPermissionDenied`; the test needs a real metadata service with the volume created as one identity and written as another, or it passes vacuously.
 - [ ] Task 5 — `TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO` passes.
 - [ ] Task 6 — `TestConnection_WriteZeroesThenReadIsZeros` asserts `st.punches == 1` and `st.writes == 0`, and fails when `WriteZeroes` is changed to a zero-buffer write.
 - [ ] Task 6 — `TestConnection_WriteZeroesWithNoHoleIsAccepted` passes (`NO_HOLE` is a MUST we advertise) and `TestConnection_WriteWithNoHoleFlagIsEINVAL` passes (it is not a `WRITE` flag).
