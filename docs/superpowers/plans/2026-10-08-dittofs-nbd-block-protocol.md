@@ -3153,6 +3153,24 @@ Two harness requirements the spec calls non-negotiable, both of which the script
 - **`-persist` alone already gives 30 seconds** (`nbd-client.c:188`: `else if (cur_client->persist) NLA_PUT_U64(msg, NBD_ATTR_DEAD_CONN_TIMEOUT, 30); /* Default 30 seconds for persist mode */`). So the default is already inside the hung-task window. The script should still set `-T` explicitly and print the value, because a default that happens to be safe is not a configured one — but it must not *depend* on `-persist` being what supplied the window.
 - The kernel side landed in 2017 (`560bc4b39952ed77cdb0000992e9415b0ee89edb`, "nbd: handle dead connections"), so any kernel in support today has it; the requirement to check is `nbd-client`'s netlink support, not the kernel's.
 
+**THE VERSION TRAP, and it is the one that will actually bite.** Everything above is true of `master` and of the **3.27.1** tag. It is **not** true of **3.26.1**, which is what most hosts ship: Debian bookworm has `1:3.26.1-6.1`, Ubuntu 24.04 has `1:3.26.1-2`, Debian trixie/sid has `1:3.27.1-4`. Measured by fetching each tag's `nbd-client.c` and `args.c`:
+
+| | 3.26.1 | 3.27.1 | master |
+|---|---|---|---|
+| `-T`/`--dead-timeout` | **absent entirely** | present (`args.c:76`, `:198`) | present |
+| `NBD_ATTR_DEAD_CONN_TIMEOUT` sent | **never** | only behind the gate below | yes |
+| persist over netlink | **no — `-p` is silently ignored** | **no — same bug** | yes |
+
+On 3.26.1 there is no way to set `dead_conn_timeout` at all: the flag does not exist, and its `netlink_configure` sends only `INDEX`, `SIZE_BYTES`, `BLOCK_SIZE_BYTES`, `SERVER_FLAGS` and `TIMEOUT` (`NBD_ATTR_TIMEOUT`, which is `NBD_SET_TIMEOUT` — a different mechanism, see above). Worse, 3.26.1's netlink path does `netlink_configure(...); return 0;` and **never reaches the ioctl reconnect loop**, so `-p`/`--persist` is parsed, stored, and then silently ignored whenever netlink is available (which is the default).
+
+**3.27.1 is not usable either, for a different and more confusing reason.** Its `nbd-client.c:1548` gates the persist monitoring loop on `cur_client->persist_mode`, but the CLI sets `cur_client->persist` (`args.c:186-188`, `client->persist = true`), and **nothing in the tree ever assigns `persist_mode = true`** — verified exhaustively across `nbd-client.c`, `args.c`, `args.h`, `nbdclt.h`, `nbd.h`, `cliserv.h`. The only two writes to it are `= false`, inside the ioctl path that the netlink path returns before reaching. So on 3.27.1 `-p` is *still* ignored, and because the loop never starts, the kernel never receives `NBD_CMD_RECONFIGURE` — the device pauses for `dead_conn_timeout` and then returns `BLK_STS_IOERR` with nothing to reconnect it. That is precisely the silent-failure class this design exists to eliminate, one layer down. (Upstream fixed it on `master` by testing `cur_client->persist` at both sites; the fix postdates 3.27.1.)
+
+**What the script must therefore do, and it must do it as a pre-flight check rather than in the README:**
+1. Parse `nbd-client --version` and **refuse below 3.27.1**, naming the version found and the distribution packages that carry it. A version gate is legitimate here because the alternative is a crash test that reports success for the wrong reason.
+2. On 3.27.1 exactly, **do not rely on `-p`**. `-T` works there and is the only lever that does: it sets `dead_conn_timeout` directly through netlink (`args.c:198` → `nbd-client.c:190-191`). But since the reconnect loop cannot start, the window must be sized to **survive the restart inside a single `dead_conn_timeout`** rather than expecting the kernel to pause and then resume. The script must state which of the two regimes it is in.
+3. **Assert the mechanism took effect rather than assuming it**, which is now more than a netlink-availability probe: read the value back. `dead_conn_timeout` is not exposed through sysfs (`drivers/block/nbd.c` creates only `pid_attr` and `backend_attr`), so there is no read-back path — which means the honest check is behavioural: SIGKILL the server, confirm the guest's I/O **blocks** rather than erroring immediately, and fail if it errors. That observation is the assertion, and it distinguishes "the window is set" from "the flag was passed".
+4. The README must say plainly that `-p` is broken on both 3.26.1 and 3.27.1, so nobody "fixes" the harness by adding it back.
+
 - [ ] **Step 3: Extend `test/nbd/README.md`**
 
 Add the boot and crash sections: prerequisites, the exact `dead_conn_timeout` value used, how to read the verdict, and the honest statement that these require a Linux host with root and cannot run in CI on macOS.
@@ -3225,6 +3243,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 8 — the launch line carries **no `hostfwd`**: it forwards host→guest, which is the wrong direction and would try to bind host port 10809 where DittoFS is listening. The guest reaches the host at `10.0.2.2` with no rule.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
 - [ ] Task 8 — the crash rig sets `dead_conn_timeout` with `-T`/`--dead-timeout` and fails when netlink is unavailable, rather than silently running the ioctl path where the option is parsed and ignored.
+- [ ] Task 8 — the crash rig **refuses `nbd-client` below 3.27.1** (3.26.1 has no `-T` at all) and **does not pass `-p` on 3.27.1**, where the persist loop is gated on `persist_mode`, a field nothing ever sets. Measured: `-p` is silently ignored on both 3.26.1 and 3.27.1. And the window is asserted **behaviourally** — SIGKILL the server, confirm the guest's I/O blocks rather than erroring immediately — because `dead_conn_timeout` has no sysfs read-back (only `pid_attr` and `backend_attr` exist).
 - [ ] Task 8 — `mkfs.ext4` + mount + write + `sync` + unmount + remount in a KVM guest.
 - [ ] Task 8 — SIGKILL mid-write → restart → guest I/O resumes inside the dead-connection window; host-side `fsck` clean.
 - [ ] The volume is readable as a plain file over NFS (the B1 property, spec §2.2).
