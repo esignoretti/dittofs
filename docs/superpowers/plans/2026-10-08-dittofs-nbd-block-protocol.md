@@ -1394,7 +1394,7 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 **Interfaces:**
 - Consumes: Task 2's `Export`/`Exporter`/`Identity`, Task 3's `Config` (timeouts), `Adapter`.
 - Produces:
-  - `type Timeouts struct { Read, Write, Idle time.Duration }` — declared here, in `connection.go`. `Read` bounds one request header or payload; `Idle` bounds a connection that has completed its handshake but sends nothing, so `Read` must be the *shorter* of the two or a stalled client is held open by the wrong timer. Task 3 stores the operator-facing `TimeoutsConfig` (four fields); Step 6 below adds `Config.timeouts()` to narrow four to these three, dropping `Shutdown` because the base adapter owns the drain deadline.
+  - `type Timeouts struct { Read, Write, Idle time.Duration }` — declared here, in `connection.go`. **`Idle` bounds the wait for the next request header; `Read` bounds finishing a request already started** (the payload read Step 7 of Task 5 adds). The split is what the siblings already do — NFS arms `Idle` on the connection loop (`pkg/adapter/nfs/connection.go:312`) and `Read` on the fragment read (`:338`), SMB likewise (`pkg/adapter/smb/connection.go:230`, `:258`) — and it makes both doc comments true. Note `Idle == 0` means *no idle timeout* (`config.go:42`), so it is a sentinel and **cannot** be folded into a `min(Read, Idle)`; it is an independent arm guarded by `> 0`, exactly as the siblings guard it. Task 3 stores the operator-facing `TimeoutsConfig` (four fields); Step 6 below adds `Config.timeouts()` to narrow four to these three, dropping `Shutdown` because the base adapter owns the drain deadline.
   - `type StoreResolver func(ctx context.Context, exp *Export) (BlockStore, error)` — a function type rather than a method on `Handler`, so the dispatch tests can inject a fake store. The production implementation wraps `common.ResolveForWrite` (below), so `internal/adapter/nbd` never imports `pkg/controlplane/runtime`.
   - `type BlockStore interface { ReadAt(...); WriteAt(...); PunchHole(...); Flush(...); LocalDurable() bool; RemoteDurable() bool; RequireDurableCommit() bool }` — the four I/O methods plus the three durability accessors, so `commit` can call `common.CommitBlockStore` without the concrete `*engine.Store`. `*engine.Store` satisfies all seven (`pkg/block/engine/readwrite.go:21`, `:87`, `:286`; `pkg/block/engine/flush.go:534`; `pkg/block/engine/engine.go:388`, `:397`, `:406`).
   - `type Handler struct { exporter Exporter; stores StoreResolver; meta *metadata.Service; id Identity; timeouts Timeouts; draining func() bool; degraded atomic.Int64 }`
@@ -1695,7 +1695,25 @@ Expected: FAIL — `undefined: NewHandler`, `undefined: BlockStore`.
 `serve(ctx, conn)`:
 1. `exp, err := ServeHandshake(ctx, conn, h.exporter)`. On error, return it — the handshake already told the client why where the protocol has a way to.
 2. Resolve the block store once: `bs, err := h.stores(ctx, exp)`. A failure here is `Degraded` territory (`h.degraded.Add(1)`), not a wire error — the connection ends, because every subsequent command would fail the same way.
-3. **Loop, one command at a time.** Set `conn.SetReadDeadline(time.Now().Add(h.timeouts.Read))` before each `ReadRequest`; a deadline error returns a timeout error from `Serve`, closing the connection. On `ErrBadMagic` or any decode error, return it.
+3. **Loop, one command at a time.** Before each `ReadRequest`, arm the wait for the next header from `Idle` when it is set, else from `Read`; a deadline error returns a timeout error from `Serve`, closing the connection. On `ErrBadMagic` or any decode error, return it.
+
+```go
+// Idle bounds the wait for a header; Read bounds finishing a request that has
+// already started (the payload read in Task 5). At the defaults both are 5m, so
+// the distinction only shows for an operator who separates them — which is
+// exactly when the field's own doc has to be true rather than nearly true.
+//
+// Idle == 0 means no idle timeout, so it cannot be folded into a min(): the
+// guard is an independent arm, the same shape NFS uses at
+// pkg/adapter/nfs/connection.go:312.
+budget := h.timeouts.Read
+if h.timeouts.Idle > 0 {
+	budget = h.timeouts.Idle
+}
+if err := conn.SetReadDeadline(time.Now().Add(budget)); err != nil {
+	return err
+}
+```
 4. Switch on `req.Type`. **Every branch must validate flags first**, then bounds, then act — in that order, so a malformed request never reaches the store:
 
 ```go
@@ -1721,7 +1739,7 @@ draining := func() bool {
 }
 ```
 
-**The handler's own read deadline fights the base adapter's shutdown, and the handler has to lose that fight deliberately.** `initiateShutdown` calls `interruptBlockingReads` (`pkg/adapter/base.go:447`), which sets a **100 ms** read deadline on every active connection to unblock pending reads. But the handler sets its own deadline before each read (`SetReadDeadline(time.Now().Add(h.timeouts.Read))` — 5 minutes by default), and a `SetReadDeadline` **replaces** the previous one. So a handler that finishes a command after shutdown began will overwrite the 100 ms interruption with a fresh 5-minute deadline, and `waitForDrain` will sit until `ShutdownTimeout` (30 s) expires and force-close.
+**The handler's own read deadline fights the base adapter's shutdown, and the handler has to lose that fight deliberately.** `initiateShutdown` calls `interruptBlockingReads` (`pkg/adapter/base.go:447`), which sets a **100 ms** read deadline on every active connection to unblock pending reads. But the handler arms its own deadline before each read (5 minutes by default), and a `SetReadDeadline` **replaces** the previous one. So a handler that finishes a command after shutdown began will overwrite the 100 ms interruption with a fresh 5-minute deadline, and `waitForDrain` will sit until `ShutdownTimeout` (30 s) expires and force-close.
 
 The loop must therefore check `h.draining()` **before** arming its own deadline, and when draining:
 
