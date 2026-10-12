@@ -2590,35 +2590,28 @@ rather than asserted:**
   by the number of volume files rather than by write count, and the shutdown path
   flushes it.
 
-**So the fix is a judgement call and the plan makes it explicitly:** add the
-metadata flush to `handleFlush`, so NBD's barrier is the same barrier the other
-adapters use, **or** record in the code why NBD deliberately omits it. What is
-not acceptable is the current state, where the omission is invisible — the code
-comment on `commit` currently says the durability rule *"has exactly one
-implementation across the adapters instead of one per protocol"*, which is true
-of the block-store half and silent about the other half.
+**RULING: add the metadata flush.** `commit` becomes `FlushStableWrite`, so
+NBD's barrier is the same barrier the other adapters use. The alternative —
+keeping `CommitBlockStore` alone and documenting why NBD is different — was
+rejected because NBD is not different in any way that matters here: an NBD
+device is a boot path (Task 8 boots a kernel from it, and a kernel issues
+`FLUSH`), the command's own spec text is an unconditional durability barrier,
+and the cost of the fix is one type widening plus one body change. The
+omit-and-document option would have to argue that a client told "durable" need
+not actually be durable, which is exactly the class of bug the residency-truth
+gate (spec §7) exists to prevent.
 
-**If the fix is taken** (the recommended option, because an NBD device is a boot
-path — Task 8 boots a kernel from it, and the kernel does issue `FLUSH`):
-- Widen `FlushStableWrite`'s `blockStore *engine.Store` parameter to the
-  `Committer` interface that Task 4 already introduced
-  (`internal/adapter/common/write_payload.go:79-84`) and pass the fileSync flag.
-  Its body uses nothing else engine-specific, so this is a type-only change.
-  NFS passes a concrete `*engine.Store`, which still satisfies `Committer`.
-- NBD has no DATA_SYNC/FILE_SYNC split — `NBD_CMD_FLUSH` is an unconditional
-  barrier over everything already acked, and FUA is the same promise for one
-  command — so both call sites pass `fileSync = true`. That is the honest
-  mapping: a metadata flush failure must fail the command rather than be
-  downgraded to a warning, because there is no weaker level to report.
-- `handleFlush` needs `h.authContext(ctx, exp)` and `exp.Handle`, both already
-  available (`connection.go:118`, `handshake.go:92`).
-- Pin it with a test that asserts the raw store changed across a FLUSH, not just
-  that `FlushPendingWriteForFile` was called — the probe above is the shape:
-  read `GetFile` from `rt.GetMetadataStoreForShare(integrationShare)` before and
-  after, and require the mtime to move. Note the fixture trap: the volume must be
-  created as the identity the handler serves as (`newIntegrationFixtureAs`), or
-  `PrepareWrite` fails with `AccessDenied: write permission denied` before any of
-  this is reachable.
+What was *not* acceptable is the state before this ruling: the omission was
+invisible. The code comment on `commit` says the durability rule *"has exactly
+one implementation across the adapters instead of one per protocol"*, which was
+true of the block-store half and silent about the other half.
+
+**The fix, and why the type widening is provably safe.**
+`FlushStableWrite`'s body already passes `blockStore` to `CommitBlockStore`,
+whose parameter is `Committer` (`internal/adapter/common/write_payload.go:125`),
+so the concrete `*engine.Store` must already satisfy the interface — widening the
+declared parameter changes no call site and no behaviour. NFS keeps passing a
+concrete `*engine.Store`.
 
 **Interfaces:**
 - Consumes: a DittoFS NBD server listening on a real TCP port. The script does not start one; it takes a port.
