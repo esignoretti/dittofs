@@ -947,6 +947,16 @@ qemu-system-aarch64 -M virt -accel kvm -cpu host -m 2G \
   HVF is a working substitute for the boot path, so the boot half of §9.5 is runnable on
   an Apple-silicon host; only the crash rig (plan Task 8 Step 2) genuinely needs Linux,
   because of `nbd-client`'s netlink requirement rather than the accelerator.
+- **The client must be in the init network namespace.** `nbd_mcast_index` sends the
+  `NBD_CMD_LINK_DEAD` notification with `genlmsg_multicast` (`drivers/block/nbd.c:2673`),
+  which hardcodes `&init_net` (`include/net/genetlink.h:530`). A client inside a container
+  netns therefore never learns the link died, `link_dead` is never set, and the device
+  blocks for the whole `dead_conn_timeout` and then fails with `BLK_STS_IOERR` — the exact
+  symptom of not passing `-p` at all, wearing the costume of a server bug. Measured with
+  only the namespace changed: in a container netns a listener on the group got **zero**
+  messages and the read failed at the window; with `--network=host` it got the message and
+  the client logged `Successfully reconnected after 3 attempts`, completing the blocked
+  read with the bytes written before the crash.
 - **`-accel` must be explicit and `-cpu host` depends on it.** Without an accelerator QEMU
   uses TCG, where `-cpu host` is rejected outright — measured: `Invalid CPU model: host`
   plus the list of valid models. `-cpu max` is the portable substitute. `-accel
