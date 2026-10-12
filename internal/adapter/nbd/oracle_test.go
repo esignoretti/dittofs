@@ -61,14 +61,25 @@ const oracleExportName = "export/boot"
 // DittoFS refuses a WRITE past the end with NBD_ENOSPC and a READ or TRIM past
 // the end with NBD_EINVAL, while qemu-nbd against a larger file would succeed —
 // so a size mismatch surfaces as a transcript divergence that names neither
-// cause. The sequence reaches 9 MiB, so 16 MiB leaves room without being large.
+// cause. The sequence reaches 13 MiB, so 16 MiB leaves room without being large.
 const oracleExportSize = 16 << 20
 
 // oracleCommands is the identical qemu-io sequence run against both servers.
 //
-// `read -P 0 12M 1M` is the never-written range: storeFake.ReadAt zero-fills
-// past both the written extent and past len(data[id]), so it needs no setup and
-// still compares equal.
+// EVERY DESTRUCTIVE STEP IS PAIRED WITH A PATTERN WRITE FIRST, and that pairing
+// is the difference between an oracle and a green light. A `discard` or
+// `write -z` on a range that was never written is invisible: the range reads as
+// zeros either way, because storeFake.ReadAt zero-fills past the written extent
+// and qemu-nbd's scratch file is sparse. Measured against the sequence without
+// the two `write -P 0x33` / `write -P 0x44` steps: making handleDiscard a
+// complete no-op left the differential test PASSING, and so did removing
+// --discard=unmap from the qemu-nbd launch — both of the test's headline claims
+// were unfalsifiable. With the pattern writes in place, each mutation fails on
+// the `read -P 0` that follows, naming the range and the byte count.
+//
+// `read -P 0 12M 1M` is the never-written range, and it is here on purpose: it
+// pins that an unwritten range reads as zeros on BOTH servers, which is the
+// property the two pattern writes above must not be confused with.
 //
 // `flush` carries no offset, length or payload, so it exercises the control
 // path with no data at all.
@@ -76,8 +87,10 @@ var oracleCommands = []string{
 	"write -P 0x11 0 1M",
 	"write -P 0x22 4M 64k",
 	"read -P 0x11 0 1M",
+	"write -P 0x33 1M 1M",
 	"discard 1M 1M",
 	"read -P 0 1M 1M",
+	"write -P 0x44 8M 1M",
 	"write -z 8M 1M",
 	"read -P 0 8M 1M",
 	"read -P 0 12M 1M",
