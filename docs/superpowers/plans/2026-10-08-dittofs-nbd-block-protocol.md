@@ -2975,13 +2975,96 @@ The oracle's most valuable assertion is not the data path — it is the flag set
 
 Capture the negotiated transmission flags for both servers and assert that every flag DittoFS advertises is also advertised by `qemu-nbd`, and specifically that `SEND_FLUSH` and `SEND_FUA` are present on both. `libnbd`'s `nbdinfo --list` does this in one command but **is not in Homebrew core** (`brew search --formula libnbd` returns only fuzzy matches; `nbdkit` likewise), so it cannot be the only path. The portable path is a ~40-line Python handshake in the script — read the greeting, send `NBD_FLAG_C_FIXED_NEWSTYLE`, send `NBD_OPT_GO` for the export, and decode the `NBD_INFO_EXPORT` reply's 16-bit flags — which needs nothing but a Python 3 interpreter. **Use the Python path as the primary**, because a script that silently degrades when a tool is missing is a script whose check nobody notices has stopped running. If `nbdinfo` is present, run it too and print its output for the record; do not make the assertion depend on it.
 
-**The handshake has four field-layout traps, all hit and fixed while measuring this against `qemu-nbd` 11.1.2. Do not write it from memory:**
-1. **The greeting is 18 bytes, not 16.** `NBDMAGIC` (8) + `IHAVEOPT` (8) + `gflags` (**2**, a `uint16`) — then the 4-byte version comes *separately*. Reading `>QII` in one go desynchronizes the stream and the next read hangs until the socket times out.
-2. **The version field is `NBD_VERSION = 1`, and it is sent after the greeting**, not inside it. Reading it as part of the first struct yields a bogus `0x49484156`-scale number and a spurious "not fixed newstyle" error.
-3. **`gflags` is a capability bitmap, not the version.** Check `gflags & NBD_FLAG_FIXED_NEWSTYLE` (bit 0) rather than comparing it to a number.
-4. **`NBD_INFO_EXPORT`'s body is `u16 info_type, u64 size, u16 flags`** — decode it as `struct.unpack(">QH", body[2:12])`. Unpacking it as `">HQQ"` fails with `struct.error: unpack requires a buffer of 18 bytes`.
+**The handshake has three field-layout traps, all hit and fixed while measuring this against `qemu-nbd` 11.1.2. Do not write it from memory:**
+1. **The greeting is 18 bytes: `NBDMAGIC` (8) + `IHAVEOPT` (8) + `gflags` (2, a `uint16`).** There is **no version field** in the fixed-newstyle greeting — the server sends those 18 bytes and then waits for the client's 4-byte flags. Reading `>QII` (16 bytes, as the old-style handshake suggests) or trying to read a version after the 18 desynchronizes the stream, and the *next* read hangs until the socket times out rather than failing with a clear error. This is the trap that cost the most time.
+2. **`gflags` is a capability bitmap, not a version.** Check `gflags & NBD_FLAG_FIXED_NEWSTYLE` (bit 0) rather than comparing it to a number. (The version comparison belongs to the *old-style* handshake, which this is not.)
+3. **`NBD_INFO_EXPORT`'s body is `u16 info_type, u64 size, u16 flags`** — decode it as `struct.unpack(">QH", body[2:12])`. Unpacking it as `">HQQ"` fails with `struct.error: unpack requires a buffer of 18 bytes`.
 
 Measured reference values from `qemu-nbd` 11.1.2 against a 16 MiB raw file with `-x export/boot --discard=unmap`: `flags = 0x0c6d` — `HAS_FLAGS`(0), `SEND_FLUSH`(2), `SEND_FUA`(3), `SEND_TRIM`(5), `SEND_WRITE_ZEROES`(6), `SEND_CACHE`(10), `SEND_FAST_ZERO`(11). DittoFS advertises `FlagHASFlags | FlagSendFlush | FlagSendFUA | FlagSendTrim | FlagSendWriteZeroes` (`internal/adapter/nbd/handshake.go:101`) = **`0x006d`**, and every one of those bits is present in `0x0c6d` (verified by masking: `0x006d & 0x0c6d == 0x006d`). The two extra bits the oracle sets are `0xc00` = `SEND_CACHE | SEND_FAST_ZERO`, which DittoFS deliberately does not advertise — so the assertion must be **one-directional** (ours ⊆ theirs), never equality.
+
+**A handshake that was actually run against `qemu-nbd` 11.1.2 and returned `0x0c6d`, written with all four traps fixed.** Use this rather than re-deriving it; the traps above cost four debug cycles to find:
+
+```python
+#!/usr/bin/env python3
+"""Negotiate one export and print its transmission flags.
+
+Usage: nbd-flags.py <port> <export-name>
+Exits non-zero if the server does not offer fixed-newstyle or refuses the export.
+"""
+import socket, struct, sys
+
+NBDMAGIC = 0x4e42444d41474943
+IHAVEOPT = 0x49484156454f5054
+NBD_FLAG_FIXED_NEWSTYLE = 1 << 0
+NBD_FLAG_NO_ZEROES      = 1 << 1
+NBD_OPT_GO   = 7
+NBD_REP_ACK  = 1
+NBD_REP_INFO = 3
+NBD_INFO_EXPORT = 0
+
+NAMES = {0: "HAS_FLAGS", 1: "READ_ONLY", 2: "SEND_FLUSH", 3: "SEND_FUA",
+         4: "ROTATIONAL", 5: "SEND_TRIM", 6: "SEND_WRITE_ZEROES", 7: "SEND_DF",
+         8: "CAN_MULTI_CONN", 9: "SEND_RESIZE", 10: "SEND_CACHE",
+         11: "SEND_FAST_ZERO", 12: "BLOCK_STATUS_PAYLOAD", 13: "SEND_BLOCK_STATUS",
+         14: "CAN_META_CONTEXT"}
+
+def recvn(s, n):
+    b = b""
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c:
+            raise EOFError("short read")
+        b += c
+    return b
+
+def negotiate(port, export):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    # TRAP 1: the greeting is 18 bytes -- NBDMAGIC(8) IHAVEOPT(8) gflags(u16).
+    # There is NO version field in the fixed-newstyle handshake: the server sends
+    # these 18 bytes and then waits for the client flags. Reading 16 bytes (or
+    # reading a version after the 18) desynchronizes the stream, and the next
+    # read hangs until the socket times out.
+    magic, ihav, gflags = struct.unpack(">QQH", recvn(s, 18))
+    if magic != NBDMAGIC:
+        raise ValueError("bad NBDMAGIC")
+    if ihav != IHAVEOPT:
+        raise ValueError("bad IHAVEOPT")
+    # TRAP 2: gflags is a capability bitmap -- test the bit, do not compare it
+    # to a version number. (The old-style handshake's version field is the thing
+    # people reach for here, and it is not on the wire.)
+    if not (gflags & NBD_FLAG_FIXED_NEWSTYLE):
+        raise ValueError(f"server lacks fixed newstyle (gflags=0x{gflags:04x})")
+    s.sendall(struct.pack(">I", NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES))
+    name = export.encode()
+    payload = struct.pack(">I", len(name)) + name + struct.pack(">H", 0)
+    s.sendall(struct.pack(">QII", IHAVEOPT, NBD_OPT_GO, len(payload)) + payload)
+    flags = None
+    while True:
+        _, _, rtype, rlen = struct.unpack(">QIII", recvn(s, 20))
+        body = recvn(s, rlen)
+        if rtype == NBD_REP_INFO and rlen >= 12:
+            info_type = struct.unpack(">H", body[:2])[0]
+            if info_type == NBD_INFO_EXPORT:
+                # TRAP 3: u16 info_type, u64 size, u16 flags.
+                size, flags = struct.unpack(">QH", body[2:12])
+        elif rtype == NBD_REP_ACK:
+            break
+        elif rtype & 0x80000000:
+            raise ValueError(f"server refused the export (reply type {rtype})")
+    s.close()
+    if flags is None:
+        raise ValueError("no NBD_INFO_EXPORT in the reply")
+    return flags
+
+if __name__ == "__main__":
+    f = negotiate(int(sys.argv[1]), sys.argv[2])
+    print(f"flags = 0x{f:04x}")
+    for bit in range(16):
+        if f & (1 << bit):
+            print(f"  {bit:2d} {NAMES.get(bit, '?')}")
+```
+
+Against DittoFS the same script must print `0x006d`, and the parity assertion is then `(dittofs & qemu) == dittofs`. Note the script takes the export name as an argument precisely so the same code runs against both servers — and that it must be given `export/boot` for both, which is what the `-x` flag above arranges.
 
 - [ ] **Step 3: Write `test/nbd/README.md`**
 
