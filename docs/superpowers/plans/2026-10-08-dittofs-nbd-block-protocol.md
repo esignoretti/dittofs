@@ -126,7 +126,7 @@ Inputs and conditions the spec implies but whose tests no single task obviously 
 | File | Covers |
 |---|---|
 | `test/nbd/run-oracle.sh` | Differential comparison against `qemu-nbd`; drives Tier A (`go test -run TestOracle_`) and Tier B when a server port is given. |
-| `internal/adapter/nbd/oracle_test.go` | Tier A: the real `Handler` on a real TCP listener, driven by the real `qemu-io`, diffed against `qemu-nbd`. |
+| `internal/adapter/nbd/oracle_test.go` | Tier A: the real `Handler` on a real TCP listener behind a fake `Exporter`, driven by the real `qemu-io`, diffed against `qemu-nbd`. External (`package nbd_test`), so it redefines its own export name and store fake. |
 | `test/nbd/boot-qemu.sh` | KVM boot over NBD. |
 | `test/nbd/crash-restart.sh` | SIGKILL mid-write, restart, resume. |
 | `test/nbd/README.md` | Prerequisites and what each script proves. |
@@ -2611,6 +2611,37 @@ a handshake and no data path.
 skips; run the Python flag-parity handshake against both servers; and, when
 `DITTOFS_NBD_PORT` is set, additionally drive Tier B. It must print which tier
 ran — a green run that does not say what it checked means nothing.
+
+**Exactly what Tier A constructs, because the pieces are not all reusable.**
+
+```go
+// Package nbd_test, so it can import internal/adapter/testruntime. The
+// in-package test helpers are NOT visible here: testExportName, pipe,
+// newTestHandler and writeVolumeFixture all live in `package nbd` files, so
+// this test defines its own export name and its own store fake.
+rt, _ := testruntime.NewWithShareStore(t)   // for the metadata service, not the adapter
+meta := rt.GetMetadataService()             // PunchHole and PrepareWrite need a real one
+// ...create the share, the `volumes` directory and the volume file exactly as
+// internal/adapter/nbd/integration_test.go does, under ONE identity, and set
+// the size afterwards (CreateFile zeroes it).
+
+exporter := oracleExporter{exp}   // a fake: `func (o oracleExporter) Resolve(name string) (*nbd.Export, error)`
+stores := func(ctx context.Context, exp *nbd.Export) (nbd.BlockStore, error) { return st, nil }
+h := nbd.NewHandler(exporter, stores, meta, nbd.Identity{UID: 65534, GID: 65534},
+    nbd.Timeouts{Read: 30 * time.Second, Write: 30 * time.Second, Idle: 5 * time.Minute},
+    func() bool { return false })
+```
+
+A **fake `Exporter`**, not `nbd.NewRuntimeExporter`, is the right choice here: the
+oracle's subject is the codec, `volume_test.go` already covers export resolution
+against a real runtime, and routing through the runtime would drag share and
+volume provisioning back into the test the split was meant to keep it out of.
+`nbd.Export`'s fields are all exported (`handshake.go:82`), so a literal is enough.
+The metadata service is real and unavoidable: `handleTrim` and `handleWriteZeroes`
+call `h.meta.PunchHole`, which panics on a nil service — the same reason Tasks 5
+and 6 needed `writeVolumeFixture`. `nbd.Conn.Serve(ctx)` (`connection.go:150`) is
+the accept-loop entry point, so each accepted `net.Conn` becomes `nbd.NewConn(h, c)`
+and `go conn.Serve(ctx)`.
 
 What it does:
 
