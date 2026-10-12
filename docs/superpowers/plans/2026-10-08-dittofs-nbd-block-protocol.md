@@ -2060,85 +2060,62 @@ if _, err := bs.WriteAt(ctx, string(intent.PayloadID), nil, data, req.Offset); e
 
 **`mapError` is the single place the wire layer converts an error, and it calls `common.NormalizeBlockStoreError` internally** — so the handler passes the raw error and needs no explicit normalize call. Normalizing first matters: the engine returns raw sentinels as well as `*merrs.StoreError`, and normalization is what turns a raw one into a `*merrs.StoreError` with the right code while leaving an already-wrapped one alone (`if goerrors.As(err, &storeErr) { return err }`). The failure mode of getting this wrong is an error code that silently degrades to `ErrEIO` because `errors.Is` no longer matches through an extra wrap — so a disk-full becomes an I/O error and the client has no way to know its device is full.
 
-`normalizeBlockStoreError` (`internal/adapter/common/normalize.go:25`) is currently unexported. **Export it in this task** (`NormalizeBlockStoreError`, a one-word change) rather than writing a second classifier: one implementation of the classification, or the NBD path drifts from NFS and SMB. Do not hand-roll a classifier that skips normalization.
+**Task 4 already exported it.** `NormalizeBlockStoreError` is at `internal/adapter/common/normalize.go:27` and `mapError` calls it at `internal/adapter/nbd/connection.go:291`. Nothing to do here — recorded so nobody goes looking for a rename that has already happened.
 
 - [ ] **Step 1: Write the failing tests**
 
-Replace `TestConnection_WriteIsEINVALBeforeTask5` with the real cases:
+The names below are the contract; the bodies are yours to write. They are **not** transcribed because they cannot be: `handleWrite` calls `h.meta.PrepareWrite` and `h.meta.CommitWrite`, and the connection tests' `newTestHandler` passes **`nil`** for `meta` (`internal/adapter/nbd/connection_test.go:151`) — correct for Task 4, where nothing on the read path touched metadata. So every WRITE test that expects `Error == 0` needs a handler with a real metadata service.
+
+**Add a second fixture helper** beside `newTestHandler`, and use it for the write tests:
 
 ```go
-func TestConnection_WritePersistsBytes(t *testing.T) {
-	// WRITE 4096 bytes at offset 8192; expect Error == 0, and a following READ
-	// of [8192, 12288) returns them byte-exact.
-}
-
-func TestConnection_WritePastEndIsENOSPC(t *testing.T) {
-	// Offset: size-4096, Length: 4097 → ErrENOSPC, NOT EINVAL. The spec:
-	// "The server SHOULD return NBD_ENOSPC if it receives a write request
-	// including one or more sectors beyond the size of the device." A read or
-	// trim past the end is EINVAL; a write is ENOSPC. The export size is fixed,
-	// so a WRITE past the end is refused, never grown.
-}
-
-func TestConnection_WriteZeroLengthIsEINVAL(t *testing.T) {
-	// Length: 0 → ErrEINVAL. There is no payload to drain, so the connection
-	// stays usable: a following READ on the same connection must succeed.
-}
-
-// The desync guard. A rejected WRITE still has its payload in flight; if the
-// handler replies without consuming it, the next "request header" is the
-// payload's first bytes and the connection is garbage from then on.
-func TestConnection_RejectedWriteKeepsTheStreamSynchronized(t *testing.T) {
-	// Send a WRITE that is rejected on the range check (Length: 4096, offset
-	// past the end) WITH its 4096-byte payload, then send a valid READ and
-	// expect the correct reply. Without the drain, the READ's reply is a
-	// parse of payload bytes.
-}
-
-func TestConnection_RejectedHugeWriteDoesNotAllocate(t *testing.T) {
-	// Declare Length: 1<<30 on a 1 MiB export, send a little of the payload,
-	// then stall. Expect ErrENOSPC (the range check precedes the read) and no
-	// 1 GiB allocation. Uses Timeouts.Read to bound the drain.
-}
-
-func TestConnection_WriteTruncatedPayloadIsAnError(t *testing.T) {
-	// Declare Length: 4096, send 100 bytes, then close. Serve must return an
-	// error and must NOT report success.
-}
-
-func TestConnection_WriteWithFUAIsDurableBeforeReply(t *testing.T) {
-	// A fake whose Flush records the order: assert Flush happened before the
-	// reply was written. This is the assertion that makes FUA mean something.
-}
-
-func TestConnection_FlushIsAckedWhenDurable(t *testing.T) {
-	// CommitAck: journal semantics — local fs store, Flush returns
-	// &block.FlushResult{Finalized: false}, nil. Expect Error == 0.
-}
-
-func TestConnection_FlushIsEIOWhenNotDurable(t *testing.T) {
-	// requireDurable set, Flush returns {Finalized: false}, nil, and the store
-	// reports localDurable false / remoteDurable false. Expect ErrEIO: FLUSH
-	// promised durability and could not deliver it, so there is no honest
-	// success to send.
-}
-
-func TestConnection_FlushWithNonZeroLengthIsEINVAL(t *testing.T) {
-	// The spec requires length and offset to be zero.
-}
-
-func TestConnection_FlushOnReadOnlyExportIsPermitted(t *testing.T) {
-	// A read-only export still answers FLUSH successfully. Refusing would make
-	// a client error a device that has nothing to flush.
-}
+// newWriteTestHandler builds a handler whose metadata service is real. The
+// read-path helper passes nil because READ never touches metadata; WRITE does,
+// through PrepareWrite and CommitWrite, so it needs a service whose store is
+// the same share the fake block store stands in for.
+func newWriteTestHandler(t *testing.T, st BlockStore, exp *Export) *Handler
 ```
+
+Build it the way `integrationHandler` does (`internal/adapter/nbd/integration_test.go:96`): a `runtime.Runtime` from `testruntime.NewWithShareStore(t)` with one share and one metadata store, `rt.GetMetadataService()` for the service, and `exp.Handle` set to a real volume file's handle — a volume file created under the share's root with `CreateFile` and then sized with `SetFileAttributes`, because `ApplyCreateDefaults` zeroes the size (`pkg/metadata/validation.go:492`). Reuse the fixture that `integration_test.go` already builds if it can be factored into a helper both files call; do not build a second one that drifts.
+
+Tests whose assertions are *rejections* need no metadata (the handler returns before touching it), so they may keep `newTestHandler`. Tests that must reach `Error == 0` on a WRITE cannot.
+
+```go
+func TestConnection_WritePersistsBytes(t *testing.T)
+func TestConnection_WritePastEndIsENOSPC(t *testing.T)
+func TestConnection_WriteZeroLengthIsEINVAL(t *testing.T)
+func TestConnection_RejectedWriteKeepsTheStreamSynchronized(t *testing.T)
+func TestConnection_RejectedHugeWriteDoesNotAllocate(t *testing.T)
+func TestConnection_WriteTruncatedPayloadIsAnError(t *testing.T)
+func TestConnection_WriteWithFUAIsDurableBeforeReply(t *testing.T)
+func TestConnection_FlushIsAckedWhenDurable(t *testing.T)
+func TestConnection_FlushIsEIOWhenNotDurable(t *testing.T)
+func TestConnection_FlushWithNonZeroLengthIsEINVAL(t *testing.T)
+func TestConnection_FlushOnReadOnlyExportIsPermitted(t *testing.T)
+```
+
+What each must assert, in the terms the test file already uses (`sendRequest`, `readReplyHeader`, `readPayload`, `assertNoPayload`, `completeHandshake`, `pipe`):
+
+- **`WritePersistsBytes`** — WRITE 4096 bytes at offset 8192 **with its payload**; `rep.Error == 0`; then a READ of `[8192, 12288)` on the same connection returns those bytes byte-exact. This is the only test that proves a WRITE round-trips, so it must assert the bytes rather than the error code.
+- **`WritePastEndIsENOSPC`** — `Offset: exp.Size-4096, Length: 4097`, **payload sent**, expect `ErrENOSPC`. Not `EINVAL`: the spec reserves `ENOSPC` for a write past the end and `EINVAL` for a read or trim. The export size is fixed, so a WRITE past the end is refused, never grown.
+- **`WriteZeroLengthIsEINVAL`** — `Length: 0` → `ErrEINVAL`, and **no drain** (there is no payload to consume). Then a valid READ on the same connection must succeed, which is what proves the zero-length path did not consume the next header.
+- **`RejectedWriteKeepsTheStreamSynchronized`** — the desync guard, and the highest-value test in the task. Send a WRITE rejected on the range check (`Length: 4096`, offset past the end) **with its 4096-byte payload**, then a valid READ, and expect the READ's reply. Without the drain, the "request header" the server reads next is payload bytes.
+- **`RejectedHugeWriteDoesNotAllocate`** — `Length: 1<<30` on a 1 MiB export, **send a little of the payload, then stall**. `ErrENOSPC` must arrive (the range check precedes the drain) within `Timeouts.Read`, and the process must not grow by 1 GiB. Note the drain itself will then block on the missing bytes and `Serve` returns a timeout — that is the correct outcome and the test should assert it, not treat it as a failure.
+- **`WriteTruncatedPayloadIsAnError`** — declare `Length: 4096`, send 100 bytes, then close. `Serve` returns an error and never reports success. Distinct from the huge-write case: here the client stopped mid-payload on a request the server had accepted.
+- **`WriteWithFUAIsDurableBeforeReply`** — a fake whose `Flush` records whether the reply had already been written. This is the assertion that makes FUA mean something; it is the one Step 8 proves by moving the commit call.
+- **`FlushIsAckedWhenDurable`** — `CommitAck: journal` semantics: an fs local store, `Flush` returning `&block.FlushResult{Finalized: false}, nil`. `rep.Error == 0`.
+- **`FlushIsEIOWhenNotDurable`** — `requireDurable` set, `Flush` returning `{Finalized: false}, nil`, and the store reporting `localDurable`/`remoteDurable` both false. Expect `ErrEIO`: FLUSH promised durability and could not deliver it, so there is no honest success to send.
+- **`FlushWithNonZeroLengthIsEINVAL`** — the spec requires `length` and `offset` to be zero on FLUSH.
+- **`FlushOnReadOnlyExportIsPermitted`** — a read-only export still answers FLUSH successfully. Refusing would make a client error a device that has nothing to flush.
 
 - [ ] **Step 2: Run them and confirm they fail**
 
 Run: `go test ./internal/adapter/nbd/ -run 'TestConnection_Write|TestConnection_Flush' -v`
 Expected: FAIL.
 
-Add `TestConnection_RejectedWriteKeepsTheStreamSynchronized` to **Review Focus** item 6, which it pins — it is the highest-value test in this task, because the failure it catches is silent and remote (a client sees a protocol error minutes later on an unrelated command).
+Add `TestConnection_RejectedWriteKeepsTheStreamSynchronized` to **Review Focus** item 6 if it is not already there — it is the highest-value test in this task, because the failure it catches is silent and remote (a client sees a protocol error minutes later on an unrelated command).
+
+**Delete `TestConnection_WriteIsEINVALBeforeTask5`** (`internal/adapter/nbd/connection_test.go:338`). It pins the dispatcher's `default` branch for a command the adapter advertises but does not yet serve, and after this task WRITE is served — so it asserts the opposite of the intended behaviour and will fail. `TestConnection_UnknownCommandIsEINVAL` and `TestConnection_UnimplementedCommandIsEINVAL` still cover the `default` branch for values the spec does not define. **Update `TestConnection_WriteWithNoHoleFlagIsEINVAL` rather than deleting it** (see Step 3 check 6): it pins a real rule — `NO_HOLE` is not a `WRITE` flag — but it must now send the payload its header declares.
 
 - [ ] **Step 3: Implement `handleWrite`**
 
@@ -2149,17 +2126,35 @@ Order of checks, and the order is the point:
 3. `req.Length == 0` → `ErrEINVAL`.
 4. `req.Offset > math.MaxUint64 - uint64(req.Length)` → `ErrEIO`.
 5. `req.Offset + uint64(req.Length) > exp.Size` → `ErrENOSPC` (**not** `EINVAL`). The spec: *"The server SHOULD return `NBD_ENOSPC` if it receives a write request including one or more sectors beyond the size of the device. ... It SHOULD return `NBD_EINVAL` if it receives a read or trim request including one or more sectors beyond the size of the device."* A write past the end means the client's view of the device is too large; a read or trim past the end is a malformed request. Different causes, different codes.
-6. **Drain the payload on every error path from here on.** The client has already sent `req.Length` bytes — the spec says so unconditionally (*"The client MUST follow the request header with *length* number of bytes"*). If the handler writes an error reply and returns without consuming them, those bytes are read as the *next request header* and the connection desynchronizes into garbage. So every rejection after the header is parsed must discard the payload first:
+6. **Drain the payload on every error path from here on — except a zero-length one.** The client has already sent `req.Length` bytes — the spec says so unconditionally (*"The client MUST follow the request header with *length* number of bytes"*). If the handler writes an error reply and returns without consuming them, those bytes are read as the *next request header* and the connection desynchronizes into garbage. Check 3 already returned for `Length == 0`, so **no drain happens there**; every rejection that reaches this step has a non-zero payload and must discard it before replying.
+
+   **This changes what the existing flag-rejection test must send.** `TestConnection_WriteWithNoHoleFlagIsEINVAL` (`internal/adapter/nbd/connection_test.go:578`) sent a bare `WRITE` header with `Length: 4096` and no payload, because before this task the dispatcher's `default` branch answered without ever reading one. Once `handleWrite` exists, the flag check returns `ErrEINVAL` and the drain then blocks waiting for 4096 bytes that never arrive, so the test hangs on `readReplyHeader` until the Go test timeout instead of failing. **Update it to send its payload** before asserting `ErrEINVAL` — the reply is written after the drain, not before it. A test that declares bytes it does not send is asserting against a client the spec forbids.
+
+   The drain must also share the request's deadline. `SetReadDeadline` is armed once before `ReadRequest` and `ReadRequest` reads exactly 28 bytes, so the deadline is already partly spent by the time the drain starts — and the drain is where a hostile or stalled client parks. Give it the remainder of the request budget rather than a fresh one, or a client that declares 1 GiB and sends nothing holds the connection for a second full timeout:
 
    ```go
    // The payload is already in flight; skipping it would desync the stream.
+   // Bounded by a deadline so a client that declares a huge length and sends
+   // nothing cannot hold the connection open indefinitely.
+   if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
+       return err
+   }
    if _, err := io.CopyN(io.Discard, conn, int64(req.Length)); err != nil {
        return err // the connection is unusable either way
    }
    ```
 
-   Use `io.CopyN(io.Discard, ...)` rather than `make([]byte, req.Length)`: a client that declares a 4 GiB length must cost the server a bounded buffer, not an allocation. This is the same class as Review Focus 1, one layer down.
-7. **Then** allocate `data := make([]byte, req.Length)` and `io.ReadFull(conn, data)`. A truncated payload returns the read error — the connection is unusable at that point, so returning is correct and the client gets a TCP close rather than a success reply for bytes the server never saw.
+   `io.CopyN(io.Discard, ...)` rather than `make([]byte, req.Length)`: a client that declares a 4 GiB length must cost the server a bounded buffer, not an allocation. This is the same class as Review Focus 1, one layer down.
+7. **Then** read the payload into a buffer sized to the request, using the same bounded shape so a truncated payload costs no allocation either:
+
+   ```go
+   data := make([]byte, req.Length)
+   if _, err := io.ReadFull(io.LimitReader(conn, int64(req.Length)), data); err != nil {
+       return err // the client stopped mid-payload; the connection is unusable
+   }
+   ```
+
+   A truncated payload returns the read error — the connection is unusable at that point, so returning is correct and the client gets a TCP close rather than a success reply for bytes the server never saw.
 8. `authCtx := h.authContext(ctx, exp)`, then `metaSvc.PrepareWrite(authCtx, exp.Handle, req.Offset+uint64(req.Length))` — `metaSvc` is `h.meta`, and `exp.Handle` was resolved once at handshake and has been on the handler ever since. (The auth context is built per command from the command's context, not cached: it embeds `Context`, and a cached one would carry the first command's deadline and cancellation into every later command on the connection.)
 9. `bs.WriteAt(ctx, string(intent.PayloadID), nil, data, req.Offset)` on a deadline-wrapped ctx (see above), with the returned `[]block.ChunkRef` discarded — the canonical projection happens at Flush time, not here (`pkg/block/engine/readwrite.go` doc).
 10. `h.meta.CommitWrite(authCtx, intent)`.
