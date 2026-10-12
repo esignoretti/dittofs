@@ -835,10 +835,27 @@ Boot path being tested (EDK2 has no NBD driver, so UEFI-boot-from-NBD is not a p
 ```
 local (small, static):  kernel + initramfs        <- firmware boots this; no NBD needed
 initramfs:              modprobe nbd
-                        nbd-client <host> <port> /dev/nbd0
-                        mount /dev/nbd0p1 /root; switch_root
+                        nbd-client -N export/boot 10.0.2.2 10809 /dev/nbd0
+                        mkfs.ext4 /dev/nbd0        <- FIRST BOOT ONLY
+                        mount /dev/nbd0 /root; switch_root
 NBD (DittoFS):          the root filesystem
 ```
+
+**Two things about that line are easy to get wrong, and both fail in a way that names
+neither cause.**
+
+- **`-N <export>` is mandatory.** Without it `nbd-client` does not omit the export name —
+it sends an **empty** one (`master` sets `if(!cur_client->name) cur_client->name = "";` at
+`nbd-client.c:1504-1505` and only prints a warning about oldstyle). DittoFS refuses it:
+`RuntimeExporter.Resolve` requires a `/` with a non-empty share on the left and a
+non-empty volume on the right (`sep <= 0 || sep == len(name)-1` → `ErrUnknownExport`),
+and the measured result of resolving `""` is `nbd: unknown export`. The handshake then
+fails with a message that does not mention the missing flag.
+- **The mount is `/dev/nbd0`, not `/dev/nbd0p1`.** The export is a single file served
+whole, and nothing in this path writes a partition table — `mkfs.ext4` goes directly on
+the device, which is also what phase 1 below says it does. A `p1` suffix assumes a
+partition table that no step creates, so the mount would fail with `no such device`
+after a successful handshake and a successful `mkfs`.
 
 The upside of root-on-NBD is that the part being tested is exactly the part doing all the
 writing (root fs fsyncs), not the read-only kernel load.
@@ -862,8 +879,8 @@ qemu-system-aarch64 -M virt -cpu host -m 2G \
   listening on 10809 it fails to bind at startup. Nothing is needed: QEMU's user-net
   gateway `10.0.2.2` is the *host* as seen from inside the guest, and a guest-initiated
   outbound connection to it crosses SLIRP with no rule, the same way the guest reaches
-  the outside world. The guest runs `nbd-client 10.0.2.2 10809 /dev/nbd0`, which is
-  exactly the direction that needs no forwarding.
+  the outside world. The guest runs `nbd-client -N export/boot 10.0.2.2 10809 /dev/nbd0`,
+  which is exactly the direction that needs no forwarding.
 - The `cache=` mode that matters is the one on the **NBD client's** device
   (`/dev/nbd0`), not on a QEMU `-drive`: there is no QEMU block layer between the guest
   and DittoFS. §9.3's "record the cache mode" therefore applies to the guest's mount

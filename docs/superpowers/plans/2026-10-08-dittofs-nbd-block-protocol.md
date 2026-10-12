@@ -3109,10 +3109,16 @@ Topology, exactly as the spec's §9.5:
 ```
 local (small, static):  kernel + initramfs        <- firmware boots this; no NBD needed
 initramfs:              modprobe nbd
-                        nbd-client 10.0.2.2 10809 /dev/nbd0
-                        mount /dev/nbd0p1 /root; switch_root
+                        nbd-client -N export/boot 10.0.2.2 10809 /dev/nbd0
+                        mkfs.ext4 /dev/nbd0        <- FIRST BOOT ONLY
+                        mount /dev/nbd0 /root; switch_root
 NBD (DittoFS):          the root filesystem
 ```
+
+**Two spellings in that line are load-bearing, and both fail without naming the cause:**
+
+- **`-N <export>` is mandatory.** Omitting it does not mean "no export name" — `nbd-client` sends an **empty** one (`master`: `if(!cur_client->name) cur_client->name = "";`, `nbd-client.c:1504-1505`, with only a warning about oldstyle). DittoFS refuses it, because `RuntimeExporter.Resolve` requires a `/` with a non-empty share on the left and a non-empty volume on the right (`sep <= 0 || sep == len(name)-1` → `ErrUnknownExport`). Measured: resolving `""` returns `nbd: unknown export`. The client reports a handshake failure that never mentions the missing flag. The name must be the same one the oracle uses — `<share>/<volume>` with no leading slash, e.g. `export/boot`.
+- **Mount `/dev/nbd0`, not `/dev/nbd0p1`.** The export is a single file served whole and nothing in this path writes a partition table; `mkfs.ext4` goes directly on the device. A `p1` suffix assumes a partition table no step creates, so the mount fails with `no such device` after both the handshake and the `mkfs` have already succeeded.
 
 - **No data disk.** The root filesystem arrives over NBD. A `-drive` holding the volume would test the wrong path.
 - **No `hostfwd` rule.** `hostfwd` forwards a *host* port *into the guest*, which is the opposite of what this topology needs and would also try to bind host port 10809 where DittoFS is already listening. The guest initiates the connection outward to `10.0.2.2`, QEMU's user-net gateway to the host, and a guest-initiated outbound connection crosses SLIRP with no rule — the same path the guest uses to reach the outside world.
@@ -3241,6 +3247,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
 - [ ] Task 7 — `internal/adapter/nbd/oracle_test.go` skips (not fails) without QEMU, and `run-oracle.sh` treats that skip as a failure; the script prints which tier ran, so a green run says what it checked.
 - [ ] Task 8 — the launch line carries **no `hostfwd`**: it forwards host→guest, which is the wrong direction and would try to bind host port 10809 where DittoFS is listening. The guest reaches the host at `10.0.2.2` with no rule.
+- [ ] Task 8 — the guest's `nbd-client` line names the export (`-N export/boot`) and mounts `/dev/nbd0`, not `/dev/nbd0p1`. Measured: omitting `-N` makes `nbd-client` send an **empty** export name (`nbd-client.c:1504-1505`), which `RuntimeExporter.Resolve` refuses (`sep <= 0` → `ErrUnknownExport`) — probe result `nbd: unknown export`, reported to the client as a handshake failure that never mentions the flag. And nothing in the path writes a partition table, so a `p1` suffix fails with `no such device` after the handshake and `mkfs` have both already succeeded.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
 - [ ] Task 8 — the crash rig sets `dead_conn_timeout` with `-T`/`--dead-timeout` and fails when netlink is unavailable, rather than silently running the ioctl path where the option is parsed and ignored.
 - [ ] Task 8 — the crash rig **refuses `nbd-client` below 3.27.1** (3.26.1 has no `-T` at all) and **does not pass `-p` on 3.27.1**, where the persist loop is gated on `persist_mode`, a field nothing ever sets. Measured: `-p` is silently ignored on both 3.26.1 and 3.27.1. And the window is asserted **behaviourally** — SIGKILL the server, confirm the guest's I/O blocks rather than erroring immediately — because `dead_conn_timeout` has no sysfs read-back (only `pid_attr` and `backend_attr` exist).
