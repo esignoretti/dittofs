@@ -126,7 +126,7 @@ Inputs and conditions the spec implies but whose tests no single task obviously 
 | File | Covers |
 |---|---|
 | `test/nbd/run-oracle.sh` | Differential comparison against `qemu-nbd`; drives Tier A (`go test -run TestOracle_`) and Tier B when a server port is given. |
-| `internal/adapter/nbd/oracle_test.go` | Tier A: the real `Handler` on a real TCP listener behind a fake `Exporter`, driven by the real `qemu-io`, diffed against `qemu-nbd`. External (`package nbd_test`), so it redefines its own export name and store fake. |
+| `internal/adapter/nbd/oracle_test.go` | Tier A: the real `Handler` on a real TCP listener behind a fake `Exporter`, driven by the real `qemu-io`, diffed against `qemu-nbd`. Internal (`package nbd`), so it reuses `newWriteVolumeFixture`, `storeFake`, `pipe` and `sendRequest` rather than duplicating them — an external test package would have to redefine all of them, including a seven-method `BlockStore` fake. |
 | `test/nbd/boot-qemu.sh` | KVM boot over NBD. |
 | `test/nbd/crash-restart.sh` | SIGKILL mid-write, restart, resume. |
 | `test/nbd/README.md` | Prerequisites and what each script proves. |
@@ -2606,8 +2606,7 @@ a handshake and no data path.
 `test/nbd/run-oracle.sh`, following the existing `test/crash/*.sh` convention: a `#!/usr/bin/env bash` header with a comment block explaining what it proves, `set -euo pipefail`, a usage line, and a prerequisites check.
 
 **Tier A is a Go test, so the script's job is narrow.**
-`internal/adapter/nbd/oracle_test.go` (package `nbd_test`, external — it imports
-`internal/adapter/testruntime`, which an in-package test cannot) does this:
+`internal/adapter/nbd/oracle_test.go` (package `nbd`, internal — see the note below on why) does this:
 
 1. Skip, not fail, when `qemu-nbd` or `qemu-io` is absent: `t.Skip` with the
    missing binary named, so `go test ./...` stays green on a machine without
@@ -2622,9 +2621,10 @@ a handshake and no data path.
    the accept loop `pkg/adapter/nbd/adapter_test.go:88` already uses, exporting
    `testExportName` and taking the port from the listener, not from config
    (`BaseAdapter.Port()` returns the *configured* port, `pkg/adapter/base.go:598`).
-4. Start `qemu-nbd` as a subprocess against a `t.TempDir()` scratch file of the
-   same size, with `-f raw -p <free port> -b 127.0.0.1 --persistent
+4. Start `qemu-nbd` as a subprocess against a `t.TempDir()` scratch file **of exactly the export's size**, with `-f raw -p <free port> -b 127.0.0.1 --persistent
    --discard=unmap`, and stop it in `t.Cleanup`.
+
+   **The scratch file must be the export's size, and the export must be large enough for the sequence below.** The two sizes have to agree, because every command in Step 5 is bounds-checked against the export: DittoFS refuses a WRITE past the end with `NBD_ENOSPC` and a READ or TRIM past the end with `NBD_EINVAL`, while `qemu-nbd` against a larger file would succeed. A mismatch therefore shows up as a transcript divergence that names neither cause. The committed `newWriteVolumeFixture` builds a **1 MiB** volume (`internal/adapter/nbd/integration_test.go:142` sets `Size: 1 << 20`) and the sequence below reaches **9 MiB**, so Tier A cannot use that fixture's volume as-is: it needs its own fixture sized to the sequence, e.g. 16 MiB, built by the same helper with the size parameterised (`newIntegrationFixtureAs` already takes the identity; add the size beside it rather than writing a second provisioning block).
 5. Run the identical `qemu-io -f raw -c '<cmd>'` sequence against both, capture
    stdout+stderr, and require the transcripts to match line for line. Addresses
    are `nbd://127.0.0.1:<port>/<export>` — see the export-name note below.
@@ -2639,33 +2639,49 @@ ran — a green run that does not say what it checked means nothing.
 **Exactly what Tier A constructs, because the pieces are not all reusable.**
 
 ```go
-// Package nbd_test, so it can import internal/adapter/testruntime. The
-// in-package test helpers are NOT visible here: testExportName, pipe,
-// newTestHandler and writeVolumeFixture all live in `package nbd` files, so
-// this test defines its own export name and its own store fake.
-rt, _ := testruntime.NewWithShareStore(t)   // for the metadata service, not the adapter
-meta := rt.GetMetadataService()             // PunchHole and PrepareWrite need a real one
-// ...create the share, the `volumes` directory and the volume file exactly as
-// internal/adapter/nbd/integration_test.go does, under ONE identity, and set
-// the size afterwards (CreateFile zeroes it).
-
-exporter := oracleExporter{exp}   // a fake: `func (o oracleExporter) Resolve(name string) (*nbd.Export, error)`
-stores := func(ctx context.Context, exp *nbd.Export) (nbd.BlockStore, error) { return st, nil }
-h := nbd.NewHandler(exporter, stores, meta, nbd.Identity{UID: 65534, GID: 65534},
-    nbd.Timeouts{Read: 30 * time.Second, Write: 30 * time.Second, Idle: 5 * time.Minute},
-    func() bool { return false })
+// Package nbd, NOT nbd_test, and that is a deliberate choice with a verified
+// basis rather than an inheritance.
+//
+// The reason to be in-package is that this test needs the fixture Tasks 4-6
+// already built: newWriteVolumeFixture (a real metadata service, an enabled
+// share, and the volume file), storeFake (a seven-method BlockStore fake with
+// its failure-injection fields), pipe (a real loopback pair, not net.Pipe) and
+// sendRequest/readReplyHeader. An external test package cannot see any of them
+// and would have to redefine every one -- including a second BlockStore fake
+// that would drift from the one the other tests use.
+//
+// The plan originally specified package nbd_test on the grounds that an
+// in-package test cannot import internal/adapter/testruntime. That is FALSE:
+// integration_test.go is package nbd and imports it at line 10, and
+// `go test ./internal/adapter/nbd/ -run TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO`
+// compiles and passes. There is no cycle either way -- `go list -deps
+// ./internal/adapter/testruntime` contains no entry for dittofs/internal/adapter/nbd.
+// So the constraint was imaginary, and in-package is strictly better here.
+//
+// What this test does NOT reuse is the fixture's VOLUME SIZE: the sequence
+// below reaches 9 MiB and the committed fixture builds a 1 MiB volume, so Tier
+// A provisions its own volume at the size the sequence needs.
+rt, name, bs := newIntegrationFixtureAsSized(t, integrationIdentity, 16<<20)
+exp, err := NewRuntimeExporter(rt, integrationIdentity).Resolve(context.Background(), name)
+// ...then serve exp with the in-package helpers:
+//   h := NewHandler(exporterFor(exp), resolverFor(st), rt.GetMetadataService(),
+//                   integrationIdentity, Timeouts{Read: 30 * time.Second,
+//                   Write: 30 * time.Second, Idle: 5 * time.Minute},
+//                   func() bool { return false })
+//   server, client := pipe(t)   // real loopback socket, NOT net.Pipe
+//   go h.serve(ctx, server)     // h.serve, not Conn.Serve, so the test reads the error
+//   completeHandshake(t, client, exp.Name)
 ```
 
-A **fake `Exporter`**, not `nbd.NewRuntimeExporter`, is the right choice here: the
-oracle's subject is the codec, `volume_test.go` already covers export resolution
-against a real runtime, and routing through the runtime would drag share and
-volume provisioning back into the test the split was meant to keep it out of.
-`nbd.Export`'s fields are all exported (`handshake.go:82`), so a literal is enough.
-The metadata service is real and unavoidable: `handleTrim` and `handleWriteZeroes`
-call `h.meta.PunchHole`, which panics on a nil service — the same reason Tasks 5
-and 6 needed `writeVolumeFixture`. `nbd.Conn.Serve(ctx)` (`connection.go:150`) is
-the accept-loop entry point, so each accepted `net.Conn` becomes `nbd.NewConn(h, c)`
-and `go conn.Serve(ctx)`.
+A **fake `Exporter`** — `exporterFor(exp)`, already in `connection_test.go:160` —
+is the right choice rather than `nbd.NewRuntimeExporter`: the oracle's subject is
+the codec, `volume_test.go` already covers export resolution against a real
+runtime, and routing through the runtime would drag share and volume
+provisioning back into the test the split was meant to keep it out of.
+`nbd.Export`'s fields are all exported (`handshake.go:82`), so a literal is
+enough. The metadata service is real and unavoidable: `handleTrim` and
+`handleWriteZeroes` call `h.meta.PunchHole`, which panics on a nil service —
+the same reason Tasks 5 and 6 needed `writeVolumeFixture`.
 
 What it does:
 
