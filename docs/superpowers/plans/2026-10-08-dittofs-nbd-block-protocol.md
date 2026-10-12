@@ -2449,6 +2449,30 @@ func TestConnection_IdleDeadlineClosesASilentConnection(t *testing.T) {
 }
 ```
 
+**The second arm needs its own test, and the block above does not cover it.**
+`TestConnection_IdleDeadlineClosesASilentConnection` pins the *header* wait; the
+payload wait is a different arm in a different function, and nothing pins it.
+Measured: deleting `conn.SetReadDeadline(time.Now().Add(h.timeouts.Read))` from
+`handleWrite` (the arm before `io.ReadFull`) leaves **the whole package green** —
+`go test ./internal/adapter/nbd/ -count=1` → `ok ... 4.725s`. The committed
+`TestConnection_WriteTruncatedPayloadIsAnError` does not catch it because it uses
+`testTimeouts()` (`Read 5s / Idle 5s`, so the two budgets are equal) **and closes
+the client**, so the read returns on EOF and no deadline is ever consulted. Add:
+
+```go
+func TestConnection_PayloadReadIsBoundedByRead(t *testing.T) {
+	// Timeouts{Read: 200 * time.Millisecond, Idle: 5 * time.Second} -- the
+	// inverse of the header test, because this one must be bounded by Read.
+	// Complete the handshake, send a WRITE header declaring 4096 bytes, send
+	// 100 bytes of payload, then go silent WITHOUT closing: only the deadline
+	// can end this, and it must be Read's. Assert serve returns non-nil within
+	// ~1s and that st.writes == 0.
+	//
+	// With the arm removed the payload read inherits the header's Idle budget
+	// (5s), so serve is still running at 1s and the test fails.
+}
+```
+
 Leave the arm inside `if !h.draining()`, which is already correct: `initiateShutdown` sets a 100 ms deadline on every active connection (`pkg/adapter/base.go:447`) and a fresh `SetReadDeadline` replaces it, so arming the full budget while draining would hold the drain open for it.
 
 - [ ] **Step 6: Run the tests and confirm they pass**
@@ -2846,6 +2870,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 5 — `TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO` passes.
 - [ ] Task 6 — `TestConnection_WriteZeroesThenReadIsZeros` asserts `st.punches == 1` and `st.writes == 0`, and fails when `WriteZeroes` is changed to a zero-buffer write.
 - [ ] Task 6 — `TestConnection_IdleDeadlineClosesASilentConnection` fails when the `Idle` arm is removed, and only when `Idle` is shorter than `Read` (`Idle: 200ms` vs `Read: 5s`). Measured without the arm: `serve still running after 1.5s`.
+- [ ] Task 6 — `TestConnection_PayloadReadIsBoundedByRead` fails when the payload arm is removed from `handleWrite` (`Read: 200ms` vs `Idle: 5s`, the inverse fixture). Measured: without it the payload read inherits the 5s header budget and **the whole package still passes**, because `TestConnection_WriteTruncatedPayloadIsAnError` uses equal budgets and closes the client, so EOF ends the read before any deadline is consulted.
 - [ ] Task 6 — `TestIntegration_TrimFreesAndReadsZero` and `TestIntegration_WriteZeroesDoesNotMaterializeChunks` assert the manifest shrank (`file.Blocks` before/after, read through `GetFile`), not that `DataExtents` shrank. The extent-map assertion is unsatisfiable: `engine.PunchHole` zero-overwrites through the local append log, so the local tier keeps reporting the range, and `DataExtents` over-reports by documented contract.
 - [ ] Task 6 — `TestConnection_WriteZeroesWithNoHoleIsAccepted` passes (`NO_HOLE` is a MUST we advertise) and `TestConnection_WriteWithNoHoleFlagIsEINVAL` passes (it is not a `WRITE` flag).
 - [ ] Task 6 — `TestConnection_TrimZeroLengthIsEINVAL` and `TestConnection_WriteZeroesZeroLengthIsEINVAL` pin the uniform zero-length answer (`EINVAL`), and each is followed by a valid command on the same connection to prove the stream is still usable.
