@@ -63,7 +63,7 @@ There are two kinds of scenario:
 | `03-folder-resort.fio` | Sorting a large folder by another column | Phase 1: small random reads over the folder's table. Phase 2: small random writes for the new index. Runs for one user only, `USERS` is ignored | Fixed work |
 | `04-search-reindex.fio` | Windows Search re-indexing the mailbox | Random reads (8K to 64K) over the whole file, plus paced 32K mixed I/O (40% reads) on the search catalog and paced sequential 64K writes to its log | Fixed time |
 | `05-ost-full-sync.fio` | Downloading a full mailbox into a new OST | Rate limited sequential 256K writes appended past the end of the file, plus small random metadata I/O | Fixed time |
-| `06-logoff-compaction.fio` | Sign-out with FSLogix VHDX compaction | 1 MiB sequential reads from the tail of the file and 1 MiB sequential writes toward the front, at the same time | Fixed work |
+| `06-logoff-compaction.fio` | Sign-out with FSLogix VHDX compaction | 1 MiB sequential reads from the tail of the file and 1 MiB sequential writes toward the front, at the same time, then a truncate to 60% of the file | Fixed work |
 
 ## Running
 
