@@ -3207,6 +3207,26 @@ guest: I/O resumes without a filesystem error; fsck clean (on the host)
 
 Two harness requirements the spec calls non-negotiable, both of which the script must enforce rather than document:
 
+**A working recipe, measured end to end against a live DittoFS on this host, with the verdict it produced.** The ordering is the whole test and the first two attempts got it wrong:
+
+```
+1. connect WITH BOTH -persist -T 60, then write a pattern and FLUSH it
+   (flush matters: without it the pattern is only in the guest's page cache,
+    and a read after the crash returns it from cache, proving nothing)
+2. SIGKILL the server FIRST, before issuing the read
+3. THEN issue the read - it must PAUSE, not fail
+4. restart the server inside the window
+5. the read completes with the pre-crash bytes
+```
+
+Measured result, with real DittoFS killed and restarted: the read was still blocked at t=4s, t=8s and t=12s (that is `-T` reaching the kernel); the server came back at t=16s; the read returned `exit=0 elapsed=14s` with **`PRE-CRASH-PATTERN-AAAA`** — the exact bytes written before the crash — and the persist daemon logged `Received link dead notification for device 0` → `Our device, triggering reconnect` → three refused attempts → `Successfully reconnected after 4 attempts`. That is both halves of the assertion in one transcript: blocking proves `-T`, resuming proves `-p`.
+
+**The two orderings that look right and prove nothing, both of which were actually run here first:**
+- **Reading before killing.** The read is served from the guest's page cache and returns in `elapsed=0s`; the kill then lands on an idle device. This passed and meant nothing. Either drop caches (`echo 3 > /proc/sys/vm/drop_caches`) before reading, or — better, and what the recipe above does — kill first so the read cannot be served locally at all.
+- **Writing without flushing.** The write is acknowledged into page cache; `dd` reports success; a later read returns the cached copy. The flush is what makes the bytes the server's problem, and therefore what makes their survival evidence.
+
+A script that reports a pass without a nonzero pause and a completed read after the restart has tested the page cache, not the adapter.
+
 1. **A clean `umount` is not evidence.** The script must SIGKILL the server; it must refuse to pass if the guest unmounted cleanly, because that never exercises the barrier.
 2. **Restart inside the dead-connection window.** The kernel's `dead_conn_timeout` (commit `560bc4b399`, `NBD_ATTR_DEAD_CONN_TIMEOUT`) pauses in-flight requests rather than failing them — but a window over ~120 s trips the hung-task detector, so the script must measure and print the actual restart time and fail if it exceeds the configured window.
 
