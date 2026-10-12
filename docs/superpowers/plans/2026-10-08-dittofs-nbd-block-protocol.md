@@ -2069,15 +2069,22 @@ if _, err := bs.WriteAt(ctx, string(intent.PayloadID), nil, data, req.Offset); e
 
 The names below are the contract; the bodies are yours to write. They are **not** transcribed because they cannot be: `handleWrite` calls `h.meta.PrepareWrite` and `h.meta.CommitWrite`, and the connection tests' `newTestHandler` passes **`nil`** for `meta` (`internal/adapter/nbd/connection_test.go:151`) — correct for Task 4, where nothing on the read path touched metadata. So every WRITE test that expects `Error == 0` needs a handler with a real metadata service.
 
-**Add a second fixture helper** beside `newTestHandler`, and use it for the write tests:
+**Add a second fixture helper** beside `newTestHandler`, and use it for the write tests. What landed in Task 5 is a small struct rather than a bare function, because a write test needs the resolved export and the runtime's metadata service together:
 
 ```go
-// newWriteTestHandler builds a handler whose metadata service is real. The
-// read-path helper passes nil because READ never touches metadata; WRITE does,
-// through PrepareWrite and CommitWrite, so it needs a service whose store is
-// the same share the fake block store stands in for.
-func newWriteTestHandler(t *testing.T, st BlockStore, exp *Export) *Handler
+// writeVolumeFixture holds a runtime, the volume file's export, and the
+// share's real block store, built once per test.
+type writeVolumeFixture struct {
+	rt  *runtime.Runtime
+	exp *Export
+	bs  *engine.Store
+}
+
+func newWriteVolumeFixture(t *testing.T) *writeVolumeFixture
+func (f *writeVolumeFixture) newHandler(t *testing.T, st BlockStore) *Handler
 ```
+
+Both live in `internal/adapter/nbd/integration_test.go` (`:48`, `:69`) and are in `package nbd`, so `connection_test.go` reaches them without an import. `newHandler` passes `integrationIdentity` to `NewHandler`, and `newWriteVolumeFixture` creates the volume *as* `integrationIdentity` through `newIntegrationFixtureAs`.
 
 Build it the way `integrationHandler` does (`internal/adapter/nbd/integration_test.go:96`): a `runtime.Runtime` from `testruntime.NewWithShareStore(t)` with one share and one metadata store, `rt.GetMetadataService()` for the service, and `exp.Handle` set to a real volume file's handle — a volume file created under the share's root with `CreateFile` and then sized with `SetFileAttributes`, because `ApplyCreateDefaults` zeroes the size (`pkg/metadata/validation.go:492`). Reuse the fixture that `integration_test.go` already builds if it can be factored into a helper both files call; do not build a second one that drifts.
 
@@ -2254,9 +2261,11 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 // that record existing. Add both in this task.
 //
 // Tests that expect Error == 0 on TRIM or WRITE_ZEROES need Task 5's
-// newWriteTestHandler: the read-path helper passes nil for meta
-// (connection_test.go:151), and the handler now calls h.meta.PunchHole.
-// Rejection tests may keep the nil-meta helper.
+// writeVolumeFixture (integration_test.go:48) and its newHandler method
+// (integration_test.go:69), which wire a real metadata service: the read-path
+// helper passes nil for meta (connection_test.go:151), and the handler now
+// calls h.meta.PunchHole. newWriteVolumeFixture(t).newHandler(t, st) is the
+// call. Rejection tests may keep the nil-meta helper.
 
 func TestConnection_TrimIsEPERMOnReadOnlyExport(t *testing.T) {
 	// ErrEPERM. Note the export DOES advertise SEND_TRIM even when read-only:
