@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > that actually shipped them. Nothing here has been reconstructed after the
 > fact.
 
-## [0.35.0] — unreleased
+## [0.35.0] — 2026-10-12
 
 The main change in 0.35.0 is that **BadgerDB is now the only metadata
 store**: the PostgreSQL, SQLite and legacy `memory` metadata store backends have
