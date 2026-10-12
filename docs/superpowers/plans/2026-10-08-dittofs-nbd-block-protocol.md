@@ -3210,6 +3210,8 @@ On 3.26.1 there is no way to set `dead_conn_timeout` at all: the flag does not e
 
 Add the boot and crash sections: prerequisites, the exact `dead_conn_timeout` value used, how to read the verdict, and the honest statement that these require a Linux host with root and cannot run in CI on macOS.
 
+The prerequisites section must state the `nbd-client` requirement plainly, because it is the one thing a reader will otherwise get wrong by using their distribution's package: **no released `nbd-client` can reconnect**, so the harness needs a build from `master` (after `eac55e0b06fe`). Name the two failure modes it avoids — 3.27.0/3.27.1 gate the persist loop on a field nothing sets true, and ≤3.26.1 has no `-T` and returns from the netlink path before reaching the loop — and say that both `-T` and `-p` are required and do different jobs. A reader who tries a release will get a `BLK_STS_IOERR` after the full window that looks like a DittoFS bug; the README is where that is ruled out in advance.
+
 - [ ] **Step 4: Syntax-check both scripts**
 
 Run: `bash -n test/nbd/boot-qemu.sh && bash -n test/nbd/crash-restart.sh`

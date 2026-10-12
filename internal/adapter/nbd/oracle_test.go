@@ -424,18 +424,31 @@ func oracleStartQemuNBD(t *testing.T, qemuNBD, scratch string) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start qemu-nbd: %v", err)
 	}
+	// exited is closed when qemu-nbd has terminated. It has to come from a
+	// goroutine running Wait: cmd.ProcessState is nil until Wait returns, so a
+	// poll loop cannot see a dead child by checking it. Measured — a child that
+	// exits immediately still reports ProcessState == nil on every poll.
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		<-exited
 	})
-	oracleWaitForPort(t, port, &stderr, cmd)
+	oracleWaitForPort(t, port, &stderr, exited, cmd)
 	oracleQemuNBDPort = port
 }
 
 // oracleWaitForPort polls until the server accepts a connection, and fails with
 // qemu-nbd's own stderr if it dies first. A bare sleep would turn a qemu-nbd
 // that refused to start into a transcript divergence.
-func oracleWaitForPort(t *testing.T, port int, stderr *strings.Builder, cmd *exec.Cmd) {
+//
+// exited is read rather than cmd.ProcessState because that field stays nil until
+// Wait returns; reading stderr after <-exited is also the only race-free read of
+// it, since the pipe copier Wait supervises is what writes to the builder.
+func oracleWaitForPort(t *testing.T, port int, stderr *strings.Builder, exited <-chan struct{}, cmd *exec.Cmd) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -444,11 +457,19 @@ func oracleWaitForPort(t *testing.T, port int, stderr *strings.Builder, cmd *exe
 			_ = c.Close()
 			return
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			break
+		select {
+		case <-exited:
+			t.Fatalf("qemu-nbd exited before accepting a connection on 127.0.0.1:%d; stderr: %s", port, stderr.String())
+		default:
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// A qemu-nbd that is alive but not listening is still writing to stderr, so
+	// reading the builder here races the pipe copier Wait supervises. Kill it and
+	// let Wait return before reading. (Measured under -race: reading it while the
+	// process runs is a reported DATA RACE on the strings.Builder.)
+	_ = cmd.Process.Kill()
+	<-exited
 	t.Fatalf("qemu-nbd never accepted a connection on 127.0.0.1:%d; stderr: %s", port, stderr.String())
 }
 
