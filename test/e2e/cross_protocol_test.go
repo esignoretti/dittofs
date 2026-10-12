@@ -425,20 +425,16 @@ func TestCrossProtocol_ErrorConformance(t *testing.T) {
 		{name: "ErrNotDirectory", code: merrs.ErrNotDirectory, trigger: helpers.TriggerErrNotDirectory},
 		{name: "ErrNameTooLong", code: merrs.ErrNameTooLong, trigger: helpers.TriggerErrNameTooLong},
 		{name: "ErrInvalidArgument", code: merrs.ErrInvalidArgument, trigger: helpers.TriggerErrInvalidArgument},
-		// decision: only the NFS leg runs. The SMB code for a stale handle,
-		// STATUS_FILE_CLOSED, is sent only for a FileId missing from the
-		// server's open table, and a cifs client never sends one it has not
-		// opened; a file removed under an open handle surfaces as
-		// STATUS_OBJECT_NAME_NOT_FOUND instead. Run the SMB leg if the server
-		// ever answers a handle whose file was removed with FILE_CLOSED.
-		{name: "ErrStaleHandle", code: merrs.ErrStaleHandle, trigger: helpers.TriggerErrStaleHandle,
-			skipSMBReason: "STATUS_FILE_CLOSED is unreachable from a cifs client"},
 		{name: "ErrAccessDenied", code: merrs.ErrAccessDenied, trigger: helpers.TriggerErrAccessDenied, share: shareRestricted},
-		// decision: SMB has no EPERM, so this row's SMB leg cannot tell a
-		// not-owner refusal from any other access denial — both arrive as
-		// STATUS_ACCESS_DENIED. Only the NFS leg tells ErrPermissionDenied
-		// apart from ErrAccessDenied.
-		{name: "ErrPermissionDenied", code: merrs.ErrPermissionDenied, trigger: helpers.TriggerErrPermissionDenied, share: shareRestricted},
+		// decision: only the NFS leg runs. Nothing a cifs client sends
+		// without POSIX extensions reaches the ownership check: it discards
+		// the server's error on a chmod, never sends a chown, and an explicit
+		// timestamp is authorized by FILE_WRITE_ATTRIBUTES on the open handle
+		// rather than by ownership. Run the SMB leg if the fixture ever mounts
+		// with an option that sends mode or owner changes (cifsacl,
+		// modefromsid).
+		{name: "ErrPermissionDenied", code: merrs.ErrPermissionDenied, trigger: helpers.TriggerErrPermissionDenied,
+			skipSMBReason: "no cifs operation reaches the server's ownership check"},
 		{name: "ErrReadOnly", code: merrs.ErrReadOnly, trigger: helpers.TriggerErrReadOnly, share: shareReadOnly},
 		{name: "ErrNoSpace", code: merrs.ErrNoSpace, trigger: helpers.TriggerErrNoSpace, share: shareQuota},
 		{name: "ErrLocked", code: merrs.ErrLocked, trigger: helpers.TriggerErrLocked},
@@ -483,7 +479,8 @@ const (
 	// shareReadOnly is "/archive": a read-only share.
 	shareReadOnly
 	// shareRestricted is "/restricted": readable by everyone, writable only
-	// by an explicit grant. Both legs mount it as an identity without one.
+	// by an explicit grant. Both legs mount it as an identity without one,
+	// and it has no peer.
 	shareRestricted
 	// shareQuota is "/quota": read-write with a 1 MiB byte quota.
 	shareQuota
@@ -558,18 +555,17 @@ func setupErrorConformanceFixture(t *testing.T) *errorConformanceFixture {
 		helpers.WithShareDefaultPermission("read-write"),
 		helpers.WithShareQuotaBytes("1MiB"))
 
-	// SMB users. The writer is granted read-write everywhere. The reader is
-	// granted only read on "/restricted" and has its own uid, so a file the
-	// writer creates there is not the reader's.
+	// SMB users. The writer is granted read-write on every share but
+	// "/restricted", where the reader is granted only read.
 	smbPass := "testpass123"
 	writer := helpers.UniqueTestName("confuser")
 	_, err := cli.CreateUser(writer, smbPass)
 	require.NoError(t, err)
-	for _, share := range []string{"/export", "/archive", "/restricted", "/quota"} {
+	for _, share := range []string{"/export", "/archive", "/quota"} {
 		require.NoError(t, cli.GrantUserPermission(share, writer, "read-write"))
 	}
 	reader := helpers.UniqueTestName("confreader")
-	_, err = cli.CreateUser(reader, smbPass, helpers.WithUID(confReaderUID))
+	_, err = cli.CreateUser(reader, smbPass)
 	require.NoError(t, err)
 	require.NoError(t, cli.GrantUserPermission("/restricted", reader, "read"))
 
@@ -601,26 +597,19 @@ func setupErrorConformanceFixture(t *testing.T) *errorConformanceFixture {
 
 	rwNFS := mountNFS("/export")
 	rwSMB := mountSMB("/export", writerCreds)
-	restrictedWriter := mountSMB("/restricted", writerCreds)
 
 	return &errorConformanceFixture{mounts: map[conformanceShare]conformanceMounts{
-		// Each protocol's peer is the other protocol's mount of the share.
+		// Each protocol's peer is the other protocol's mount of the share. The
+		// two identities differ — NFS root is squashed to the guest, SMB is
+		// the writer — so a file one creates is not owned by the other.
 		shareReadWrite: {nfs: rwNFS, smb: rwSMB, nfsPeer: rwSMB, smbPeer: rwNFS},
 		shareReadOnly:  {nfs: mountNFS("/archive"), smb: mountSMB("/archive", writerCreds)},
 		// NFS mounts as root, which the default squash maps to the guest;
-		// SMB mounts as the reader. Neither may write. The peer on both legs
-		// is the writer's mount, which can seed files neither leg owns.
-		shareRestricted: {
-			nfs: mountNFS("/restricted"), smb: mountSMB("/restricted", readerCreds),
-			nfsPeer: restrictedWriter, smbPeer: restrictedWriter,
-		},
-		shareQuota: {nfs: mountNFS("/quota"), smb: mountSMB("/quota", writerCreds)},
+		// SMB mounts as the reader. Neither may write.
+		shareRestricted: {nfs: mountNFS("/restricted"), smb: mountSMB("/restricted", readerCreds)},
+		shareQuota:      {nfs: mountNFS("/quota"), smb: mountSMB("/quota", writerCreds)},
 	}}
 }
-
-// confReaderUID is the reader's uid on the server. It only has to differ from
-// the writer's, which has no uid of its own and so takes the default.
-const confReaderUID = 2001
 
 // assertErrnoMatches compares an observed TriggerResult to an expected
 // syscall.Errno, with a human-friendly diagnostic on failure. An observed
