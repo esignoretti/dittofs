@@ -94,6 +94,17 @@ func newIntegrationFixture(t *testing.T) (*runtime.Runtime, string, *engine.Stor
 // integrationIdentity.
 func newIntegrationFixtureAs(t *testing.T, id Identity) (*runtime.Runtime, string, *engine.Store) {
 	t.Helper()
+	return newIntegrationFixtureAsSized(t, id, 1<<20)
+}
+
+// newIntegrationFixtureAsSized is newIntegrationFixtureAs with an explicit
+// export size. The size is fixed at creation and the handler bounds-checks
+// against it, so a test whose command sequence reaches past the export's end
+// needs its own: a WRITE past the end is NBD_ENOSPC and a READ or TRIM past it
+// is NBD_EINVAL, and those are indistinguishable from a real codec bug when
+// they show up as a transcript divergence.
+func newIntegrationFixtureAsSized(t *testing.T, id Identity, size uint64) (*runtime.Runtime, string, *engine.Store) {
+	t.Helper()
 	rt, bsID := testruntime.NewWithShareStore(t)
 	store := badgertest.NewInMemory(t)
 	if err := rt.RegisterMetadataStore("nbd-meta", store); err != nil {
@@ -139,7 +150,7 @@ func newIntegrationFixtureAs(t *testing.T, id Identity) (*runtime.Runtime, strin
 	}
 	// Creation zeroes the size, so the export size is set explicitly: it is
 	// fixed at creation and the handler bounds-checks against it.
-	if _, err := metaSvc.SetFileAttributes(authCtx, createdHandle, &metadata.SetAttrs{Size: ptr(uint64(1 << 20))}); err != nil {
+	if _, err := metaSvc.SetFileAttributes(authCtx, createdHandle, &metadata.SetAttrs{Size: ptr(size)}); err != nil {
 		t.Fatal(err)
 	}
 
