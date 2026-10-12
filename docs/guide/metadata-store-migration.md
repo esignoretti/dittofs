@@ -150,11 +150,6 @@ shares on a second server running the new version, then switch clients over.
    (`dfsctl adapter edit nfs --port 12049`, and the same for SMB), and have
    clients remount: file handles from the old server do not carry over.
 
-   Stop the old server, move the new instance's adapters to the
-   ports clients use (`dfsctl adapter edit nfs --port 12049`, and the same for
-   SMB), and have clients remount: file handles from the old server do not carry
-   over.
-
 ## What does not move
 
 - **Snapshots.** Snapshots belong to the old server's shares. Keep the old server,
