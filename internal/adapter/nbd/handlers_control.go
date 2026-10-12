@@ -30,12 +30,16 @@ func (h *Handler) handleFlush(ctx context.Context, bs BlockStore, exp *Export, r
 
 // commit is the durability barrier a FLUSH and a FUA write both need.
 //
-// It is common.CommitBlockStore, the same function NFS COMMIT and SMB Flush
-// call, so the durability rule — requireDurable → localDurable || (Finalized &&
-// remoteDurable), and ErrNotDurableYet otherwise — has exactly one
-// implementation across the adapters instead of one per protocol. mapError
-// turns ErrNotDurableYet into NBD_EIO: the command promised durability and
-// could not deliver it, so there is no honest success to send.
+// It is common.FlushStableWrite, the same function NFSv3/NFSv4 WRITE and
+// COMMIT and SMB CLOSE/FLUSH call, so the durability rule — requireDurable →
+// localDurable || (Finalized && remoteDurable), and ErrNotDurableYet otherwise
+// — has exactly one implementation across the adapters instead of one per
+// protocol. That rule has two halves and the barrier needs both: the block
+// store's bytes and the file's pending metadata (size and mtime, which
+// deferred commits hold back). Committing only the block-store half would leave
+// a client told "durable" with metadata that a restart can lose. mapError turns
+// ErrNotDurableYet into NBD_EIO: the command promised durability and could not
+// deliver it, so there is no honest success to send.
 //
 // decision: the FLUSH barrier is correct without tracking which writes are
 // outstanding because dispatch is serialized. A command is handled and replied
@@ -46,5 +50,5 @@ func (h *Handler) handleFlush(ctx context.Context, bs BlockStore, exp *Export, r
 // commands, that stops being true and this barrier needs explicit tracking of
 // in-flight writes.
 func (h *Handler) commit(ctx context.Context, bs BlockStore, exp *Export) error {
-	return common.CommitBlockStore(ctx, bs, exp.PayloadID)
+	return common.FlushStableWrite(h.authContext(ctx, exp), h.meta, bs, exp.Handle, exp.PayloadID, true)
 }

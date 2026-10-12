@@ -413,6 +413,70 @@ func TestIntegration_WriteThenFlushThenReadBackByteExact(t *testing.T) {
 	}
 }
 
+// TestIntegration_FlushPersistsPendingMetadata is the assertion that the FLUSH
+// barrier has both halves. With deferred commits on (the default,
+// pkg/metadata/service.go:131), a WRITE's size/mtime change is held in pending
+// state and never reaches the store; only FlushPendingWriteForFile publishes it.
+// A barrier that commits the block store alone therefore answers FLUSH with
+// success while the file's metadata stays unwritten — a client told "durable"
+// whose size and mtime a restart can lose.
+//
+// The observable is the RAW store's mtime, read through
+// rt.GetMetadataStoreForShare rather than the metadata service: the service
+// merges pending state into its reads, so a read through it would show the
+// write's mtime before any flush happened and the test would pass while
+// proving nothing. The middle assertion pins exactly that distinction — the
+// mtime must NOT move across the WRITE, only across the FLUSH.
+func TestIntegration_FlushPersistsPendingMetadata(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	store, err := f.rt.GetMetadataStoreForShare(integrationShare)
+	if err != nil {
+		t.Fatalf("GetMetadataStoreForShare: %v", err)
+	}
+	ctx := context.Background()
+
+	before, err := store.GetFile(ctx, f.exp.Handle)
+	if err != nil {
+		t.Fatalf("GetFile before the write: %v", err)
+	}
+
+	// The fixture's export is 1 MiB and the write is well inside it, so the
+	// metadata layer's durable-extent clamp cannot withhold the size. The write
+	// is what creates the pending mtime this test requires to move.
+	st := newStoreFake()
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
+
+	if rep := writeThroughClient(t, client, 0, make([]byte, 4096), 0); rep.Error != 0 {
+		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
+	}
+
+	// Deferred commit: the write is acked but its metadata is still pending, so
+	// the raw store must be untouched. This is the assertion that makes the
+	// test about the gap rather than about writes in general.
+	pending, err := store.GetFile(ctx, f.exp.Handle)
+	if err != nil {
+		t.Fatalf("GetFile after the write: %v", err)
+	}
+	if !pending.Mtime.Equal(before.Mtime) {
+		t.Fatalf("the raw store's mtime moved across an unflushed WRITE: %v -> %v (deferred commits are off, so this test cannot exercise the flush)",
+			before.Mtime, pending.Mtime)
+	}
+
+	if rep := flushThroughClient(t, client); rep.Error != 0 {
+		t.Fatalf("FLUSH reply error = %d, want 0", rep.Error)
+	}
+
+	after, err := store.GetFile(ctx, f.exp.Handle)
+	if err != nil {
+		t.Fatalf("GetFile after the FLUSH: %v", err)
+	}
+	if !after.Mtime.After(before.Mtime) {
+		t.Fatalf("the raw store's mtime did not move across a FLUSH: %v -> %v, so the barrier committed the block store but not the file's pending metadata",
+			before.Mtime, after.Mtime)
+	}
+}
+
 // manifestBytes is the number of payload bytes the file's block list
 // references. It is the observable a punch moves: metadata.Service.PunchHole
 // prunes file.Blocks and persists the pruned manifest, and that pruning is the

@@ -1111,10 +1111,15 @@ func TestConnection_WriteWithFUAIsDurableBeforeReply(t *testing.T) {
 // CommitAck: journal semantics — the store is durable, Flush reports the remote
 // mirror as not finalized, and the commit is acknowledged because the local
 // tier already survives a restart.
+//
+// It needs the real-metadata fixture: commit is common.FlushStableWrite, whose
+// second half calls meta.FlushPendingWriteForFile, and newTestHandler passes nil
+// for meta. The block store is still the fake, so st.flushes is the observable.
 func TestConnection_FlushIsAckedWhenDurable(t *testing.T) {
+	f := newWriteVolumeFixture(t)
 	st := newStoreFake()
-	h := newTestHandler(st, testExport(8192), testTimeouts())
-	client, _ := serveHandler(t, h, testExportName)
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
 
 	rep := flushThroughClient(t, client)
 	if rep.Error != 0 {
@@ -1128,13 +1133,14 @@ func TestConnection_FlushIsAckedWhenDurable(t *testing.T) {
 // FLUSH promised durability and could not deliver it, so there is no honest
 // success to send: the commit rule's ErrNotDurableYet maps to NBD_EIO.
 func TestConnection_FlushIsEIOWhenNotDurable(t *testing.T) {
+	f := newWriteVolumeFixture(t)
 	st := newStoreFake()
 	st.localDurable = false
 	st.remoteDurable = false
 	st.requireDurable = true
 
-	h := newTestHandler(st, testExport(8192), testTimeouts())
-	client, _ := serveHandler(t, h, testExportName)
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
 
 	rep := flushThroughClient(t, client)
 	if rep.Error != ErrEIO {
@@ -1145,9 +1151,10 @@ func TestConnection_FlushIsEIOWhenNotDurable(t *testing.T) {
 // The spec requires offset and length to be zero on FLUSH. There is no payload
 // to drain — the command has none — so the connection stays usable.
 func TestConnection_FlushWithNonZeroLengthIsEINVAL(t *testing.T) {
+	f := newWriteVolumeFixture(t)
 	st := newStoreFake()
-	h := newTestHandler(st, testExport(8192), testTimeouts())
-	client, _ := serveHandler(t, h, testExportName)
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
 
 	sendRequest(t, client, &Request{Type: CmdFlush, Cookie: 17, Length: 4096})
 	rep := readReplyHeader(t, client)
@@ -1167,12 +1174,14 @@ func TestConnection_FlushWithNonZeroLengthIsEINVAL(t *testing.T) {
 // client error a device that has nothing to flush, and the command carries no
 // data to protect.
 func TestConnection_FlushOnReadOnlyExportIsPermitted(t *testing.T) {
-	exp := testExport(8192)
+	f := newWriteVolumeFixture(t)
+	exp := *f.exp
 	exp.ReadOnly = true
 
 	st := newStoreFake()
-	h := newTestHandler(st, exp, testTimeouts())
-	client, _ := serveHandler(t, h, testExportName)
+	h := NewHandler(exporterFor(&exp), resolverFor(st), f.rt.GetMetadataService(),
+		integrationIdentity, testTimeouts(), func() bool { return false })
+	client, _ := serveHandler(t, h, exp.Name)
 
 	rep := flushThroughClient(t, client)
 	if rep.Error != 0 {

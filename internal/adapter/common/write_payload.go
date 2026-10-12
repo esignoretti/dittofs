@@ -201,7 +201,7 @@ func CommitBlockStore(
 func FlushStableWrite(
 	authCtx *metadata.AuthContext,
 	metaSvc *metadata.Service,
-	blockStore *engine.Store,
+	blockStore Committer,
 	handle metadata.FileHandle,
 	payloadID metadata.PayloadID,
 	fileSync bool,
