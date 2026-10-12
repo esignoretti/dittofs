@@ -221,7 +221,7 @@ func TestValidateEndpoint_SSRF(t *testing.T) {
 }
 
 // The endpoint guard's verdict is permanent, so the SDK must not retry it: a
-// refused dial used to be retried 10 times with backoff, minutes per call.
+// refused dial must fail on the first attempt.
 func TestDialGuard_RefusalIsNotRetried(t *testing.T) {
 	store, err := NewFromConfig(context.Background(), Config{
 		Bucket:         "bucket",
