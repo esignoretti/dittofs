@@ -81,12 +81,14 @@ shares on a second server running the new version, then switch clients over.
    ```bash
    dfs start --config /etc/dittofs-new/config.yaml \
      --pid-file /run/dittofs-new.pid --log-file /var/log/dittofs-new.log
-   dfsctl login --server http://127.0.0.1:8081 --username admin
+   dfsctl login --server http://127.0.0.1:8081 --username admin --context new
    ```
 
-   `dfsctl` talks to the last server you logged in to, so from here on every
-   `dfsctl` command goes to the new instance. To run one against the old server,
-   log in to it again or pass `--server` to that command.
+   Without `--context`, the login replaces your current context, and dfsctl
+   forgets the old server. With it, both servers stay saved: `dfsctl context
+   list` shows them, and `dfsctl context use <name>` picks the one the next
+   commands go to. `--server` alone does not switch servers, it keeps the token
+   of the active context.
 
 2. **Recreate the setup on the new instance.** Its control plane starts empty, so
    create again the users, groups and permissions the shares need
@@ -116,7 +118,7 @@ shares on a second server running the new version, then switch clients over.
    briefly disconnects its NFS clients:
 
    ```bash
-   # on each server, for each share you copy
+   # on each server (dfsctl context use <name>), for each share you copy
    dfsctl share nfs-config set /export --squash none
    dfsctl adapter disable nfs
    dfsctl adapter enable nfs --port <that server's NFS port>
