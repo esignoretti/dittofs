@@ -335,7 +335,7 @@ development machine is macOS arm64 (Apple silicon).
 | Half | Status on this host | Why |
 | --- | --- | --- |
 | `boot-qemu.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses cleanly without kernel/initramfs/volume |
-| `boot-qemu.sh` live boot off NBD | **PROVEN on this host, 2026-10-12** | see the recorded run below; a real aarch64 kernel booted via `hvf` and the guest's ext4 root was the DittoFS export |
+| `boot-qemu.sh` live boot off NBD | **PROVEN on this host, 2026-10-12, by the script itself** | see the recorded run below; a real aarch64 kernel booted via `hvf`, and the guest's ext4 root was the DittoFS export, remounted with `hello.txt` intact |
 | `crash-restart.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses on Darwin naming the missing Linux block layer, and refuses without a `master` `nbd-client`, root, netlink, init netns, or a provisioned volume |
 | `crash-restart.sh` crash/reconnect verdict | **the mechanism was PROVEN manually, not by this script** | the recipe was run by hand inside a Linux container (`--network=host`, Docker Desktop's kernel has `CONFIG_BLK_DEV_NBD=y`) against a live DittoFS: with `-persist -T 60` a read stayed blocked at t=4s/8s/12s, the server returned at t=16s, and the read completed `exit=0 elapsed=14s` returning the pre-crash bytes with `Successfully reconnected after 4 attempts` in the client log. The **script** has not been run end to end; it needs a Linux host with root and a `master`-built `nbd-client` |
 | Host-side `fsck` after the crash | **not run here** | follows the crash run; needs the Linux host |
