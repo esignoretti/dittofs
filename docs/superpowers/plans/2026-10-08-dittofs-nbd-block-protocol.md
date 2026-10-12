@@ -2241,35 +2241,57 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 - [ ] **Step 1: Write the failing tests**
 
 ```go
+// storeFake needs a punches counter and a punchErr field before these tests can
+// assert anything: the fake's PunchHole (connection_test.go:99) zero-fills and
+// returns without recording that it ran, and Step 7's bite proof depends on
+// that record existing. Add both in this task.
+//
+// Tests that expect Error == 0 on TRIM or WRITE_ZEROES need Task 5's
+// newWriteTestHandler: the read-path helper passes nil for meta
+// (connection_test.go:151), and the handler now calls h.meta.PunchHole.
+// Rejection tests may keep the nil-meta helper.
+
 func TestConnection_TrimIsEPERMOnReadOnlyExport(t *testing.T) {
-	// A read-only export does not advertise SEND_TRIM, so a TRIM arriving on
-	// one is a client bug. ErrEPERM, not EINVAL: the spec says "it SHOULD
-	// return NBD_EPERM if it receives a write or trim request on a read-only
-	// export" — a deliberate, client-actionable refusal rather than a
-	// malformed-request verdict.
+	// ErrEPERM. Note the export DOES advertise SEND_TRIM even when read-only:
+	// handshake.go:101 sets it unconditionally and only adds READ_ONLY. So this
+	// is not a client violating "MUST NOT send a trim request unless
+	// NBD_FLAG_SEND_TRIM was set" — it is the case the spec's error list names
+	// explicitly: "it SHOULD return NBD_EPERM if it receives a write or trim
+	// request on a read-only export".
 }
 
 func TestConnection_TrimThenReadIsZeros(t *testing.T) {
-	// Write 8192 non-zero bytes, TRIM [4096, 8192), read back: the trimmed
-	// range is zeros and [0, 4096) is untouched.
+	// Write 8192 non-zero bytes, TRIM [4096, 8192), read back: zeros in the
+	// trimmed range, [0, 4096) untouched. Needs the real-meta fixture.
 }
 
-func TestConnection_TrimPastEndIsClamped(t *testing.T) {
-	// TRIM offset near the end with a length running past it: the operation
-	// succeeds over the in-range part. Clamped, not refused — a discard that
-	// covers the end of the device is a normal filesystem action.
+func TestConnection_TrimPastEndIsEINVAL(t *testing.T) {
+	// Length runs past the export end → ErrEINVAL, refused not clamped. The
+	// spec: "it SHOULD return NBD_EINVAL if it receives a read or trim request
+	// including one or more sectors beyond the size of the device." READ
+	// already answers EINVAL past the end (handlers_read.go:42), and the same
+	// condition deserves the same answer.
+}
+
+func TestConnection_TrimOffsetPastEndIsEINVAL(t *testing.T) {
+	// offset >= size with a small length. Asserted separately because it is the
+	// case a subtraction-based clamp underflows on (see Step 3).
+}
+
+func TestConnection_WriteZeroesPastEndIsENOSPC(t *testing.T) {
+	// ErrENOSPC, not EINVAL: the spec gives write zeroes its own rule — "The
+	// server SHOULD return NBD_ENOSPC if it receives a write zeroes request
+	// including one or more sectors beyond the size of the device."
 }
 
 func TestConnection_WriteZeroesWithNoHoleIsAccepted(t *testing.T) {
 	// The spec MUSTs this: "The server MUST support the use of this flag if it
-	// advertises NBD_FLAG_SEND_WRITE_ZEROES." Expect Error == 0, and PunchHole
-	// still called (which zero-overwrites rather than creating a hole).
+	// advertises NBD_FLAG_SEND_WRITE_ZEROES." Expect Error == 0 and
+	// st.punches == 1 (PunchHole zero-overwrites rather than creating a hole).
 }
 
 func TestConnection_TrimZeroLengthIsEINVAL(t *testing.T) {
 	// Length: 0 → ErrEINVAL, the same answer READ, WRITE and WRITE_ZEROES give.
-	// One rule for all four: the spec leaves zero-length behaviour unspecified
-	// and no correct client sends one.
 }
 
 func TestConnection_WriteZeroesZeroLengthIsEINVAL(t *testing.T) {
@@ -2279,7 +2301,7 @@ func TestConnection_WriteZeroesZeroLengthIsEINVAL(t *testing.T) {
 
 func TestConnection_WriteZeroesThenReadIsZeros(t *testing.T) {
 	// The important one: WRITE_ZEROES must not materialize real chunks.
-	// Assert on the fake that PunchHole was called and WriteAt was NOT.
+	// Assert st.punches == 1 and st.writes == 0 on the fake.
 }
 
 func TestConnection_WriteZeroesOnReadOnlyExportIsEPERM(t *testing.T) {
@@ -2290,8 +2312,15 @@ func TestConnection_ReadOnReadOnlyExportSucceeds(t *testing.T) {
 }
 
 func TestConnection_WriteOnReadOnlyExportIsEPERM(t *testing.T) {
+	// Pins Task 5's handleWrite check 2. It lives here because the read-only
+	// fixture is added in this task; the code under test is Task 5's.
 }
 ```
+
+These tests need a read-only export variant of the fixture: `testExport(size)`
+(`connection_test.go:127`) returns `ReadOnly: false`. Add the flag as a parameter
+or a second helper rather than mutating the returned `Export`, which other tests
+share.
 
 - [ ] **Step 2: Run them and confirm they fail**
 
@@ -2300,25 +2329,46 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement both handlers**
 
-Both call `bs.PunchHole(ctx, string(exp.PayloadID), nil, req.Offset, length)`, where `length` is clamped:
+Both call the same two-step sequence the NFS DEALLOCATE handler uses (`internal/adapter/nfs/v4/handlers/deallocate.go:67`, `:91`):
 
 ```go
-end := req.Offset + uint64(req.Length)
-if end > exp.Size {
-    end = exp.Size
+authCtx := h.authContext(ctx, exp)
+res, err := h.meta.PunchHole(authCtx, exp.Handle, req.Offset, uint64(req.Length))
+if err != nil {
+    return mapError(err)
 }
-length := end - req.Offset
+if _, err := bs.PunchHole(ctx, string(res.PayloadID), res.PreOpBlocks, req.Offset, uint64(req.Length)); err != nil {
+    return mapError(err)
+}
 ```
 
-**Zero-length is `ErrEINVAL` on both commands**, the same answer `READ` and `WRITE` give. The spec leaves zero-length behaviour unspecified for all four (*"the behavior of a server on such a request is unspecified although the server SHOULD NOT disconnect"*) and no correct client sends one, so one uniform rule beats a per-command table somebody has to remember. It also matches the answer every other malformed request gets. The zero-length check runs **before** the clamp below, so a request that is both zero-length and past the end reports `EINVAL` rather than silently becoming a no-op. `length == 0` also means there is no payload to drain on either command, so the connection must stay usable for the next one.
+**The metadata punch is not optional, for two independent reasons.**
 
-This is the same clamp the NFS DEALLOCATE handler uses (`internal/adapter/nfs/v4/handlers/deallocate.go:129`). Reuse the shape; do not import across `internal/adapter/nfs` and `internal/adapter/nbd` for a four-line function.
+First, **without it the storage is never freed.** `engine.Store.PunchHole` does the reap — `DecrementRefCountAndReapMany` plus `ReprojectBlocks` — only inside `if len(currentBlocks) > 0` (`pkg/block/engine/readwrite.go:308`). Called with `nil`, it skips the reap entirely and only zero-overwrites the range, so reads return zeros while every CAS object stays referenced and the manifest keeps listing the chunks. The command would look like it worked and free nothing, which is the one thing a discard exists to do. `metadata.Service.PunchHole` (`pkg/metadata/sparse.go:48`) prunes `file.Blocks`, persists the new manifest, and returns `PreOpBlocks` for the block store to reap against.
+
+Second, **without it the command bypasses authorization.** `metadata.Service.PunchHole` calls `checkWritePermission` (`pkg/metadata/sparse.go:80`); `engine.Store.PunchHole` checks nothing. WRITE goes through `PrepareWrite`, which checks. A TRIM that went straight to the engine would be the one mutating command in the adapter that no permission funnel sees — and it destroys data. This is CLAUDE.md invariant 2: every operation carries a `*metadata.AuthContext`.
+
+Order of checks, and the order is the point:
+
+1. `req.Flags &^ allowedFlags != 0` → `ErrEINVAL` (see the flag table below).
+2. `exp.ReadOnly` → `ErrEPERM`.
+3. `req.Length == 0` → `ErrEINVAL`.
+4. `req.Offset > math.MaxUint64 - uint64(req.Length)` → `ErrEIO`, the same wrap guard `handleRead` uses and for the same reason.
+5. `req.Offset >= exp.Size` → `ErrEINVAL` for TRIM, `ErrENOSPC` for WRITE_ZEROES.
+6. `req.Offset + uint64(req.Length) > exp.Size` → the same two codes.
+7. The store calls above.
+8. If `req.Flags&FlagFUA != 0`, `h.commit(ctx, bs, exp)` **before** writing the reply, exactly as WRITE does.
+9. Write the reply with no payload.
+
+**Out of range is refused, not clamped — and a clamp is where the bug was.** An earlier draft of this task clamped with `end := min(offset+length, size); length := end - offset`. That **underflows** when `req.Offset > exp.Size`: `end` becomes `exp.Size`, and `exp.Size - req.Offset` wraps to a number near 2⁶⁴. Measured: `offset=10000, length=100, size=8192` → `18446744073709549808`. The engine's own overflow guard then turns it into a confusing `punch range overflow` error instead of the right answer. Checks 5 and 6 make the subtraction unnecessary, so there is no clamp to get wrong.
+
+This also resolves an internal contradiction in the design spec. §4.4 said `TRIM`/`WRITE_ZEROES` are *"clamped to the export end"* while §4.6 and §13 both said a `TRIM` past the end is `EINVAL`. The spec's per-command error guidance is the more specific rule and wins: *"it SHOULD return `NBD_EINVAL` if it receives a read or trim request including one or more sectors beyond the size of the device"*, and for write zeroes *"The server SHOULD return `NBD_ENOSPC` if it receives a write zeroes request including one or more sectors beyond the size of the device."* Both spec sections are corrected in the same commit as this plan edit.
 
 **TRIM over-delivers, deliberately.** The spec says a client *"MUST NOT make any assumptions about the contents of the export affected by this command"* and a server *"MAY discard length bytes starting at offset, but is not required to."* `PunchHole` zeroes the range anyway (`pkg/block/engine/readwrite.go:281`). That is the honest mapping: the alternative is a cheaper discard leaving reads non-deterministic. Put this in a `decision:` comment at the call site with the spec quote, because the next reader will otherwise "optimize" it.
 
-**WRITE_ZEROES must not become a zero-buffer `WriteAt`.** That is exactly the reference library's bug: on a CAS store it *materializes* zero chunks, so a filesystem's discard path allocates storage instead of freeing it. The test asserts `PunchHole` was called and `WriteAt` was not, and that assertion is the guard.
+**WRITE_ZEROES must not become a zero-buffer `WriteAt`.** That is exactly the reference library's bug: on a CAS store it *materializes* zero chunks, so a filesystem's discard path allocates storage instead of freeing it. The test asserts `st.punches == 1` and `st.writes == 0`, and that assertion is the guard.
 
-Flag validation: `Flags &^ FlagFUA != 0` → `ErrEINVAL` for both, and for the same reason as `WRITE` — the flag is not documented as applicable to that request. FUA on TRIM/WRITE_ZEROES is honored through the same `h.commit` path as WRITE.
+Flag validation differs by command: `TRIM` accepts `FUA` only; `WRITE_ZEROES` accepts `FUA` and `NO_HOLE`. Any other bit → `ErrEINVAL`, for the same reason as `WRITE` — the flag is not documented as applicable to that request. FUA on either is honored through the same `h.commit` path as WRITE.
 
 **`NO_HOLE` on `WRITE_ZEROES` must be accepted, not rejected.** The spec: *"The server MUST support the use of this flag if it advertises `NBD_FLAG_SEND_WRITE_ZEROES`"*, and we do. It is the client asking that the range be genuinely allocated rather than left sparse. `PunchHole` already zero-overwrites the range rather than creating a hole (`pkg/block/engine/readwrite.go:281`), so honoring it requires no extra work — but the handler must not refuse the flag, and a test must assert that. Rejecting it would violate a MUST on the strength of the same rule that makes `NO_HOLE` invalid on `WRITE`.
 
@@ -2359,12 +2409,14 @@ func TestIntegration_WriteZeroesDoesNotMaterializeChunks(t *testing.T) {
 
 - [ ] **Step 7: Verify the WRITE_ZEROES test actually bites**
 
-Change `handleWriteZeroes` to call `bs.WriteAt(ctx, string(exp.PayloadID), nil, make([]byte, req.Length), req.Offset)` instead of `PunchHole`. Run `go test ./internal/adapter/nbd/ -run TestConnection_WriteZeroesThenReadIsZeros -v` and confirm it fails on the "PunchHole was called" assertion. Restore.
+Change `handleWriteZeroes` to call `bs.WriteAt(ctx, string(exp.PayloadID), nil, make([]byte, req.Length), req.Offset)` instead of the punch pair. Run `go test ./internal/adapter/nbd/ -run TestConnection_WriteZeroesThenReadIsZeros -v` and confirm it fails on the `st.punches == 1` assertion. Restore.
 
-- [ ] **Step 8: Run the full suite**
+- [ ] **Step 8: Run the affected suites**
 
-Run: `go build ./... && make test-unit`
+Run: `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...`
 Expected: clean.
+
+**Do not run `make test-unit`** (`go test -race ./...`) and read a timeout as a failure: five packages — `internal/adapter/nfs/v3/handlers`, `internal/adapter/smb/handlers`, `pkg/block/chunker`, `pkg/block/engine`, `pkg/block/middleware/encryption` — hit the 10m deadline on this machine from SQLite contention under `-race`, reproducible on a clean base and unrelated to this work. They were verified environmental during Task 3.
 
 - [ ] **Step 9: Commit**
 
@@ -2547,10 +2599,11 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 5 — `TestConnection_RejectedWriteKeepsTheStreamSynchronized` passes, and fails when the payload drain is removed.
 - [ ] Task 5 — `TestConnection_WriteWithFUAIsDurableBeforeReply` passes, and fails when `commit` is moved after the reply.
 - [ ] Task 5 — `TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO` passes.
-- [ ] Task 6 — `TestConnection_WriteZeroesThenReadIsZeros` asserts `PunchHole` was called and `WriteAt` was not, and fails when `WriteZeroes` is changed to a zero-buffer write.
+- [ ] Task 6 — `TestConnection_WriteZeroesThenReadIsZeros` asserts `st.punches == 1` and `st.writes == 0`, and fails when `WriteZeroes` is changed to a zero-buffer write.
 - [ ] Task 6 — `TestConnection_WriteZeroesWithNoHoleIsAccepted` passes (`NO_HOLE` is a MUST we advertise) and `TestConnection_WriteWithNoHoleFlagIsEINVAL` passes (it is not a `WRITE` flag).
 - [ ] Task 6 — `TestConnection_TrimZeroLengthIsEINVAL` and `TestConnection_WriteZeroesZeroLengthIsEINVAL` pin the uniform zero-length answer (`EINVAL`), and each is followed by a valid command on the same connection to prove the stream is still usable.
-- [ ] Task 6 — `go build ./... && make test-unit` clean.
+- [ ] Task 6 — `TestConnection_TrimPastEndIsEINVAL`, `TestConnection_TrimOffsetPastEndIsEINVAL`, and `TestConnection_WriteZeroesPastEndIsENOSPC` pin out-of-range refusal (not clamping), and `TestConnection_TrimIsEPERMOnReadOnlyExport` passes with `SEND_TRIM` still advertised.
+- [ ] Task 6 — `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...` clean (NOT `make test-unit`, which times out on five unrelated packages on this machine).
 - [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`.
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.

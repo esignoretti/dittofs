@@ -407,8 +407,11 @@ partitioned the device at negotiation time; a size change invalidates its partit
 underneath a mounted filesystem.
 
 So: size is set at volume creation from `metadata.File.Size` and never changes. `WRITE`
-past the end is **refused** rather than growing the file, and `TRIM`/`WRITE_ZEROES` are
-clamped to the export end.
+past the end is **refused** rather than growing the file, and `TRIM`/`WRITE_ZEROES` past the
+end are **refused too** — `TRIM` with `NBD_EINVAL`, `WRITE_ZEROES` with `NBD_ENOSPC`, each
+following the spec's own per-command error guidance (§4.6). An earlier draft clamped them
+to the export end; that is not what the spec asks for, and a clamp written as
+`end - offset` underflows when `offset` is already past the end.
 
 ### 4.5 Serialization
 
@@ -434,7 +437,7 @@ bottleneck. For a boot disk backed by a local journal, it very likely will not b
 | Misaligned, unknown command, unknown or inapplicable flag | `NBD_EINVAL` (22) |
 | Zero-length `READ`, `WRITE`, `TRIM`, or `WRITE_ZEROES` | `NBD_EINVAL` (22) |
 | `READ` or `TRIM` beyond the export size | `NBD_EINVAL` (22) |
-| `WRITE` beyond the export size | `NBD_ENOSPC` (28) |
+| `WRITE` or `WRITE_ZEROES` beyond the export size | `NBD_ENOSPC` (28) |
 | Read unservable honestly (cold after hydrate, integrity failure) | `NBD_EIO` (5) |
 | `ErrNotDurableYet` from a FLUSH or FUA | `NBD_EIO` (5) |
 | `offset + length` wraps | `NBD_EIO` (5) |
@@ -861,7 +864,7 @@ For the implementation, in the order the checks become meaningful:
 - [ ] A `READ` carrying `NBD_CMD_FLAG_FUA` is served, not refused
 - [ ] A rejected `WRITE` with its payload still in flight leaves the connection synchronized
 - [ ] A zero-length `READ`, `WRITE`, `TRIM`, or `WRITE_ZEROES` returns `NBD_EINVAL` and the connection stays usable
-- [ ] A `WRITE` past the export end returns `NBD_ENOSPC`; `READ`/`TRIM` past the end return `NBD_EINVAL`
+- [ ] A `WRITE` or `WRITE_ZEROES` past the export end returns `NBD_ENOSPC`; `READ`/`TRIM` past the end return `NBD_EINVAL`
 - [ ] `nbdinfo --map` is unavailable in v1 by design (no structured replies, no `BLOCK_STATUS`)
 - [ ] The volume is readable as a plain file over NFS (the B1 property)
 - [ ] `docs/guide/cli.md` regenerated; `test/required-tests.sh` unaffected
