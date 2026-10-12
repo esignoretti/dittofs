@@ -243,12 +243,22 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 				return err
 			}
 
+		case CmdWrite:
+			if err := h.handleWrite(ctx, bs, exp, req, conn); err != nil {
+				return err
+			}
+
+		case CmdFlush:
+			if err := h.handleFlush(ctx, bs, exp, req, conn); err != nil {
+				return err
+			}
+
 		default:
 			// Every command the adapter advertises but does not yet serve
-			// (WRITE, FLUSH, TRIM, WRITE_ZEROES, CACHE, BLOCK_STATUS) and every
-			// value the spec does not define. An unimplemented command is an
-			// invalid command: NBD_ENOTSUP is reserved by the spec for
-			// WRITE_ZEROES with FAST_ZERO, which the adapter does not advertise.
+			// (TRIM, WRITE_ZEROES, CACHE, BLOCK_STATUS) and every value the spec
+			// does not define. An unimplemented command is an invalid command:
+			// NBD_ENOTSUP is reserved by the spec for WRITE_ZEROES with
+			// FAST_ZERO, which the adapter does not advertise.
 			if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
 				return err
 			}
@@ -315,7 +325,17 @@ func mapError(err error) NBDError {
 		case merrs.ErrNoSpace:
 			logger.Debug("nbd: block store is full", "error", err)
 			return ErrENOSPC
-		case merrs.ErrPermissionDenied:
+		case merrs.ErrPermissionDenied, merrs.ErrAccessDenied:
+			// Both POSIX denials reach the wire as NBD_EPERM. They are distinct
+			// in the metadata layer — ErrPermissionDenied is EPERM ("requires
+			// ownership or root privileges") and ErrAccessDenied is EACCES ("the
+			// permission bits do not allow it") — but NBD has one permission
+			// error, and the client's action is the same either way. The
+			// ErrAccessDenied arm is the one that matters in practice: the
+			// metadata permission funnel returns it for every denial by POSIX
+			// mode bits, so without it a write refused by file permissions
+			// would reach the client as NBD_EIO — a hardware failure reported
+			// for an authorization decision.
 			logger.Debug("nbd: block store denied the operation", "error", err)
 			return ErrEPERM
 		}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,6 +41,11 @@ type storeFake struct {
 	localDurable   bool
 	remoteDurable  bool
 	requireDurable bool
+
+	// onFlush runs inside Flush before it returns, so a test can observe the
+	// store at the moment it is asked to commit. It is set before the server
+	// goroutine starts, never after.
+	onFlush func()
 
 	// panicOnRead makes ReadAt panic instead of returning, so a test can drive
 	// a panic from below the dispatcher — exactly where a real one would (a nil
@@ -106,6 +112,9 @@ func (s *storeFake) PunchHole(_ context.Context, id string, currentBlocks []bloc
 
 func (s *storeFake) Flush(_ context.Context, _ string) (*block.FlushResult, error) {
 	s.flushes++
+	if s.onFlush != nil {
+		s.onFlush()
+	}
 	if s.flushErr != nil {
 		return nil, s.flushErr
 	}
@@ -222,6 +231,30 @@ func readPayload(t *testing.T, r io.Reader, n int) []byte {
 	return buf
 }
 
+// writeThroughClient sends one WRITE together with its payload and returns the
+// reply. The payload always goes out: the spec requires a client to follow the
+// request header with length bytes, whatever the server answers.
+func writeThroughClient(t *testing.T, client net.Conn, offset uint64, data []byte, flags CommandFlags) *Reply {
+	t.Helper()
+	sendRequest(t, client, &Request{
+		Type: CmdWrite, Flags: flags, Cookie: 0x77, Offset: offset, Length: uint32(len(data)),
+	})
+	if len(data) > 0 {
+		if _, err := client.Write(data); err != nil {
+			t.Fatalf("write payload: %v", err)
+		}
+	}
+	return readReplyHeader(t, client)
+}
+
+// flushThroughClient sends one FLUSH and returns the reply. FLUSH carries no
+// payload, so there is nothing to send after the header.
+func flushThroughClient(t *testing.T, client net.Conn) *Reply {
+	t.Helper()
+	sendRequest(t, client, &Request{Type: CmdFlush, Cookie: 0x78})
+	return readReplyHeader(t, client)
+}
+
 // assertNoPayload asserts nothing arrives on the connection within d. An error
 // reply carries no payload, and a closed connection is also "nothing".
 func assertNoPayload(t *testing.T, client net.Conn, d time.Duration) {
@@ -329,26 +362,6 @@ func TestConnection_UnimplementedCommandIsEINVAL(t *testing.T) {
 	// an invalid command.
 	if rep.Error != ErrEINVAL {
 		t.Fatalf("unimplemented command reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
-	}
-}
-
-// TestConnection_WriteIsEINVALBeforeTask5 pins the dispatcher's default branch
-// for a command the adapter advertises but does not yet serve. Task 5 replaces
-// this with the real WRITE handler.
-func TestConnection_WriteIsEINVALBeforeTask5(t *testing.T) {
-	st := newStoreFake()
-	h := newTestHandler(st, testExport(8192), testTimeouts())
-	server, client := pipe(t)
-	serveConn(h, server)
-	completeHandshake(t, client, testExportName)
-
-	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 5, Offset: 0, Length: 4096})
-	rep := readReplyHeader(t, client)
-	if rep.Error != ErrEINVAL {
-		t.Fatalf("WRITE reply error = %d, want ErrEINVAL (%d) while the write path is unimplemented", rep.Error, uint32(ErrEINVAL))
-	}
-	if st.writes != 0 {
-		t.Fatalf("the store saw %d writes for an unimplemented command", st.writes)
 	}
 }
 
@@ -583,6 +596,14 @@ func TestConnection_WriteWithNoHoleFlagIsEINVAL(t *testing.T) {
 	completeHandshake(t, client, testExportName)
 
 	sendRequest(t, client, &Request{Type: CmdWrite, Flags: FlagNoHole, Cookie: 1, Offset: 0, Length: 4096})
+	// The payload goes out even though the request is refused: the spec requires
+	// a client to follow the header with length bytes unconditionally, and the
+	// server drains them before reading the next header. A test that declares
+	// bytes it never sends is asserting against a client the spec forbids, and
+	// it would leave the server draining a payload that never comes.
+	if _, err := client.Write(make([]byte, 4096)); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
 	rep := readReplyHeader(t, client)
 	if rep.Error != ErrEINVAL {
 		t.Fatalf("WRITE with NBD_CMD_FLAG_NO_HOLE reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
@@ -767,5 +788,338 @@ func TestHandler_AuthContextCarriesIdentityAndReadOnlyCeiling(t *testing.T) {
 	}
 	if other.ShareReadOnly {
 		t.Fatal("a writable export produced a read-only auth context")
+	}
+}
+
+// serveHandler starts h over a pipe, completes the handshake, and returns the
+// client end and the channel carrying serve's result.
+func serveHandler(t *testing.T, h *Handler, exportName string) (net.Conn, chan error) {
+	t.Helper()
+	server, client := pipe(t)
+	done := serveConn(h, server)
+	completeHandshake(t, client, exportName)
+	return client, done
+}
+
+// TestConnection_WritePersistsBytes is the only test that proves a WRITE
+// round-trips, so it asserts the bytes rather than the error code.
+func TestConnection_WritePersistsBytes(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
+
+	want := make([]byte, 4096)
+	for i := range want {
+		want[i] = byte(i%251) + 1
+	}
+
+	rep := writeThroughClient(t, client, 8192, want, 0)
+	if rep.Error != 0 {
+		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
+	}
+	if st.writes != 1 {
+		t.Fatalf("the store saw %d writes, want 1", st.writes)
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{
+		Type: CmdRead, Cookie: 8, Offset: 8192, Length: 4096,
+	})
+	if rep.Error != 0 {
+		t.Fatalf("READ after WRITE returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("READ after WRITE did not return the bytes that were written")
+	}
+}
+
+// A write past the end is NBD_ENOSPC, not NBD_EINVAL: the spec reserves EINVAL
+// for a read or trim past the end, because a write past the end means the
+// client's view of the device is too large while a read past the end is a
+// malformed request. The export size is fixed, so a write never grows it.
+func TestConnection_WritePastEndIsENOSPC(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	// The last byte of the export is addressable, so one byte more is the
+	// smallest request that is out of range.
+	rep := writeThroughClient(t, client, 8192-4096, make([]byte, 4097), 0)
+	if rep.Error != ErrENOSPC {
+		t.Fatalf("WRITE past the export end reply error = %d, want ErrENOSPC (%d)", rep.Error, uint32(ErrENOSPC))
+	}
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a request past the export end", st.writes)
+	}
+}
+
+// A zero-length write carries no payload, so the handler must not drain one:
+// draining would consume the next request header and park the connection until
+// the read deadline. The READ that follows on the same connection is what
+// proves the zero-length path left the stream where it found it.
+func TestConnection_WriteZeroLengthIsEINVAL(t *testing.T) {
+	st := newStoreFake()
+	st.data[testPayloadID] = make([]byte, 4096)
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 11, Length: 0})
+	rep := readReplyHeader(t, client)
+	if rep.Error != ErrEINVAL {
+		t.Fatalf("zero-length WRITE reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
+	}
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a zero-length request", st.writes)
+	}
+	assertNoPayload(t, client, 100*time.Millisecond)
+
+	rep, got := readReplyAndPayload(t, client, &Request{
+		Type: CmdRead, Cookie: 12, Offset: 0, Length: 4096,
+	})
+	if rep.Error != 0 {
+		t.Fatalf("READ after a zero-length WRITE returned error %d; the zero-length path consumed the next header", rep.Error)
+	}
+	if len(got) != 4096 {
+		t.Fatalf("READ after a zero-length WRITE returned %d bytes, want 4096", len(got))
+	}
+}
+
+// A rejected WRITE still has its payload in flight — the spec requires the
+// client to follow the request header with length bytes unconditionally — so
+// the handler must consume them before reading the next header. Without the
+// drain the bytes that follow are read as a request header, and the symptom
+// appears on an unrelated command.
+func TestConnection_RejectedWriteKeepsTheStreamSynchronized(t *testing.T) {
+	want := make([]byte, 4096)
+	for i := range want {
+		want[i] = 0x5a
+	}
+	st := newStoreFake()
+	st.data[testPayloadID] = want
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	// 4096 bytes at offset 8192 on an 8192-byte export: refused on the range
+	// check, with the payload already sent.
+	rep := writeThroughClient(t, client, 8192, make([]byte, 4096), 0)
+	if rep.Error != ErrENOSPC {
+		t.Fatalf("WRITE past the export end reply error = %d, want ErrENOSPC (%d)", rep.Error, uint32(ErrENOSPC))
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{
+		Type: CmdRead, Cookie: 13, Offset: 0, Length: 4096,
+	})
+	if rep.Error != 0 {
+		t.Fatalf("READ after a rejected WRITE returned error %d; the rejected payload was read as the next request header", rep.Error)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("READ after a rejected WRITE returned the wrong bytes")
+	}
+}
+
+// A client that declares a gigabyte and sends nothing must be answered and then
+// dropped, not allocated for and not held open. The reply precedes the drain,
+// so the client gets the error it can act on instead of only a closed socket;
+// Serve then ends on the drain's read deadline, which is the correct outcome.
+func TestConnection_RejectedHugeWriteDoesNotAllocate(t *testing.T) {
+	const declared = 1 << 30
+
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(1<<20),
+		Timeouts{Read: time.Second, Write: 5 * time.Second, Idle: 5 * time.Second})
+	client, done := serveHandler(t, h, testExportName)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 14, Offset: 0, Length: declared})
+	// A little of the declared payload, then silence.
+	if _, err := client.Write(make([]byte, 4096)); err != nil {
+		t.Fatalf("write partial payload: %v", err)
+	}
+
+	rep := readReplyHeader(t, client)
+	if rep.Error != ErrENOSPC {
+		t.Fatalf("huge WRITE reply error = %d, want ErrENOSPC (%d)", rep.Error, uint32(ErrENOSPC))
+	}
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a request past the export end", st.writes)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil after the drain timed out; the connection must close")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the drain's read deadline")
+	}
+
+	runtime.ReadMemStats(&after)
+	if grew := after.TotalAlloc - before.TotalAlloc; grew >= declared {
+		t.Fatalf("the server allocated %d bytes for a request that declared %d", grew, declared)
+	}
+}
+
+// Distinct from the huge-write case: here the client stopped mid-payload on a
+// request the server had accepted, so the stream position is unknown and the
+// connection must close rather than report success for bytes it never saw.
+func TestConnection_WriteTruncatedPayloadIsAnError(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, done := serveHandler(t, h, testExportName)
+
+	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 15, Offset: 0, Length: 4096})
+	if _, err := client.Write(make([]byte, 100)); err != nil {
+		t.Fatalf("write partial payload: %v", err)
+	}
+	_ = client.Close()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil after the client stopped mid-payload; the reply must not claim success")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not return after the client stopped mid-payload")
+	}
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a payload the server never fully received", st.writes)
+	}
+}
+
+// FUA is the assertion that makes the flag mean something: the spec says the
+// server "MUST NOT send its reply to that command until all write operations
+// ... have been completed and persisted to non-volatile storage", so the commit
+// has to run before the reply is written.
+//
+// The check runs inside the store's Flush, on the server's goroutine, and hands
+// the client read to the test goroutine over a channel — the reply is not in
+// flight yet, so a read that succeeds means the reply was written first.
+func TestConnection_WriteWithFUAIsDurableBeforeReply(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+
+	atCommit := make(chan struct{})
+	verdict := make(chan struct{})
+	st.onFlush = func() {
+		atCommit <- struct{}{}
+		<-verdict
+	}
+
+	h := f.newHandler(t, st)
+	client, done := serveHandler(t, h, f.exp.Name)
+
+	sendRequest(t, client, &Request{
+		Type: CmdWrite, Flags: FlagFUA, Cookie: 16, Offset: 0, Length: 4096,
+	})
+	if _, err := client.Write(make([]byte, 4096)); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	select {
+	case <-atCommit:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the FUA write never reached Flush")
+	}
+
+	// The server is inside Flush, so a reply read that succeeds means the reply
+	// was written before the commit.
+	if err := client.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var hdr [16]byte
+	_, err := io.ReadFull(client, hdr[:])
+	sawReply := err == nil
+	_ = client.SetReadDeadline(time.Time{})
+	verdict <- struct{}{}
+
+	if sawReply {
+		t.Fatal("the reply was written before the FUA commit: a client that has seen the reply has not been given the durability it asked for")
+	}
+	if st.flushes != 1 {
+		t.Fatalf("the store saw %d flushes for a FUA write, want 1", st.flushes)
+	}
+
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not return after the client closed")
+	}
+}
+
+// CommitAck: journal semantics — the store is durable, Flush reports the remote
+// mirror as not finalized, and the commit is acknowledged because the local
+// tier already survives a restart.
+func TestConnection_FlushIsAckedWhenDurable(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	rep := flushThroughClient(t, client)
+	if rep.Error != 0 {
+		t.Fatalf("FLUSH on a durable store reply error = %d, want 0", rep.Error)
+	}
+	if st.flushes != 1 {
+		t.Fatalf("the store saw %d flushes, want 1", st.flushes)
+	}
+}
+
+// FLUSH promised durability and could not deliver it, so there is no honest
+// success to send: the commit rule's ErrNotDurableYet maps to NBD_EIO.
+func TestConnection_FlushIsEIOWhenNotDurable(t *testing.T) {
+	st := newStoreFake()
+	st.localDurable = false
+	st.remoteDurable = false
+	st.requireDurable = true
+
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	rep := flushThroughClient(t, client)
+	if rep.Error != ErrEIO {
+		t.Fatalf("FLUSH on a non-durable store reply error = %d, want ErrEIO (%d)", rep.Error, uint32(ErrEIO))
+	}
+}
+
+// The spec requires offset and length to be zero on FLUSH. There is no payload
+// to drain — the command has none — so the connection stays usable.
+func TestConnection_FlushWithNonZeroLengthIsEINVAL(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192), testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	sendRequest(t, client, &Request{Type: CmdFlush, Cookie: 17, Length: 4096})
+	rep := readReplyHeader(t, client)
+	if rep.Error != ErrEINVAL {
+		t.Fatalf("FLUSH with a nonzero length reply error = %d, want ErrEINVAL (%d)", rep.Error, uint32(ErrEINVAL))
+	}
+	if st.flushes != 0 {
+		t.Fatalf("the store saw %d flushes for a malformed FLUSH", st.flushes)
+	}
+
+	if rep := flushThroughClient(t, client); rep.Error != 0 {
+		t.Fatalf("FLUSH after a malformed one reply error = %d, want 0", rep.Error)
+	}
+}
+
+// A read-only export still answers FLUSH successfully. Refusing would make a
+// client error a device that has nothing to flush, and the command carries no
+// data to protect.
+func TestConnection_FlushOnReadOnlyExportIsPermitted(t *testing.T) {
+	exp := testExport(8192)
+	exp.ReadOnly = true
+
+	st := newStoreFake()
+	h := newTestHandler(st, exp, testTimeouts())
+	client, _ := serveHandler(t, h, testExportName)
+
+	rep := flushThroughClient(t, client)
+	if rep.Error != 0 {
+		t.Fatalf("FLUSH on a read-only export reply error = %d, want 0", rep.Error)
+	}
+	if st.flushes != 1 {
+		t.Fatalf("the store saw %d flushes, want 1", st.flushes)
 	}
 }

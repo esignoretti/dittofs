@@ -25,6 +25,53 @@ const (
 // integrationExportName is the name the handler's exporter resolves.
 const integrationExportName = integrationShare + "/" + integrationVolume
 
+// integrationIdentity is the synthetic identity the adapter serves as, and the
+// identity the write fixture creates its volume with.
+//
+// The two must match, and that is a property of the adapter rather than of the
+// test: NBD carries no client identity, so every metadata operation runs as the
+// one configured identity, and a volume the adapter must write has to be owned
+// by it. A fixture that creates the volume as one identity and writes as
+// another is refused by the metadata layer's permission gate before the block
+// store is reached — correctly, and that refusal has its own test.
+var integrationIdentity = Identity{UID: 65534, GID: 65534}
+
+// writeVolumeFixture is the runtime, the resolved export, and the real block
+// store for a volume a write test can reach.
+//
+// It exists because the connection tests' newTestHandler passes nil for meta,
+// which is correct for READ (nothing on that path touches metadata) and wrong
+// for WRITE, which calls PrepareWrite and CommitWrite. A write test that
+// expects Error == 0 needs a real service whose store holds the same share the
+// fake block store stands in for. Tests that assert a rejection do not need
+// this: handleWrite returns before metadata is reached.
+type writeVolumeFixture struct {
+	rt  *runtime.Runtime
+	exp *Export
+	bs  *engine.Store
+}
+
+// newWriteVolumeFixture builds the runtime, volume file and export once, with
+// the volume owned by the identity the handler serves as.
+func newWriteVolumeFixture(t *testing.T) *writeVolumeFixture {
+	t.Helper()
+	rt, name, bs := newIntegrationFixtureAs(t, integrationIdentity)
+	exp, err := NewRuntimeExporter(rt, integrationIdentity).Resolve(context.Background(), name)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", name, err)
+	}
+	return &writeVolumeFixture{rt: rt, exp: exp, bs: bs}
+}
+
+// newHandler builds a handler over st with the fixture's real metadata service.
+// The handle on exp is the real volume file's, which is what lets PrepareWrite
+// resolve the share and the payload.
+func (f *writeVolumeFixture) newHandler(t *testing.T, st BlockStore) *Handler {
+	t.Helper()
+	return NewHandler(exporterFor(f.exp), resolverFor(st), f.rt.GetMetadataService(),
+		integrationIdentity, testTimeouts(), func() bool { return false })
+}
+
 // newIntegrationFixture builds a runtime with one enabled share holding one
 // volume file, and returns the runtime, the export name, and the share's real
 // block store.
@@ -33,6 +80,18 @@ const integrationExportName = integrationShare + "/" + integrationVolume
 // store — which is what makes LocalDurable() true and the eviction assertions
 // below meaningful.
 func newIntegrationFixture(t *testing.T) (*runtime.Runtime, string, *engine.Store) {
+	t.Helper()
+	// The read tests create the volume as UID 1000 and read it through a
+	// handler serving as integrationIdentity: the file is mode 0o644, so the
+	// reading identity gets the "other" read bits and the read is permitted.
+	return newIntegrationFixtureAs(t, Identity{UID: 1000, GID: 1000})
+}
+
+// newIntegrationFixtureAs is newIntegrationFixture with id as the identity the
+// share root and the volume are created as. The creating identity matters: the
+// file is owned by whoever created it, and a write through the handler runs as
+// integrationIdentity.
+func newIntegrationFixtureAs(t *testing.T, id Identity) (*runtime.Runtime, string, *engine.Store) {
 	t.Helper()
 	rt, bsID := testruntime.NewWithShareStore(t)
 	store := badgertest.NewInMemory(t)
@@ -47,7 +106,7 @@ func newIntegrationFixture(t *testing.T) (*runtime.Runtime, string, *engine.Stor
 		Name: integrationShare, MetadataStore: "nbd-meta", BlockStoreID: bsID,
 		Enabled:           true,
 		DefaultPermission: string(models.PermissionReadWrite),
-		RootAttr:          &metadata.FileAttr{UID: 1000, GID: 1000},
+		RootAttr:          &metadata.FileAttr{UID: id.UID, GID: id.GID},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +118,7 @@ func newIntegrationFixture(t *testing.T) (*runtime.Runtime, string, *engine.Stor
 	metaSvc := rt.GetMetadataService()
 	authCtx := &metadata.AuthContext{
 		Context:  context.Background(),
-		Identity: &metadata.Identity{UID: ptr(uint32(1000)), GID: ptr(uint32(1000))},
+		Identity: &metadata.Identity{UID: &id.UID, GID: &id.GID},
 	}
 	vols, _, err := metaSvc.CreateDirectory(authCtx, root, "volumes", &metadata.FileAttr{Mode: 0o755})
 	if err != nil {
@@ -211,4 +270,144 @@ func integrationPayloadID(t *testing.T, rt *runtime.Runtime) string {
 		t.Fatalf("Resolve: %v", err)
 	}
 	return string(exp.PayloadID)
+}
+
+// TestIntegration_WriteDeniedByPermissionIsEPERM covers the arm that is easiest
+// to leave out and hardest to notice: the metadata permission funnel returns
+// ErrAccessDenied (POSIX EACCES) for a denial by file permission bits, which is
+// a different code from ErrPermissionDenied (POSIX EPERM). With no arm for it
+// the error falls through mapError's default and reaches the client as NBD_EIO
+// — a hardware failure reported for an authorization decision.
+//
+// The fixture creates the volume as UID 1000 with mode 0o644 and serves the
+// write as integrationIdentity, so only the "other" bits apply and the write is
+// refused. That mismatch is the point of the test, not an accident: the
+// identity the adapter serves as is not the identity that owns the volume.
+func TestIntegration_WriteDeniedByPermissionIsEPERM(t *testing.T) {
+	rt, name, _ := newIntegrationFixtureAs(t, Identity{UID: 1000, GID: 1000})
+	exp, err := NewRuntimeExporter(rt, integrationIdentity).Resolve(context.Background(), name)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", name, err)
+	}
+	st := newStoreFake()
+	h := NewHandler(exporterFor(exp), resolverFor(st), rt.GetMetadataService(),
+		integrationIdentity, testTimeouts(), func() bool { return false })
+
+	server, client := pipe(t)
+	serveConn(h, server)
+	completeHandshake(t, client, name)
+
+	if rep := writeThroughClient(t, client, 0, make([]byte, 4096), 0); rep.Error != ErrEPERM {
+		t.Fatalf("WRITE refused by file permissions reply error = %d, want ErrEPERM (%d)", rep.Error, uint32(ErrEPERM))
+	}
+	// The refusal happens before the store is touched.
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a refused request", st.writes)
+	}
+}
+
+// TestIntegration_FlushWithCommitAckJournalSucceeds pins the production shape
+// the adapter ships in: a share whose local tier is a real journal-backed fs
+// store (testruntime.New points JournalRoot at a temp dir) and no strict
+// durability enforcement. The flush is answered success because
+// engine.Store.Flush fsyncs the local store and returns on the local-durable
+// fast path (pkg/block/engine/flush.go:554) without waiting on the remote
+// mirror.
+func TestIntegration_FlushWithCommitAckJournalSucceeds(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	// The precondition is asserted, not assumed: with strict enforcement on,
+	// this test would be asserting the opposite policy.
+	if f.bs.RequireDurableCommit() {
+		t.Fatal("fixture share requires durable commits; this test pins the default async policy")
+	}
+	if !f.bs.LocalDurable() {
+		t.Fatal("fixture local store is not durable; this test pins the fs-local fast path")
+	}
+	h := integrationHandler(f.rt)
+
+	server, client := pipe(t)
+	serveConn(h, server)
+	completeHandshake(t, client, integrationExportName)
+
+	if rep := flushThroughClient(t, client); rep.Error != 0 {
+		t.Fatalf("FLUSH on a durable local store reply error = %d, want 0", rep.Error)
+	}
+}
+
+// TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO pins the honest
+// failure: a share that requires durable commits, whose local store is volatile
+// and whose remote is not durable, must answer FLUSH with an error rather than
+// acknowledge a durability it did not provide.
+//
+// The local store is forced non-durable because that is the only way to reach
+// the rule over a real engine: the fixture's local tier is a journal, and
+// engine.Store.Flush returns on the localDurable fast path before the remote is
+// consulted at all, so strict enforcement alone changes nothing. This is the
+// same lever internal/adapter/common/commit_durability_test.go uses.
+func TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+
+	setter, ok := f.bs.Local().(interface{ SetDurable(bool) })
+	if !ok {
+		t.Fatal("the fixture's local store cannot report a durability override")
+	}
+	setter.SetDurable(false)
+	t.Cleanup(func() { setter.SetDurable(true) })
+	f.bs.SetRequireDurableCommit(true)
+	if f.bs.LocalDurable() {
+		t.Fatal("the local store still reports durable after the override")
+	}
+	if f.bs.RemoteDurable() {
+		t.Fatal("the fixture's remote reports durable; the memory remote is volatile by default")
+	}
+
+	h := integrationHandler(f.rt)
+	server, client := pipe(t)
+	serveConn(h, server)
+	completeHandshake(t, client, integrationExportName)
+
+	if rep := flushThroughClient(t, client); rep.Error != ErrEIO {
+		t.Fatalf("FLUSH that cannot reach a durable store reply error = %d, want ErrEIO (%d)", rep.Error, uint32(ErrEIO))
+	}
+}
+
+// TestIntegration_WriteThenFlushThenReadBackByteExact is the round trip over a
+// real engine.Store: bytes go out through WRITE, the durability barrier is
+// crossed by FLUSH, and the same bytes come back through READ on the same
+// connection. It is the only test that exercises all three commands against a
+// store that really stores.
+func TestIntegration_WriteThenFlushThenReadBackByteExact(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	h := f.newHandler(t, f.bs)
+
+	const size = 128 << 10
+	want := make([]byte, size)
+	// Pseudorandom rather than a repeating pattern, so a store that returns
+	// the right bytes at the wrong offset cannot match.
+	rng := uint32(0x9e3779b9)
+	for i := range want {
+		rng ^= rng << 13
+		rng ^= rng >> 17
+		rng ^= rng << 5
+		want[i] = byte(rng)
+	}
+
+	server, client := pipe(t)
+	serveConn(h, server)
+	completeHandshake(t, client, integrationExportName)
+
+	if rep := writeThroughClient(t, client, 0, want, 0); rep.Error != 0 {
+		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
+	}
+	if rep := flushThroughClient(t, client); rep.Error != 0 {
+		t.Fatalf("FLUSH reply error = %d, want 0", rep.Error)
+	}
+
+	rep, got := readReplyAndPayload(t, client, &Request{Type: CmdRead, Cookie: 0x79, Offset: 0, Length: size})
+	if rep.Error != 0 {
+		t.Fatalf("READ reply error = %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("READ returned %d bytes that do not match what was written", len(got))
+	}
 }
