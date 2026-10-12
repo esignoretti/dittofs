@@ -795,16 +795,22 @@ Reference launch. Note the three disks, and that only `boot.img` is local:
 ```
 qemu-system-aarch64 -M virt -cpu host -m 2G \
   -drive if=virtio,file=boot.img,format=raw \
-  -netdev user,id=n0,hostfwd=tcp::10809-:10809 -device virtio-net,netdev=n0
+  -netdev user,id=n0 -device virtio-net,netdev=n0
 ```
 
 - `boot.img` — kernel + initramfs, small and static. Boots without NBD. This is the
   disk whose `cache=` mode does not matter, because nothing writes to it.
 - **No data disk.** The root filesystem arrives over NBD from DittoFS, which is the
   thing under test.
-- `hostfwd` maps the guest's loopback to the host's NBD port. The guest runs
-  `nbd-client 10.0.2.2 10809 /dev/nbd0` — `10.0.2.2` being QEMU's user-net gateway to
-  the host.
+- **No `hostfwd` rule, and adding one would break the run.** QEMU's user networking
+  forwards a *host* port *into the guest* (`hostfwd=[tcp]:[hostaddr]:hostport-[guestaddr]:guestport`),
+  so `hostfwd=tcp::10809-:10809` would try to bind host port 10809 and forward it to
+  a guest listener — the opposite direction, and on a host where DittoFS is already
+  listening on 10809 it fails to bind at startup. Nothing is needed: QEMU's user-net
+  gateway `10.0.2.2` is the *host* as seen from inside the guest, and a guest-initiated
+  outbound connection to it crosses SLIRP with no rule, the same way the guest reaches
+  the outside world. The guest runs `nbd-client 10.0.2.2 10809 /dev/nbd0`, which is
+  exactly the direction that needs no forwarding.
 - The `cache=` mode that matters is the one on the **NBD client's** device
   (`/dev/nbd0`), not on a QEMU `-drive`: there is no QEMU block layer between the guest
   and DittoFS. §9.3's "record the cache mode" therefore applies to the guest's mount

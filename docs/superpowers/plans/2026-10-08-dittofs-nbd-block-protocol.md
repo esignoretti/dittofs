@@ -125,7 +125,8 @@ Inputs and conditions the spec implies but whose tests no single task obviously 
 
 | File | Covers |
 |---|---|
-| `test/nbd/run-oracle.sh` | Differential comparison against `qemu-nbd`. |
+| `test/nbd/run-oracle.sh` | Differential comparison against `qemu-nbd`; drives Tier A (`go test -run TestOracle_`) and Tier B when a server port is given. |
+| `internal/adapter/nbd/oracle_test.go` | Tier A: the real `Handler` on a real TCP listener, driven by the real `qemu-io`, diffed against `qemu-nbd`. |
 | `test/nbd/boot-qemu.sh` | KVM boot over NBD. |
 | `test/nbd/crash-restart.sh` | SIGKILL mid-write, restart, resume. |
 | `test/nbd/README.md` | Prerequisites and what each script proves. |
@@ -2508,18 +2509,108 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 ## Task 7: Differential oracle against `qemu-nbd`
 
 **Files:**
-- Create: `test/nbd/run-oracle.sh`, `test/nbd/README.md`
-- Modify: `test/required-tests.sh` only if the script is added to the required list — check first; a script needing QEMU should not be a required test.
+- Create: `test/nbd/run-oracle.sh`, `test/nbd/README.md`,
+  `internal/adapter/nbd/oracle_test.go`
+- Modify: nothing. `test/required-tests.json` is deliberately **not** touched:
+  `test/required-tests.sh` runs `go test` for every name in the manifest, and
+  the Tier A oracle needs a QEMU install, so listing it there would make the
+  required set fail on every machine without one. A QEMU-dependent test is a
+  manual regression check, not a required one — the manifest's own purpose is
+  the opposite: names whose removal must be loud. (If Tier A is ever split so
+  the QEMU-free half can run alone, that half can be listed.)
 
 **Interfaces:**
-- Consumes: the running DittoFS server with an NBD adapter.
+- Consumes: a DittoFS NBD server listening on a real TCP port. The script does not start one; it takes a port.
 - Produces: `test/nbd/run-oracle.sh` — exits nonzero on any divergence.
 
 This is the independent check on a hand-rolled codec. `qemu-nbd` is a known-good NBD server; the same client commands run against both, and the byte sequences and negotiated flags are diffed.
 
+**The oracle needs a server on a real port, and nothing in this repo starts one.**
+DittoFS serves adapters from the control plane, not from a config file:
+`pkg/config/config.go:37` says *"Dynamic configuration (users, groups, shares,
+stores, adapters) is managed through the REST API and stored in the control
+plane database"*, and `pkg/adapter/smb/config.go`'s `Enabled` is set `true`
+unconditionally by the adapter factory (`cmd/dfs/commands/start.go:967`), so
+there is no "off" a config file could express. A live run therefore needs
+`dfs start` plus `dfsctl store metadata add`, `dfsctl store block add`,
+`dfsctl share create`, and `dfsctl adapter enable nbd` — the sequence
+`test/scenarios/setup.sh:73-81` already performs for smb and nfs, needing only
+an `nbd` line. (It does need one non-obvious config value: the NBD bind gate
+refuses a wildcard bind without `allow_remote_bind`, and the adapter factory
+never sets `BindAddress`, so the adapter must be created with
+`dfsctl adapter edit nbd --config '{"bind_address":"127.0.0.1"}'`.)
+
+**But a live server cannot serve this oracle, for a reason that is not
+incidental.** `RuntimeExporter.Resolve` (`internal/adapter/nbd/volume.go`)
+resolves a volume by `Lookup`ing the share root, then `volumes/`, then the
+volume name — and **no command in the repo creates a volume file**:
+`grep -rn "volume" cmd/dfsctl/` returns nothing, and
+`internal/adapter/nbd/volume.go:21` records that *"the operator, not the
+protocol, decides who owns the volumes"*, so the operator creates
+`volumes/<name>` through the share's own NFS/SMB mount. And the volume is a
+**file inside a share**, so the byte-level oracle also needs an fs-backed local
+tier, which is a second piece of production configuration rather than a test
+fixture. A script that stood all of that up would be testing share
+provisioning, not the codec, and would be unusable in CI.
+
+**So the oracle is split, and the split is the point.**
+
+- **Tier A — the codec, in-process, no QEMU and no provisioning.** A Go test
+  that serves the real `Handler` on a real TCP listener and runs the real
+  `qemu-io` against it, comparing against `qemu-nbd`. This is where the value
+  is: `qemu-io` is a real independent NBD client, which is exactly what a
+  hand-rolled codec needs to be checked against, and the whole codec is
+  reachable without the control plane because `internal/adapter/nbd`'s
+  `Handler` is built from an `Exporter`, a `StoreResolver`, a
+  `*metadata.Service`, an `Identity` and `Timeouts` — all of which a test can
+  supply. `pkg/adapter/nbd/adapter_test.go:88` already serves a real listener
+  and `internal/adapter/nbd/handshake_test.go:50` already does a real TCP
+  handshake, so neither the listener nor the wire path is new machinery.
+  `test/nbd/run-oracle.sh` remains the driver: it checks QEMU is present, runs
+  `go test` for Tier A, and reports.
+- **Tier B — the deployed path, when someone has a server.** The same script
+  accepts an already-running DittoFS NBD port via an environment variable or a
+  flag, and skips Tier B with a printed reason when it is absent. It must not
+  *discover* a server or silently fall back to Tier A: the script's output has
+  to say which tier ran, or a green run means nothing in particular.
+
+The flag-parity check (Step 2) belongs to **both** tiers, because it needs only
+a handshake and no data path.
+
 - [ ] **Step 1: Write the script**
 
 `test/nbd/run-oracle.sh`, following the existing `test/crash/*.sh` convention: a `#!/usr/bin/env bash` header with a comment block explaining what it proves, `set -euo pipefail`, a usage line, and a prerequisites check.
+
+**Tier A is a Go test, so the script's job is narrow.**
+`internal/adapter/nbd/oracle_test.go` (package `nbd_test`, external — it imports
+`internal/adapter/testruntime`, which an in-package test cannot) does this:
+
+1. Skip, not fail, when `qemu-nbd` or `qemu-io` is absent: `t.Skip` with the
+   missing binary named, so `go test ./...` stays green on a machine without
+   QEMU while the script — which checks first — reports the skip as a failure.
+2. Build the same fixture Tasks 4–6 use: `testruntime.NewWithShareStore`, a
+   metadata store, a share with `Enabled: true`, and the volume file. The store
+   is an in-memory fake of the seven-method `BlockStore`, so the oracle
+   compares **the codec and the handshake**, not the block layer — state that
+   in the test's doc comment, because a reader who believes it covers
+   `PunchHole` will trust it for something it never tested.
+3. `net.Listen("tcp", "127.0.0.1:0")` and serve the real `Handler` on it with
+   the accept loop `pkg/adapter/nbd/adapter_test.go:88` already uses, exporting
+   `testExportName` and taking the port from the listener, not from config
+   (`BaseAdapter.Port()` returns the *configured* port, `pkg/adapter/base.go:598`).
+4. Start `qemu-nbd` as a subprocess against a `t.TempDir()` scratch file of the
+   same size, with `-f raw -p <free port> -b 127.0.0.1 --persistent
+   --discard=unmap`, and stop it in `t.Cleanup`.
+5. Run the identical `qemu-io -f raw -c '<cmd>'` sequence against both, capture
+   stdout+stderr, and require the transcripts to match line for line. Addresses
+   are `nbd://127.0.0.1:<port>/<export>` — see the export-name note below.
+
+`test/nbd/run-oracle.sh` then only has to: refuse without `qemu-nbd`,
+`qemu-img` and `qemu-io` (naming the missing binary); run
+`go test ./internal/adapter/nbd/ -run TestOracle_ -v -count=1` and fail if it
+skips; run the Python flag-parity handshake against both servers; and, when
+`DITTOFS_NBD_PORT` is set, additionally drive Tier B. It must print which tier
+ran — a green run that does not say what it checked means nothing.
 
 What it does:
 
@@ -2547,7 +2638,7 @@ What it does:
    throwaway server holding a scratch file, and it has no business listening on
    anything but loopback. `--persistent` (`-t`, *"don't exit on the last
    connection"*) keeps it alive across the several `qemu-io` invocations.
-3. Against `qemu-nbd` and against DittoFS's NBD port, run the same `qemu-io` command sequence and capture both transcripts:
+3. Against `qemu-nbd` and against DittoFS, run the same `qemu-io` command sequence and capture both transcripts:
    - `qemu-io -f raw -c 'write -P 0x11 0 1M'`
    - `qemu-io -f raw -c 'write -P 0x22 4M 64k'`
    - `qemu-io -f raw -c 'read -P 0x11 0 1M'`
@@ -2584,19 +2675,21 @@ Capture the negotiated transmission flags for both servers and assert that every
 
 - [ ] **Step 3: Write `test/nbd/README.md`**
 
-Prerequisites (`brew install qemu` on macOS; the Linux packages on a Linux host), what each of the three scripts proves, and — explicitly — that the oracle validates the *codec and flags* while the KVM harness (Task 8) validates the *boot path*. State that the oracle needs no root and no VM, so it is the cheap regression check.
+Prerequisites (`brew install qemu` on macOS; the Linux packages on a Linux host), what each of the three scripts proves, and — explicitly — that the oracle validates the *codec and flags* while the KVM harness (Task 8) validates the *boot path*. State that the oracle needs no root, no VM and no share provisioning, so it is the cheap regression check, and state which tier needs what: Tier A needs QEMU only; Tier B needs a running server with an NBD adapter and a provisioned volume, and is skipped without `DITTOFS_NBD_PORT`.
 
 - [ ] **Step 4: Run the oracle**
 
 Run: `test/nbd/run-oracle.sh`
-Expected: exit 0, both transcripts identical.
+Expected: exit 0, Tier A transcripts identical, flag parity asserted for both servers.
+
+**QEMU is not installed on this machine.** `command -v qemu-nbd qemu-img qemu-io` returns nothing, and `qemu-system-aarch64` is absent too, so Task 7 and Task 8 both need `brew install qemu` before they can run. If it is not installed when you get here, do not skip the step and do not write a script you never ran: report the missing prerequisite and say exactly which steps are unverified. A script whose failure path was never executed is a script that has never run.
 
 If it diverges, the divergence is the finding: a hand-rolled codec's first real client is where a transposed field shows up. Diagnose against the spec before changing anything.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add test/nbd/
+git add test/nbd/ internal/adapter/nbd/oracle_test.go
 git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "test(nbd): differential oracle against qemu-nbd"
 ```
 
@@ -2627,7 +2720,7 @@ NBD (DittoFS):          the root filesystem
 ```
 
 - **No data disk.** The root filesystem arrives over NBD. A `-drive` holding the volume would test the wrong path.
-- `-netdev user,id=n0,hostfwd=tcp::10809-:10809` — `10.0.2.2` is QEMU's user-net gateway to the host.
+- **No `hostfwd` rule.** `hostfwd` forwards a *host* port *into the guest*, which is the opposite of what this topology needs and would also try to bind host port 10809 where DittoFS is already listening. The guest initiates the connection outward to `10.0.2.2`, QEMU's user-net gateway to the host, and a guest-initiated outbound connection crosses SLIRP with no rule — the same path the guest uses to reach the outside world.
 - **No UEFI-boot-from-NBD.** EDK2 has no NBD driver; the boot path is kernel+initramfs from a local disk, then root-on-NBD via `switch_root`.
 - The script must build the initramfs with the `nbd` module and `nbd-client`, or refuse with a message naming what is missing.
 - **The recovery environment must not be on NBD.** The script must not run `fsck` from inside the guest: the guest's root is the volume under test, so an `fsck` there is judging a crash it is also recovering from. The check belongs on the host, against the volume read as a file over NFS — which is the B1 property (spec §2.2) earning its place.
@@ -2638,7 +2731,7 @@ Reference launch (from the spec):
 ```
 qemu-system-aarch64 -M virt -cpu host -m 2G \
   -drive if=virtio,file=boot.img,format=raw \
-  -netdev user,id=n0,hostfwd=tcp::10809-:10809 -device virtio-net,netdev=n0
+  -netdev user,id=n0 -device virtio-net,netdev=n0
 ```
 
 - [ ] **Step 2: Write `crash-restart.sh`**
@@ -2729,6 +2822,8 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 6 — `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...` clean (NOT `make test-unit`, which times out on five unrelated packages on this machine).
 - [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`, and the script passes `--discard=unmap` (without it the discard step diverges on the oracle's configuration, not on the codec).
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
+- [ ] Task 7 — `internal/adapter/nbd/oracle_test.go` skips (not fails) without QEMU, and `run-oracle.sh` treats that skip as a failure; the script prints which tier ran, so a green run says what it checked.
+- [ ] Task 8 — the launch line carries **no `hostfwd`**: it forwards host→guest, which is the wrong direction and would try to bind host port 10809 where DittoFS is listening. The guest reaches the host at `10.0.2.2` with no rule.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
 - [ ] Task 8 — the crash rig sets `dead_conn_timeout` with `-T`/`--dead-timeout` and fails when netlink is unavailable, rather than silently running the ioctl path where the option is parsed and ignored.
 - [ ] Task 8 — `mkfs.ext4` + mount + write + `sync` + unmount + remount in a KVM guest.
