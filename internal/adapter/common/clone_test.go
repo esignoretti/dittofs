@@ -8,7 +8,8 @@ import (
 
 	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/metadata"
-	metadatamemory "github.com/marmos91/dittofs/pkg/metadata/store/memory"
+
+	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
 )
 
 // TestCloneWholeFile_O1 asserts the reflink is a pure metadata operation: the
@@ -17,7 +18,7 @@ import (
 // `cp --reflink` case.
 func TestCloneWholeFile_O1(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	coord := &fakeCoordinator{}
 	bs := newCloneTestEngineWithMS(t, coord, ms)
 
@@ -31,7 +32,7 @@ func TestCloneWholeFile_O1(t *testing.T) {
 	dstHandle := putTestFile(t, ms, "/dst.bin", "dst-pid", nil, 0)
 	cache := &recordingInvalidator{}
 
-	if err := CloneWholeFile(ctx, bs, ms, cache, srcHandle, dstHandle, "dst-pid", 0); err != nil {
+	if err := CloneWholeFile(ctx, bs, ms, cache, srcHandle, dstHandle, "dst-pid", 0, nil); err != nil {
 		t.Fatalf("CloneWholeFile failed: %v", err)
 	}
 
@@ -70,7 +71,7 @@ func TestCloneWholeFile_O1(t *testing.T) {
 // invalidation. This is the defense-in-depth guard for the shared primitive.
 func TestCloneWholeFile_SelfCloneNoOp(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	coord := &fakeCoordinator{}
 	bs := newCloneTestEngineWithMS(t, coord, ms)
 
@@ -78,7 +79,7 @@ func TestCloneWholeFile_SelfCloneNoOp(t *testing.T) {
 	selfHandle := putTestFile(t, ms, "/self.bin", "same-pid", srcBlocks, 4096)
 	cache := &recordingInvalidator{}
 
-	if err := CloneWholeFile(ctx, bs, ms, cache, selfHandle, selfHandle, "same-pid", 0); err != nil {
+	if err := CloneWholeFile(ctx, bs, ms, cache, selfHandle, selfHandle, "same-pid", 0, nil); err != nil {
 		t.Fatalf("CloneWholeFile self-clone failed: %v", err)
 	}
 	if len(coord.incrementCalls) != 0 {
@@ -94,7 +95,7 @@ func TestCloneWholeFile_SelfCloneNoOp(t *testing.T) {
 // RefCount bumps, and skips the POST-txn cache invalidation.
 func TestCloneWholeFile_RollsBackOnIncrementError(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	coord := &fakeCoordinator{
 		failOnNthIncrTrip: 2, // fail the 2nd unique-hash increment
 		failOnNthIncrErr:  errors.New("synthetic increment failure"),
@@ -109,7 +110,7 @@ func TestCloneWholeFile_RollsBackOnIncrementError(t *testing.T) {
 	dstHandle := putTestFile(t, ms, "/dst.bin", "dst-pid", nil, 0)
 	cache := &recordingInvalidator{}
 
-	if err := CloneWholeFile(ctx, bs, ms, cache, srcHandle, dstHandle, "dst-pid", 0); err == nil {
+	if err := CloneWholeFile(ctx, bs, ms, cache, srcHandle, dstHandle, "dst-pid", 0, nil); err == nil {
 		t.Fatal("expected CloneWholeFile to fail on IncrementRefCount error")
 	}
 
@@ -133,7 +134,7 @@ func TestCloneWholeFile_RollsBackOnIncrementError(t *testing.T) {
 // index, so an unseeded destination is invisible to all of it.
 func TestCloneWholeFile_SeedsDestinationRanges(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	bs, local := newCloneTestEngineWithLocal(t, &fakeCoordinator{}, ms)
 
 	srcBlocks := []block.ChunkRef{
@@ -154,7 +155,7 @@ func TestCloneWholeFile_SeedsDestinationRanges(t *testing.T) {
 		t.Fatalf("the destination already had %d index extents before the clone", len(before))
 	}
 
-	if err := CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, "seed-dst-pid", 0); err != nil {
+	if err := CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, "seed-dst-pid", 0, nil); err != nil {
 		t.Fatalf("CloneWholeFile: %v", err)
 	}
 
@@ -177,13 +178,13 @@ func TestCloneWholeFile_SeedsDestinationRanges(t *testing.T) {
 // them would describe the source's own bytes as remote-only.
 func TestCloneWholeFile_SelfCloneSeedsNothing(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	bs, local := newCloneTestEngineWithLocal(t, &fakeCoordinator{}, ms)
 
 	srcBlocks := []block.ChunkRef{{Hash: block.ContentHash{0x44}, Offset: 0, Size: 4096}}
 	selfHandle := putTestFile(t, ms, "/seed-self.bin", "seed-self-pid", srcBlocks, 4096)
 
-	if err := CloneWholeFile(ctx, bs, ms, nil, selfHandle, selfHandle, "seed-self-pid", 0); err != nil {
+	if err := CloneWholeFile(ctx, bs, ms, nil, selfHandle, selfHandle, "seed-self-pid", 0, nil); err != nil {
 		t.Fatalf("CloneWholeFile self-clone: %v", err)
 	}
 
@@ -220,7 +221,7 @@ func TestCloneWholeFile_SelfCloneSeedsNothing(t *testing.T) {
 // broken enough to fail every read would look like a pass.
 func TestCloneWholeFile_DropsTheDestinationsStaleLocalRanges(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	bs, _ := newCloneTestEngineWithLocal(t, &fakeCoordinator{}, ms)
 
 	srcBlocks := []block.ChunkRef{
@@ -250,7 +251,7 @@ func TestCloneWholeFile_DropsTheDestinationsStaleLocalRanges(t *testing.T) {
 		t.Fatalf("the destination did not hold its own bytes before the clone")
 	}
 
-	if err := CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, "stale-dst-pid", 0); err != nil {
+	if err := CloneWholeFile(ctx, bs, ms, nil, srcHandle, dstHandle, "stale-dst-pid", 0, nil); err != nil {
 		t.Fatalf("CloneWholeFile: %v", err)
 	}
 
@@ -274,7 +275,7 @@ func TestCloneWholeFile_DropsTheDestinationsStaleLocalRanges(t *testing.T) {
 // nothing replaced.
 func TestCloneWholeFile_SelfCloneKeepsItsLocalRanges(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	bs, local := newCloneTestEngineWithLocal(t, &fakeCoordinator{}, ms)
 
 	const size = 4096
@@ -284,7 +285,7 @@ func TestCloneWholeFile_SelfCloneKeepsItsLocalRanges(t *testing.T) {
 		t.Fatalf("WriteAt: %v", err)
 	}
 
-	if err := CloneWholeFile(ctx, bs, ms, nil, selfHandle, selfHandle, "self-pid", 0); err != nil {
+	if err := CloneWholeFile(ctx, bs, ms, nil, selfHandle, selfHandle, "self-pid", 0, nil); err != nil {
 		t.Fatalf("CloneWholeFile self-clone: %v", err)
 	}
 

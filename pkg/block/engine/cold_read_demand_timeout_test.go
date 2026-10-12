@@ -11,7 +11,8 @@ import (
 	"github.com/marmos91/dittofs/pkg/block/journal/journaltest"
 	"github.com/marmos91/dittofs/pkg/block/remote"
 	remotememory "github.com/marmos91/dittofs/pkg/block/remote/memory"
-	metastore "github.com/marmos91/dittofs/pkg/metadata/store/memory"
+
+	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
 )
 
 // blockingRemote models a remote whose GET has stalled after the pre-check
@@ -73,7 +74,7 @@ func TestColdRead_DemandFetchFailsFastWhenRemoteStalls(t *testing.T) {
 	loc := journaltest.New(t)
 	rs := newBlockingRemote()
 	fbs := newStubFileChunkStore()
-	mds := metastore.NewMemoryMetadataStoreWithDefaults()
+	mds := badgertest.NewInMemory(t)
 
 	chunk := make([]byte, 4096)
 	seedSyncedRemoteChunk(t, fbs, rs, mds, "p", 0, chunk)

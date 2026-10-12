@@ -8,7 +8,8 @@ import (
 
 	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/metadata"
-	metadatamemory "github.com/marmos91/dittofs/pkg/metadata/store/memory"
+
+	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
 )
 
 type cloneRangeStore struct {
@@ -50,7 +51,7 @@ func TestCloneRangeRevalidatesTransactionSizes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+			ms := badgertest.NewInMemory(t)
 			coord := &fakeCoordinator{}
 			bs := newCloneTestEngineWithMS(t, coord, ms)
 			refs := []block.ChunkRef{{Hash: block.ContentHash{1}, Size: 4096}}
@@ -62,7 +63,7 @@ func TestCloneRangeRevalidatesTransactionSizes(t *testing.T) {
 				setCloneTestSize(t, ms, src, tc.sourceSize)
 				setCloneTestSize(t, ms, dst, tc.destSize)
 			}}
-			err := CloneWholeFile(ctx, bs, store, nil, src, dst, "range-dst", 4096)
+			err := CloneWholeFile(ctx, bs, store, nil, src, dst, "range-dst", 4096, nil)
 			var se *metadata.StoreError
 			if !errors.As(err, &se) || se.Code != tc.wantCode {
 				t.Fatalf("clone error = %v, want code %v", err, tc.wantCode)
@@ -80,7 +81,7 @@ func TestCloneRangeRevalidatesTransactionSizes(t *testing.T) {
 
 func TestLocalCloneRangePreservesGrowthDuringCopy(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	bs, _ := newLocalOnlyTestEngine(t, &fakeCoordinator{}, ms)
 	src := putTestFile(t, ms, "/src", "range-src", nil, 4096)
 	dst := putTestFile(t, ms, "/dst", "range-dst", nil, 4096)
@@ -88,35 +89,38 @@ func TestLocalCloneRangePreservesGrowthDuringCopy(t *testing.T) {
 	tail := bytes.Repeat([]byte{0x33}, 4096)
 	writeAndSeal(t, ctx, bs, "range-src", source)
 	writeAndSeal(t, ctx, bs, "range-dst", bytes.Repeat([]byte{0x22}, 4096))
-	grew := false
+
+	writer := make(chan error, 1)
 	store := &cloneRangeStore{Store: ms, beforeTransaction: func() {
-		// The copy has validated its bounds and written the prefix, but the
-		// final size transaction has not read the destination yet.
-		head := make([]byte, len(source))
-		if _, err := bs.ReadAt(ctx, "range-dst", head, 0); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(head, source) {
-			t.Fatal("growth hook ran before the copied prefix was written")
-		}
-		grew = true
-		if _, err := bs.WriteAt(ctx, "range-dst", nil, tail, 4096); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := bs.Flush(ctx, "range-dst"); err != nil {
-			t.Fatal(err)
-		}
-		if err := bs.DrainRollups(ctx); err != nil {
-			t.Fatal(err)
-		}
-		setCloneTestSize(t, ms, dst, 8192)
+		// Start a separate write at the replacement seam. It must run only after
+		// the clone releases its source/destination scope.
+		go func() {
+			writer <- bs.WithPayloadScope(ctx, []string{"range-dst"}, false, func(ctx context.Context) error {
+				if _, err := bs.WriteAt(ctx, "range-dst", nil, tail, 4096); err != nil {
+					return err
+				}
+				if _, err := bs.Flush(ctx, "range-dst"); err != nil {
+					return err
+				}
+				if err := bs.DrainPayload(ctx, "range-dst"); err != nil {
+					return err
+				}
+				file, err := ms.GetFile(ctx, dst)
+				if err != nil {
+					return err
+				}
+				file.Size = 8192
+				return ms.UpdateAttrs(ctx, file)
+			})
+		}()
 	}}
-	if err := CloneWholeFile(ctx, bs, store, nil, src, dst, "range-dst", 4096); err != nil {
+	if err := CloneWholeFile(ctx, bs, store, nil, src, dst, "range-dst", 4096, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !grew {
-		t.Fatal("growth hook was not reached")
+	if err := <-writer; err != nil {
+		t.Fatal(err)
 	}
+
 	after, err := ms.GetFile(ctx, dst)
 	if err != nil {
 		t.Fatal(err)
@@ -135,14 +139,14 @@ func TestLocalCloneRangePreservesGrowthDuringCopy(t *testing.T) {
 
 func TestLocalCloneRangeRejectsLongerDestination(t *testing.T) {
 	ctx := context.Background()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	bs, _ := newLocalOnlyTestEngine(t, &fakeCoordinator{}, ms)
 	src := putTestFile(t, ms, "/src", "range-src", nil, 4096)
 	dst := putTestFile(t, ms, "/dst", "range-dst", nil, 8192)
 	previous := bytes.Repeat([]byte{0x22}, 8192)
 	writeAndSeal(t, ctx, bs, "range-src", bytes.Repeat([]byte{0x11}, 4096))
 	writeAndSeal(t, ctx, bs, "range-dst", previous)
-	err := CloneWholeFile(ctx, bs, ms, nil, src, dst, "range-dst", 0)
+	err := CloneWholeFile(ctx, bs, ms, nil, src, dst, "range-dst", 0, nil)
 	var se *metadata.StoreError
 	if !errors.As(err, &se) || se.Code != metadata.ErrNotSupported {
 		t.Fatalf("clone error = %v, want unsupported", err)

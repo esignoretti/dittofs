@@ -28,6 +28,39 @@ func (h *Handler) setFileInfoFromStore(
 	class types.FileInfoClass,
 	buffer []byte,
 ) (*SetInfoResponse, error) {
+	if (class != types.FileEndOfFileInformation && class != types.FileAllocationInformation) || len(buffer) < 8 {
+		return h.applyFileInfoFromStore(ctx, authCtx, openFile, class, buffer)
+	}
+	metaSvc := h.Registry.GetMetadataService()
+	file, err := metaSvc.GetFileForRead(authCtx.Context, openFile.MetadataHandle)
+	if err != nil {
+		return setInfoStatus(types.StatusForErr(err)), nil
+	}
+	if file.PayloadID == "" {
+		return h.applyFileInfoFromStore(ctx, authCtx, openFile, class, buffer)
+	}
+	blockStore, err := common.ResolveForWrite(authCtx.Context, h.Registry, openFile.MetadataHandle)
+	if err != nil {
+		return setInfoStatus(types.StatusForErr(err)), nil
+	}
+	result, err := common.WithFilePayloadScope(authCtx, metaSvc, blockStore, openFile.MetadataHandle, func(authCtx *metadata.AuthContext) (*SetInfoResponse, error) {
+		// Size operations use authCtx.Context for metadata and payload I/O.
+		// Keep the dispatcher's context so it receives their PostSend hooks.
+		return h.applyFileInfoFromStore(ctx, authCtx, openFile, class, buffer)
+	})
+	if err != nil && result == nil {
+		return setInfoStatus(types.StatusForErr(err)), nil
+	}
+	return result, err
+}
+
+func (h *Handler) applyFileInfoFromStore(
+	ctx *SMBHandlerContext,
+	authCtx *metadata.AuthContext,
+	openFile *OpenFile,
+	class types.FileInfoClass,
+	buffer []byte,
+) (*SetInfoResponse, error) {
 	switch class {
 	case types.FileBasicInformation:
 		// FILE_BASIC_INFORMATION [MS-FSCC] 2.4.7 (40 bytes)
@@ -1715,14 +1748,13 @@ func applyFrozenTimestamps(openFile *OpenFile, file *metadata.File) {
 // read taken here. That is what keeps the restore from erasing somebody else's
 // update: an advance committed before the rename is already in SourcePreCtime,
 // so putting it back is a no-op rather than a walk backwards, and the value
-// compared against has been through the store, so it still compares equal on
-// backends that truncate timestamps on the way in.
+// compared against has been through the store, so it still compares equal
+// after the store's timestamp encoding.
 //
-// The first of those holds on backends whose transaction serialises the read
-// against concurrent writers, which is all of them — postgres because its
-// transactions run at REPEATABLE READ, where a write landing inside the
-// rename's own window aborts the rename's update rather than being erased by
-// it.
+// The first of those holds because the rename's transaction serialises the
+// read against concurrent writers: under Badger's SSI a write landing inside
+// the rename's own window aborts the rename's update rather than being erased
+// by it.
 //
 // There is no permission check on the restore. An explicit timestamp write is
 // ownership-gated in the metadata layer while the rename itself is authorized

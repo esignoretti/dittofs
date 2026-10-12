@@ -14,7 +14,10 @@
     "  variant        second axis (NFS minor version, SMB auth), or absent",
     "  known_failures blacklist path relative to test/; a string when there is one",
     "                 table, or an object keyed by variant value when a suite",
-    "                 grades each variant against its own table",
+    "                 grades each variant against its own table. A value may",
+    "                 be a list of tables graded together (a shared table plus",
+    "                 a per-variant overlay); run.sh passes them to the suite",
+    "                 in DITTOFS_KNOWN_FAILURES, colon-separated.",
     "  tiers          profiles to run per GitHub event, defaulting to \"defaults\";",
     "                 \"all\" means every profile the suite has",
     "  timeout_minutes  the CI job timeout for one cell of this suite",
@@ -36,9 +39,9 @@
     "wpts": {
       "description": "Windows Protocol Test Suites FileServer BVT",
       "protocol": "SMB",
-      "profiles": ["memory", "badger", "badger-s3", "postgres-s3"],
+      "profiles": ["memory", "badger", "badger-s3"],
       "known_failures": "smb-conformance/KNOWN_FAILURES.md",
-      "tiers": { "pull_request": ["memory", "postgres-s3"] },
+      "tiers": { "pull_request": ["memory", "badger-s3"] },
       "timeout_minutes": 30,
       "steps": [
         {
@@ -53,7 +56,7 @@
     "smbtorture": {
       "description": "Samba smbtorture SMB2/3 protocol suite",
       "protocol": "SMB",
-      "profiles": ["memory", "badger", "sqlite", "postgres"],
+      "profiles": ["memory", "badger"],
       "known_failures": "smb-conformance/smbtorture/KNOWN_FAILURES.md",
       "tiers": { "pull_request": ["memory", "badger"] },
       "timeout_minutes": 45,
@@ -71,7 +74,7 @@
       "description": "pjdfstest POSIX filesystem semantics over NFS",
       "host_adapter": true,
       "protocol": "NFS",
-      "profiles": ["memory", "badger", "postgres", "postgres-s3"],
+      "profiles": ["memory", "badger", "badger-s3"],
       "variant": {
         "name": "nfs-version",
         "values": ["3", "4", "4.1"]
@@ -81,7 +84,7 @@
         "4": "posix/KNOWN_FAILURES_V4.md",
         "4.1": "posix/KNOWN_FAILURES_V4.md"
       },
-      "tiers": { "pull_request": ["memory", "postgres-s3"] },
+      "tiers": { "pull_request": ["memory", "badger-s3"] },
       "timeout_minutes": 60,
       "steps": [
         {
@@ -106,27 +109,11 @@
       ]
     },
 
-    "nfs-kerberos": {
-      "description": "NFS sec=krb5 mount and Kerberos credential handling",
-      "protocol": "NFS",
-      "profiles": ["memory-kerberos"],
-      "known_failures": null,
-      "timeout_minutes": 30,
-      "steps": [
-        {
-          "name": "run",
-          "cmd": "nfs-conformance/run.sh",
-          "args": ["--verbose"],
-          "root": false
-        }
-      ]
-    },
-
     "pynfs": {
       "description": "pynfs NFSv4.0/4.1 protocol conformance",
       "host_adapter": true,
       "protocol": "NFS",
-      "profiles": ["memory", "badger", "postgres", "postgres-s3"],
+      "profiles": ["memory", "badger", "badger-s3"],
       "variant": {
         "name": "minor-version",
         "values": ["4.0", "4.1"]
@@ -135,7 +122,7 @@
         "4.0": "nfs-conformance/pynfs/KNOWN_FAILURES_V40.md",
         "4.1": "nfs-conformance/pynfs/KNOWN_FAILURES_V41.md"
       },
-      "tiers": { "pull_request": ["memory", "postgres-s3"] },
+      "tiers": { "pull_request": ["memory", "badger-s3"] },
       "timeout_minutes": 45,
       "steps": [
         {
@@ -143,6 +130,88 @@
           "cmd": "nfs-conformance/pynfs/run-pynfs.sh",
           "args": ["--profile", "{profile}", "--minor-version", "{variant}"],
           "root": false
+        }
+      ]
+    },
+    "cthon04": {
+      "description": "Connectathon basic/general/special/lock over named NFS mount option sets",
+      "host_adapter": true,
+      "protocol": "NFS",
+      "profiles": ["memory", "badger", "badger-s3"],
+      "variant": {
+        "name": "mount-options",
+        "values": ["default", "v3", "v4.0", "v4.1", "v4.1-noac", "v4.1-smallio"]
+      },
+      "known_failures": {
+        "default": "nfs-mount/cthon04/KNOWN_FAILURES.md",
+        "v3": ["nfs-mount/cthon04/KNOWN_FAILURES.md", "nfs-mount/cthon04/KNOWN_FAILURES_V3.md"],
+        "v4.0": "nfs-mount/cthon04/KNOWN_FAILURES.md",
+        "v4.1": "nfs-mount/cthon04/KNOWN_FAILURES.md",
+        "v4.1-noac": "nfs-mount/cthon04/KNOWN_FAILURES.md",
+        "v4.1-smallio": "nfs-mount/cthon04/KNOWN_FAILURES.md"
+      },
+      "tiers": { "pull_request": ["memory"], "push": [] },
+      "timeout_minutes": 30,
+      "steps": [
+        {
+          "name": "setup",
+          "cmd": "posix/setup-posix.sh",
+          "args": ["{profile}", "--no-mount"],
+          "root": true
+        },
+        {
+          "name": "run",
+          "cmd": "nfs-mount/cthon04/run.sh",
+          "args": ["--variant", "{variant}"],
+          "root": true
+        },
+        {
+          "name": "teardown",
+          "cmd": "posix/teardown-posix.sh",
+          "args": [],
+          "root": true,
+          "always": true
+        }
+      ]
+    },
+    "nfstest": {
+      "description": "NetApp nfstest modules over named NFS mount option sets",
+      "host_adapter": true,
+      "protocol": "NFS",
+      "profiles": ["memory"],
+      "variant": {
+        "name": "mount-options",
+        "values": ["default", "v3", "v4.0", "v4.1", "v4.1-noac", "v4.1-smallio"]
+      },
+      "known_failures": {
+        "default": ["nfs-mount/nfstest/KNOWN_FAILURES.md", "nfs-mount/nfstest/KNOWN_FAILURES_V4.md"],
+        "v3": ["nfs-mount/nfstest/KNOWN_FAILURES.md", "nfs-mount/nfstest/KNOWN_FAILURES_V3.md"],
+        "v4.0": ["nfs-mount/nfstest/KNOWN_FAILURES.md", "nfs-mount/nfstest/KNOWN_FAILURES_V4.md", "nfs-mount/nfstest/KNOWN_FAILURES_V40.md"],
+        "v4.1": ["nfs-mount/nfstest/KNOWN_FAILURES.md", "nfs-mount/nfstest/KNOWN_FAILURES_V4.md"],
+        "v4.1-noac": ["nfs-mount/nfstest/KNOWN_FAILURES.md", "nfs-mount/nfstest/KNOWN_FAILURES_V4.md"],
+        "v4.1-smallio": ["nfs-mount/nfstest/KNOWN_FAILURES.md", "nfs-mount/nfstest/KNOWN_FAILURES_V4.md"]
+      },
+      "tiers": { "pull_request": [], "push": [] },
+      "timeout_minutes": 60,
+      "steps": [
+        {
+          "name": "setup",
+          "cmd": "posix/setup-posix.sh",
+          "args": ["{profile}", "--no-mount"],
+          "root": true
+        },
+        {
+          "name": "run",
+          "cmd": "nfs-mount/nfstest/run.sh",
+          "args": ["--variant", "{variant}"],
+          "root": true
+        },
+        {
+          "name": "teardown",
+          "cmd": "posix/teardown-posix.sh",
+          "args": [],
+          "root": true,
+          "always": true
         }
       ]
     }

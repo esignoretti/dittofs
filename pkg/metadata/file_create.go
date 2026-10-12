@@ -149,6 +149,12 @@ func (s *Service) CreateHardLink(ctx *AuthContext, dirHandle FileHandle, name st
 	// captured inside the transaction below (H9).
 	wcc := &DirWcc{}
 
+	guard, err := s.lockNamespace(namespaceAccess{handle: dirHandle})
+	if err != nil {
+		return nil, err
+	}
+	defer guard.unlock()
+
 	// Serialize concurrent links onto this exact (dir, name) so the
 	// in-transaction existence recheck stays atomic on a store that does not
 	// abort read-write conflicts, matching the create path. Released once the
@@ -163,9 +169,11 @@ func (s *Service) CreateHardLink(ctx *AuthContext, dirHandle FileHandle, name st
 	err = withRelaxedTransaction(store, ctx.Context, func(tx Transaction) error {
 		// Re-read the directory inside the transaction so the pre-op snapshot and
 		// the timestamp mutation derive from the same committed state.
-		if txDir, dErr := tx.GetFile(ctx.Context, dirHandle); dErr == nil && txDir != nil {
-			dir = txDir
+		txDir, dErr := transactionDirectory(ctx.Context, tx, dirHandle)
+		if dErr != nil {
+			return dErr
 		}
+		dir = txDir
 		wcc.Before = CopyFileAttr(&dir.FileAttr)
 
 		// Re-check existence inside the transaction to close the TOCTOU race
@@ -177,18 +185,12 @@ func (s *Service) CreateHardLink(ctx *AuthContext, dirHandle FileHandle, name st
 				Message: "file already exists",
 				Path:    name,
 			}
+		} else if !IsNotFoundError(innerErr) {
+			return innerErr
 		}
 
-		// Increment target's link count BEFORE inserting the directory entry.
-		// Both statements lock the target inode — the entry through the
-		// parent_child_map foreign key, which takes FOR KEY SHARE, and the
-		// count through a plain UPDATE, which takes FOR UPDATE. Taking the
-		// weaker lock first and upgrading leaves a remove that takes the
-		// stronger one directly to deadlock against this, which postgres
-		// resolves only after a full deadlock_timeout. Same order as RemoveFile
-		// means neither waits on the other's escalation. Move still takes them
-		// the other way round, so a link racing a rename of one inode is not
-		// covered by this.
+		// Increment target's link count BEFORE inserting the directory entry,
+		// the same order RemoveFile uses.
 		//
 		// A failed read must abort: writing an nlink below the number of
 		// directory entries pointing at the file lets a later unlink free
@@ -256,6 +258,7 @@ func (s *Service) CreateHardLink(ctx *AuthContext, dirHandle FileHandle, name st
 		return nil, err
 	}
 
+	guard.unlock()
 	s.notifyDirChange(shareNameForHandle(dirHandle), dirHandle, lock.DirChangeAddEntry, ctx)
 	return wcc, nil
 }
@@ -446,9 +449,9 @@ func (s *Service) createEntry(
 	}
 
 	// The exact-attrs marker is a create-path instruction, not file state: it is
-	// cleared before the File is stored so a backend that persists the whole
-	// FileAttr (the memory store) does not hand it back through GetFile and let a
-	// later caller take the exact-create path by accident.
+	// cleared before the File is stored so no stored copy of the FileAttr can
+	// hand it back through GetFile and let a later caller take the exact-create
+	// path by accident.
 	newAttr.ExactAttrs = false
 
 	// Set device numbers for block/char devices
@@ -499,26 +502,20 @@ func (s *Service) createEntry(
 		newFile.ACL = inherited
 	}
 
-	// wcc brackets the parent directory attributes around the mutation. Per
-	// #1573 the child-creating transaction no longer touches the parent inode,
-	// so WCC.Before is captured here (before the transaction) and WCC.After is
-	// synthesized after commit rather than both being read inside the txn.
+	// Read the parent again inside the transaction, after pinning its lifetime.
+	// The cached preflight read may predate its removal.
 	wcc := &DirWcc{}
-
-	// Overlay any coalesced (not-yet-persisted) parent-directory timestamps onto
-	// the pre-op snapshot so WCC.Before reflects what readers currently observe
-	// (#1573). Captured before the transaction: the create no longer reads or
-	// writes the parent inode, so there is nothing to re-snapshot inside it.
-	s.mergeDirTimes(parentHandle, &parent.FileAttr)
-	wcc.Before = CopyFileAttr(&parent.FileAttr)
 	now := time.Now()
 
-	// Execute the child-creating writes in a single transaction. Crucially this
-	// transaction does NOT read or write the parent inode: the parent mtime bump
-	// used to make every concurrent same-dir create read+write one shared key,
-	// which BadgerDB SSI aborts as a conflict, serializing them on retry-backoff
-	// (#1573). Touching only the new child's disjoint keys lets group-commit
-	// batch concurrent creates; the parent timestamp is coalesced below.
+	guard, err := s.lockNamespace(namespaceAccess{handle: parentHandle})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer guard.unlock()
+
+	// The transaction reads the parent to reject a removed directory, but never
+	// writes its inode. The timestamp bump remains coalesced after commit so
+	// concurrent creates write only disjoint child keys.
 	//
 	// Relaxed durability (#1573 Wall 1): these are pure-namespace child keys, not
 	// paired with block data, so the commit may become durable with bounded lag.
@@ -542,6 +539,14 @@ func (s *Service) createEntry(
 		defer s.lockParentLink(parentHandle)()
 	}
 	err = withRelaxedTransaction(store, ctx.Context, func(tx Transaction) error {
+		txParent, pErr := transactionDirectory(ctx.Context, tx, parentHandle)
+		if pErr != nil {
+			return pErr
+		}
+		parent = txParent
+		s.mergeDirTimes(parentHandle, &parent.FileAttr)
+		wcc.Before = CopyFileAttr(&parent.FileAttr)
+
 		// TOCTOU guard: re-check inside transaction.
 		if _, innerErr := tx.GetChild(ctx.Context, parentHandle, name); innerErr == nil {
 			return &StoreError{
@@ -549,6 +554,8 @@ func (s *Service) createEntry(
 				Message: "file already exists",
 				Path:    name,
 			}
+		} else if !IsNotFoundError(innerErr) {
+			return innerErr
 		}
 
 		// The inode ID was minted for this create and the guard above found no

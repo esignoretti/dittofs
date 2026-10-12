@@ -7,7 +7,7 @@ import (
 
 	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/block/journal/journaltest"
-	metastore "github.com/marmos91/dittofs/pkg/metadata/store/memory"
+	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
 )
 
 // TestColdRead_DemandFetchIsConcurrent pins the cold-read fix: a single read
@@ -27,7 +27,7 @@ func TestColdRead_DemandFetchIsConcurrent(t *testing.T) {
 	loc := journaltest.New(t)
 	rs := newLatencyRemote(20 * time.Millisecond) // injected per-GET WAN latency
 	fbs := newStubFileChunkStore()
-	mds := metastore.NewMemoryMetadataStoreWithDefaults()
+	mds := badgertest.NewInMemory(t)
 
 	// Seed nBlocks remote-only chunks, one per block stride, so a single read
 	// over [0, nBlocks*block.BlockSize) must fetch every one from the remote. Each

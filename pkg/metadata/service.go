@@ -67,14 +67,19 @@ type Service struct {
 
 	// createNameShards serializes concurrent creation of the same (parent, name)
 	// entry. The in-transaction existence recheck in the create path is only
-	// atomic on a store that aborts read-write conflicts (BadgerDB SSI). Snapshot
-	// isolation does not supply it — PostgreSQL at REPEATABLE READ lets two
-	// racers both read the name as absent, because neither read conflicts with
-	// the other's insert — so the SetChild upsert re-links the last writer and
-	// orphans the loser's inode, surfacing as several successful exclusive
-	// creates of one name. This bank closes that window uniformly. See
+	// atomic while the store aborts read-write conflicts (BadgerDB SSI). Without
+	// that — Badger's options are passed through verbatim, so conflict detection
+	// can be switched off — two racers both read the name as absent, the
+	// SetChild upsert re-links the last writer and orphans the loser's inode,
+	// surfacing as several successful exclusive creates of one name. This bank
+	// closes that window without relying on the store's isolation. See
 	// lockCreateName.
 	createNameShards [parentLinkShardCount]sync.Mutex
+
+	// namespaceShards pin directory lifetimes across child mutations. Shared
+	// admission keeps distinct creates concurrent; deletion and directory moves
+	// exclude them until their namespace and cache updates are complete.
+	namespaceShards [parentLinkShardCount]sync.RWMutex
 
 	cookies *CookieManager // NFS/SMB cookie to store token translation
 
@@ -549,10 +554,11 @@ func (s *Service) recordDirTimes(ctx context.Context, dirHandle FileHandle, t ti
 }
 
 // flushDirTimes durably persists a directory's coalesced timestamps in a
-// dedicated transaction, serialized per-directory. Because create/remove no
-// longer touch the parent inode, this write never conflicts with concurrent
-// same-dir mutations. Best-effort: a failure (e.g. the directory was removed)
-// leaves the bump to be retried or dropped, never failing the caller.
+// dedicated transaction, serialized per-directory. Namespace mutations read
+// the parent inode, so a flush can conflict with those reads. Directory
+// operations retain their parent counter guards through this write to exclude
+// the next serialized mutation. Best-effort: a failure leaves the bump to be
+// retried or dropped, never failing the caller.
 func (s *Service) flushDirTimes(ctx context.Context, dirHandle FileHandle) {
 	lock := s.dirTimes.FlushLock(dirHandle)
 	lock.Lock()

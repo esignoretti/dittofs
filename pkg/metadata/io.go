@@ -324,32 +324,6 @@ func (s *Service) immediateCommitWrite(ctx *AuthContext, intent *WriteOperation)
 
 	var resultFile *File
 	err = store.WithTransaction(ctx.Context, func(tx Transaction) error {
-		// Fast path: a single narrow UPDATE (grow size, stamp times, clear suid)
-		// instead of GetFile (aggregate block-refs read) + UpdateAttrs (full-row
-		// rewrite), for backends that implement it. Post-op attrs are synthesized
-		// from the pre-write attrs plus the authoritative final size — the same
-		// no-read-back trick the deferred-commit path uses.
-		if applier, ok := tx.(DataWriteApplier); ok {
-			finalSize, err := applier.ApplyDataWrite(ctx.Context, intent.Handle, intent.NewSize, now, clearSUID)
-			if err != nil {
-				return err
-			}
-			attr := *intent.PreWriteAttr
-			attr.Size = finalSize
-			attr.Mtime = now
-			attr.Ctime = now
-			if clearSUID {
-				attr.Mode &= ^uint32(0o6000)
-			}
-			shareName, id, decErr := DecodeFileHandle(intent.Handle)
-			if decErr != nil {
-				return decErr
-			}
-			resultFile = &File{ID: id, ShareName: shareName, FileAttr: attr}
-			return nil
-		}
-
-		// Fallback: full read-modify-write for backends without a narrow path.
 		file, err := tx.GetFile(ctx.Context, intent.Handle)
 		if err != nil {
 			return err
@@ -401,10 +375,14 @@ func (s *Service) FlushPendingWriteForFile(ctx *AuthContext, handle FileHandle, 
 	// ACK'd data because reconcileMetadataSizeFromJournal grows metadata.Size up
 	// to the journal's durable high-water mark on share start. Only the
 	// FlushPendingWriteForFile entrypoint is downgraded; the shutdown flush calls
-	// flushPendingWrite directly with durable=true and stays durable.
+	// flushPendingWriteForFile directly with durable=true and stays durable.
 	if durable && s.shareWriteback(shareNameForHandle(handle)) {
 		durable = false
 	}
+	return s.flushPendingWriteForFile(ctx, handle, durable)
+}
+
+func (s *Service) flushPendingWriteForFile(ctx *AuthContext, handle FileHandle, durable bool) (bool, error) {
 	// Serialize flushes per file to avoid BadgerDB conflict retries
 	mu := s.pendingWrites.GetFlushLock(handle)
 	mu.Lock()
@@ -491,16 +469,6 @@ func (s *Service) flushPendingWrite(ctx *AuthContext, handle FileHandle, state *
 	}
 
 	commit := func(tx Transaction) error {
-		// The narrow applier performs exactly this update — grow-only size,
-		// stamped mtime/ctime, optional setuid/setgid clear — in a single
-		// statement. It always stamps the timestamps, so a state carrying no
-		// recorded mtime (SetCachedFile with a size but no write time) still
-		// takes the read-modify-write path below rather than stamping zero.
-		if applier, ok := tx.(DataWriteApplier); ok && !state.LastMtime.IsZero() {
-			_, err := applier.ApplyDataWrite(ctx.Context, handle, size, state.LastMtime, state.ClearSetuidSetgid)
-			return err
-		}
-
 		file, err := tx.GetFile(ctx.Context, handle)
 		if err != nil {
 			return err
@@ -573,8 +541,8 @@ func (s *Service) UpdatePendingMtime(handle FileHandle, mtime time.Time) bool {
 // are persisted before closing stores. Flushes are durable (inline fsync): a clean
 // shutdown must leave every pending size/mtime on stable storage.
 func (s *Service) FlushAllPendingWritesForShutdown(timeout time.Duration) (int, error) {
-	entries := s.pendingWrites.PopAllPending()
-	if len(entries) == 0 {
+	handles := s.pendingWrites.PendingHandles()
+	if len(handles) == 0 {
 		return 0, nil
 	}
 
@@ -590,11 +558,11 @@ func (s *Service) FlushAllPendingWritesForShutdown(timeout time.Duration) (int, 
 	flushed := 0
 	var lastErr error
 
-	for _, entry := range entries {
-		if err := s.flushPendingWrite(authCtx, entry.Handle, entry.State, true); err != nil {
+	for _, handle := range handles {
+		didFlush, err := s.flushPendingWriteForFile(authCtx, handle, true)
+		if err != nil {
 			lastErr = err
-			// Continue flushing other files
-		} else {
+		} else if didFlush {
 			flushed++
 		}
 	}
@@ -610,6 +578,16 @@ func (s *Service) PrewarmWriteCache(handle FileHandle, file *File) {
 		return
 	}
 	s.pendingWrites.SetCachedFile(handle, file)
+}
+
+// InvalidateWriteCache makes the next write fetch attributes after an external
+// manifest replacement. Pending write state is retained; callers reconcile it
+// before replacement and exclude new writes until invalidation completes.
+func (s *Service) InvalidateWriteCache(handle FileHandle) {
+	mu := s.pendingWrites.GetFlushLock(handle)
+	mu.Lock()
+	defer mu.Unlock()
+	s.pendingWrites.InvalidateCache(handle)
 }
 
 // PrepareRead validates a read operation and returns file metadata.

@@ -11,7 +11,8 @@ import (
 	"github.com/marmos91/dittofs/pkg/block/journal/journaltest"
 	remotememory "github.com/marmos91/dittofs/pkg/block/remote/memory"
 	"github.com/marmos91/dittofs/pkg/metadata"
-	metadatamemory "github.com/marmos91/dittofs/pkg/metadata/store/memory"
+
+	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
 )
 
 // TestNonClosingRemote_DelegatesDurable is the regression guard for #1274:
@@ -58,7 +59,7 @@ func TestNonClosingRemote_DelegatesDurable(t *testing.T) {
 // RemoteDurable() is TRUE and CommitBlockStore returns nil (not ErrNotDurableYet)
 // for a Finalized write.
 func TestNonClosingRemote_EngineRemoteDurableAndCommit(t *testing.T) {
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	localStore := journaltest.New(t) // volatile local — durability must come from the remote
 	localStore.SetDurable(false)     // the journal substrate is durable by default; flip it so this test keeps proving the remote's report carries the commit
 	durableRemote := remotememory.New()

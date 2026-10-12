@@ -10,7 +10,7 @@ import (
 	"github.com/marmos91/dittofs/pkg/block/engine"
 	"github.com/marmos91/dittofs/pkg/block/journal"
 	"github.com/marmos91/dittofs/pkg/block/journal/journaltest"
-	metamem "github.com/marmos91/dittofs/pkg/metadata/store/memory"
+	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
 )
 
 // gatedLocal holds a block store's close open until release is closed, and
@@ -36,7 +36,7 @@ func (g *gatedLocal) Close() error {
 func newGatedShares(t *testing.T, n int) (*Service, []*gatedLocal) {
 	t.Helper()
 
-	mds := metamem.NewMemoryMetadataStoreWithDefaults()
+	mds := badgertest.NewInMemory(t)
 	t.Cleanup(func() { _ = mds.Close() })
 
 	svc := New()

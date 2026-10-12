@@ -222,8 +222,7 @@ func (s *Service) ReadSymlink(ctx *AuthContext, handle FileHandle) (string, *Fil
 // overwritten by a value newer than its own, or wins it and is left alone.
 // Comparing outside the transaction would only move the window rather than
 // narrow it. What makes this safe is the store's isolation, not the shape of
-// this function — and every backend now provides it, postgres because its
-// transactions run at REPEATABLE READ.
+// this function — Badger's SSI transactions provide it.
 //
 // On the losing path nothing is written at all. On the winning path the row
 // read in this transaction is written back with nothing but ChangeTime changed,
@@ -900,22 +899,6 @@ func (s *Service) SetFileAttributes(ctx *AuthContext, handle FileHandle, attrs *
 		// recreated carrying the stale state, which is a worse outcome than
 		// refusing the attribute change.
 		writeRow := func(tx Transaction) error {
-			// Before the read, so the fold below runs against the committed map
-			// on a backend that refuses the second writer only once its update
-			// is reached — the same reason xattr.go's own EA path takes it.
-			// Scoped to an EA write rather than taken unconditionally: every
-			// other field here is either replaced outright or recomputed from
-			// the row on each attempt, so the store's conflict-and-retry is
-			// what orders those and a lock on every chmod and utimes would buy
-			// nothing.
-			if len(attrs.EAMutations) > 0 {
-				if locker, ok := tx.(FileRowLocker); ok {
-					if err := locker.LockFileRow(ctx.Context, handle); err != nil {
-						return err
-					}
-				}
-			}
-
 			row, err := tx.GetFile(ctx.Context, handle)
 			if err != nil {
 				return err
@@ -1287,7 +1270,10 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 			}
 			// Check if destination directory is empty
 			entries, _, err := store.ListChildren(ctx.Context, dstHandle, "", 1, NamesOnly)
-			if err == nil && len(entries) > 0 {
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(entries) > 0 {
 				return nil, nil, &StoreError{
 					Code:    ErrNotEmpty,
 					Message: "destination directory not empty",
@@ -1339,6 +1325,22 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 		return nil, nil, err
 	}
 
+	// Recycling above calls namespace operations recursively, so acquire only
+	// after it finishes. A moved directory is exclusive too: its old name must
+	// stay bound while a concurrent rmdir validates the selected victim.
+	accesses := []namespaceAccess{{handle: fromDir}, {handle: toDir}}
+	if srcFile.Type == FileTypeDirectory {
+		accesses = append(accesses, namespaceAccess{handle: srcHandle, exclusive: true})
+	}
+	if dstFile != nil && dstFile.Type == FileTypeDirectory {
+		accesses = append(accesses, namespaceAccess{handle: dstHandle, exclusive: true})
+	}
+	guard, err := s.lockNamespace(accesses...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer guard.unlock()
+
 	// rename carries the source/destination directory pre/post attributes for
 	// WCC, captured inside the transaction below (H9). For an intra-directory
 	// move FromDir and ToDir reference the same DirWcc.
@@ -1355,10 +1357,16 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 	// same shared counter keys mkdir/rmdir bump, so without serialization a rename
 	// re-introduces the BadgerDB SSI conflict #1571 fixes — racing a concurrent
 	// mkdir/rmdir/rename on either parent. Serialize both parents for the whole
-	// transaction. File moves never touch parent nlink and stay lock-free.
+	// transaction. File moves never touch parent nlink and need no counter lock.
+	var unlockParents func()
 	if srcFile.Type == FileTypeDirectory && !sameDir {
-		defer s.lockParentLinks(fromDir, toDir)()
+		unlockParents = s.lockParentLinks(fromDir, toDir)
 	}
+	defer func() {
+		if unlockParents != nil {
+			unlockParents()
+		}
+	}()
 
 	// Execute all write operations in a single transaction for better performance.
 	// Relaxed durability (#1573 Wall 1): rename rewrites only directory entries
@@ -1371,8 +1379,8 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 	var clobberedNlink uint32
 	txErr := withRelaxedTransaction(store, ctx.Context, func(tx Transaction) error {
 		// The GetChild lookups above ran outside this transaction and are
-		// advisory only: no lock covers a file rename, so a concurrent rename
-		// or unlink can retarget either name in the gap. Re-resolve both
+		// advisory only: lifecycle guards permit concurrent child mutations,
+		// so a rename or unlink can retarget either name in the gap. Re-resolve both
 		// namespace edges here and abort when they no longer match, so two
 		// renames onto the same destination cannot both commit and orphan an
 		// inode. Reading the child keys through the transaction also enters
@@ -1415,18 +1423,22 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 		// Re-read the source/destination directories inside the transaction so
 		// the pre-op snapshots and the timestamp mutations derive from the same
 		// committed state (After then monotonic w.r.t. Before).
-		if txSrc, sErr := tx.GetFile(ctx.Context, fromDir); sErr == nil && txSrc != nil {
-			srcDir = txSrc
+		txSrc, sErr := transactionDirectory(ctx.Context, tx, fromDir)
+		if sErr != nil {
+			return sErr
 		}
+		srcDir = txSrc
 		// Overlay any pending coalesced bump so Before reflects the same mtime a
 		// concurrent GETATTR would see (the tx read only sees durable state), so
 		// WCC stays continuous across rapid same-dir mutations (#1573).
 		s.mergeDirTimes(fromDir, &srcDir.FileAttr)
 		rename.FromDir.Before = CopyFileAttr(&srcDir.FileAttr)
 		if !sameDir {
-			if txDst, dErr := tx.GetFile(ctx.Context, toDir); dErr == nil && txDst != nil {
-				dstDir = txDst
+			txDst, dErr := transactionDirectory(ctx.Context, tx, toDir)
+			if dErr != nil {
+				return dErr
 			}
+			dstDir = txDst
 			s.mergeDirTimes(toDir, &dstDir.FileAttr)
 			rename.ToDir.Before = CopyFileAttr(&dstDir.FileAttr)
 		}
@@ -1435,6 +1447,12 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 		if dstFile != nil {
 			// Remove destination
 			if dstFile.Type == FileTypeDirectory {
+				if _, err := transactionDirectory(ctx.Context, tx, dstHandle); err != nil {
+					return err
+				}
+				if err := requireEmptyDirectory(ctx.Context, tx, dstHandle, toName); err != nil {
+					return err
+				}
 				if err := tx.DeleteFile(ctx.Context, dstHandle); err != nil {
 					return err
 				}
@@ -1543,8 +1561,8 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 
 		// Bump ctime on the renamed inode. The namespace edge has already been
 		// relinked above (DeleteChild/SetChild/SetParent); File.Path is no
-		// longer stored — every backend derives it on read from the
-		// parent_child_map / parent edges (#1166), so a rename just moves the
+		// longer stored — the store derives it on read from the parent
+		// edges (#1166), so a rename just moves the
 		// edge and the new path is reconstructed fresh on the next GetFile.
 		// This is what makes hard links correct: renaming one name can never
 		// stale another name's path. UpdateAttrs is tx-critical: a failed ctime
@@ -1557,19 +1575,19 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 		// Before, because srcFile was read outside this transaction: anything
 		// that advanced the inode's ChangeTime since then is already committed,
 		// and restoring the outside-tx value would erase it. After, because the
-		// SQL backends store timestamps as FILETIME ticks and truncate; an
-		// in-memory time.Time would not compare equal to what was written, so a
-		// conditional restore keyed on it would silently never fire.
+		// stored timestamp is an encoded round-trip (no monotonic reading, no
+		// location); an in-memory time.Time need not compare equal to what was
+		// written, so a conditional restore keyed on it could silently never
+		// fire.
 		//
 		// Neither read may be discarded on error: a failed "before" with a
 		// successful "after" leaves a zero SourcePreCtime that still matches,
 		// and the restore would then write a zero ChangeTime.
 		//
-		// The "before" read covers the window only on backends whose
-		// transaction serialises it against concurrent writers, which is all of
-		// them: postgres runs this transaction at REPEATABLE READ, so a write
-		// that commits between this read and the row lock the update takes
-		// aborts the update rather than being erased by it.
+		// The "before" read covers the window because the transaction
+		// serialises it against concurrent writers: under Badger's SSI a write
+		// that commits between this read and the update aborts the update
+		// rather than being erased by it.
 		pre, err := tx.GetFile(ctx.Context, srcHandle)
 		if err != nil {
 			return err
@@ -1592,7 +1610,6 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 
 		return nil
 	})
-
 	if txErr != nil {
 		return nil, nil, txErr
 	}
@@ -1627,6 +1644,17 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 		dstDir.Ctime = now
 		rename.ToDir.After = CopyFileAttr(&dstDir.FileAttr)
 	}
+	if dstFile != nil && dstFile.Type == FileTypeDirectory {
+		s.dirTimes.Clear(dstHandle)
+	}
+	// Coalesced timestamp persistence still writes the parents after the
+	// namespace commit. Keep directory counter exclusion across that flush;
+	// otherwise the next rename can conflict with this operation's final write.
+	if unlockParents != nil {
+		unlockParents()
+		unlockParents = nil
+	}
+	guard.unlock()
 
 	// Notify directory change after successful move
 	s.notifyDirChange(shareNameForHandle(fromDir), fromDir, lock.DirChangeRenameEntry, ctx)
@@ -1651,18 +1679,13 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 // re-resolution above cannot see it, because it compares only the two edges
 // this rename names.
 //
-// decision: three of the four backends cannot serve the walk a stale answer at
-// all — memory holds a store-wide mutex for the whole closure, sqlite admits one
-// transaction at a time, and badger alone actually detects the conflict, by SSI
-// over the keys the walk read. Postgres runs at REPEATABLE READ, which is
-// snapshot isolation: two renames writing disjoint parent edges are not a
-// write-write conflict, so there the walk can be stale. Composing a cycle needs
-// two cross-parent directory renames racing whose four parent handles all miss
-// each other's lockParentLinks shards; a single rename, which is all one client
-// can drive, is refused on every backend. Lock the walked rows (SELECT ... FOR
-// SHARE) or run rename at SERIALIZABLE if a cycle is ever observed on postgres.
-// Badger's guarantee is the operator's to keep: its options are passed through
-// verbatim, so disabling conflict detection voids it silently.
+// decision: the guarantee rests on Badger detecting the conflict by SSI over the
+// keys the walk read. It is the operator's to keep: Badger's options are passed
+// through verbatim, so disabling conflict detection voids it silently, and the
+// walk can then be stale. Composing a cycle then needs two cross-parent
+// directory renames racing whose four parent handles all miss each other's
+// lockParentLinks shards; a single rename, which is all one client can drive,
+// is refused regardless.
 func refuseDirectoryLoop(ctx context.Context, tx Transaction, srcHandle, dstDir FileHandle) error {
 	_, srcID, err := DecodeFileHandle(srcHandle)
 	if err != nil {

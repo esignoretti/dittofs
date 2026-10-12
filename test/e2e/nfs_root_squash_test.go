@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +44,7 @@ func TestNFSRootSquash(t *testing.T) {
 	blockStoreName := helpers.UniqueTestName("block")
 	shareName := "/export"
 
-	_, err := runner.CreateMetadataStore(metaStoreName, "memory")
+	_, err := runner.CreateInMemoryMetadataStore(metaStoreName)
 	require.NoError(t, err, "Should create metadata store")
 	t.Cleanup(func() { _ = runner.DeleteMetadataStore(metaStoreName) })
 
@@ -131,17 +130,4 @@ func TestNFSRootSquash(t *testing.T) {
 		err := framework.WriteFileAsUID(t, unknownUID, unknownGID, mountV4.FilePath("stranger4.txt"), []byte("nope"))
 		requireAccessDenied(t, err, "unknown-uid write over NFSv4")
 	})
-}
-
-// requireAccessDenied asserts that err is a permission-denied (EACCES) failure
-// and specifically NOT the EIO regression (#1449) where export-gate denials on
-// NFSv3 surfaced as "input/output error".
-func requireAccessDenied(t *testing.T, err error, what string) {
-	t.Helper()
-	require.Error(t, err, "%s should be denied", what)
-	msg := strings.ToLower(err.Error())
-	assert.Contains(t, msg, "permission denied",
-		"%s should fail with EACCES, got: %v", what, err)
-	assert.NotContains(t, msg, "input/output error",
-		"%s must not surface EIO for a permission denial (#1449), got: %v", what, err)
 }

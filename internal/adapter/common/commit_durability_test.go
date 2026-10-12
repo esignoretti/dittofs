@@ -10,7 +10,8 @@ import (
 	"github.com/marmos91/dittofs/pkg/block/journal/journaltest"
 	remotememory "github.com/marmos91/dittofs/pkg/block/remote/memory"
 	"github.com/marmos91/dittofs/pkg/metadata"
-	metadatamemory "github.com/marmos91/dittofs/pkg/metadata/store/memory"
+
+	"github.com/marmos91/dittofs/pkg/metadata/store/badger/badgertest"
 )
 
 // newMemoryEngine builds an engine with a volatile local store and the given
@@ -21,7 +22,7 @@ import (
 // syncer's mirror loop can run and report Finalized=true after a write+flush.
 func newMemoryEngine(t *testing.T, remote *remotememory.Store, durableLocalOverride *bool) *engine.Store {
 	t.Helper()
-	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
+	ms := badgertest.NewInMemory(t)
 	localStore := journaltest.New(t)
 	durable := false
 	if durableLocalOverride != nil {
