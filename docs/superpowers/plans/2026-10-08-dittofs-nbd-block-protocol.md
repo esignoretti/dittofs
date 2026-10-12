@@ -2579,6 +2579,14 @@ Two harness requirements the spec calls non-negotiable, both of which the script
 
 `-timeout` and `-persist` are **not** this mechanism — `-timeout` sets `NBD_SET_TIMEOUT` (per-request) and `-persist` is `nbd-client`'s own reconnect loop. The script must configure `dead_conn_timeout` explicitly and say so, because conflating the three is a documented real-world failure.
 
+**How to configure it, exactly, and the trap in the obvious spelling.**
+
+- The flag is `-T <seconds>` / `--dead-timeout <seconds>` (`args.c:76`, handled at `:199`). It is **not documented in `nbd-client`'s man page** — `grep -i dead man/nbd-client.8.sgml.in` finds only "deadlock" — so a reader will not discover it from `man nbd-client`. Name the flag in the script's comment and in the README so the harness is self-explanatory.
+- It reaches the kernel **only through netlink**, as `NBD_ATTR_DEAD_CONN_TIMEOUT` (`nbd-client.c:185-186`). On the ioctl path the option is parsed, stored, and then **never read**: the only other references to `dead_conn_timeout` in `nbd-client.c` are inside the netlink send. With `-nonetlink`/`-L`, or on a kernel built without netlink support, the script would print a configured window that the kernel never received — the same class of silent failure the whole design exists to eliminate, one layer down.
+- **The script must therefore assert the mechanism took effect, not just that it passed the flag.** `-nonetlink`/`-L` is not to be used, and the script must fail if netlink is unavailable rather than falling back. This is checkable before the crash test even starts: `nbd-client` refuses at `nbd-client.c:394 check_conn` when the netlink family will not resolve.
+- **`-persist` alone already gives 30 seconds** (`nbd-client.c:188`: `else if (cur_client->persist) NLA_PUT_U64(msg, NBD_ATTR_DEAD_CONN_TIMEOUT, 30); /* Default 30 seconds for persist mode */`). So the default is already inside the hung-task window. The script should still set `-T` explicitly and print the value, because a default that happens to be safe is not a configured one — but it must not *depend* on `-persist` being what supplied the window.
+- The kernel side landed in 2017 (`560bc4b39952ed77cdb0000992e9415b0ee89edb`, "nbd: handle dead connections"), so any kernel in support today has it; the requirement to check is `nbd-client`'s netlink support, not the kernel's.
+
 - [ ] **Step 3: Extend `test/nbd/README.md`**
 
 Add the boot and crash sections: prerequisites, the exact `dead_conn_timeout` value used, how to read the verdict, and the honest statement that these require a Linux host with root and cannot run in CI on macOS.
@@ -2641,6 +2649,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`, and the script passes `--discard=unmap` (without it the discard step diverges on the oracle's configuration, not on the codec).
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
+- [ ] Task 8 — the crash rig sets `dead_conn_timeout` with `-T`/`--dead-timeout` and fails when netlink is unavailable, rather than silently running the ioctl path where the option is parsed and ignored.
 - [ ] Task 8 — `mkfs.ext4` + mount + write + `sync` + unmount + remount in a KVM guest.
 - [ ] Task 8 — SIGKILL mid-write → restart → guest I/O resumes inside the dead-connection window; host-side `fsck` clean.
 - [ ] The volume is readable as a plain file over NFS (the B1 property, spec §2.2).
