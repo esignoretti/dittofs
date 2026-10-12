@@ -64,7 +64,7 @@ Implement a custom block store when you need:
 **Reference implementation**: `pkg/block/remote/s3/` (S3-backed block store)
 
 There is no "local store use case" row any more. The journal is the only local
-tier and it is not pluggable by configuration; `pkg/block/journal` remains as an
+tier and it is not pluggable by configuration; `journal.LocalStore` remains an
 internal interface with exactly one implementation (`*journal.Store`; tests open
 it through `journal/journaltest`).
 

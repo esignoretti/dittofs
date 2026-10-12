@@ -20,6 +20,7 @@ import (
 	"context"
 	"math/rand"
 	"testing"
+	"time"
 
 	"lukechampine.com/blake3"
 
@@ -240,7 +241,7 @@ func BenchmarkPerfGate_Phase12RandReadRegression(b *testing.B) {
 	// Per-machine microbench floor. The in-tree fixture is journal-backed
 	// (page-cached preads) + stub-fbs so absolute numbers depend on CPU +
 	// memory bandwidth + Go scheduler. On Apple M1 Max the bench lands
-	// ~150 K ops/s; on Linux amd64 CI it's a different absolute. The floor
+	// ~670 K ops/s; on Linux amd64 CI it's a different absolute. The floor
 	// below is the conservative cross-platform anchor — re-baseline per
 	// BENCHMARKS.md after a confirmed regression-free run on a new
 	// machine class.
@@ -250,7 +251,11 @@ func BenchmarkPerfGate_Phase12RandReadRegression(b *testing.B) {
 	floor := microbenchFloorIOPS * (1.0 - tolerance)
 	b.Logf("rand-read: %.0f ops/sec (microbench floor %.0f, tolerance %.0f%%, allowed >= %.0f)",
 		opsPerSec, microbenchFloorIOPS, tolerance*100, floor)
-	if opsPerSec < floor {
+	// decision: only a round that ran for at least a second is gated. The
+	// first b.N rounds time a handful of reads, so their rate is dominated by
+	// warm-up and lands near the floor on a fast machine. A -benchtime below
+	// one second therefore disables the gate.
+	if b.Elapsed() >= time.Second && opsPerSec < floor {
 		b.Fatalf("rand-read perf gate FAILED: %.0f IOPS, floor %.0f (microbench baseline %.0f, tolerance %.0f%%). "+
 			"Likely culprits: range-resolution linearisation, Cache.OnRead lock contention, "+
 			"loadByHash regression. Profile with: go test -bench BenchmarkPerfGate_Phase12 "+
@@ -264,9 +269,8 @@ func BenchmarkPerfGate_Phase12RandReadRegression(b *testing.B) {
 // BENCHMARKS.md when re-baselining.
 //
 // Conservative cross-platform anchor: 50 K ops/s. On the M1 Max the
-// actual measurement was ~150 K ops/s (journal local store + 4 KiB
-// reads + binary search + OnRead). On Linux amd64 CI we expect similar
-// in-memory throughput; if a CI runner is materially slower the floor
+// steady-state measurement is ~670 K ops/s (journal local store + 4 KiB
+// reads + binary search + OnRead). If a CI runner is materially slower the floor
 // must be re-anchored there rather than tightened against this
 // baseline.
 //
