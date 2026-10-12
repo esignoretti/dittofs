@@ -604,7 +604,39 @@ the outage if the server returns inside the window.
    is `nbd-client`'s own reconnect loop. Conflating them is a real failure mode: a
    reported case with `-persist -timeout 600 -connections 4` still went read-only on
    server restart.
-3. **Restart must re-bind the same port and serve the same export name, size, and bytes.**
+3. **`-persist` is broken on every released `nbd-client`, and the version gate is not
+   optional.** The mechanism above requires `-T`/`--dead-timeout` to reach the kernel
+   through netlink, and only `master` and the **3.27.1** tag can do that. Measured by
+   fetching each tag's `nbd-client.c` and `args.c`:
+
+   | | 3.26.1 | 3.27.1 | master |
+   |---|---|---|---|
+   | `-T`/`--dead-timeout` | **absent** | present (`args.c:76`, `:198`) | present |
+   | `NBD_ATTR_DEAD_CONN_TIMEOUT` sent | **never** | behind a gate nothing opens | yes |
+   | persist over netlink | **no — `-p` ignored** | **no — same bug** | yes |
+
+   **3.26.1** (Debian bookworm `1:3.26.1-6.1`, Ubuntu 24.04 `1:3.26.1-2`) has no `-T` at
+   all, and its netlink path does `netlink_configure(...); return 0;` — it never reaches
+   the ioctl reconnect loop, so `-p` is parsed, stored and silently ignored whenever
+   netlink is available (the default).
+
+   **3.27.1** (Debian trixie/sid `1:3.27.1-4`) gates the persist monitoring loop on
+   `cur_client->persist_mode` (`nbd-client.c:1548`), while the CLI sets
+   `cur_client->persist` (`args.c:186-188`). **Nothing in the tree ever assigns
+   `persist_mode = true`** — verified exhaustively across `nbd-client.c`, `args.c`,
+   `args.h`, `nbdclt.h`, `nbd.h`, `cliserv.h`; the only two writes are `= false`, inside
+   the ioctl path the netlink path returns before reaching. So the loop never starts, the
+   kernel never receives `NBD_CMD_RECONFIGURE`, and a dead connection pauses for
+   `dead_conn_timeout` and then returns `BLK_STS_IOERR` with nothing to reconnect it.
+   Upstream fixed this on `master`; the fix postdates 3.27.1.
+
+   The harness must therefore **refuse `nbd-client` below 3.27.1**, must **not pass `-p`
+   on 3.27.1** (where `-T` is the only lever that works, and the restart must fit inside a
+   single window rather than expecting pause-then-resume), and must **assert the window
+   behaviourally** — SIGKILL the server and confirm guest I/O *blocks* rather than erroring.
+   There is no read-back path to check instead: `dead_conn_timeout` is not exposed through
+   sysfs (`drivers/block/nbd.c` creates only `pid_attr` and `backend_attr`).
+4. **Restart must re-bind the same port and serve the same export name, size, and bytes.**
 
 ---
 
