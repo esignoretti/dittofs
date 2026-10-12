@@ -1,17 +1,17 @@
 //go:build e2e
 
-// Package helpers — error-conformance triggers (ADAPT-05).
+// Package helpers — error-conformance triggers.
 //
 // Each TriggerErr* helper fires one scenario over the given mount root and
 // returns the syscall.Errno that the kernel surfaces from the operation. The
-// e2e conformance test then asserts that errno matches what
-// `internal/adapter/common`'s errmap table says this protocol should return
-// for the corresponding metadata.ErrorCode.
+// e2e conformance test then asserts that errno matches what the per-adapter
+// types.StatusForErr tables say this protocol should return for the
+// corresponding metadata.ErrorCode.
 //
 // Triggers are intentionally minimal: one operation per code, no setup
 // teardown beyond what is needed to reproduce the error. Fixture reuse is the
-// caller's job (TestCrossProtocol_ErrorConformance shares one mount across
-// all subtests per PATTERNS.md's flaky-bootstrap gotcha).
+// caller's job (TestCrossProtocol_ErrorConformance mounts each share once and
+// reuses the mounts across all subtests).
 //
 // Protocol-agnostic by design: the same trigger is called against both the
 // NFS mount root and the SMB mount root; both kernels (Linux nfs client,
@@ -21,8 +21,9 @@
 // mounts".
 //
 // Every trigger takes a second root, peerRoot: a mount of the same share made
-// by another protocol, and so by another identity. Most triggers ignore it;
-// one that needs a file owned by someone else seeds it there.
+// by another protocol, and so by another identity, or "" when the share has
+// none. Most triggers ignore it; one that needs a file owned by someone else
+// seeds it there.
 package helpers
 
 import (
@@ -231,10 +232,12 @@ func TriggerErrReadOnly(t *testing.T, readOnlyMountRoot, _ string) TriggerResult
 }
 
 // TriggerErrAccessDenied creates a file at the root of a share the mounting
-// identity may only read. The share-level permission check refuses it on the
-// server: NFS3ERR_ACCES / STATUS_ACCESS_DENIED → EACCES. The caller runs as
+// identity may only read. The server refuses it — the share grant allows only
+// reads, and the share root's mode bits give that identity no write either —
+// with NFS3ERR_ACCES / STATUS_ACCESS_DENIED → EACCES. The caller runs as
 // root, which passes both kernel clients' local permission checks, so the
-// denial observed is the server's.
+// denial observed is the server's; which of the two server checks fires
+// first is not pinned here.
 func TriggerErrAccessDenied(t *testing.T, readOnlyGrantRoot, _ string) TriggerResult {
 	t.Helper()
 	path := filepath.Join(readOnlyGrantRoot, UniqueTestName("eacces")+".txt")
@@ -252,6 +255,9 @@ func TriggerErrAccessDenied(t *testing.T, readOnlyGrantRoot, _ string) TriggerRe
 // authorized by the open handle instead, so this trigger is NFS-only.
 func TriggerErrPermissionDenied(t *testing.T, mountRoot, peerRoot string) TriggerResult {
 	t.Helper()
+	if peerRoot == "" {
+		t.Fatal("TriggerErrPermissionDenied: needs a peer mount to seed a file owned by another identity")
+	}
 	name := UniqueTestName("eperm") + ".txt"
 	seed := filepath.Join(peerRoot, name)
 	if err := os.WriteFile(seed, []byte("x"), 0644); err != nil {
@@ -269,9 +275,8 @@ func TriggerErrPermissionDenied(t *testing.T, mountRoot, peerRoot string) Trigge
 // second lock is non-blocking; surfaces as STATUS_FILE_LOCK_CONFLICT on SMB /
 // NFS3ERR_JUKEBOX on NFSv3, which translate to the same errno family.
 //
-// Note: NFS locking depends on NLM daemon availability; on macOS the NLM
-// daemon is not available with userspace NFS. The conformance test should
-// invoke framework.SkipIfNFSLockingUnsupported() before this trigger.
+// NFS locking depends on the NLM daemon, which macOS does not provide for a
+// userspace NFS server, so the trigger skips there.
 func TriggerErrLocked(t *testing.T, mountRoot, _ string) TriggerResult {
 	t.Helper()
 	if runtime.GOOS == "darwin" {

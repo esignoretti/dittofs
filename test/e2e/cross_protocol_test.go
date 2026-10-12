@@ -372,15 +372,14 @@ func testDirSMBToNFS(t *testing.T, nfsMount, smbMount *framework.Mount) {
 }
 
 // ============================================================================
-// TestCrossProtocol_ErrorConformance (ADAPT-05 e2e tier).
+// TestCrossProtocol_ErrorConformance.
 // ============================================================================
 //
 // Table-driven verification that the same metadata.ErrorCode produces
 // consistent client-observable errnos on both the NFS and SMB mounts, using
 // the per-adapter types tables as the single source of truth for expected
-// per-protocol codes. Extends the XPR-01..06 pattern: one shared server and
-// one set of mounts, reused across all subtests (PATTERNS.md gotcha:
-// per-subtest mount bootstrap is flaky and compounds CI time).
+// per-protocol codes. One shared server and one set of mounts are reused
+// across all subtests, because mounting per subtest is slow and flaky.
 //
 // The assertion is: types.StatusForErr(storeErr) (nfs/types) AND
 // smb/types.StatusForErr(storeErr) from
@@ -449,7 +448,8 @@ func TestCrossProtocol_ErrorConformance(t *testing.T) {
 			wantNFSErrno := nfs3StatusToErrno(nfs3types.StatusForErr(sentinel))
 			wantSMBErrno := smbStatusToErrno(smbtypes.StatusForErr(sentinel))
 
-			m := fixture.mounts[c.share]
+			m, ok := fixture.mounts[c.share]
+			require.True(t, ok, "fixture has no mounts for share %d", c.share)
 
 			// NFS side.
 			t.Run("nfs", func(t *testing.T) {
