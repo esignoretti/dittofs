@@ -2537,9 +2537,16 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
   `internal/adapter/nbd/oracle_test.go`
 - Modify: `internal/adapter/nbd/handlers_control.go` (+ its tests) for the FLUSH
   metadata gap below. This is the one functional change in Task 7; everything
-  else is test scaffolding. It is here rather than in a new task because the
-  oracle is what makes the durability path observable, and a gap found while
-  building the instrument should be closed with it.
+  else is test scaffolding. It is here rather than in a new task because the gap
+  was found while building the instrument and should be closed with it — **not**
+  because the oracle would have caught it. **It would not have.** Measured: with
+  `commit` mutated back to `CommitBlockStore` (the metadata half dropped), the
+  oracle's differential test still PASSES (`ok ... 1.037s`) while
+  `TestIntegration_FlushPersistsPendingMetadata` fails. `qemu-io flush` prints
+  the same line against both servers whether or not the flush persisted
+  anything, because the oracle compares transcripts, not durability. The
+  regression test is the only thing that covers this, which is why Step 0 must
+  add one.
 - Modify: nothing else. `test/required-tests.json` is deliberately **not** touched:
   `test/required-tests.sh` runs `go test` for every name in the manifest, and
   the Tier A oracle needs a QEMU install, so listing it there would make the
