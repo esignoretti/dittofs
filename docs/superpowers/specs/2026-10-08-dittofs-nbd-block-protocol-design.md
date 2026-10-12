@@ -941,12 +941,18 @@ qemu-system-aarch64 -M virt -accel kvm -cpu host -m 2G \
   -display none -serial stdio
 ```
 
-- **`-accel kvm` is explicit and `-cpu host` depends on it.** Without an accelerator QEMU
+- **The accelerator is `kvm` on Linux and `hvf` on macOS; neither is portable and the
+  script must select one.** Measured on the development host: `qemu-system-aarch64 -accel
+  help` lists `hvf` and `tcg` only, and `-accel kvm` fails with `invalid accelerator kvm`.
+  HVF is a working substitute for the boot path, so the boot half of §9.5 is runnable on
+  an Apple-silicon host; only the crash rig (plan Task 8 Step 2) genuinely needs Linux,
+  because of `nbd-client`'s netlink requirement rather than the accelerator.
+- **`-accel` must be explicit and `-cpu host` depends on it.** Without an accelerator QEMU
   uses TCG, where `-cpu host` is rejected outright — measured: `Invalid CPU model: host`
-  plus the list of valid models. `-accel max` is the portable substitute for `-cpu host`.
-  `-accel kvm,fallback=allow` does **not** silently degrade on a machine without KVM (it
-  reports `invalid accelerator kvm`), so an explicit `-accel kvm` is safe and preferable:
-  a silent fallback to TCG would still boot and still pass, while making every
+  plus the list of valid models. `-cpu max` is the portable substitute. `-accel
+  kvm,fallback=allow` does **not** silently degrade on a machine without KVM (it reports
+  `invalid accelerator kvm`), so an explicit `-accel` is safe and preferable: a silent
+  fallback to TCG would still boot and still pass, while making every
   dead-connection-window measurement meaningless.
 - **`-display none -serial stdio`** is what carries the guest transcript to the host. The
   transcript is the only evidence the harness produces; without it a successful boot and a
