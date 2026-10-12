@@ -2406,12 +2406,56 @@ So the flag mask differs by command:
 
 Add `CmdTrim` → `handleTrim`, `CmdWriteZeroes` → `handleWriteZeroes`. `CmdCache` (5) and `CmdBlockStatus` (7) stay unimplemented and answer `ErrEINVAL` — the spec's value for an unknown command.
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [ ] **Step 5: Land the `Timeouts.Idle` arm Task 4's committed loop is missing**
+
+A fix to already-committed code, not new surface. It belongs here because this task already edits `connection.go` and already runs the package tests.
+
+The loop at `internal/adapter/nbd/connection.go:203` arms the wait for the next request header from `h.timeouts.Read` unconditionally. The plan has mandated since commit `056b547f` that `Idle` bound that wait and `Read` bound finishing a request already started — the split NFS uses (`pkg/adapter/nfs/connection.go:312` / `:338`) and SMB uses (`pkg/adapter/smb/connection.go:230` / `:258`). That plan-side fix landed after Task 4 was committed, so the code never got it and `Idle` is dead: an operator who sets `Idle` below `Read` sees it silently ignored.
+
+Measured with `Timeouts{Read: 5s, Idle: 200ms}` and a silent post-handshake connection: `serve still running after 1.5s`. At the defaults both are 5m, which is why nothing caught it.
+
+Replace the arm with the block the plan specifies in Task 4 Step 3 (plan:1709-1715):
+
+```go
+// Idle bounds the wait for a header; Read bounds finishing a request that has
+// already started (the payload read in handleWrite). At the defaults both are
+// 5m, so the distinction only shows for an operator who separates them -- which
+// is exactly when the field's own doc has to be true rather than nearly true.
+//
+// Idle == 0 means no idle timeout, so it cannot be folded into a min(): the
+// guard is an independent arm, the same shape NFS uses at
+// pkg/adapter/nfs/connection.go:312.
+budget := h.timeouts.Read
+if h.timeouts.Idle > 0 {
+	budget = h.timeouts.Idle
+}
+if err := conn.SetReadDeadline(time.Now().Add(budget)); err != nil {
+	return err
+}
+```
+
+**And arm `Read` before the WRITE payload read**, the other half of the split, also missing: `handleWrite` reads `req.Length` bytes through `io.ReadFull` (`internal/adapter/nbd/handlers_write.go:69`) under whatever deadline the header read left behind, so without this `Read` bounds nothing and the payload read inherits the `Idle` budget.
+
+The test that pins it must use `Idle` **shorter** than `Read`, or it passes either way:
+
+```go
+func TestConnection_IdleDeadlineClosesASilentConnection(t *testing.T) {
+	// Timeouts{Read: 5 * time.Second, Idle: 200 * time.Millisecond}: complete
+	// the handshake, then send nothing. serve must return within ~1s. With
+	// Idle == Read or Idle > Read this passes whether or not the arm exists --
+	// which is why the committed TestConnection_PartialHeaderTimesOut
+	// (connection_test.go:696, Idle 5s / Read 200ms) cannot catch it.
+}
+```
+
+Leave the arm inside `if !h.draining()`, which is already correct: `initiateShutdown` sets a 100 ms deadline on every active connection (`pkg/adapter/base.go:447`) and a fresh `SetReadDeadline` replaces it, so arming the full budget while draining would hold the drain open for it.
+
+- [ ] **Step 6: Run the tests and confirm they pass**
 
 Run: `go test ./internal/adapter/nbd/ -race -v`
 Expected: PASS.
 
-- [ ] **Step 6: Add the integration assertions**
+- [ ] **Step 7: Add the integration assertions**
 
 ```go
 func TestIntegration_TrimFreesAndReadsZero(t *testing.T) {
@@ -2441,18 +2485,18 @@ Measured against the real fixture: 1 MiB written and 256 KiB punched → `DataEx
 
 **One more trap in the same step:** `Flush` alone is not enough to populate the manifest. With a durable local store it returns before the remote drain (`pkg/block/engine/flush.go:554`), so `file.Blocks` is still empty and the punch has nothing to prune — a test written that way passes for the wrong reason. Call `bs.DrainAllUploads(ctx)` after `Flush` and assert `len(file.Blocks) > 0` before punching, exactly as Task 4's eviction test does.
 
-- [ ] **Step 7: Verify the WRITE_ZEROES test actually bites**
+- [ ] **Step 8: Verify the WRITE_ZEROES test actually bites**
 
 Change `handleWriteZeroes` to call `bs.WriteAt(ctx, string(exp.PayloadID), nil, make([]byte, req.Length), req.Offset)` instead of the punch pair. Run `go test ./internal/adapter/nbd/ -run 'TestConnection_WriteZeroesThenReadIsZeros|TestIntegration_WriteZeroesDoesNotMaterializeChunks' -v` and confirm BOTH fail: the unit test on `st.punches == 1` / `st.writes == 0`, and the integration test on the manifest growing instead of shrinking. Restore both.
 
-- [ ] **Step 8: Run the affected suites**
+- [ ] **Step 9: Run the affected suites**
 
 Run: `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...`
 Expected: clean.
 
 **Do not run `make test-unit`** (`go test -race ./...`) and read a timeout as a failure: five packages — `internal/adapter/nfs/v3/handlers`, `internal/adapter/smb/handlers`, `pkg/block/chunker`, `pkg/block/engine`, `pkg/block/middleware/encryption` — hit the 10m deadline on this machine from SQLite contention under `-race`, reproducible on a clean base and unrelated to this work. They were verified environmental during Task 3.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add internal/adapter/nbd/
@@ -2677,6 +2721,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 5 — a WRITE refused by POSIX mode bits reaches the client as `ErrEPERM`, not `ErrEIO`. The metadata funnel returns `merrs.ErrAccessDenied` (`pkg/metadata/auth_permissions.go:510`, `:539`), a different code from `ErrPermissionDenied`; the test needs a real metadata service with the volume created as one identity and written as another, or it passes vacuously.
 - [ ] Task 5 — `TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO` passes.
 - [ ] Task 6 — `TestConnection_WriteZeroesThenReadIsZeros` asserts `st.punches == 1` and `st.writes == 0`, and fails when `WriteZeroes` is changed to a zero-buffer write.
+- [ ] Task 6 — `TestConnection_IdleDeadlineClosesASilentConnection` fails when the `Idle` arm is removed, and only when `Idle` is shorter than `Read` (`Idle: 200ms` vs `Read: 5s`). Measured without the arm: `serve still running after 1.5s`.
 - [ ] Task 6 — `TestIntegration_TrimFreesAndReadsZero` and `TestIntegration_WriteZeroesDoesNotMaterializeChunks` assert the manifest shrank (`file.Blocks` before/after, read through `GetFile`), not that `DataExtents` shrank. The extent-map assertion is unsatisfiable: `engine.PunchHole` zero-overwrites through the local append log, so the local tier keeps reporting the range, and `DataExtents` over-reports by documented contract.
 - [ ] Task 6 — `TestConnection_WriteZeroesWithNoHoleIsAccepted` passes (`NO_HOLE` is a MUST we advertise) and `TestConnection_WriteWithNoHoleFlagIsEINVAL` passes (it is not a `WRITE` flag).
 - [ ] Task 6 — `TestConnection_TrimZeroLengthIsEINVAL` and `TestConnection_WriteZeroesZeroLengthIsEINVAL` pin the uniform zero-length answer (`EINVAL`), and each is followed by a valid command on the same connection to prove the stream is still usable.
