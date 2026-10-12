@@ -3309,6 +3309,25 @@ If the host has no KVM, **the script must refuse rather than fall back to TCG.**
 
 Per the spec's §10: **Phase 1 is the first moment the design is falsifiable end-to-end, and it is the right place to stop and reassess if the boot path turns out to need something the protocol surface does not provide.** If it does, stop and report rather than extending the surface ad hoc.
 
+**Evidence that already exists, gathered here against a LIVE DittoFS rather than the oracle's fake store — record it in the README's results section so the harness is not the only source of a verdict.** Every step below was run against a running `dfs` process with its real engine, journal and CAS, using the real `qemu-io` and the real Linux kernel client as the clients. It is stronger than the differential oracle in `internal/adapter/nbd/oracle_test.go`, which deliberately swaps the block layer for an in-package fake and therefore compares only the codec.
+
+**The full command surface, via `qemu-io` over `nbd://127.0.0.1:10809/export/owned`, every command exiting zero:** `write -P 0xaa 0 64k`; `read -P 0xaa 0 64k`; `write -P 0xbb 1M 64k`; `discard 1M 64k`; `read -P 0 1M 64k`; `write -P 0xcc 2M 64k`; `write -z 2M 64k`; `read -P 0 2M 64k`; `flush`. WRITE, READ, TRIM, WRITE_ZEROES and FLUSH all round-trip through the real durability seam.
+
+**The bytes, read back through a FRESH NBD connection after a server restart — which is what makes them durable rather than cached:**
+
+| offset | content | what it proves |
+|---|---|---|
+| 0 | `aaaaaaaaaaaaaaaa` | the WRITE **survived a server restart** |
+| 1 MiB | `0000000000000000` | `0xbb` was written, then DISCARDed — TRIM genuinely zeroes |
+| 2 MiB | `0000000000000000` | `0xcc` was written, then WRITE_ZEROES'd — it genuinely zeroes |
+| 3 MiB | `0000000000000000` | never written; zero-fill past the written extent is correct |
+
+The 1 MiB and 2 MiB rows are the ones worth keeping: a pattern is written *first* and then destroyed, so a TRIM or WRITE_ZEROES that silently did nothing would leave the pattern behind and be caught. A destructive step on a never-written range is invisible — the range reads as zeros either way — which is exactly the vacuity that had to be fixed in the oracle test.
+
+**And the crash-rig premise, proven against the same live server** (full recipe and verdict in Step 2): with `-persist -T 60`, a read issued after `SIGKILL` stayed blocked at t=4s, 8s and 12s, the server returned at t=16s, and the read completed `exit=0 elapsed=14s` returning the pre-crash bytes, with the daemon logging `Successfully reconnected after 4 attempts`.
+
+**Two negatives worth recording as known-good behaviour rather than gaps:** `nbdinfo --map` reports `server does not support metadata context "base:allocation"` — correct, because v1 deliberately implements no hole-reporting surface (spec §5); and `nbdinfo nbd://host:port` with no export name fails with `No such file or directory for the default export` — also correct, since the server has no default export and the client is expected to use `--list`.
+
 - [ ] **Step 7: Commit**
 
 ```bash
