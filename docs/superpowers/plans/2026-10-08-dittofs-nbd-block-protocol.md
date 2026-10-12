@@ -2057,9 +2057,11 @@ _, err = h.meta.CommitWrite(authCtx, intent)
 ctx, cancel := common.WithRequestDeadline(ctx)
 defer cancel()
 if _, err := bs.WriteAt(ctx, string(intent.PayloadID), nil, data, req.Offset); err != nil {
-    return mapError(err)
+    return h.writeReply(conn, req.Cookie, mapError(err), nil)
 }
 ```
+
+Note the error shape: `mapError` returns `NBDError`, a `uint32` with no `Error()` method, so it is an *argument to the reply*, never a returned error. A handler that returned it would compile-fail, and a variant that swallowed it would leave the client waiting forever.
 
 **`mapError` is the single place the wire layer converts an error, and it calls `common.NormalizeBlockStoreError` internally** — so the handler passes the raw error and needs no explicit normalize call. Normalizing first matters: the engine returns raw sentinels as well as `*merrs.StoreError`, and normalization is what turns a raw one into a `*merrs.StoreError` with the right code while leaving an already-wrapped one alone (`if goerrors.As(err, &storeErr) { return err }`). The failure mode of getting this wrong is an error code that silently degrades to `ErrEIO` because `errors.Is` no longer matches through an extra wrap — so a disk-full becomes an I/O error and the client has no way to know its device is full.
 
@@ -2351,12 +2353,14 @@ Both call the same two-step sequence the NFS DEALLOCATE handler uses (`internal/
 authCtx := h.authContext(ctx, exp)
 res, err := h.meta.PunchHole(authCtx, exp.Handle, req.Offset, uint64(req.Length))
 if err != nil {
-    return mapError(err)
+    return h.writeReply(conn, req.Cookie, mapError(err), nil)
 }
 if _, err := bs.PunchHole(ctx, string(res.PayloadID), res.PreOpBlocks, req.Offset, uint64(req.Length)); err != nil {
-    return mapError(err)
+    return h.writeReply(conn, req.Cookie, mapError(err), nil)
 }
 ```
+
+**`mapError` returns `NBDError`, which is not an `error`** — it is a `uint32` with no `Error()` method (`internal/adapter/nbd/protocol.go:76`), so `return mapError(err)` from a handler does not compile and, if it did, would send the client nothing and hang it. Every error on this path goes through `h.writeReply(conn, req.Cookie, mapError(err), nil)`, which is what the shipped `handleWrite` and `handleRead` do (`handlers_write.go:88`, `handlers_read.go:84`). Use that shape; there is no helper that turns a store error into a returned error, and adding one would put the reply in two places.
 
 **The metadata punch is not optional, for two independent reasons.**
 
