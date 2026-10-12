@@ -424,6 +424,13 @@ func TestCrossProtocol_ErrorConformance(t *testing.T) {
 		{name: "ErrNotDirectory", code: merrs.ErrNotDirectory, trigger: helpers.TriggerErrNotDirectory},
 		{name: "ErrNameTooLong", code: merrs.ErrNameTooLong, trigger: helpers.TriggerErrNameTooLong},
 		{name: "ErrInvalidArgument", code: merrs.ErrInvalidArgument, trigger: helpers.TriggerErrInvalidArgument},
+		// decision: this row pins the errno a server-side write denial
+		// reaches the client as, not which check denies it. A read-only
+		// default permission also gives the share root a root-owned 0755
+		// mode, so the mode bits refuse the write too, and the row passes
+		// even with the share-grant check broken. Pin the grant separately,
+		// on a share whose root mode bits would allow the write, if the
+		// grant check needs its own e2e coverage.
 		{name: "ErrAccessDenied", code: merrs.ErrAccessDenied, trigger: helpers.TriggerErrAccessDenied, share: shareRestricted},
 		// decision: only the NFS leg runs. Nothing a cifs client sends
 		// without POSIX extensions reaches the ownership check: it discards
@@ -474,15 +481,16 @@ func TestCrossProtocol_ErrorConformance(t *testing.T) {
 type conformanceShare int
 
 const (
-	// shareReadWrite is "/export": read-write for every identity.
+	// shareReadWrite is "/export": read-write for every identity. The only
+	// share with peer mounts.
 	shareReadWrite conformanceShare = iota
-	// shareReadOnly is "/archive": a read-only share.
+	// shareReadOnly is "/archive": a read-only share. No peer.
 	shareReadOnly
 	// shareRestricted is "/restricted": readable by everyone, writable only
-	// by an explicit grant. Both legs mount it as an identity without one,
-	// and it has no peer.
+	// by an explicit grant. Both legs mount it as an identity without one.
+	// No peer.
 	shareRestricted
-	// shareQuota is "/quota": read-write with a 1 MiB byte quota.
+	// shareQuota is "/quota": read-write with a 1 MiB byte quota. No peer.
 	shareQuota
 )
 
