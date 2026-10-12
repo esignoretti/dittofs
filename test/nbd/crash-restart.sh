@@ -273,7 +273,20 @@ case $client_probe in
 esac
 
 if [ "${NBD_CLIENT_ALLOW_UNVERIFIED:-0}" != 1 ]; then
-	client_version=$("$nbd_client" --version 2>&1 | head -n1 || true)
+	# --version is unreliable on the master build, and the obvious fix is wrong.
+	# Measured, master prints:
+	#   ERROR: no information specified
+	#   <blank>
+	#   Usage: nbd-client -name|-N name host [port] nbd_device
+	#   ... "Note, that kernel 2.4.2 and older ones do not work correctly ..."
+	# and exits 0. A naive version-token grep therefore extracts **2.4.2** from
+	# the usage text — a bare-release string that trips the refusal below on the
+	# exact build this rig requires. So anchor on the only forms that mean a
+	# version: "nbd-client version X" or "This is nbd-client, from nbd X".
+	client_version=$("$nbd_client" --version 2>&1 |
+		sed -n 's/.*[Tt]his is nbd-client, from nbd \([0-9][^ ]*\).*/\1/p; s/.*nbd-client version \([0-9][^ ]*\).*/\1/p' |
+		head -n1 || true)
+	[ -n "$client_version" ] || client_version="none reported (a master build reports no version)"
 	# A release tag (e.g. "3.27.1") is a git build only if it carries a hash or
 	# is otherwise not a bare release. 3.27.0 and 3.27.1 both have -T and both
 	# silently ignore -p; everything older has no -T. Refuse a bare release.
@@ -299,6 +312,15 @@ esac
 # NBD_CMD_LINK_DEAD multicast (genlmsg_multicast hardcodes &init_net,
 # include/net/genetlink.h:530) never reaches it and the device behaves exactly as
 # with no -p at all.
+#
+# This gate is a PROXY and it fails open, which is why the success path also
+# asserts on the client's own notification line. Inside a container /proc/1 IS
+# the container's init, so "self == PID 1" holds there while the process is
+# still not in the HOST's init netns: measured in a bridge-mode container, self
+# and PID 1 were both net:[4026533431] against the host's net:[4026531840]. The
+# gate therefore cannot catch the exact case it was written for; it only catches
+# a process in a DIFFERENT netns from its own PID 1. The authoritative check is
+# behavioural, and lives at the end of the run.
 if [ -r /proc/self/ns/net ] && [ -r /proc/1/ns/net ]; then
 	self_netns=$(readlink /proc/self/ns/net)
 	init_netns=$(readlink /proc/1/ns/net)
@@ -334,7 +356,12 @@ esac
 	die "no way to restart the server: pass --restart-cmd 'CMD' (or set DITTOFS_RESTART_CMD). Without it the read can only fail at the window, which proves -T but not -p. To run that negative control deliberately, pass --keep-dead."
 
 command -v dd >/dev/null 2>&1 || die "dd not found; it is required to write and read the pattern"
-command -v pgrep >/dev/null 2>&1 || die "pgrep not found (procps); it is required to find the server to SIGKILL, or pass --dfs-pid PID"
+# pgrep is needed ONLY when --dfs-pid was not supplied: line 382 below skips the
+# discovery path entirely when it was. Gating it unconditionally made the message
+# self-contradictory ("or pass --dfs-pid PID") while passing --dfs-pid still
+# refused, measured in a container with no procps installed.
+[ -n "$dfs_pid" ] || command -v pgrep >/dev/null 2>&1 ||
+	die "pgrep not found (procps) and no --dfs-pid was given. Pass --dfs-pid PID to name the server to SIGKILL directly, or install procps."
 
 [ -b "$device" ] ||
 	die "'$device' is not a block device. The nbd kernel module must be loaded and /dev/nbd0 present (modprobe nbd). A p1 suffix is wrong: the export is a single file served whole, with no partition table."
@@ -354,7 +381,7 @@ printf '  export name      : %s\n' "$export_name"
 printf '  server           : %s:%s\n' "$server" "$port"
 printf '  device           : %s\n' "$device"
 printf '  nbd-client       : %s (%s)\n' "$nbd_client" "${client_version:-version unknown}"
-printf '  netns            : $self_netns (init: $init_netns) — OK\n'
+printf '  netns            : %s (init: %s) — OK\n' "$self_netns" "$init_netns"
 printf '  dead_conn_timeout: %ss, set with -T/--dead-timeout AND -p/--persist\n' "$dead_timeout"
 printf '  adapter identity : UID/GID 65534 (not configurable; applyDefaults rewrites UID 0)\n'
 printf '  share mount      : %s\n' "$volume_path"
@@ -385,6 +412,7 @@ cleanup() {
 		kill "$read_pid" 2>/dev/null || true
 	fi
 	"$nbd_client" -d "$device" >/dev/null 2>&1 || true
+	[ -n "${client_log:-}" ] && rm -f "$client_log"
 }
 trap cleanup EXIT
 
@@ -498,6 +526,22 @@ read_bytes=$(cat "$read_out")
 printf '\nVERDICT: read paused (blocked for >=2s), server restarted at t=%ss inside the %ss window, read completed status=0 elapsed=%ss with %s.\n' \
 	"$restart_at" "$dead_timeout" "$read_elapsed" "$read_bytes"
 printf 'Blocking proves -T; resuming proves -p. Both are present in this run.\n'
+
+# The positive assertion for the mechanism itself. The netns gate earlier is a
+# PROXY and it fails open: inside a container /proc/1 is the container's init, so
+# "self == PID 1" is true there while the process is still not in the HOST's init
+# netns — measured in a bridge-mode container, self and PID 1 were both
+# net:[4026533431] against the host's net:[4026531840]. So assert on the client's
+# own line instead: it is emitted only when the kernel's NBD_CMD_LINK_DEAD
+# multicast actually reached this process. Absent, the reconnect happened by some
+# other route and this run does not establish what it claims.
+if ! grep -q 'link dead notification' "$client_log" 2>/dev/null; then
+	printf '\nWARNING: the read resumed, but the client never logged "Received link dead notification" — so the kernel multicast did not reach it and the reconnect came from somewhere else. Most likely the process is in a container netns rather than the host init netns (genlmsg_multicast hardcodes &init_net, include/net/genetlink.h:530). The mechanism this rig exists to prove is NOT established by this run.\n' >&2
+	printf 'client log was:\n' >&2
+	sed 's/^/  /' "$client_log" >&2 2>/dev/null || true
+	exit 1
+fi
+printf 'Client logged the link-dead notification, so the kernel multicast reached it and -p reconnected.\n'
 
 if command -v fsck.ext4 >/dev/null 2>&1; then
 	printf '\nNOTE: run the host-side fsck yourself, against the volume read as a file\n'
