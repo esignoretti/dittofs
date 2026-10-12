@@ -843,7 +843,7 @@ NBD (DittoFS):          the root filesystem
 The upside of root-on-NBD is that the part being tested is exactly the part doing all the
 writing (root fs fsyncs), not the read-only kernel load.
 
-Reference launch. Note the three disks, and that only `boot.img` is local:
+Reference launch. Note that the only local disk is `boot.img`:
 
 ```
 qemu-system-aarch64 -M virt -cpu host -m 2G \
