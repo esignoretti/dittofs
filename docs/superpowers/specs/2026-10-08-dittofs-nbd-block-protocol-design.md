@@ -715,14 +715,23 @@ the handler.
 ### 9.2 Integration — in-process
 
 A real `engine.Store` over an fs local store and a memory remote, driven by a real NBD
-client library over `net.Pipe`. Assertions that matter:
+client over a loopback TCP socket. Assertions that matter:
 
 - FLUSH after writes with `CommitAck: journal` returns success.
 - The same with `requireDurable` set and an unhealthy remote returns `NBD_EIO`.
 - A `WRITE`+FUA is durable before its reply.
-- A `TRIM`'d range reads back as zeros.
+- A `TRIM`'d range reads back as zeros, and the manifest shrank — the reclaim is
+  observable in `file.Blocks`, **not** in `engine.Store.DataExtents`, which
+  over-reports by documented contract and keeps reporting a punched range because
+  `PunchHole` zero-overwrites it through the local append log.
 - A READ of an evicted-but-manifest-covered range hydrates and returns real bytes.
 - A READ of a genuinely never-written range returns zeros (not an error).
+
+**Not `net.Pipe`.** It is synchronous and unbuffered: a server `Write` blocks until the
+reader consumes every byte, so a test that reads a reply header and asserts without
+draining the payload that follows leaves the server blocked forever and hangs until the
+Go test timeout instead of failing. Use a connected loopback TCP socket, where the kernel
+buffers the reply.
 
 ### 9.3 Crash — the tier that tests the reliability model
 
