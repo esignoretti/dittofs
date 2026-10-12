@@ -3194,6 +3194,15 @@ That last note is the trap from Task 5: `CreateFile` with `FileAttr{Size: N}` do
 - Note the `volumes/` **directory** carries the same requirement, and fails earlier: a `volumes/` owned by root at mode 0755 refuses the adapter's `CreateFile` outright (`Permission denied` from the mount), so it must be created by the adapter identity too — or removed and recreated, which is the only reliable repair once it exists.
 - `dfsctl user create --uid 65534` is the supported way to name that identity; the grant level on the share must be read-write (a `none` default permission refuses the *resolution* itself, reported as `nbd: unknown export` — see the resolution note above).
 
+**`nbd: unknown export` has FOUR distinct causes and names none of them — which is why it cost this investigation the most time, and why the harness must print all four facts before it starts.** The four, all measured:
+
+1. **The volume does not exist.** `Resolve` reaches `metaSvc.Lookup(authCtx, volsDirHandle, volume)` and returns `ErrUnknownExport` for anything absent.
+2. **The share is disabled** — `internal/adapter/nbd/volume.go:101 if !sh.Enabled` (deliberate: the export name is client-supplied, so the server must not reveal that a share exists but is quiesced).
+3. **The share's default permission is `none`** — the adapter's synthetic identity cannot traverse the share root, so the `Lookup` of `volumes/` fails. This is the one that reads most like a naming problem and is not one.
+4. **`-N` was omitted entirely**, so the client sent an EMPTY export name (see the `-N` note above).
+
+The message is identical in all four cases, and the client renders it as a handshake failure that never mentions permissions, provisioning or the flag. **A script that reports this message and stops has told the operator nothing actionable**, so the pre-flight must print, before it starts: the share's existence, its `Enabled` flag, its default permission, and the volume's existence and size. Three of the four causes are then visible in the pre-flight output instead of being guessed from a client-side error message.
+
 So the harness's provisioning step must create the volume **as the adapter identity**, and Step 1's pre-flight must verify the resulting owner, not merely the volume's existence.
 
 - [ ] **Step 2: Write `crash-restart.sh`**
