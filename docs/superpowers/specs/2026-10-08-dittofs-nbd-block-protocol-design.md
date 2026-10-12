@@ -289,7 +289,7 @@ The command flags below are honored only where advertised; see §4.2.
 | `NBD_CMD_READ` | 0 | `engine.Store.ReadAt(ctx, payloadID, buf, offset)` |
 | `NBD_CMD_WRITE` | 1 | `PrepareWrite` → `engine.Store.WriteAt` → `CommitWrite` |
 | `NBD_CMD_DISC` | 2 | Drain in-flight, close. **No reply** |
-| `NBD_CMD_FLUSH` | 3 | `common.CommitBlockStore(ctx, bs, payloadID)` (parameter widened to an interface; see §3.2) |
+| `NBD_CMD_FLUSH` | 3 | `common.FlushStableWrite(authCtx, metaSvc, bs, handle, payloadID, true)` — the block-store commit **and** the metadata flush, the same combined barrier NFS COMMIT and SMB FLUSH use. The narrower `common.CommitBlockStore` alone leaves the file's deferred size/mtime state unpersisted; see the note under the table. |
 | `NBD_CMD_TRIM` | 4 | `engine.Store.PunchHole` |
 | `NBD_CMD_CACHE` | 5 | Not advertised → `NBD_EINVAL` (22); see the note below |
 | `NBD_CMD_WRITE_ZEROES` | 6 | `engine.Store.PunchHole` |
@@ -504,12 +504,33 @@ store like any other.
 |---|---|---|
 | `READ` | bytes, or an error — never zeros it cannot stand behind | `read_internal.go:104` fail-closed; `:78` heal-or-fail |
 | `WRITE` (no FUA) | accepted into the journal, ordering preserved | `engine.WriteAt` → `local.WriteAt` |
-| `WRITE` + FUA | persisted before reply | write, then `CommitBlockStore` |
-| `FLUSH` | every already-replied write is persistent | `common.CommitBlockStore` |
+| `WRITE` + FUA | persisted before reply | write, then `FlushStableWrite(..., fileSync=true)` |
+| `FLUSH` | every already-replied write is persistent | `common.FlushStableWrite(..., fileSync=true)` |
 | `TRIM` / `WRITE_ZEROES` | range reads as zeros afterward | `engine.PunchHole` zero-overwrite |
 
+**The FLUSH barrier has two halves, and the first draft of this design specified
+only one.** `common.CommitBlockStore` commits the block store; it does not touch
+the metadata service's deferred write state. `metadata.Service` runs with
+deferred commits enabled by default (`pkg/metadata/service.go:131`), so a WRITE's
+size and mtime live in a pending-writes tracker until something calls
+`FlushPendingWriteForFile`. NFSv3 COMMIT (`internal/adapter/nfs/v3/handlers/commit.go:257-277`),
+NFSv4 COMMIT (`internal/adapter/nfs/v4/handlers/commit.go:105-119`), NFSv3/v4
+WRITE with a stable level (`internal/adapter/nfs/v3/handlers/write.go:299`,
+`internal/adapter/nfs/v4/handlers/write.go:238`) and SMB CLOSE/FLUSH
+(`internal/adapter/smb/handlers/close.go:242-272`) all make both calls, and
+`common.FlushStableWrite` (`internal/adapter/common/write_payload.go:201`) exists
+precisely to make them in the right order with the right error policy. NBD must
+use it for the same reason they do: the command promised durability, and the
+client's next act is typically a reboot.
+
+NBD has no DATA_SYNC/FILE_SYNC distinction — `NBD_CMD_FLUSH` is an unconditional
+barrier over everything already acknowledged, and FUA is the same promise for one
+command — so both call sites pass `fileSync = true`: a metadata flush failure
+must fail the command, because there is no weaker level to report instead.
+
 **The adapter adds no durability machinery of its own.** It calls the same
-`CommitBlockStore` that NFS COMMIT and SMB Flush call. `CommitAck: journal`
+`FlushStableWrite` (and through it `CommitBlockStore`) that NFS COMMIT and SMB
+Flush call. `CommitAck: journal`
 (`pkg/controlplane/models/share.go:24`) is the honest default for a block volume —
 *"durable in the share's journal. It survives process and host crash, not device loss"* —
 and with an fs local store `LocalDurable()` is true, so

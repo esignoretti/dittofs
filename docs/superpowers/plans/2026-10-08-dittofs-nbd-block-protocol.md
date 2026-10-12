@@ -2535,13 +2535,90 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "fea
 **Files:**
 - Create: `test/nbd/run-oracle.sh`, `test/nbd/README.md`,
   `internal/adapter/nbd/oracle_test.go`
-- Modify: nothing. `test/required-tests.json` is deliberately **not** touched:
+- Modify: `internal/adapter/nbd/handlers_control.go` (+ its tests) for the FLUSH
+  metadata gap below. This is the one functional change in Task 7; everything
+  else is test scaffolding. It is here rather than in a new task because the
+  oracle is what makes the durability path observable, and a gap found while
+  building the instrument should be closed with it.
+- Modify: nothing else. `test/required-tests.json` is deliberately **not** touched:
   `test/required-tests.sh` runs `go test` for every name in the manifest, and
   the Tier A oracle needs a QEMU install, so listing it there would make the
   required set fail on every machine without one. A QEMU-dependent test is a
   manual regression check, not a required one — the manifest's own purpose is
   the opposite: names whose removal must be loud. (If Tier A is ever split so
   the QEMU-free half can run alone, that half can be listed.)
+
+### FLUSH commits the block store but not the metadata — found while auditing this task
+
+`handleFlush` (`internal/adapter/nbd/handlers_control.go`) calls only
+`h.commit` → `common.CommitBlockStore`, the **block store** half of the barrier.
+The metadata half is missing, and the sibling protocols all do both:
+`common.FlushStableWrite` (`internal/adapter/common/write_payload.go:201`) is
+exactly `CommitBlockStore` **then** `metaSvc.FlushPendingWriteForFile`, and it is
+what NFSv3 WRITE (`internal/adapter/nfs/v3/handlers/write.go:299`), NFSv4 WRITE
+(`internal/adapter/nfs/v4/handlers/write.go:238`), NFSv3 COMMIT
+(`internal/adapter/nfs/v3/handlers/commit.go:257-277`), NFSv4 COMMIT
+(`internal/adapter/nfs/v4/handlers/commit.go:105-119`) and SMB CLOSE/FLUSH
+(`internal/adapter/smb/handlers/close.go:242-272`) call. Neither the plan nor the
+spec mentioned `FlushStableWrite` or `FlushPendingWriteForFile` anywhere —
+`grep` returns nothing in both documents — so this is an omission in the design,
+not an implementer error.
+
+**Measured, not inferred.** With deferred commits on (the default:
+`pkg/metadata/service.go:131` `s.deferredCommit.Store(true)`), after
+`PrepareWrite` + `CommitWrite` + `h.commit` the raw metadata store's mtime is
+**unchanged**; calling `FlushPendingWriteForFile(ctx, handle, false)` afterwards
+returns `flushed=true` and **does** change it. So the pending size/mtime state
+survives an NBD FLUSH that the client was told succeeded.
+
+**Why this is Minor rather than Important, stated so the severity is auditable
+rather than asserted:**
+- **The size can never be wrong.** NBD's `handleWrite` calls
+  `PrepareWrite(authCtx, exp.Handle, req.Offset+uint64(req.Length))`
+  (`internal/adapter/nbd/handlers_write.go:95`) and refuses anything past
+  `exp.Size` first (`:61`), so `MaxSize` ≤ the size already stored; nothing in the
+  NBD adapter calls `SetFileAttributes` or any other size setter. The flush is
+  also max-only (`pkg/metadata/io.go:474` `if size > file.Size`), so it cannot
+  shrink the export either.
+- **The mtime is not observable over NBD.** The dispatch has five arms —
+  `CmdRead`, `CmdWrite`, `CmdFlush`, `CmdTrim`, `CmdWriteZeroes`
+  (`internal/adapter/nbd/connection.go:261-281`) — and no metadata command, so a
+  client cannot read the mtime back. It is also not consumed by the block layer
+  or the GC.
+- **The state is bounded and not lost.** `RecordWrite` keeps one state per
+  handle (`pkg/metadata/pending_writes.go:83-92`), so the pending set is bounded
+  by the number of volume files rather than by write count, and the shutdown path
+  flushes it.
+
+**So the fix is a judgement call and the plan makes it explicitly:** add the
+metadata flush to `handleFlush`, so NBD's barrier is the same barrier the other
+adapters use, **or** record in the code why NBD deliberately omits it. What is
+not acceptable is the current state, where the omission is invisible — the code
+comment on `commit` currently says the durability rule *"has exactly one
+implementation across the adapters instead of one per protocol"*, which is true
+of the block-store half and silent about the other half.
+
+**If the fix is taken** (the recommended option, because an NBD device is a boot
+path — Task 8 boots a kernel from it, and the kernel does issue `FLUSH`):
+- Widen `FlushStableWrite`'s `blockStore *engine.Store` parameter to the
+  `Committer` interface that Task 4 already introduced
+  (`internal/adapter/common/write_payload.go:79-84`) and pass the fileSync flag.
+  Its body uses nothing else engine-specific, so this is a type-only change.
+  NFS passes a concrete `*engine.Store`, which still satisfies `Committer`.
+- NBD has no DATA_SYNC/FILE_SYNC split — `NBD_CMD_FLUSH` is an unconditional
+  barrier over everything already acked, and FUA is the same promise for one
+  command — so both call sites pass `fileSync = true`. That is the honest
+  mapping: a metadata flush failure must fail the command rather than be
+  downgraded to a warning, because there is no weaker level to report.
+- `handleFlush` needs `h.authContext(ctx, exp)` and `exp.Handle`, both already
+  available (`connection.go:118`, `handshake.go:92`).
+- Pin it with a test that asserts the raw store changed across a FLUSH, not just
+  that `FlushPendingWriteForFile` was called — the probe above is the shape:
+  read `GetFile` from `rt.GetMetadataStoreForShare(integrationShare)` before and
+  after, and require the mtime to move. Note the fixture trap: the volume must be
+  created as the identity the handler serves as (`newIntegrationFixtureAs`), or
+  `PrepareWrite` fails with `AccessDenied: write permission denied` before any of
+  this is reachable.
 
 **Interfaces:**
 - Consumes: a DittoFS NBD server listening on a real TCP port. The script does not start one; it takes a port.
@@ -2601,6 +2678,63 @@ provisioning, not the codec, and would be unusable in CI.
 The flag-parity check (Step 2) belongs to **both** tiers, because it needs only
 a handshake and no data path.
 
+- [ ] **Step 0: Close the FLUSH metadata gap (its own commit)**
+
+Do this first and commit it alone, so the functional change is reviewable
+independently of the test scaffolding that follows.
+
+1. Widen `FlushStableWrite`'s `blockStore` parameter from `*engine.Store` to
+   `common.Committer` (`internal/adapter/common/write_payload.go:79-84`).
+   Type-only; the body uses `CommitBlockStore`, which already takes `Committer`.
+2. In `internal/adapter/nbd/handlers_control.go`, change **`commit`** — not
+   `handleFlush` alone — to call
+   `common.FlushStableWrite(h.authContext(ctx, exp), h.meta, bs, exp.Handle, exp.PayloadID, true)`
+   in place of `common.CommitBlockStore(ctx, bs, exp.PayloadID)`. `commit` is
+   already the single barrier both call sites share, so changing it there fixes
+   FLUSH *and* FUA with one edit, and keeps the "one implementation" property
+   the code comment claims. Building the `AuthContext` inside `commit` from the
+   `ctx` it already receives is correct for both callers: `handleWrite` passes
+   the same command context it used for `PrepareWrite`, and
+   `h.authContext(ctx, exp)` is pure.
+
+   Then correct `commit`'s doc comment, which currently says the durability rule
+   *"has exactly one implementation across the adapters instead of one per
+   protocol"* while implementing only the block-store half — the sentence
+   becomes true once `FlushStableWrite` is the body, and the
+   `decision:` paragraph about serialization (which is what makes a FLUSH a
+   barrier over already-acked writes) still holds and should stay.
+3. Add a test that reads the raw store before and after a FLUSH and requires the
+   mtime to move. Build the fixture with `newIntegrationFixtureAs(t, integrationIdentity)`
+   — with the wrong identity `PrepareWrite` fails `AccessDenied` and the test
+   never reaches the barrier.
+
+**This breaks the four `connection_test.go` FLUSH tests, and the failure is a
+panic rather than an assertion.** `newTestHandler` (`connection_test.go:177`)
+passes `nil` for the metadata service, and `FlushPendingWriteForFile` dereferences
+it: measured, a nil `*metadata.Service` panics with `runtime error: invalid
+memory address or nil pointer dereference`. The four affected tests are
+`TestConnection_FlushIsAckedWhenDurable` (`:1119`),
+`TestConnection_FlushIsEIOWhenNotDurable` (`:1139`),
+`TestConnection_FlushWithNonZeroLengthIsEINVAL` (`:1161`) and
+`TestConnection_FlushOnReadOnlyExportIsPermitted` (`:1177`). Move them onto the
+real fixture (`newWriteVolumeFixture`, whose `newHandler` passes
+`f.rt.GetMetadataService()`), as Tasks 5 and 6 already did for the WRITE and
+punch paths. The two that assert on `st.flushes` still work, because `storeFake`
+is passed through `resolverFor`; the EINVAL case must additionally keep asserting
+`st.flushes == 0`, which is what proves a malformed FLUSH never reaches the
+barrier at all.
+
+Expected: the new test fails before step 2 and passes after. If it passes before,
+it is not testing the gap — check that `deferredCommit` is on (it is by default)
+and that the read is from `rt.GetMetadataStoreForShare(integrationShare)`, not
+from the service's cached path.
+
+```bash
+git add internal/adapter/common/write_payload.go internal/adapter/nbd/
+git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S \
+  -m "fix(nbd): commit the metadata half of the FLUSH barrier"
+```
+
 - [ ] **Step 1: Write the script**
 
 `test/nbd/run-oracle.sh`, following the existing `test/crash/*.sh` convention: a `#!/usr/bin/env bash` header with a comment block explaining what it proves, `set -euo pipefail`, a usage line, and a prerequisites check.
@@ -2617,10 +2751,14 @@ a handshake and no data path.
    compares **the codec and the handshake**, not the block layer — state that
    in the test's doc comment, because a reader who believes it covers
    `PunchHole` will trust it for something it never tested.
-3. `net.Listen("tcp", "127.0.0.1:0")` and serve the real `Handler` on it with
-   the accept loop `pkg/adapter/nbd/adapter_test.go:88` already uses, exporting
-   `testExportName` and taking the port from the listener, not from config
-   (`BaseAdapter.Port()` returns the *configured* port, `pkg/adapter/base.go:598`).
+3. `net.Listen("tcp", "127.0.0.1:0")` and serve the real `Handler` on it with a
+   real accept loop — `go NewConn(h, c).Serve(ctx)` per accepted connection —
+   exporting the fixture's export name and taking the port from the listener,
+   not from config (`BaseAdapter.Port()` returns the *configured* port,
+   `pkg/adapter/base.go:598`). **Not `pipe(t)` and not `go h.serve(...)`:** the
+   client is `qemu-io`, a separate process, so an in-process socket pair cannot
+   be reached. `pipe`/`serveConn` remain the right tools for every other test in
+   the package, which is why this is easy to get wrong by habit.
 4. Start `qemu-nbd` as a subprocess against a `t.TempDir()` scratch file **of exactly the export's size**, with `-f raw -p <free port> -b 127.0.0.1 --persistent
    --discard=unmap`, and stop it in `t.Cleanup`.
 
@@ -2642,13 +2780,16 @@ ran — a green run that does not say what it checked means nothing.
 // Package nbd, NOT nbd_test, and that is a deliberate choice with a verified
 // basis rather than an inheritance.
 //
-// The reason to be in-package is that this test needs the fixture Tasks 4-6
-// already built: newWriteVolumeFixture (a real metadata service, an enabled
-// share, and the volume file), storeFake (a seven-method BlockStore fake with
-// its failure-injection fields), pipe (a real loopback pair, not net.Pipe) and
-// sendRequest/readReplyHeader. An external test package cannot see any of them
-// and would have to redefine every one -- including a second BlockStore fake
-// that would drift from the one the other tests use.
+// The reason to be in-package is that this test needs pieces Tasks 4-6 already
+// built: storeFake (a seven-method BlockStore fake whose PunchHole zeroes the
+// range and whose ReadAt zero-fills past the written extent), resolverFor, and
+// integrationIdentity. An external test package cannot see any of them and
+// would have to redefine every one -- including a second BlockStore fake that
+// would drift from the one the other tests use.
+//
+// It does NOT need pipe, sendRequest, readReplyHeader, completeHandshake or
+// exporterFor: the client here is qemu-io, not a test goroutine, so the
+// handshake and the framing are the client's business.
 //
 // The plan originally specified package nbd_test on the grounds that an
 // in-package test cannot import internal/adapter/testruntime. That is FALSE:
@@ -2660,28 +2801,86 @@ ran — a green run that does not say what it checked means nothing.
 //
 // What this test does NOT reuse is the fixture's VOLUME SIZE: the sequence
 // below reaches 9 MiB and the committed fixture builds a 1 MiB volume, so Tier
-// A provisions its own volume at the size the sequence needs.
-rt, name, bs := newIntegrationFixtureAsSized(t, integrationIdentity, 16<<20)
+// A provisions its own volume at the size the sequence needs. Add the sized
+// helper BESIDE the existing one rather than changing its signature, which four
+// other tests call:
+//
+//   func newIntegrationFixtureAs(t *testing.T, id Identity) (*runtime.Runtime, string, *engine.Store) {
+//       return newIntegrationFixtureAsSized(t, id, 1<<20)   // unchanged behaviour
+//   }
+//   func newIntegrationFixtureAsSized(t *testing.T, id Identity, size uint64) (*runtime.Runtime, string, *engine.Store) {
+//       // ... the existing body, with `Size: ptr(size)` in SetFileAttributes
+//   }
+rt, name, _ := newIntegrationFixtureAsSized(t, integrationIdentity, 16<<20)
 exp, err := NewRuntimeExporter(rt, integrationIdentity).Resolve(context.Background(), name)
-// ...then serve exp with the in-package helpers:
-//   h := NewHandler(exporterFor(exp), resolverFor(st), rt.GetMetadataService(),
-//                   integrationIdentity, Timeouts{Read: 30 * time.Second,
-//                   Write: 30 * time.Second, Idle: 5 * time.Minute},
-//                   func() bool { return false })
-//   server, client := pipe(t)   // real loopback socket, NOT net.Pipe
-//   go h.serve(ctx, server)     // h.serve, not Conn.Serve, so the test reads the error
-//   completeHandshake(t, client, exp.Name)
+
+// The block layer is the in-package fake, pre-sized to the volume so its
+// zero-fill read path covers the whole export: ReadAt zero-fills past the
+// written extent, and a read beyond `len(data[id])` also zero-fills, so the
+// never-written-range step below compares equal either way.
+st := newStoreFake()
+
+// The server must be on a REAL TCP PORT, because the client is `qemu-io` -- a
+// separate process. `pipe(t)` and `go h.serve(ctx, server)` are the right tools
+// for every other test in this package and the WRONG ones here: pipe's pair is
+// an in-process loopback socket, so an external process can never reach it.
+ln, err := net.Listen("tcp", "127.0.0.1:0")
+port := ln.Addr().(*net.TCPAddr).Port   // from the listener, not from config:
+                                        // BaseAdapter.Port() is the CONFIGURED
+                                        // port (pkg/adapter/base.go:598).
+
+// The exporter must be the REAL one, for a reason that is not stylistic --
+// see the export-name paragraph below.
+h := NewHandler(NewRuntimeExporter(rt, integrationIdentity), resolverFor(st),
+    rt.GetMetadataService(), integrationIdentity,
+    Timeouts{Read: 30 * time.Second, Write: 30 * time.Second, Idle: 5 * time.Minute},
+    func() bool { return false })
+
+ctx, cancel := context.WithCancel(context.Background())
+t.Cleanup(func() {
+    cancel()
+    _ = ln.Close() // unblocks Accept; the loop then returns
+})
+go func() {
+    for {
+        c, err := ln.Accept()
+        if err != nil {
+            return // listener closed by cleanup
+        }
+        go NewConn(h, c).Serve(ctx)
+    }
+}()
+
+// qemu-io addresses it as nbd://127.0.0.1:<port>/export/boot -- the ONE-slash
+// form, which the client turns into the wire name `export/boot`. That is why
+// the real exporter is required above; see the paragraph after this fence.
 ```
 
-A **fake `Exporter`** — `exporterFor(exp)`, already in `connection_test.go:160` —
-is the right choice rather than `nbd.NewRuntimeExporter`: the oracle's subject is
-the codec, `volume_test.go` already covers export resolution against a real
-runtime, and routing through the runtime would drag share and volume
-provisioning back into the test the split was meant to keep it out of.
-`nbd.Export`'s fields are all exported (`handshake.go:82`), so a literal is
-enough. The metadata service is real and unavoidable: `handleTrim` and
+**The exporter must be the real `NewRuntimeExporter`, NOT `exporterFor(exp)`,
+and this is a correctness requirement rather than a preference.** `qemu-io`
+sends the export name with one leading `/` stripped — `nbd://127.0.0.1:<port>/export/boot`
+becomes the wire name `export/boot` (see the export-name paragraph below).
+`exporterFor` builds a `fakeExporter`, whose `Resolve` is an **exact map
+lookup** keyed on `testExportName` = `"/export/boot"` (`handshake_test.go:18-23`,
+`connection_test.go:135`). Measured: `fakeExporter.Resolve(ctx, "export/boot")`
+returns `nbd: unknown export` while `Resolve(ctx, "/export/boot")` succeeds. So
+a Tier A built on `exporterFor` would fail the handshake on the very first
+`qemu-io` command with an unknown-export error that has nothing to do with the
+codec — and it would look like a codec bug. The real exporter folds the share
+half through `metadata.NormalizeShareName` (`pkg/metadata/validation.go:176`),
+which re-prepends the slash, so it accepts the spelling the client actually
+sends. This is exactly the fold the export-name paragraph pins, and it is worth
+having the oracle exercise it rather than fake around it.
+
+The metadata service is real and unavoidable: `handleTrim` and
 `handleWriteZeroes` call `h.meta.PunchHole`, which panics on a nil service —
-the same reason Tasks 5 and 6 needed `writeVolumeFixture`.
+the same reason Tasks 5 and 6 needed `writeVolumeFixture`. The block store stays
+the `storeFake` (`resolverFor(st)`), so the oracle compares the codec and the
+handshake against a fake block layer; `storeFake.PunchHole` does zero the range
+(`connection_test.go:112-116`) and `ReadAt` zero-fills past the written extent,
+which is what makes the `discard` and `write -z` steps comparable. Say this in
+the test's doc comment, because a reader who believes it covers `PunchHole` will
+trust it for something it never tested.
 
 What it does:
 
@@ -2893,6 +3092,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 6 — `TestConnection_TrimPastEndIsEINVAL`, `TestConnection_TrimOffsetPastEndIsEINVAL`, and `TestConnection_WriteZeroesPastEndIsENOSPC` pin out-of-range refusal (not clamping), and `TestConnection_TrimIsEPERMOnReadOnlyExport` passes with `SEND_TRIM` still advertised.
 - [ ] Task 6 — `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...` clean (NOT `make test-unit`, which times out on five unrelated packages on this machine).
 - [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`, and the script passes `--discard=unmap` (without it the discard step diverges on the oracle's configuration, not on the codec).
+- [ ] Task 7 (Step 0) — an NBD `FLUSH` persists the file's deferred metadata, not just the block store: reading `rt.GetMetadataStoreForShare(integrationShare)` before and after shows the mtime move. Measured before the fix: `h.commit` left the raw store's mtime **unchanged**, and `FlushPendingWriteForFile(ctx, handle, false)` then returned `flushed=true` and changed it. The four `connection_test.go` FLUSH tests move off `newTestHandler` (nil meta panics: `runtime error: invalid memory address or nil pointer dereference`) onto `newWriteVolumeFixture`, and the EINVAL case still asserts `st.flushes == 0`.
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
 - [ ] Task 7 — `internal/adapter/nbd/oracle_test.go` skips (not fails) without QEMU, and `run-oracle.sh` treats that skip as a failure; the script prints which tier ran, so a green run says what it checked.
 - [ ] Task 8 — the launch line carries **no `hostfwd`**: it forwards host→guest, which is the wrong direction and would try to bind host port 10809 where DittoFS is listening. The guest reaches the host at `10.0.2.2` with no rule.
