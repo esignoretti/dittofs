@@ -134,7 +134,9 @@ func TestNFSv41IOSurvivesPacketLoss(t *testing.T) {
 
 	_, _, nfsPort := setupNFSv4TestServer(t)
 
-	mount := framework.MountNFSWithVersion(t, nfsPort, "4.1")
+	// Mount over IPv4: "localhost" resolves to ::1, which the iptables rule
+	// below does not filter.
+	mount := framework.MountNFSWithVersionAt(t, "127.0.0.1", nfsPort, "4.1")
 	t.Cleanup(mount.Cleanup)
 
 	filePath := mount.FilePath("packet_loss_test.bin")
