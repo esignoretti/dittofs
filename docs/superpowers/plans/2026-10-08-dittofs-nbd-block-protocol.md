@@ -2415,21 +2415,35 @@ Expected: PASS.
 
 ```go
 func TestIntegration_TrimFreesAndReadsZero(t *testing.T) {
-	// Write 1 MiB, Flush, PunchHole a 256 KiB range through the handler, then
-	// read it back: zeros. Then assert via bs.DataExtents that the trimmed
-	// range is no longer reported as data.
+	// Write 1 MiB, Flush, DrainAllUploads, then PunchHole through the handler
+	// (h.meta.PunchHole then bs.PunchHole). Assert two things, in this order:
+	//
+	//   1. the punched range reads back as zeros;
+	//   2. the manifest shrank — file.Blocks, read before and after through
+	//      rt.GetMetadataService().GetFile(ctx, exp.Handle), has fewer entries
+	//      and references fewer bytes.
 }
 
 func TestIntegration_WriteZeroesDoesNotMaterializeChunks(t *testing.T) {
-	// Write 1 MiB, then WRITE_ZEROES over it. Assert the export still reads
-	// zeros AND that DataExtents no longer reports the range — the second half
-	// is what proves storage was freed rather than filled with zeros.
+	// Write 1 MiB, then WRITE_ZEROES over it. Same two assertions: reads
+	// zeros, and the manifest shrank rather than growing.
 }
 ```
 
+**Do NOT assert that `bs.DataExtents` stops reporting the punched range. That assertion is unsatisfiable — it was measured, not reasoned.** Two structural reasons:
+
+1. **The punch writes a record, so the local tier keeps answering "data here".** `engine.Store.PunchHole` zero-overwrites the range through the local append log (`pkg/block/engine/readwrite.go:281`) — that is the mechanism that guarantees reads return zeros regardless of rollup state. The side effect is that the local tier now holds an interval covering the punched range.
+2. **`DataExtents` over-reports on purpose.** Its doc says *"The map may over-report data but must never under-report it"* (`pkg/block/engine/dataextents.go:41`), because NFSv4.2 SEEK and READ_PLUS callers must never skip real data. Reporting a hole where a punch happened is exactly the over-report the polarity permits — a client that copies zeros loses nothing.
+
+Measured against the real fixture: 1 MiB written and 256 KiB punched → `DataExtents` still `[[0 1048576]]`; a punch aligned to a real chunk extent over 4 MiB of random data → still `[[0 4194304]]`; while the same punches took `file.Blocks` from **4 to 3** and the referenced bytes from **4194304 to 3095584**, and the punched range read back as zeros.
+
+**So the manifest is the observable.** `metadata.Service.PunchHole` prunes `file.Blocks` and persists the new manifest; that pruning is the reclaim, and `GetFile` is how a test sees it. The engine's own reclaim test asserts the same thing the same way (`pkg/block/engine/api_blockref_test.go:270`, which checks the returned `kept` list and the coordinator's reap calls, never the extent map).
+
+**One more trap in the same step:** `Flush` alone is not enough to populate the manifest. With a durable local store it returns before the remote drain (`pkg/block/engine/flush.go:554`), so `file.Blocks` is still empty and the punch has nothing to prune — a test written that way passes for the wrong reason. Call `bs.DrainAllUploads(ctx)` after `Flush` and assert `len(file.Blocks) > 0` before punching, exactly as Task 4's eviction test does.
+
 - [ ] **Step 7: Verify the WRITE_ZEROES test actually bites**
 
-Change `handleWriteZeroes` to call `bs.WriteAt(ctx, string(exp.PayloadID), nil, make([]byte, req.Length), req.Offset)` instead of the punch pair. Run `go test ./internal/adapter/nbd/ -run TestConnection_WriteZeroesThenReadIsZeros -v` and confirm it fails on the `st.punches == 1` assertion. Restore.
+Change `handleWriteZeroes` to call `bs.WriteAt(ctx, string(exp.PayloadID), nil, make([]byte, req.Length), req.Offset)` instead of the punch pair. Run `go test ./internal/adapter/nbd/ -run 'TestConnection_WriteZeroesThenReadIsZeros|TestIntegration_WriteZeroesDoesNotMaterializeChunks' -v` and confirm BOTH fail: the unit test on `st.punches == 1` / `st.writes == 0`, and the integration test on the manifest growing instead of shrinking. Restore both.
 
 - [ ] **Step 8: Run the affected suites**
 
@@ -2663,6 +2677,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 5 — a WRITE refused by POSIX mode bits reaches the client as `ErrEPERM`, not `ErrEIO`. The metadata funnel returns `merrs.ErrAccessDenied` (`pkg/metadata/auth_permissions.go:510`, `:539`), a different code from `ErrPermissionDenied`; the test needs a real metadata service with the volume created as one identity and written as another, or it passes vacuously.
 - [ ] Task 5 — `TestIntegration_FlushRequireDurableWithUnhealthyRemoteIsEIO` passes.
 - [ ] Task 6 — `TestConnection_WriteZeroesThenReadIsZeros` asserts `st.punches == 1` and `st.writes == 0`, and fails when `WriteZeroes` is changed to a zero-buffer write.
+- [ ] Task 6 — `TestIntegration_TrimFreesAndReadsZero` and `TestIntegration_WriteZeroesDoesNotMaterializeChunks` assert the manifest shrank (`file.Blocks` before/after, read through `GetFile`), not that `DataExtents` shrank. The extent-map assertion is unsatisfiable: `engine.PunchHole` zero-overwrites through the local append log, so the local tier keeps reporting the range, and `DataExtents` over-reports by documented contract.
 - [ ] Task 6 — `TestConnection_WriteZeroesWithNoHoleIsAccepted` passes (`NO_HOLE` is a MUST we advertise) and `TestConnection_WriteWithNoHoleFlagIsEINVAL` passes (it is not a `WRITE` flag).
 - [ ] Task 6 — `TestConnection_TrimZeroLengthIsEINVAL` and `TestConnection_WriteZeroesZeroLengthIsEINVAL` pin the uniform zero-length answer (`EINVAL`), and each is followed by a valid command on the same connection to prove the stream is still usable.
 - [ ] Task 6 — `TestConnection_TrimPastEndIsEINVAL`, `TestConnection_TrimOffsetPastEndIsEINVAL`, and `TestConnection_WriteZeroesPastEndIsENOSPC` pin out-of-range refusal (not clamping), and `TestConnection_TrimIsEPERMOnReadOnlyExport` passes with `SEND_TRIM` still advertised.
