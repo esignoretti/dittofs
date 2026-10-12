@@ -93,6 +93,10 @@ func setupDirDelegation(t *testing.T, dirName string, files ...string) *dirDeleg
 	entries := framework.ListDir(t, holderDir)
 	require.Len(t, entries, len(files), "holder should list the directory")
 
+	// decision: skipping when the client requests no directory delegation is
+	// what keeps these tests green today. The server recalls a directory
+	// delegation on every change instead of notifying, so once a client does
+	// request one, every notification test here fails together.
 	if !waitForLog(t, sp, readdirSince, getDirDelegationOp, 1, 2*time.Second) {
 		t.Skip("the kernel NFS client sent no GET_DIR_DELEGATION, so there is no directory delegation to observe")
 	}
