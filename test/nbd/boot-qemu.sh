@@ -220,11 +220,25 @@ fi
 
 # The initramfs must actually carry the nbd module and nbd-client; a boot that
 # reaches the handshake without them fails with a message naming neither.
+#
+# Both checks must avoid `grep -q` on the END of a pipe from gzip. Under
+# `set -o pipefail` that combination is a FALSE NEGATIVE: grep -q exits at the
+# first match, gzip is killed by SIGPIPE, and the pipeline's status becomes 141
+# (128+13) even though the string WAS found. Measured on a valid initramfs:
+#   gzip -dc x.cpio.gz | grep -aq nbd-client >/dev/null   -> status 141  (refused)
+#   gzip -dc x.cpio.gz | grep -a  nbd-client >/dev/null   -> status 0    (correct)
+#   gzip -dc x.cpio.gz | grep -a  <absent>   >/dev/null   -> status 1    (correct)
+# So the original would have refused EVERY initramfs, valid or not. Dropping -q
+# makes grep read to EOF, so no SIGPIPE arises and the status means what it says.
+#
+# (Do NOT "fix" this by capturing the stream into a variable: a cpio archive is
+# full of NUL bytes, which a shell variable cannot hold — measured, a 3.6MB
+# listing came back as an empty string and both checks reported MISSING.)
 if command -v gzip >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
-	if ! gzip -dc -- "$initramfs" 2>/dev/null | grep -aq 'nbd-client'; then
+	if ! gzip -dc -- "$initramfs" 2>/dev/null | grep -a 'nbd-client' >/dev/null; then
 		die "initramfs '$initramfs' does not contain nbd-client. The guest would boot and never reach the export. Rebuild it with bin/nbd-client (see test/nbd/README.md) or pass --initramfs-dir."
 	fi
-	if ! gzip -dc -- "$initramfs" 2>/dev/null | grep -aq 'nbd\.ko'; then
+	if ! gzip -dc -- "$initramfs" 2>/dev/null | grep -a 'nbd\.ko' >/dev/null; then
 		die "initramfs '$initramfs' does not contain the nbd kernel module (nbd.ko). modprobe nbd would fail in the guest. Rebuild it with lib/modules/.../nbd.ko or pass --initramfs-dir."
 	fi
 fi
