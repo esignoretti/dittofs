@@ -2446,7 +2446,29 @@ This is the independent check on a hand-rolled codec. `qemu-nbd` is a known-good
 What it does:
 
 1. Refuse to run without `qemu-nbd`, `qemu-img`, and `qemu-io`; name the missing binary in the error.
-2. Create a scratch file of a known size (e.g. 64 MiB) and serve it with `qemu-nbd -f raw -p <oracle-port> --persistent` in the background.
+2. Create a scratch file of a known size (e.g. 64 MiB) and serve it with
+   `qemu-nbd -f raw -p <oracle-port> -b 127.0.0.1 --persistent --discard=unmap`
+   in the background.
+
+   **`--discard=unmap` is not optional, and leaving it out makes the oracle lie.**
+   `qemu-nbd` starts with `int flags = BDRV_O_RDWR` (`qemu-nbd.c:589`) and
+   `BDRV_O_UNMAP` is a separate bit (`include/block/block-common.h:246`,
+   *"execute guest UNMAP/TRIM operations"*) that only `--discard=unmap` sets —
+   `bdrv_parse_discard_flags` clears it and re-sets it only for `on`/`unmap`
+   (`block.c:1154`). Without it a `NBD_CMD_TRIM` reaches the block layer and is
+   dropped: qemu-nbd replies **success** and the data is still there. Since
+   DittoFS's `PunchHole` genuinely zeroes the range, the `discard` step below
+   would then diverge on the *oracle's* configuration and be reported as a
+   codec bug — the most expensive kind of false positive, because the natural
+   fix is to make DittoFS stop zeroing. A server that drops a discard is legal
+   (*"A server MAY discard length bytes starting at offset, but is not required
+   to"*), so this is not a qemu-nbd defect; it is a configuration the comparison
+   has to pin.
+
+   `-b 127.0.0.1` is written explicitly rather than relied on: the oracle is a
+   throwaway server holding a scratch file, and it has no business listening on
+   anything but loopback. `--persistent` (`-t`, *"don't exit on the last
+   connection"*) keeps it alive across the several `qemu-io` invocations.
 3. Against `qemu-nbd` and against DittoFS's NBD port, run the same `qemu-io` command sequence and capture both transcripts:
    - `qemu-io -f raw -c 'write -P 0x11 0 1M'`
    - `qemu-io -f raw -c 'write -P 0x22 4M 64k'`
@@ -2457,6 +2479,18 @@ What it does:
    - `qemu-io -f raw -c 'flush'`
 4. `qemu-img info` against both, and diff the reported size and format.
 5. Diff the two transcripts. Any line that differs is a failure, with both transcripts printed.
+
+**Export-name spelling, and why it is worth pinning.** QEMU turns a URI path into
+the export name by stripping exactly one leading `/` (`nbd_parse_uri`,
+`qemu-nbd.c:1563-1569`: `p = g_uri_get_path(uri); if (p[0] == '/') { p++; }`). So
+`nbd://127.0.0.1:<port>/export/boot` sends the export name `export/boot`. That
+resolves against DittoFS because `RuntimeExporter.Resolve` folds the share half
+with `metadata.NormalizeShareName` (`pkg/metadata/validation.go:176`), which
+re-prepends the slash — so both `export/boot` and `/export/boot` reach the same
+volume. Write the single-slash form in the script and say in a comment that the
+fold is what makes it work, because a reader who sees the volume listed as
+`/export/boot` will otherwise "fix" the URI to `//export/boot` and get the same
+result for a different reason.
 
 - [ ] **Step 2: Add the flag-parity check**
 
@@ -2604,7 +2638,7 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 6 — `TestConnection_TrimZeroLengthIsEINVAL` and `TestConnection_WriteZeroesZeroLengthIsEINVAL` pin the uniform zero-length answer (`EINVAL`), and each is followed by a valid command on the same connection to prove the stream is still usable.
 - [ ] Task 6 — `TestConnection_TrimPastEndIsEINVAL`, `TestConnection_TrimOffsetPastEndIsEINVAL`, and `TestConnection_WriteZeroesPastEndIsENOSPC` pin out-of-range refusal (not clamping), and `TestConnection_TrimIsEPERMOnReadOnlyExport` passes with `SEND_TRIM` still advertised.
 - [ ] Task 6 — `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...` clean (NOT `make test-unit`, which times out on five unrelated packages on this machine).
-- [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`.
+- [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`, and the script passes `--discard=unmap` (without it the discard step diverges on the oracle's configuration, not on the codec).
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
 - [ ] Task 8 — `mkfs.ext4` + mount + write + `sync` + unmount + remount in a KVM guest.
