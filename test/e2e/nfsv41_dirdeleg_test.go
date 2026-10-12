@@ -35,10 +35,11 @@ import (
 // delegation to observe and the test skips saying so.
 
 var (
-	getDirDelegationOp  = regexp.MustCompile(`op_name=GET_DIR_DELEGATION`)
-	dirDelegGranted     = regexp.MustCompile(`Directory delegation granted[^\n]*notification_mask=0x([0-9a-f]+)`)
-	cbNotifyQueued      = regexp.MustCompile(`CB_NOTIFY queued`)
-	dirDelegReturnedRev = regexp.MustCompile(`op_name=DELEGRETURN status=0\b|Delegation revoked with the client's state`)
+	getDirDelegationOp        = regexp.MustCompile(`op_name=GET_DIR_DELEGATION`)
+	dirDelegGranted           = regexp.MustCompile(`Directory delegation granted[^\n]*notification_mask=0x([0-9a-f]+)`)
+	cbNotifyQueued            = regexp.MustCompile(`CB_NOTIFY queued`)
+	backchannelCallbackFailed = regexp.MustCompile(`BackchannelSender callback failed`)
+	dirDelegReturnedRev       = regexp.MustCompile(`op_name=DELEGRETURN status=0\b|Delegation revoked with the client's state`)
 )
 
 // Notification type bit numbers (RFC 8881 §20.4, notify_type4).
@@ -119,6 +120,10 @@ func (f *dirDelegFixture) requireNotified(t *testing.T, what string, notifyType 
 	if f.notifMask&(1<<notifyType) != 0 {
 		require.True(t, waitForLog(t, f.sp, f.mutateFrom, cbNotifyQueued, 1, 5*time.Second),
 			"%s by another client should queue a CB_NOTIFY to the delegation holder", what)
+		// Queued is not delivered: a CB_NOTIFY the client rejects shows up as a
+		// failed backchannel callback.
+		assert.False(t, waitForLog(t, f.sp, f.mutateFrom, backchannelCallbackFailed, 1, time.Second),
+			"the CB_NOTIFY should reach the holder")
 		return
 	}
 	require.True(t, waitForLog(t, f.sp, f.mutateFrom, cbRecallSent, 1, 5*time.Second),
