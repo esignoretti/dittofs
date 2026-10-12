@@ -2753,12 +2753,36 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S \
    be reached. `pipe`/`serveConn` remain the right tools for every other test in
    the package, which is why this is easy to get wrong by habit.
 4. Start `qemu-nbd` as a subprocess against a `t.TempDir()` scratch file **of exactly the export's size**, with `-f raw -p <free port> -b 127.0.0.1 --persistent
-   --discard=unmap`, and stop it in `t.Cleanup`.
+   --discard=unmap -x export/boot`, and stop it in `t.Cleanup`. **`-x export/boot` is mandatory** — measured, `qemu-nbd` exposes an *empty* export name by default, so the `nbd://…/export/boot` URI that works against DittoFS fails against the oracle with `server reported: export 'export/boot' not present`. Without `-x`, every command diverges for a reason that has nothing to do with the codec.
 
    **The scratch file must be the export's size, and the export must be large enough for the sequence below.** The two sizes have to agree, because every command in Step 5 is bounds-checked against the export: DittoFS refuses a WRITE past the end with `NBD_ENOSPC` and a READ or TRIM past the end with `NBD_EINVAL`, while `qemu-nbd` against a larger file would succeed. A mismatch therefore shows up as a transcript divergence that names neither cause. The committed `newWriteVolumeFixture` builds a **1 MiB** volume (`internal/adapter/nbd/integration_test.go:142` sets `Size: 1 << 20`) and the sequence below reaches **9 MiB**, so Tier A cannot use that fixture's volume as-is: it needs its own fixture sized to the sequence, e.g. 16 MiB, built by the same helper with the size parameterised (`newIntegrationFixtureAs` already takes the identity; add the size beside it rather than writing a second provisioning block).
 5. Run the identical `qemu-io -f raw -c '<cmd>'` sequence against both, capture
-   stdout+stderr, and require the transcripts to match line for line. Addresses
-   are `nbd://127.0.0.1:<port>/<export>` — see the export-name note below.
+   stdout+stderr **and each command's exit status**, normalize the timing line,
+   and require the results to match. Addresses are
+   `nbd://127.0.0.1:<port>/export/boot` — see the export-name note below.
+
+   **The transcript must be normalized before it is diffed, and the diff must
+   include exit codes. Both halves are measured requirements, not hygiene:**
+   - **Normalize.** `qemu-io` prints a timing line after every command
+     (`1 MiB, 1 ops; 00.00 sec (1.533 GiB/sec and 1569.8587 ops/sec)`) whose
+     numbers change on every run. Measured: two *identical* runs against the
+     *same* `qemu-nbd` produced a diff on that line alone, so a literal
+     line-for-line comparison can never pass. Drop every line containing
+     `ops;` before diffing (`sed '/ops;/d'`), which was measured to make two
+     identical runs byte-identical.
+   - **Record exit codes.** `qemu-io` reports a pattern mismatch on **stdout**
+     and exits **1**; the failure line is
+     `Pattern verification failed at offset 0, 1048576 bytes`. Measured, and
+     the exit code is the load-bearing half: a read of the wrong pattern still
+     prints `read 1048576/1048576 bytes at offset 0` and a timing line, so a
+     transcript that ignores the status reads as success. Emit `exit=$?` after
+     each command into the transcript, and run the sequence with `set +e` so
+     one failure does not truncate the comparison.
+
+   This is also what makes the `discard` step meaningful: measured on
+   `qemu-nbd` 11.1.2, `read -P 0` after a discarded range exits **0** with
+   `--discard=unmap` and exits **1** without it. The exit code is the entire
+   signal.
 
 `test/nbd/run-oracle.sh` then only has to: refuse without `qemu-nbd`,
 `qemu-img` and `qemu-io` (naming the missing binary); run
@@ -2807,10 +2831,9 @@ ran — a green run that does not say what it checked means nothing.
 rt, name, _ := newIntegrationFixtureAsSized(t, integrationIdentity, 16<<20)
 exp, err := NewRuntimeExporter(rt, integrationIdentity).Resolve(context.Background(), name)
 
-// The block layer is the in-package fake, pre-sized to the volume so its
-// zero-fill read path covers the whole export: ReadAt zero-fills past the
-// written extent, and a read beyond `len(data[id])` also zero-fills, so the
-// never-written-range step below compares equal either way.
+// The block layer is the in-package fake. It needs no sizing: ReadAt
+// zero-fills both past the written extent and past `len(data[id])`, so the
+// never-written-range step below compares equal without any setup.
 st := newStoreFake()
 
 // The server must be on a REAL TCP PORT, because the client is `qemu-io` -- a
@@ -2878,9 +2901,17 @@ trust it for something it never tested.
 What it does:
 
 1. Refuse to run without `qemu-nbd`, `qemu-img`, and `qemu-io`; name the missing binary in the error.
-2. Create a scratch file of a known size (e.g. 64 MiB) and serve it with
-   `qemu-nbd -f raw -p <oracle-port> -b 127.0.0.1 --persistent --discard=unmap`
+2. Create a scratch file **of exactly the export's size** (see the construction note above: a size mismatch turns into a transcript divergence that names neither cause) and serve it with
+   `qemu-nbd -f raw -p <oracle-port> -b 127.0.0.1 --persistent --discard=unmap -x export/boot`
    in the background.
+
+   **`-x export/boot` is not optional either, and its omission is the more
+   confusing of the two.** Measured: `qemu-nbd` exposes an **empty** export name
+   by default, so `nbd://127.0.0.1:<port>/export/boot` — the URI that works
+   against DittoFS — is refused by the oracle with
+   `server reported: export 'export/boot' not present` on every single command.
+   The oracle needs the flag even though the code under test does not — the
+   asymmetry is what makes it easy to omit.
 
    **`--discard=unmap` is not optional, and leaving it out makes the oracle lie.**
    `qemu-nbd` starts with `int flags = BDRV_O_RDWR` (`qemu-nbd.c:589`) and
@@ -2909,8 +2940,8 @@ What it does:
    - `qemu-io -f raw -c 'write -z 8M 1M'` then `read -P 0 8M 1M`
    - a read of a never-written range
    - `qemu-io -f raw -c 'flush'`
-4. `qemu-img info` against both, and diff the reported size and format.
-5. Diff the two transcripts. Any line that differs is a failure, with both transcripts printed.
+4. `qemu-img info` against both, and diff the reported size and format. Measured deterministic — the output contains no timing and two runs against the same server are byte-identical, so this one is a plain diff.
+5. Diff the two normalized transcripts (timing lines dropped, exit codes included). Any difference is a failure, with both transcripts printed.
 
 **Export-name spelling, and why it is worth pinning.** QEMU turns a URI path into
 the export name by stripping exactly one leading `/` (`nbd_parse_uri`,
@@ -2924,6 +2955,14 @@ fold is what makes it work, because a reader who sees the volume listed as
 `/export/boot` will otherwise "fix" the URI to `//export/boot` and get the same
 result for a different reason.
 
+**And the oracle has to be told to answer to that name.** Measured: `qemu-nbd`
+exposes an **empty** export name unless given `-x`/`--export-name` — with no
+`-x`, `nbd://127.0.0.1:<port>/x` fails with `server reported: export 'x' not
+present`, and even the pathless form works only because it resolves to the empty
+name. `-x export/boot` makes the two servers answer to the same name, which is
+what makes one URI string usable against both. The asymmetry is easy to miss
+because it is the *oracle* that needs the flag, not the code under test.
+
 - [ ] **Step 2: Add the flag-parity check**
 
 The oracle's most valuable assertion is not the data path — it is the flag set:
@@ -2934,7 +2973,15 @@ The oracle's most valuable assertion is not the data path — it is the flag set
 # DO advertise, because those are the ones a client acts on without verifying.
 ```
 
-Capture the negotiated transmission flags for both servers and assert that every flag DittoFS advertises is also advertised by `qemu-nbd`, and specifically that `SEND_FLUSH` and `SEND_FUA` are present on both. `libnbd`'s `nbdinfo --list` does this in one command but **is not in Homebrew core** (`brew search --formula libnbd` returns only fuzzy matches; `nbdkit` likewise), so it cannot be the only path. The portable path is a 20-line Python handshake in the script — read the greeting, send `NBD_FLAG_C_FIXED_NEWSTYLE`, send `NBD_OPT_GO` for the export, and decode the `NBD_INFO_EXPORT` reply's 16-bit flags — which needs nothing but a Python 3 interpreter. **Use the Python path as the primary**, because a script that silently degrades when a tool is missing is a script whose check nobody notices has stopped running. If `nbdinfo` is present, run it too and print its output for the record; do not make the assertion depend on it.
+Capture the negotiated transmission flags for both servers and assert that every flag DittoFS advertises is also advertised by `qemu-nbd`, and specifically that `SEND_FLUSH` and `SEND_FUA` are present on both. `libnbd`'s `nbdinfo --list` does this in one command but **is not in Homebrew core** (`brew search --formula libnbd` returns only fuzzy matches; `nbdkit` likewise), so it cannot be the only path. The portable path is a ~40-line Python handshake in the script — read the greeting, send `NBD_FLAG_C_FIXED_NEWSTYLE`, send `NBD_OPT_GO` for the export, and decode the `NBD_INFO_EXPORT` reply's 16-bit flags — which needs nothing but a Python 3 interpreter. **Use the Python path as the primary**, because a script that silently degrades when a tool is missing is a script whose check nobody notices has stopped running. If `nbdinfo` is present, run it too and print its output for the record; do not make the assertion depend on it.
+
+**The handshake has four field-layout traps, all hit and fixed while measuring this against `qemu-nbd` 11.1.2. Do not write it from memory:**
+1. **The greeting is 18 bytes, not 16.** `NBDMAGIC` (8) + `IHAVEOPT` (8) + `gflags` (**2**, a `uint16`) — then the 4-byte version comes *separately*. Reading `>QII` in one go desynchronizes the stream and the next read hangs until the socket times out.
+2. **The version field is `NBD_VERSION = 1`, and it is sent after the greeting**, not inside it. Reading it as part of the first struct yields a bogus `0x49484156`-scale number and a spurious "not fixed newstyle" error.
+3. **`gflags` is a capability bitmap, not the version.** Check `gflags & NBD_FLAG_FIXED_NEWSTYLE` (bit 0) rather than comparing it to a number.
+4. **`NBD_INFO_EXPORT`'s body is `u16 info_type, u64 size, u16 flags`** — decode it as `struct.unpack(">QH", body[2:12])`. Unpacking it as `">HQQ"` fails with `struct.error: unpack requires a buffer of 18 bytes`.
+
+Measured reference values from `qemu-nbd` 11.1.2 against a 16 MiB raw file with `-x export/boot --discard=unmap`: `flags = 0x0c6d` — `HAS_FLAGS`(0), `SEND_FLUSH`(2), `SEND_FUA`(3), `SEND_TRIM`(5), `SEND_WRITE_ZEROES`(6), `SEND_CACHE`(10), `SEND_FAST_ZERO`(11). DittoFS advertises `FlagHASFlags | FlagSendFlush | FlagSendFUA | FlagSendTrim | FlagSendWriteZeroes` (`internal/adapter/nbd/handshake.go:101`) = **`0x006d`**, and every one of those bits is present in `0x0c6d` (verified by masking: `0x006d & 0x0c6d == 0x006d`). The two extra bits the oracle sets are `0xc00` = `SEND_CACHE | SEND_FAST_ZERO`, which DittoFS deliberately does not advertise — so the assertion must be **one-directional** (ours ⊆ theirs), never equality.
 
 - [ ] **Step 3: Write `test/nbd/README.md`**
 
@@ -2945,7 +2992,9 @@ Prerequisites (`brew install qemu` on macOS; the Linux packages on a Linux host)
 Run: `test/nbd/run-oracle.sh`
 Expected: exit 0, Tier A transcripts identical, flag parity asserted for both servers.
 
-**QEMU is not installed on this machine.** `command -v qemu-nbd qemu-img qemu-io` returns nothing, and `qemu-system-aarch64` is absent too, so Task 7 and Task 8 both need `brew install qemu` before they can run. If it is not installed when you get here, do not skip the step and do not write a script you never ran: report the missing prerequisite and say exactly which steps are unverified. A script whose failure path was never executed is a script that has never run.
+**QEMU was installed while auditing this task.** `brew install qemu` was run on this machine (it was absent), giving `qemu-nbd`, `qemu-io` and `qemu-img` at `/opt/homebrew/bin/` — `qemu-nbd --version` reports **11.1.2**, which is what the measurements in this task were taken against. So the prerequisite is now met and Step 4 can actually be run. On a fresh machine the command is `brew install qemu` (macOS) or the distro's `qemu-utils` package (Debian/Ubuntu).
+
+Do not skip the step and do not write a script you never ran: report the missing prerequisite and say exactly which steps are unverified. A script whose failure path was never executed is a script that has never run.
 
 If it diverges, the divergence is the finding: a hand-rolled codec's first real client is where a transposed field shows up. Diagnose against the spec before changing anything.
 
@@ -3084,7 +3133,9 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 6 — `TestConnection_TrimZeroLengthIsEINVAL` and `TestConnection_WriteZeroesZeroLengthIsEINVAL` pin the uniform zero-length answer (`EINVAL`), and each is followed by a valid command on the same connection to prove the stream is still usable.
 - [ ] Task 6 — `TestConnection_TrimPastEndIsEINVAL`, `TestConnection_TrimOffsetPastEndIsEINVAL`, and `TestConnection_WriteZeroesPastEndIsENOSPC` pin out-of-range refusal (not clamping), and `TestConnection_TrimIsEPERMOnReadOnlyExport` passes with `SEND_TRIM` still advertised.
 - [ ] Task 6 — `go build ./... && go test -race ./internal/adapter/nbd/... ./pkg/adapter/nbd/... ./internal/adapter/common/...` clean (NOT `make test-unit`, which times out on five unrelated packages on this machine).
-- [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical transcripts against `qemu-nbd`, and the script passes `--discard=unmap` (without it the discard step diverges on the oracle's configuration, not on the codec).
+- [ ] Task 7 — `test/nbd/run-oracle.sh` exits 0 with identical **normalized** transcripts against `qemu-nbd`, and the script passes `--discard=unmap` (without it the discard step diverges on the oracle's configuration, not on the codec). Measured on `qemu-nbd` 11.1.2: with the flag, a read of the discarded range exits 0; without it, exit 1 and the data survives.
+- [ ] Task 7 — the oracle's `qemu-nbd` launch passes `-x export/boot`. Measured: without `-x` the oracle exposes an **empty** export name, so the URI that works against DittoFS fails with `server reported: export 'export/boot' not present` — a divergence that names neither cause.
+- [ ] Task 7 — transcripts are normalized before diffing (`sed '/ops;/d'`) and each command's exit status is captured. Measured: `qemu-io`'s timing line changes on every run (two identical runs against the *same* server differ on it alone, so a literal diff can never pass), and a pattern mismatch is reported on stdout while only the **exit code** distinguishes it — the transcript still reads `read 1048576/1048576 bytes at offset 0`.
 - [ ] Task 7 (Step 0) — an NBD `FLUSH` persists the file's deferred metadata, not just the block store: reading `rt.GetMetadataStoreForShare(integrationShare)` before and after shows the mtime move. Measured before the fix: `h.commit` left the raw store's mtime **unchanged**, and `FlushPendingWriteForFile(ctx, handle, false)` then returned `flushed=true` and changed it. The four `connection_test.go` FLUSH tests move off `newTestHandler` (nil meta panics: `runtime error: invalid memory address or nil pointer dereference`) onto `newWriteVolumeFixture`, and the EINVAL case still asserts `st.flushes == 0`.
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
 - [ ] Task 7 — `internal/adapter/nbd/oracle_test.go` skips (not fails) without QEMU, and `run-oracle.sh` treats that skip as a failure; the script prints which tier ran, so a green run says what it checked.
