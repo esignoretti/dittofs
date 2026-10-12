@@ -3122,13 +3122,16 @@ git -c gpg.format=ssh -c user.signingkey=$HOME/.ssh/id_rsa.pub commit -S -m "tes
 Topology, exactly as the spec's §9.5:
 
 ```
-local (small, static):  kernel + initramfs        <- firmware boots this; no NBD needed
+host:                   -kernel Image -initrd initramfs.cpio.gz   <- no disk, no NBD
 initramfs:              modprobe nbd
-                        nbd-client -N export/boot 10.0.2.2 10809 /dev/nbd0
+                        nbd-client -N export/boot 10.0.2.2 10809 /dev/nbd0 &
                         mkfs.ext4 /dev/nbd0        <- FIRST BOOT ONLY
                         mount /dev/nbd0 /root; switch_root
 NBD (DittoFS):          the root filesystem
 ```
+
+The `&` is load-bearing: with `-p` the client never returns (see Step 2), so a foreground
+`nbd-client` would hang before `switch_root` and the boot would never reach the volume.
 
 **Two spellings in that line are load-bearing, and both fail without naming the cause:**
 
@@ -3137,7 +3140,7 @@ NBD (DittoFS):          the root filesystem
 
 - **No data disk.** The root filesystem arrives over NBD. A `-drive` holding the volume would test the wrong path.
 - **No `hostfwd` rule.** `hostfwd` forwards a *host* port *into the guest*, which is the opposite of what this topology needs and would also try to bind host port 10809 where DittoFS is already listening. The guest initiates the connection outward to `10.0.2.2`, QEMU's user-net gateway to the host, and a guest-initiated outbound connection crosses SLIRP with no rule — the same path the guest uses to reach the outside world.
-- **No UEFI-boot-from-NBD.** EDK2 has no NBD driver; the boot path is kernel+initramfs from a local disk, then root-on-NBD via `switch_root`.
+- **No UEFI-boot-from-NBD.** EDK2 has no NBD driver, and `-M virt` on arm64 has no BIOS to run EDK2 with in the first place. The boot path is `-kernel`/`-initrd` handed over directly, then root-on-NBD via `switch_root`.
 - The script must build the initramfs with the `nbd` module and `nbd-client`, or refuse with a message naming what is missing.
 - **The recovery environment must not be on NBD.** The script must not run `fsck` from inside the guest: the guest's root is the volume under test, so an `fsck` there is judging a crash it is also recovering from. The check belongs on the host, against the volume read as a file over NFS — which is the B1 property (spec §2.2) earning its place.
 - Record which cache is in the path, in the script's own output: in this topology the guest's kernel NBD client speaks TCP directly to DittoFS, so there is no QEMU block layer, and a `-drive`'s `cache=` mode is irrelevant. Print the guest page-cache state and the share's `CommitAck` value so the run is self-describing.
@@ -3145,10 +3148,32 @@ NBD (DittoFS):          the root filesystem
 Reference launch (from the spec):
 
 ```
-qemu-system-aarch64 -M virt -cpu host -m 2G \
-  -drive if=virtio,file=boot.img,format=raw \
-  -netdev user,id=n0 -device virtio-net,netdev=n0
+qemu-system-aarch64 -M virt -accel kvm -cpu host -m 2G \
+  -kernel Image -initrd initramfs.cpio.gz \
+  -append "console=ttyAMA0 rdinit=/init" \
+  -netdev user,id=n0 -device virtio-net,netdev=n0 \
+  -display none -serial stdio
 ```
+
+**Three things about that line were wrong in the first draft, and each one fails in a way that names neither the cause nor the fix.**
+
+- **`-cpu host` requires an explicit `-accel kvm`.** Measured on QEMU 11.1.2: `qemu-system-aarch64 -M virt -cpu host` alone → `qemu-system-aarch64: Invalid CPU model: host`, followed by the list of valid models (`cortex-a7 … neoverse-n2, max`). Without an accelerator QEMU defaults to TCG, and `host` is meaningless there because TCG has no host CPU to mirror. `-accel kvm -cpu host` is accepted. `-accel max` is the portable substitute. **And `-accel kvm` must stay explicit rather than relying on `fallback=allow`:** measured, `-accel kvm,fallback=allow` on a machine without KVM prints `invalid accelerator kvm` — it does not silently degrade — so the explicit form is safe and the script should pass it. A silent TCG fallback would be much worse than a refusal here, because TCG is slow enough to make the dead-connection window measurements meaningless while still passing.
+- **There is no `boot.img`.** The first draft's `-drive if=virtio,file=boot.img,format=raw` implies something creates a bootable disk, and nothing in this plan does: `grep` for `boot.img` finds only the launch line and its own description. On `-M virt` an arm64 guest has no BIOS, and the plan never says how a kernel would be found on a disk. **Use `-kernel`/`-initrd` instead** — it removes a provisioning step and one more thing that can fail for an unrelated reason. `-kernel` is verified available on the QEMU in use (`qemu-system-aarch64 -M virt -kernel /nonexistent` → `could not load kernel '/nonexistent'`, i.e. the option is parsed and acted on).
+- **`-display none -serial stdio` is required** for the guest transcript to reach the host, which is the only evidence the script produces. Without it the boot is silent and a successful boot is indistinguishable from a hung one.
+
+**The volume must be provisioned before the guest boots, and nothing in the plan said so.** `RuntimeExporter.Resolve` looks up the share root, then `volumes/`, then the volume name — and **no command creates a volume**: `grep -rn "volume" cmd/dfsctl/` returns nothing. `internal/adapter/nbd/volume.go:21` records the intent (*"the operator, not the protocol, decides who owns the volumes"*), so provisioning is by hand, through the share's own NFS/SMB mount, and it is the operator's job in production too. The harness must therefore do it explicitly, and the plan's Step 1 must say how, because a script that skips it fails at the handshake with `nbd: unknown export` — the same message an omitted `-N` produces, which is why the two must be distinguished in the script's own output. Minimum sequence:
+
+```
+# host, before the guest boots: a share, a local tier, and a volume file of the right size
+dfsctl store metadata add ... ; dfsctl store block add ... ; dfsctl share create /export
+dfsctl adapter enable nbd
+# create volumes/boot THROUGH the share (NFS or SMB), as the configured identity, then:
+#   the file's size IS the export size (spec §4.4), and CreateFile zeroes it
+#   (pkg/metadata/validation.go:492 ApplyCreateDefaults sets Size = 0), so the size
+#   must be set afterwards with SetFileAttributes(SetAttrs{Size: &n})
+```
+
+That last note is the trap from Task 5: `CreateFile` with `FileAttr{Size: N}` does **not** produce a file of size N.
 
 - [ ] **Step 2: Write `crash-restart.sh`**
 
@@ -3231,9 +3256,13 @@ Run: `shellcheck test/nbd/*.sh` if available; fix what it reports.
 
 Run both on a host lacking QEMU/root and confirm each exits nonzero naming the missing prerequisite — not with a partial run, and not with exit 0.
 
+Also verify the **volume check** specifically, because it is the prerequisite whose absence produces a message that names something else: with a share and adapter present but no `volumes/boot`, the script must fail naming the missing volume, not let the guest boot and fail the handshake with `nbd: unknown export` (which reads as an export-name problem and is not one).
+
 - [ ] **Step 6: Record a run on a Linux host**
 
 This is the step that produces the actual evidence, and it is the point at which the design is falsified or confirmed. Record the transcript in the README's results section: the `dead_conn_timeout` value, the measured restart time, the guest's I/O behaviour, and the host-side `fsck` verdict.
+
+If the host has no KVM, **the script must refuse rather than fall back to TCG.** A TCG run boots and passes, and every timing in it — the dead-connection window, the restart time, the hung-task bound — is meaningless. Report "not run: no KVM" as the honest outcome; a green run under TCG is worse than no run, because it looks like evidence.
 
 Per the spec's §10: **Phase 1 is the first moment the design is falsifiable end-to-end, and it is the right place to stop and reassess if the boot path turns out to need something the protocol surface does not provide.** If it does, stop and report rather than extending the surface ad hoc.
 
@@ -3286,6 +3315,8 @@ Run in order; each becomes meaningful at the task named.
 - [ ] Task 7 — the flag-parity check confirms every flag DittoFS advertises is one `qemu-nbd` also advertises.
 - [ ] Task 7 — `internal/adapter/nbd/oracle_test.go` skips (not fails) without QEMU, and `run-oracle.sh` treats that skip as a failure; the script prints which tier ran, so a green run says what it checked.
 - [ ] Task 8 — the launch line carries **no `hostfwd`**: it forwards host→guest, which is the wrong direction and would try to bind host port 10809 where DittoFS is listening. The guest reaches the host at `10.0.2.2` with no rule.
+- [ ] Task 8 — the launch line passes **`-accel kvm` explicitly alongside `-cpu host`**. Measured on QEMU 11.1.2: `-M virt -cpu host` without an accelerator → `Invalid CPU model: host` and the list of valid models, because the default is TCG and `host` has no meaning there. And **no `-drive`/`boot.img`**: the kernel and initramfs come from `-kernel`/`-initrd`, because `-M virt` on arm64 has no BIOS and nothing in the plan creates a bootable disk. `-display none -serial stdio` carries the transcript, which is the only evidence the harness produces.
+- [ ] Task 8 — the harness **provisions `volumes/<name>` before the guest boots**, and sets its size after creating it (`ApplyCreateDefaults`, `pkg/metadata/validation.go:492`, sets `Size = 0` for every non-symlink, so `CreateFile` alone yields a zero-length export). Nothing in the repo creates a volume — `grep -rn "volume" cmd/dfsctl/` is empty — so a script that assumes one exists fails at the handshake with `nbd: unknown export`, the same message an omitted `-N` produces.
 - [ ] Task 8 — the guest's `nbd-client` line names the export (`-N export/boot`) and mounts `/dev/nbd0`, not `/dev/nbd0p1`. Measured: omitting `-N` makes `nbd-client` send an **empty** export name (`nbd-client.c:1504-1505`), which `RuntimeExporter.Resolve` refuses (`sep <= 0` → `ErrUnknownExport`) — probe result `nbd: unknown export`, reported to the client as a handshake failure that never mentions the flag. And nothing in the path writes a partition table, so a `p1` suffix fails with `no such device` after the handshake and `mkfs` have both already succeeded.
 - [ ] Task 8 — `bash -n` clean on both scripts; each refuses cleanly without prerequisites.
 - [ ] Task 8 — the crash rig sets `dead_conn_timeout` with `-T`/`--dead-timeout` and fails when netlink is unavailable, rather than silently running the ioctl path where the option is parsed and ignored.

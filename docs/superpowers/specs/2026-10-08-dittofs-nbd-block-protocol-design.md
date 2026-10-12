@@ -894,16 +894,22 @@ of the hand-rolled codec.
 qcow2 *files* for a dedup test — it never boots a VM — so the VM launch is **new code**,
 not an extension.
 
-Boot path being tested (EDK2 has no NBD driver, so UEFI-boot-from-NBD is not a path):
+Boot path being tested (EDK2 has no NBD driver, so UEFI-boot-from-NBD is not a path; and on
+`-M virt` an arm64 guest has no BIOS at all, so the kernel is handed over directly):
 
 ```
-local (small, static):  kernel + initramfs        <- firmware boots this; no NBD needed
+host:                   -kernel Image -initrd initramfs.cpio.gz   <- no disk, no NBD
 initramfs:              modprobe nbd
-                        nbd-client -N export/boot 10.0.2.2 10809 /dev/nbd0
+                        nbd-client -N export/boot 10.0.2.2 10809 /dev/nbd0 &
                         mkfs.ext4 /dev/nbd0        <- FIRST BOOT ONLY
                         mount /dev/nbd0 /root; switch_root
 NBD (DittoFS):          the root filesystem
 ```
+
+Note the `&` on the `nbd-client` line: with `-p` it never returns (§6.2 item 5), so in the
+foreground `switch_root` would never be reached. The first draft of this block described
+the kernel and initramfs as coming from "firmware" on a local disk, which was wrong twice
+over — there is no firmware on this machine type and no disk in the launch line.
 
 **Two things about that line are easy to get wrong, and both fail in a way that names
 neither cause.**
@@ -924,16 +930,36 @@ after a successful handshake and a successful `mkfs`.
 The upside of root-on-NBD is that the part being tested is exactly the part doing all the
 writing (root fs fsyncs), not the read-only kernel load.
 
-Reference launch. Note that the only local disk is `boot.img`:
+Reference launch. The kernel and initramfs are passed directly — there is no boot disk,
+and on `-M virt` an arm64 guest has no BIOS to read one with:
 
 ```
-qemu-system-aarch64 -M virt -cpu host -m 2G \
-  -drive if=virtio,file=boot.img,format=raw \
-  -netdev user,id=n0 -device virtio-net,netdev=n0
+qemu-system-aarch64 -M virt -accel kvm -cpu host -m 2G \
+  -kernel Image -initrd initramfs.cpio.gz \
+  -append "console=ttyAMA0 rdinit=/init" \
+  -netdev user,id=n0 -device virtio-net,netdev=n0 \
+  -display none -serial stdio
 ```
 
-- `boot.img` — kernel + initramfs, small and static. Boots without NBD. This is the
-  disk whose `cache=` mode does not matter, because nothing writes to it.
+- **`-accel kvm` is explicit and `-cpu host` depends on it.** Without an accelerator QEMU
+  uses TCG, where `-cpu host` is rejected outright — measured: `Invalid CPU model: host`
+  plus the list of valid models. `-accel max` is the portable substitute for `-cpu host`.
+  `-accel kvm,fallback=allow` does **not** silently degrade on a machine without KVM (it
+  reports `invalid accelerator kvm`), so an explicit `-accel kvm` is safe and preferable:
+  a silent fallback to TCG would still boot and still pass, while making every
+  dead-connection-window measurement meaningless.
+- **`-display none -serial stdio`** is what carries the guest transcript to the host. The
+  transcript is the only evidence the harness produces; without it a successful boot and a
+  hung boot are the same observation.
+- **The volume must exist before the guest boots.** No command creates one — `grep -rn
+  "volume" cmd/dfsctl/` finds nothing — because §4.7's premise is that the operator owns
+  the volumes. The harness creates `volumes/<name>` through the share's own NFS/SMB mount
+  and sets its size, which *is* the export size (§4.4). Note `CreateFile` alone is not
+  enough: `ApplyCreateDefaults` (`pkg/metadata/validation.go:492`) sets `Size = 0` for
+  every non-symlink, so the size must be set afterwards.
+- `boot.img` — **removed.** The earlier draft carried `-drive if=virtio,file=boot.img,format=raw`,
+  which implies something creates a bootable disk and nothing does. `-kernel`/`-initrd`
+  removes a provisioning step and a failure mode that would have been unrelated to NBD.
 - **No data disk.** The root filesystem arrives over NBD from DittoFS, which is the
   thing under test.
 - **No `hostfwd` rule, and adding one would break the run.** QEMU's user networking
