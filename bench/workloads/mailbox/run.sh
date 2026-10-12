@@ -25,11 +25,23 @@ export COMPACT_MOVE="${COMPACT_MOVE:-4g}"
 export COMPACT_BS="${COMPACT_BS:-1m}"
 
 job="${1:?usage: run.sh <job.fio> [fio args]}"; shift
+[ -r "$job" ] || { echo "run.sh: cannot read job file: $job" >&2; exit 1; }
 
 # Results live next to this script, wherever it is called from.
 results_dir="$(cd "$(dirname "$0")" && pwd)/results"
 mkdir -p "$results_dir"
-out="$results_dir/$(basename "$job" .fio)-u${USERS}-$(date +%Y%m%d-%H%M%S).json"
+
+# A job that never references ${USERS} (03 opens only user.0.vhdx) measures one user.
+name="$(basename "$job" .fio)"
+users_label="$USERS"
+if ! grep -q '\${USERS}' "$job"; then
+  if [ "$USERS" != "1" ]; then
+    echo "warning: $name does not use USERS; USERS=$USERS does not apply, result is labelled -u1" >&2
+  fi
+  users_label=1
+fi
+out="$results_dir/${name}-u${users_label}-$(date +%Y%m%d-%H%M%S).json"
+
 fio --output-format=json+ --output="$out" "$@" "$job"
 
 # fio --parse-only writes nothing; drop the empty file and skip the summary.
