@@ -114,9 +114,9 @@ WRITEs, whether it caches them, when it returns a delegation. A failure there on
 DittoFS if the Linux kernel server passes the same assertion on the same kernel.
 [`nfstest/baseline-knfsd.sh`](nfstest/baseline-knfsd.sh) runs those modules through the same
 `run.sh` against knfsd, under every option set, grades each set against DittoFS's tables, and
-writes [`nfstest/baseline-knfsd.md`](nfstest/baseline-knfsd.md). A row knfsd fails too is about
-the client; a row knfsd passes is ours. It needs the in-kernel nfsd, so it runs on a Linux host,
-or in CI: nightly beside the nfstest cells, or on demand:
+writes [`nfstest/baseline-knfsd.md`](nfstest/baseline-knfsd.md). A row knfsd fails every time is
+about the client; a row knfsd passes is ours. It needs the in-kernel nfsd, so it runs on a Linux
+host, or in CI: nightly beside the nfstest cells, or on demand:
 
 ```bash
 gh workflow run nfs-knfsd-baseline.yml            # every option set
@@ -130,3 +130,19 @@ which needs neither Linux nor root:
 ```bash
 test/nfs-mount/nfstest/baseline-knfsd.sh --report-only <artifact>/results/baseline-knfsd-<time>
 ```
+
+A row's pattern can cover assertions knfsd fails and others it passes, and one assertion name
+recurs within a module, so a row knfsd fails only in part does not cover every DittoFS failure
+under it. `--compare` sets DittoFS nfstest results beside knfsd's, assertion by assertion: pass it
+one or more nightly nfstest artifacts, or a local `test/conformance/results/nfstest`, and the
+report lists, per option set, every `dio` or `delegation` assertion DittoFS fails more often than
+knfsd, where knfsd passed it at least once or never reached it:
+
+```bash
+gh run download <nightly-run-id> --pattern 'nfstest-*' --dir <run-id>
+test/nfs-mount/nfstest/baseline-knfsd.sh --report-only <baseline-results> --compare <run-id>
+```
+
+Under `default` (NFSv4.2) knfsd never reaches the `DELEGRETURN should be sent after the close`
+assertions. It grants no write delegation that nfstest recognises at 4.2, and the client sends no
+CLOSE while it holds the read delegation. Those rows rest on the `v4.1` evidence.
