@@ -9,7 +9,7 @@ row knfsd *passes* is DittoFS-specific.
 
 - Kernel: `6.17.0-1022-azure`
 - nfstest: `9408954`
-- Generated: 2026-10-13T10:55:21Z
+- Run: 2026-10-13T09:13:03Z
 
 ## default
 
@@ -19,11 +19,14 @@ DittoFS known-failure rows for these modules:
 
 | Row | knfsd |
 |-----|-------|
-| `delegation/basic*: CLOSE should be sent to the server` | fails too |
-| `delegation/basic*: DELEGRETURN should be sent after the close` | not reached |
-| `dio/*: WRITE (*) should be sent` | fails too |
-| `dio/*: WRITEs should be cached for buffered I/O` | fails too |
-| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too |
+| `delegation/basic*: CLOSE should be sent to the server` | fails too (3 of 3) |
+| `delegation/basic02: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic04: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic0[369]: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic10: DELEGRETURN should be sent after the close` | not reached |
+| `dio/*: WRITE (*) should be sent` | fails too (6 of 6) |
+| `dio/*: WRITEs should be cached for buffered I/O` | fails too (10 of 10) |
+| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too (40 of 40) |
 
 Assertions knfsd fails:
 
@@ -66,10 +69,10 @@ DittoFS known-failure rows for these modules:
 | Row | knfsd |
 |-----|-------|
 | `dio/*: WRITE (*) should be sent` | not reached |
-| `dio/*: WRITEs should be cached for buffered I/O` | fails too |
+| `dio/*: WRITEs should be cached for buffered I/O` | fails too (2 of 10) |
 | `dio/[rw]size: traceback: Exception: Packet trace file is empty` | not reached |
 | `dio/[rw]size: traceback: Exception: mount.nfs: requested NFS version or transport protocol is not supported for /tmp/dittofs-test` | not reached |
-| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too |
+| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too (62 of 62) |
 
 Assertions knfsd fails:
 
@@ -91,11 +94,16 @@ DittoFS known-failure rows for these modules:
 
 | Row | knfsd |
 |-----|-------|
-| `delegation/basic*: CLOSE should be sent to the server` | fails too |
-| `delegation/basic*: DELEGRETURN should be sent after the close` | not reached |
-| `dio/*: WRITE (*) should be sent` | fails too |
-| `dio/*: WRITEs should be cached for buffered I/O` | fails too |
-| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too |
+| `delegation/basic*: CLOSE should be sent to the server` | fails too (3 of 3) |
+| `delegation/basic02: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic04: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic08: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic0[369]: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic10: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic1[12]: DELEGRETURN should be sent after the close` | not reached |
+| `dio/*: WRITE (*) should be sent` | fails too (9 of 9) |
+| `dio/*: WRITEs should be cached for buffered I/O` | fails too (2 of 15) |
+| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too (48 of 48) |
 | `dio/vectored_io: traceback: Exception: Packet trace file is empty: use --trcdelay option to give tcpdump time to flush buffer to packet trace` | not reached |
 
 Assertions knfsd fails:
@@ -138,11 +146,14 @@ DittoFS known-failure rows for these modules:
 
 | Row | knfsd |
 |-----|-------|
-| `delegation/basic*: CLOSE should be sent to the server` | passes |
-| `delegation/basic*: DELEGRETURN should be sent after the close` | fails too |
-| `dio/*: WRITE (*) should be sent` | fails too |
-| `dio/*: WRITEs should be cached for buffered I/O` | fails too |
-| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too |
+| `delegation/basic*: CLOSE should be sent to the server` | passes (12) |
+| `delegation/basic02: DELEGRETURN should be sent after the close` | passes (1) |
+| `delegation/basic04: DELEGRETURN should be sent after the close` | fails too (1 of 1) |
+| `delegation/basic0[369]: DELEGRETURN should be sent after the close` | passes (3) |
+| `delegation/basic10: DELEGRETURN should be sent after the close` | fails too (1 of 1) |
+| `dio/*: WRITE (*) should be sent` | fails too (4 of 4) |
+| `dio/*: WRITEs should be cached for buffered I/O` | fails too (8 of 20) |
+| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too (30 of 30) |
 
 Assertions knfsd fails:
 
@@ -170,11 +181,14 @@ DittoFS known-failure rows for these modules:
 
 | Row | knfsd |
 |-----|-------|
-| `delegation/basic*: CLOSE should be sent to the server` | fails too |
-| `delegation/basic*: DELEGRETURN should be sent after the close` | fails too |
-| `dio/*: WRITE (*) should be sent` | fails too |
-| `dio/*: WRITEs should be cached for buffered I/O` | fails too |
-| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too |
+| `delegation/basic*: CLOSE should be sent to the server` | fails too (7 of 12) |
+| `delegation/basic02: DELEGRETURN should be sent after the close` | fails too (1 of 1) |
+| `delegation/basic04: DELEGRETURN should be sent after the close` | not reached |
+| `delegation/basic0[369]: DELEGRETURN should be sent after the close` | fails too (1 of 3) |
+| `delegation/basic10: DELEGRETURN should be sent after the close` | passes (1) |
+| `dio/*: WRITE (*) should be sent` | fails too (7 of 7) |
+| `dio/*: WRITEs should be cached for buffered I/O` | fails too (16 of 20) |
+| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too (40 of 40) |
 
 Assertions knfsd fails:
 
@@ -212,11 +226,14 @@ DittoFS known-failure rows for these modules:
 
 | Row | knfsd |
 |-----|-------|
-| `delegation/basic*: CLOSE should be sent to the server` | passes |
-| `delegation/basic*: DELEGRETURN should be sent after the close` | fails too |
-| `dio/*: WRITE (*) should be sent` | fails too |
-| `dio/*: WRITEs should be cached for buffered I/O` | fails too |
-| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too |
+| `delegation/basic*: CLOSE should be sent to the server` | passes (12) |
+| `delegation/basic02: DELEGRETURN should be sent after the close` | passes (1) |
+| `delegation/basic04: DELEGRETURN should be sent after the close` | fails too (1 of 1) |
+| `delegation/basic0[369]: DELEGRETURN should be sent after the close` | passes (3) |
+| `delegation/basic10: DELEGRETURN should be sent after the close` | fails too (1 of 1) |
+| `dio/*: WRITE (*) should be sent` | fails too (4 of 4) |
+| `dio/*: WRITEs should be cached for buffered I/O` | fails too (7 of 20) |
+| `dio/vectored_io: WRITE should be sent to the server with size *` | fails too (30 of 30) |
 
 Assertions knfsd fails:
 
