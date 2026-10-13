@@ -55,6 +55,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=../option-sets.sh
 source "$SCRIPT_DIR/../option-sets.sh"
+# shellcheck source=../netns.sh
+source "$SCRIPT_DIR/../netns.sh"
 # shellcheck source=../../common/known-failures.sh
 source "$TEST_DIR/common/known-failures.sh"
 
@@ -120,10 +122,9 @@ run_knfsd() {
         { apt-get update -qq && apt-get install -y -qq nfs-kernel-server; } || die "could not install nfs-kernel-server"
     fi
 
-    # The address run.sh mounts from, computed the same way and handed to it,
-    # so the export can be limited to it.
-    SERVER="${NFSTEST_SERVER:-$(hostname -I | awk '{print $1}')}"
-    [[ -n "$SERVER" ]] || die "cannot determine this host's address; set NFSTEST_SERVER"
+    # run.sh's clients mount from their own network namespaces, on the subnet
+    # netns.sh puts behind the host bridge, so the export is limited to it.
+    CLIENTS="$NS_SUBNET.0/24"
 
     modprobe nfsd 2>/dev/null || true
     # An nfsd already serving is someone else's: cleanup leaves it running.
@@ -152,13 +153,14 @@ run_knfsd() {
 
     # No fsid=0: the export is then reachable at its own path over NFSv3 and
     # through the kernel's pseudo-root over NFSv4, so one --export serves every
-    # option set. no_root_squash because nfstest creates its files as root,
-    # which is why it goes to this host's own addresses and nowhere else.
-    log "Exporting $EXPORT_DIR to $SERVER and 127.0.0.1..."
+    # option set. Root is squashed, as DittoFS's export for these suites
+    # squashes it: nfstest runs as an ordinary user and only mounts as root,
+    # and the world-writable directory lets that user create its files.
+    log "Exporting $EXPORT_DIR to $CLIENTS..."
     mkdir -p "$EXPORT_DIR" /etc/exports.d
     chmod 777 "$EXPORT_DIR"
-    local opts="rw,insecure,no_root_squash,no_subtree_check"
-    echo "$EXPORT_DIR $SERVER($opts) 127.0.0.1($opts)" >"$EXPORTS_FILE"
+    local opts="rw,insecure,root_squash,no_subtree_check"
+    echo "$EXPORT_DIR $CLIENTS($opts)" >"$EXPORTS_FILE"
     systemctl start nfs-server 2>/dev/null || service nfs-kernel-server start 2>/dev/null || true
     rpc.nfsd 8 || die "rpc.nfsd failed to start"
     exportfs -ra
@@ -179,7 +181,7 @@ run_knfsd() {
         # An empty NFSTEST_MOUNTPORT leaves the v3 MOUNT port to rpcbind, where
         # knfsd's mountd registers. run.sh exits with the count of failures not on
         # the tables, which here is a finding, not an error.
-        NFS_PORT=2049 NFSTEST_SERVER="$SERVER" NFSTEST_EXPORT="$EXPORT_DIR" NFSTEST_MOUNTPORT="" \
+        NFS_PORT=2049 NFSTEST_EXPORT="$EXPORT_DIR" NFSTEST_MOUNTPORT="" \
             DITTOFS_RESULTS_DIR="$RESULTS_ROOT/$v" DITTOFS_KNOWN_FAILURES="$(tables "$v")" \
             "$SCRIPT_DIR/run.sh" --variant "$v" --modules "$modules" || true
     done
