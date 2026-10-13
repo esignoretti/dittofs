@@ -72,11 +72,15 @@ MOUNT_OPTS="$(option_set_mount_opts "$VARIANT" "$NFS_PORT")"
 
 if [[ -z "${DITTOFS_CLIENT_NS:-}" ]]; then
     FETCHED="$("$SUITE_DIR/fetch.sh" cthon04)" || { echo "could not fetch cthon04" >&2; exit 2; }
-    CTHON=/tmp/dittofs-nfs-mount/cthon04
+    # A fresh private directory, not a fixed path another user could have
+    # prepared; it is opened to reading only once it is this script's own.
+    WORKBASE="$(mktemp -d /tmp/dittofs-nfs-mount.XXXXXX)" || exit 2
+    chmod 0755 "$WORKBASE"
+    CTHON="$WORKBASE/cthon04"
     teardown() {
         client_ns_down_all
         test_user_release
-        rm -rf "$CTHON"
+        rm -rf "$WORKBASE"
     }
     trap teardown EXIT
     client_ns_down_all
@@ -86,10 +90,9 @@ if [[ -z "${DITTOFS_CLIENT_NS:-}" ]]; then
     client_ns_up 1 || exit 2
 
     client_ns_exec 1 env DITTOFS_CLIENT_NS=1 CTHON="$CTHON" DITTOFS_RESULTS_DIR="$RESULTS_DIR" \
-        "$SCRIPT_DIR/run.sh" "${ARGS[@]}"
+        "$SCRIPT_DIR/run.sh" "${ARGS[@]}" || echo "the client side exited $?" >&2
 
-    # The teardown step deletes the server log; keep it with the results,
-    # which CI uploads.
+    # The teardown step deletes the server log; keep it with the results.
     gzip -c /tmp/dittofs-posix-server.log >"$RESULTS_DIR/server.log.gz" 2>/dev/null || true
 
     # Not exec: the EXIT trap has to run to tear the namespace down.

@@ -101,12 +101,16 @@ extra="$(option_set_extra_opts "$VARIANT")"
 
 if [[ -z "${DITTOFS_CLIENT_NS:-}" ]]; then
     FETCHED="$("$SUITE_DIR/fetch.sh" nfstest)" || { echo "could not fetch nfstest" >&2; exit 2; }
-    NFSTEST=/tmp/dittofs-nfs-mount/nfstest
-    SSHD_DIR=/tmp/dittofs-nfs-mount/sshd
+    # A fresh private directory, not a fixed path another user could have
+    # prepared; it is opened to reading only once it is this script's own.
+    WORKBASE="$(mktemp -d /tmp/dittofs-nfs-mount.XXXXXX)" || exit 2
+    chmod 0755 "$WORKBASE"
+    NFSTEST="$WORKBASE/nfstest"
+    SSHD_DIR="$WORKBASE/sshd"
     teardown() {
         client_ns_down_all
         test_user_release
-        rm -rf "$NFSTEST" "$SSHD_DIR"
+        rm -rf "$WORKBASE"
     }
     trap teardown EXIT
     client_ns_down_all
@@ -129,10 +133,10 @@ if [[ -z "${DITTOFS_CLIENT_NS:-}" ]]; then
     nc -z -w 1 "$CLIENT2" 22 2>/dev/null || { echo "sshd on the second client never came up" >&2; exit 2; }
 
     client_ns_exec 1 env DITTOFS_CLIENT_NS=1 NFSTEST="$NFSTEST" DITTOFS_RESULTS_DIR="$RESULTS_DIR" \
-        NFSTEST_MODULES="$MODULES" "$SCRIPT_DIR/run.sh" "${ARGS[@]}"
+        NFSTEST_MODULES="$MODULES" "$SCRIPT_DIR/run.sh" "${ARGS[@]}" ||
+        echo "the client side exited $?" >&2
 
-    # The teardown step deletes the server log; keep it with the results,
-    # which CI uploads.
+    # The teardown step deletes the server log; keep it with the results.
     gzip -c /tmp/dittofs-posix-server.log >"$RESULTS_DIR/server.log.gz" 2>/dev/null || true
 
     # Not exec: the EXIT trap has to run to tear the namespaces down.
@@ -151,9 +155,14 @@ mkdir -p "$MOUNT_POINT"
 detach "$MOUNT_POINT"
 
 cleanup() {
-    # A module killed by its timeout never stops its packet capture; nfstest
-    # stops captures itself only when it gets to.
+    # A module killed by its timeout never stops its packet capture, nor ends
+    # what it started on the second client: its ssh sessions, its remote
+    # procedure server there, and that client's mount, which lives in the
+    # second namespace and is reachable only through it.
     pkill -f 'tcpdump .*nfstest_' 2>/dev/null || true
+    pkill -u "$TEST_USER_NAME" -x ssh 2>/dev/null || true
+    sudo -u "$TEST_USER_NAME" -H timeout 30 ssh "$CLIENT2" \
+        "sudo pkill -u $TEST_USER_NAME -x python3; sudo umount -f -l $MOUNT_POINT" >/dev/null 2>&1 || true
     detach "$MOUNT_POINT"
 }
 trap 'cleanup; rm -rf "$WORKDIR"' EXIT
@@ -195,8 +204,11 @@ COUNT=0
             continue
         fi
         # shellcheck disable=SC2046  # module_args is a word list on purpose
-        (cd "$WORKDIR" && timeout --kill-after=30 "$MODULE_TIMEOUT" \
-            sudo -u "$TEST_USER_NAME" -H env PYTHONPATH="$NFSTEST" \
+        # timeout runs inside sudo, as the test user: sudo cannot pass on a
+        # SIGKILL, so from outside it would end sudo and leave a module stuck
+        # on a hung mount running.
+        (cd "$WORKDIR" && sudo -u "$TEST_USER_NAME" -H \
+            timeout --kill-after=30 "$MODULE_TIMEOUT" env PYTHONPATH="$NFSTEST" \
             python3 "$NFSTEST/test/nfstest_$m" \
             --server "$SERVER" --port "$NFS_PORT" --export "$NFSTEST_EXPORT" \
             --nfsversion "$VERSION" --mtpoint "$MOUNT_POINT" \

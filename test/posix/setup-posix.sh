@@ -415,10 +415,16 @@ configure_via_api() {
     # Both settings are read when the adapter starts, so they go in before it
     # is enabled. A kernel NFSv3 client asks the server's rpcbind where the lock
     # manager is; without the registration it reaches no lock manager at all.
+    # The registration replaces any lock manager already registered with this
+    # host's rpcbind, and is withdrawn when dfs stops, so a host running its
+    # own NFS server or locking NFS client loses its lock manager to it. An
+    # rpcbind started here is left running.
     if [[ "$SYSTEM_RPCBIND" == true ]]; then
         if ! rpcinfo -p 127.0.0.1 >/dev/null 2>&1; then
             log_info "Starting rpcbind..."
             rpcbind || { log_error "rpcbind failed to start"; return 1; }
+        elif rpcinfo -p 127.0.0.1 2>/dev/null | grep -qE '^ *100021 '; then
+            log_warn "a lock manager is already registered with rpcbind; dfs will replace it until it stops"
         fi
         "$DITTOFSCTL_BIN" adapter settings nfs update --portmapper-register-with-system --udp-enabled
     fi
