@@ -483,6 +483,10 @@ func resizeExistingFile(
 	req *CreateRequest,
 ) (*metadata.FileAttr, error) {
 	fileHandle, _ := metadata.EncodeFileHandle(existingFile)
+	// decision: with no size there is no permission check here, because nothing
+	// changes: the reply only reports the file's current attributes, which a
+	// LOOKUP would return too. Writing to the file is still gated by WRITE and
+	// ACCESS. Revisit if this path ever applies anything besides the size.
 	if req.Attr == nil || req.Attr.Size == nil {
 		current, err := metaSvc.GetFile(authCtx.Context, fileHandle)
 		if err != nil {
