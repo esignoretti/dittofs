@@ -9,7 +9,8 @@
 #
 # Usage:
 #   ./setup-posix.sh [config-type] [--nfs-version 3|4|4.0|4.1] [--no-mount]
-#                    [--squash MODE] [--test-user NAME:UID] [--system-rpcbind]
+#                    [--squash MODE] [--default-permission LEVEL]
+#                    [--test-user NAME:UID] [--system-rpcbind]
 #
 # Config types:
 #   memory         - In-memory BadgerDB metadata store (default)
@@ -34,6 +35,9 @@
 # The remaining flags serve suites that run as an ordinary user on a client in
 # its own network namespace (test/nfs-mount/), and change nothing for pjdfstest:
 #   --squash MODE         export squash instead of root_to_admin
+#   --default-permission LEVEL
+#                         what a user without a grant gets on the export; a
+#                         squashed root needs read to mount it over NFSv4
 #   --test-user NAME:UID  a DittoFS user NAME with uid and gid UID and a
 #                         read-write grant on the export
 #   --system-rpcbind      register MOUNT and NLM with this host's rpcbind, so a
@@ -55,6 +59,7 @@ CONFIG_TYPE="memory"
 NFS_VERSION="3"
 NO_MOUNT=false
 SQUASH="root_to_admin"
+DEFAULT_PERMISSION=""
 TEST_USER=""
 SYSTEM_RPCBIND=false
 
@@ -78,6 +83,10 @@ while [[ $# -gt 0 ]]; do
             SQUASH="${2:?--squash requires a value}"
             shift 2
             ;;
+        --default-permission)
+            DEFAULT_PERMISSION="${2:?--default-permission requires a value}"
+            shift 2
+            ;;
         --test-user)
             TEST_USER="${2:?--test-user requires NAME:UID}"
             shift 2
@@ -95,6 +104,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --no-mount   Provision the server but do not mount (does not need root)"
             echo "  --squash MODE          Export squash (default root_to_admin)"
+            echo "  --default-permission LEVEL  What users without a grant get on the export"
             echo "  --test-user NAME:UID   Also create user NAME (uid=gid=UID) with a read-write grant"
             echo "  --system-rpcbind       Register MOUNT/NLM with the host rpcbind (needs root)"
             echo ""
@@ -107,7 +117,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -*)
             echo "Unknown option: $1"
-            echo "Usage: $0 [config-type] [--nfs-version 3|4|4.0|4.1] [--no-mount] [--squash MODE] [--test-user NAME:UID] [--system-rpcbind]"
+            echo "Usage: $0 [config-type] [--nfs-version 3|4|4.0|4.1] [--no-mount] [--squash MODE] [--default-permission LEVEL] [--test-user NAME:UID] [--system-rpcbind]"
             exit 1
             ;;
         *)
@@ -358,7 +368,8 @@ configure_via_api() {
 
     # Create share
     log_info "Creating share..."
-    "$DITTOFSCTL_BIN" share create --name /export --metadata default --block-store default
+    "$DITTOFSCTL_BIN" share create --name /export --metadata default --block-store default \
+        ${DEFAULT_PERMISSION:+--default-permission "$DEFAULT_PERMISSION"}
 
     # pjdfstest's prove(1) harness runs as root and relies on uid 0 retaining
     # POSIX superuser privileges to build/tear down the test tree (chown to

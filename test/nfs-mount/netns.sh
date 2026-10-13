@@ -54,6 +54,9 @@ client_ns_up() {
     ip netns exec "$ns" ip link set lo up || return 1
     ip netns exec "$ns" ip addr add "$addr/24" dev "$ns_if" || return 1
     ip netns exec "$ns" ip link set "$ns_if" up || return 1
+    # nfstest finds its own address from the route to a public one, so a
+    # client needs a default route even though it never leaves the subnet.
+    ip netns exec "$ns" ip route add default via "$NS_SERVER_ADDR" || return 1
     # The bridge port takes a moment to start forwarding. The probe is the
     # host's rpcbind, which every client needs to reach anyway.
     local _
