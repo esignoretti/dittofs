@@ -59,9 +59,8 @@ jobs:
     timeout-minutes: 75
 
     # No `services:` block: the test step's command (test/harness/bin/dt e2e)
-    # starts Postgres 16 (dittofs/dittofs, db dittofs_test) on 127.0.0.1:5432 and
-    # Localstack 4.13.1 (S3) on 127.0.0.1:4566 itself, retrying their pulls, and
-    # hands the suite POSTGRES_* and LOCALSTACK_ENDPOINT, as it does on a laptop.
+    # starts Localstack 4.13.1 (S3) on 127.0.0.1:4566 itself, retrying its pull,
+    # and hands the suite LOCALSTACK_ENDPOINT, as it does on a laptop.
 
     steps:
       - name: Checkout

@@ -45,7 +45,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      # PostgreSQL for the metadata-store integration + conformance suites.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -60,13 +59,16 @@ jobs:
       # retrying each image pull (Actions cannot retry a `services:` pull, and a
       # transient Docker Hub error there failed the job before any step ran):
       #   - Postgres 16 on 127.0.0.1:15432, postgres/postgres, db dittofs_test,
-      #     with DITTOFS_TEST_POSTGRES_DSN and DITTOFS_TEST_PG_* pointing at it;
+      #     for the control-plane store's PostgreSQL integration tests
+      #     (DITTOFS_TEST_POSTGRES_DSN points at it);
       #   - PyKMIP on 127.0.0.1:5696, with certificates, one key per state the
-      #     provider reacts to, and the DITTOFS_TEST_KMIP_* variables.
+      #     provider reacts to, and the DITTOFS_TEST_KMIP_* variables, for the
+      #     live KMIP tests. It refuses to run when PyKMIP did not enable them, or
+      #     when their package is missing from the selection.
       # It runs the packages test/integration/packages.sh derives (see its
-      # header for why derived, and why only those) with -tags=integration -p 1,
-      # then the KMIP interop tests in pkg/block/middleware/encryption/keyprovider,
-      # which carry no integration tag and so are on no derived list.
+      # header for why derived, and why only those) with -tags=integration
+      # -count=1 -p 1: packages that use the dittofs_test database must not run
+      # their binaries concurrently.
       - name: Run the integration tests
         run: test/harness/bin/dt integration -v
 

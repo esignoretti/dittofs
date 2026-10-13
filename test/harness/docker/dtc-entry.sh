@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Entry point of the dtc container. The repo's scripts talk to their services on
-# localhost (Localstack :4566, Postgres :5432, the integration Postgres :15432,
+# localhost (Localstack :4566, the integration Postgres :15432,
 # PyKMIP :5696). Those services are sibling containers publishing on the Docker host.
 # On a bridge network (Docker Desktop) the host is host.docker.internal, so forward
 # each port; sharing the host's network (DT_HOSTNET=1, a Linux engine), they are
@@ -8,7 +8,7 @@
 set -uo pipefail
 HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${DT_HOSTNET:-}" != 1 ]]; then
-    for p in 4566 5432 15432 5696; do
+    for p in 4566 15432 5696; do
         socat "TCP-LISTEN:$p,bind=127.0.0.1,fork,reuseaddr" "TCP:host.docker.internal:$p" >/dev/null 2>&1 &
     done
 fi

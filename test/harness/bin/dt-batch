@@ -82,7 +82,7 @@ case "$SET" in
         run "pynfs 4.1 / memory"                   pynfs --minor 4.1 --profile memory
         run "pynfs 4.0 delegations / memory / LAN" pynfs --minor 4.0 --profile memory --lan --tests "delegations writedelegations"
         run "pjdfstest v3 / memory"                posix --nfs 3 --profile memory
-        run "pjdfstest v4.1 / postgres-s3"         posix --nfs 4.1 --profile postgres-s3
+        run "pjdfstest v4.1 / badger-s3"           posix --nfs 4.1 --profile badger-s3
         run "e2e (full suite)"                     e2e
         run "wpts / memory"                        smb wpts --profile memory
         run "smbtorture / memory"                  smb smbtorture --profile memory

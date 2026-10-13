@@ -45,13 +45,13 @@ dtc unit --fresh                 # -count=1: no test cache (use for baselines)
 dtc integration                  # -tags=integration, CI's derived package list, + KMIP interop
 dtc quick                        # vet + lint + unit tests of changed packages
 dtc pynfs --minor 4.0            # NFSv4.0 conformance, graded vs KNOWN_FAILURES_V40.md
-dtc pynfs --minor 4.1 --profile postgres-s3
+dtc pynfs --minor 4.1 --profile badger-s3
 dtc posix --nfs 4.1              # pjdfstest, CI's own command
 dt scenarios test/scenarios/*-xs.sh # system scenarios on rootless podman (host only)
 dtc e2e [--test P] [--nightly] [--require-nlm]
 dtc smb wpts|smbtorture --profile memory
 dtc stack up                     # dfs + Localstack S3 in Compose; then `dt stack mount` on the host
-dtc services up|down|status      # Localstack, 2x Postgres, PyKMIP
+dtc services up|down|status      # Localstack, Postgres, PyKMIP
 dtc cleanup [--volumes]          # stop everything the harness runs; refuses while a suite runs
 dtc shell                        # interactive; dtc shell -c 'go test -run X ./pkg/y'
 dtc build | dtc clean            # rebuild the image / drop image + cache volumes
@@ -89,7 +89,7 @@ How it is wired:
 - **Networking by engine.** The services publish on the Docker host's `127.0.0.1`, and
   the repo's scripts hard-code `localhost`.
   - *Docker Desktop:* the container is on the bridge network. The entry script forwards
-    `localhost:4566`, `5432`, `15432` and `5696` to `host.docker.internal`, and the
+    `localhost:4566`, `15432` and `5696` to `host.docker.internal`, and the
     testcontainers host is `host.docker.internal`.
   - *A Linux Docker Engine* (and, not verified, VM runtimes such as colima or OrbStack): a port
     published on `127.0.0.1` is reachable only from the host's own network namespace, so
@@ -147,20 +147,18 @@ timing-sensitive cases may flake, so an x86_64 host is the authoritative place f
 
 ## Shared services
 
-`dt services up|down|status [localstack|pg|pg-it|kmip]`. Each one mirrors the CI service
+`dt services up|down|status [localstack|pg-it|kmip]`. Each one mirrors the CI service
 it replaces:
 
 | Service | Container | Port | Used by | Mirrors |
 |---|---|---|---|---|
 | Localstack 4.13.1 (S3 only) | `dittofs-localstack` | 127.0.0.1:4566 | `*-s3` profiles of pynfs/posix, e2e | conformance.yml, e2e-tests.yml |
-| Postgres 16-alpine | `dittofs-postgres-test` | 127.0.0.1:5432 | `postgres*` profiles (`dittofs`/`dittofs`, db `dittofs_test`), with `--data-checksums` and CI's tuning | conformance.yml |
-| Postgres 16 | `dittofs-harness-pg-it` | 127.0.0.1:15432 | integration tests (`postgres`/`postgres`, db `dittofs_test`) | integration-tests.yml |
-| PyKMIP 0.10.0 | `dittofs-pykmip` | **127.0.0.1**:5696 | KMIP key-provider interop tests | integration-tests.yml |
+| Postgres 16 | `dittofs-harness-pg-it` | 127.0.0.1:15432 | integration tests: the control-plane store's PostgreSQL cases (`postgres`/`postgres`, db `dittofs_test`) | integration-tests.yml |
+| PyKMIP 0.10.0 | `dittofs-pykmip` | **127.0.0.1**:5696 | the live KMIP key-provider tests | integration-tests.yml |
 
-There are two Postgres instances on purpose. The integration tests create and drop
-databases as the `postgres` superuser, while the conformance profiles connect as
-`dittofs` to the same database name. Sharing one instance would let leftover state from
-one tier leak into the other.
+The metadata store is Badger only, so no suite profile and no e2e test needs a Postgres
+of its own. `dt cleanup` removes the conformance Postgres (`dittofs-postgres-test`)
+that earlier versions of the harness started.
 
 `dt` runs the steps of `test/kmip/start-pykmip.sh` itself, reading its pinned image and
 version. The reason is that the script publishes 5696 on every interface, which exposes
@@ -182,16 +180,12 @@ What `integration-tests.yml` runs (the job calls `dt integration -v`): the packa
 `-tags=integration`, run with `-tags=integration -count=1 -timeout=20m -p 1` against
 Postgres and PyKMIP. `--changed` narrows the run to changed packages.
 
-Two things it does beyond the tagged packages:
-- **Postgres host and port.** `DITTOFS_TEST_POSTGRES_DSN` is only an on/off gate for the
-  Postgres metadata-store suite, which takes its host, port and database from
-  `DITTOFS_TEST_PG_HOST/PORT/DBNAME` (default `localhost:5432`). The harness sets both,
-  because its integration Postgres is on 15432. Without them the suite reaches the
-  other Postgres and fails authentication.
-- **KMIP interop.** `pkg/block/middleware/encryption/keyprovider` has no
-  `integration`-tagged file, so it is on no derived list, and the unit job has no KMIP
-  environment. `dt integration` runs its interop tests as a separate `kmip-interop`
-  step, in CI too.
+- **Postgres.** `DITTOFS_TEST_POSTGRES_DSN` points the control-plane store's PostgreSQL
+  tests at the integration Postgres on 15432.
+- **KMIP.** The live KMIP tests are integration-tagged, so the derived list includes
+  `pkg/block/middleware/encryption/keyprovider`. A full run refuses to start when the
+  PyKMIP setup did not enable them (`DITTOFS_TEST_KMIP=1`), or when that package is
+  missing from the list, rather than pass having skipped them.
 
 `test/integration/portmap` (`-tags=portmap_system`) needs a system rpcbind and is not
 run.
@@ -250,7 +244,7 @@ sharing, not DittoFS alone. The harness does it the CI way:
 
 ```bash
 dt posix                                 # NFSv3, memory profile, full suite
-dt posix --nfs 4.1 --profile postgres-s3
+dt posix --nfs 4.1 --profile badger-s3
 dt posix chmod                           # one test directory
 ```
 
@@ -274,8 +268,8 @@ checkout plus the test-client container. The results are graded against the suit
 `KNOWN_FAILURES.md`.
 
 ```bash
-dt smb smbtorture --profile memory     # profiles: memory badger sqlite postgres
-dt smb wpts --profile memory           # profiles: memory badger badger-s3 postgres-s3
+dt smb smbtorture --profile memory     # profiles: memory badger
+dt smb wpts --profile memory           # profiles: memory badger badger-s3
 ```
 
 The Compose file publishes 8080 and 12445, so those ports must be free (no `dt stack`,
@@ -295,8 +289,8 @@ A run killed before its cleanup leaves the stack, and every later run then refus
 - **Output to a file, not a pipe.** A process the suite leaves behind can hold a pipe's
   write end open and hang the reader. The wrapper also caps the run at `E2E_WALL`
   (default 45m). The log appears in `logs/e2e-<ts>.log` at the end.
-- **The harness services.** Like CI, the suite gets `POSTGRES_*` and `LOCALSTACK_ENDPOINT`.
-  Without them it starts its own containers, and its fallback Localstack is 3.0.
+- **The harness services.** Like CI, the suite gets `LOCALSTACK_ENDPOINT`. Without it the
+  suite starts its own container, and its fallback Localstack is 3.0.
 - **`--test` narrows the packages** to those with a matching top-level test. Otherwise
   every other package prints `testing: warning: no tests to run`.
 - **A run that ran nothing fails.** CI's wrapper passes a `-run` filter that matches no
@@ -651,7 +645,6 @@ need exclusive ports; run them on demand.
 | MinIO image `minio/minio:RELEASE.2024-09-13T20-26-02Z` can no longer be pulled | `run-e2e.sh --minio` and the MinIO fixture fail without a cached image | `--minio` refused |
 | e2e falls back to Localstack 3.0; CI and Compose use 4.13.1 | two S3 emulator versions | `dt e2e` provides 4.13.1 |
 | `test/kmip/start-pykmip.sh` publishes 5696 on all interfaces | a test key server on the local network | bound to 127.0.0.1 |
-| KMIP interop tests are on no derived integration list | they ran in no CI job | `kmip-interop` step, which CI now runs through `dt integration` |
 | Repo pre-push `-timeout=60s` | pushes touching several heavy packages time out | CI's 25 min |
 | Debian 12's `mawk` has no regex intervals | the pynfs grader's `/^\*{50}$/` never matches, and every run is graded "no results block" | the image installs gawk |
 | The four e2e tests using `mountNFSExport` never unmount | on Linux, NFS hard mounts to stopped servers are left behind (9 per full run), and a later `stat` under TMPDIR blocks | `dtc e2e` force-unmounts them |

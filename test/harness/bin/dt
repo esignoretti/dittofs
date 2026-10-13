@@ -7,7 +7,7 @@
 #
 #   dt help                 list commands
 #   dt doctor               check toolchain, Docker, images, ports
-#   dt services up|down|status [localstack|pg|pg-it|kmip]
+#   dt services up|down|status [localstack|pg-it|kmip]
 #   dt unit [--full] [--changed] [--cover] [--fresh] [PKG...]   (--fresh: -count=1, no test cache)
 #   dt integration [--changed] [PKG...]
 #   dt pynfs [--profile P] [--minor 4.0|4.1] [--tests "CODES"] [--lan]
@@ -21,7 +21,7 @@
 #                           no NAME: a shell in a set-up container   (host only, not dtc)
 #   dt quick                vet + lint + unit tests of changed packages
 #   dt teardown             stop a host dfs left by a suite, clear /tmp/dittofs-*
-#   dt cleanup [--volumes]  stop ALL harness containers (Localstack, 2x Postgres, PyKMIP, stack, SMB, e2e-linux)
+#   dt cleanup [--volumes]  stop ALL harness containers (Localstack, Postgres, PyKMIP, stack, SMB, e2e-linux)
 #   dt hooks install [--container]|uninstall|status   (--container: hooks run via dtc)
 #
 # In the Linux dev container (harness/bin/dtc) every command is the same: dtc unit,
@@ -81,8 +81,6 @@ fi
 # resolves short names only through registries.conf and refuses them without it.
 LOCALSTACK_NAME=dittofs-localstack          # the name run-e2e.sh reuses
 LOCALSTACK_IMAGE=docker.io/localstack/localstack:4.13.1
-PG_NAME=dittofs-postgres-test               # conformance/posix profiles: dittofs/dittofs@5432
-PG_IMAGE=docker.io/library/postgres:16-alpine
 PGIT_NAME=dittofs-harness-pg-it             # integration tests: postgres/postgres@15432
 PGIT_IMAGE=docker.io/library/postgres:16
 PGIT_PORT=15432
@@ -199,7 +197,7 @@ listeners() { # listeners PORT...: the listening sockets on those ports, for mes
     if use_ss; then ss -ltnp | awk -v re=":($re)$" 'NR==1 || $4 ~ re'
     else lsof -w -nP -iTCP -sTCP:LISTEN | awk -v re=":($re) " 'NR==1 || $0 ~ re'; fi
 }
-# In a bridge-network dtc container, localhost:4566/5432/15432/5696 are the entry
+# In a bridge-network dtc container, localhost:4566/15432/5696 are the entry
 # script's forwarders to the Docker host, so "busy" there says nothing about a
 # conflict: the services' own state (docker) is the check.
 svc_port_taken() { $HOSTNET && port_busy "$1"; }
@@ -321,23 +319,6 @@ svc_localstack_up() {
     info "localstack S3 on http://127.0.0.1:4566"
 }
 
-svc_pg_up() {
-    if container_running "$PG_NAME"; then info "postgres (conformance) already running"; return; fi
-    docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
-    svc_port_taken 5432 && die "port 5432 is taken by something else"
-    docker_pull "$PG_IMAGE"
-    docker run -d --name "$PG_NAME" -p 127.0.0.1:5432:5432 --shm-size=256mb \
-        -e POSTGRES_USER=dittofs -e POSTGRES_PASSWORD=dittofs -e POSTGRES_DB=dittofs_test \
-        -e POSTGRES_INITDB_ARGS=--data-checksums "$PG_IMAGE" >/dev/null
-    wait_for "postgres (conformance)" 30 docker exec "$PG_NAME" pg_isready -U dittofs -d dittofs_test
-    # Same tuning the conformance workflow applies.
-    docker exec "$PG_NAME" psql -q -U dittofs -d dittofs_test \
-        -c "ALTER SYSTEM SET synchronous_commit = 'off';" \
-        -c "ALTER SYSTEM SET checkpoint_timeout = '30min';" \
-        -c "ALTER SYSTEM SET work_mem = '64MB';" -c "SELECT pg_reload_conf();" >/dev/null
-    info "postgres (conformance) on 127.0.0.1:5432 dittofs/dittofs db dittofs_test"
-}
-
 svc_pgit_up() {
     if container_running "$PGIT_NAME"; then info "postgres (integration) already running"; return; fi
     docker rm -f "$PGIT_NAME" >/dev/null 2>&1 || true
@@ -387,7 +368,7 @@ svc_kmip_up() {
 
 svc_status() {
     printf '%-24s %-10s %s\n' SERVICE STATE PORTS
-    for n in "$LOCALSTACK_NAME" "$PG_NAME" "$PGIT_NAME" "$KMIP_NAME"; do
+    for n in "$LOCALSTACK_NAME" "$PGIT_NAME" "$KMIP_NAME"; do
         local s p
         s="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo absent)"
         p="$(docker port "$n" 2>/dev/null | tr '\n' ' ' || true)"
@@ -397,21 +378,20 @@ svc_status() {
 
 cmd_services() {
     local action="${1:-status}"; shift || true
-    local which=("$@"); ((${#which[@]})) || which=(localstack pg pg-it kmip)
+    local which=("$@"); ((${#which[@]})) || which=(localstack pg-it kmip)
     docker_ok
     case "$action" in
         up)
             for s in "${which[@]}"; do
                 case "$s" in
-                    localstack) svc_localstack_up ;; pg) svc_pg_up ;; pg-it) svc_pgit_up ;; kmip) svc_kmip_up ;;
-                    *) die "unknown service: $s (localstack|pg|pg-it|kmip)" ;;
+                    localstack) svc_localstack_up ;; pg-it) svc_pgit_up ;; kmip) svc_kmip_up ;;
+                    *) die "unknown service: $s (localstack|pg-it|kmip)" ;;
                 esac
             done ;;
         down)
             for s in "${which[@]}"; do
                 case "$s" in
                     localstack) docker rm -f "$LOCALSTACK_NAME" >/dev/null 2>&1 || true ;;
-                    pg) docker rm -f "$PG_NAME" >/dev/null 2>&1 || true ;;
                     pg-it) docker rm -f "$PGIT_NAME" >/dev/null 2>&1 || true ;;
                     kmip) docker rm -f "$KMIP_NAME" >/dev/null 2>&1 || true; rm -f "$STATE/kmip.env" ;;
                     *) die "unknown service: $s" ;;
@@ -419,7 +399,7 @@ cmd_services() {
                 info "stopped $s"
             done ;;
         status) svc_status ;;
-        *) die "usage: dt services up|down|status [localstack|pg|pg-it|kmip]" ;;
+        *) die "usage: dt services up|down|status [localstack|pg-it|kmip]" ;;
     esac
 }
 
@@ -495,21 +475,18 @@ cmd_integration() {
     in_repo
     set -a; # shellcheck disable=SC1091
     source "$STATE/kmip.env"; set +a
+    # The control-plane store's PostgreSQL tests.
     export DITTOFS_TEST_POSTGRES_DSN="$IT_DSN"
-    # The Postgres metadata-store suite treats the DSN only as an on/off gate and
-    # takes its host/port/db from these (postgres_conformance_test.go).
-    export DITTOFS_TEST_PG_HOST=localhost DITTOFS_TEST_PG_PORT="$PGIT_PORT" DITTOFS_TEST_PG_DBNAME=dittofs_test
-    local rc=0
-    # -p 1 serializes the package test binaries: several packages (the metadata
-    # store conformance, the block store engine drain) share the one dittofs_test
-    # database, and the conformance suite truncates it between subtests.
-    run_logged integration go test "${verbose[@]}" -tags=integration -count=1 -timeout=20m -p 1 "${pkgs[@]}" || rc=$?
-    # Harness extra, not in CI: the KMIP interop tests carry no integration tag, so
-    # CI's derived package list never includes them and they skip in the unit job.
-    if ! $changed || grep -q 'pkg/block/middleware/encryption/keyprovider' <<<"$want"; then
-        run_logged kmip-interop go test "${verbose[@]}" -count=1 -run 'KMIP|Kmip' ./pkg/block/middleware/encryption/keyprovider/ || rc=$?
+    # The live KMIP tests skip unless DITTOFS_TEST_KMIP=1, so a full run refuses to
+    # start without them rather than pass having skipped them.
+    if ! $changed; then
+        [[ "${DITTOFS_TEST_KMIP:-}" == 1 ]] || die "the PyKMIP setup did not enable the live KMIP tests ($STATE/kmip.env)"
+        printf '%s\n' "${pkgs[@]}" | grep -Fxq "$(cd "$REPO" && go list -m)/pkg/block/middleware/encryption/keyprovider" ||
+            die "the live KMIP tests are missing from the integration package selection"
     fi
-    return "$rc"
+    # -p 1 serializes the package test binaries: packages that use the dittofs_test
+    # database must not run their binaries concurrently.
+    run_logged integration go test "${verbose[@]}" -tags=integration -count=1 -timeout=20m -p 1 "${pkgs[@]}"
 }
 
 cmd_pynfs() {
@@ -544,7 +521,6 @@ cmd_pynfs() {
     command -v "pynfs-$minor" >/dev/null || die "pynfs-$minor not on PATH (see LOCAL-DEV-SETUP.md)"
     acquire_lock "pynfs $minor $profile"
     require_host_ports_free
-    case "$profile" in postgres|postgres-s3) svc_pg_up ;; esac
     case "$profile" in *-s3) svc_localstack_up ;; esac
     in_repo
     local rc=0
@@ -606,7 +582,6 @@ cmd_posix() {
     fi
     acquire_lock "posix v$ver $profile"
     require_host_ports_free
-    case "$profile" in postgres|postgres-s3) svc_pg_up ;; esac
     case "$profile" in *-s3) svc_localstack_up ;; esac
     in_repo
     local rc=0 since="$STATE/.posix-run-start"
@@ -679,9 +654,8 @@ e2e_list() {
 #   - inside .github/scripts/run-e2e.sh, which writes output to a file, never a pipe
 #     (a process the suite leaks can hold a pipe open and hang the caller), bounds
 #     the run with a wall clock, and grades exit status plus log;
-#   - against the harness Postgres and Localstack via POSTGRES_* / LOCALSTACK_ENDPOINT,
-#     as CI does with its services. Without them the suite starts its own containers,
-#     with Localstack 3.0 as the fallback.
+#   - against the harness Localstack via LOCALSTACK_ENDPOINT, as CI does. Without it
+#     the suite starts its own container, with Localstack 3.0 as the fallback.
 # It needs root to mount. Run dt as yourself: only the suite goes through sudo. Root
 # gets its own build cache and reads the module cache offline, so no root-owned files
 # land in ~/go or ~/Library/Caches/go-build.
@@ -737,7 +711,7 @@ cmd_e2e() {
     # (framework FindFreePort), so a dfs already on 8080/12049/12445 (a developer's,
     # or a shared host's) does not conflict. The lock still keeps suites apart.
     acquire_lock "e2e"
-    docker_ok; svc_pg_up; svc_localstack_up
+    docker_ok; svc_localstack_up
     # Ask for the password now: the suite's output goes to a file, so a prompt
     # printed later would be easy to miss. Passwordless sudo skips it: `sudo -v`
     # prompts unless every sudoers entry is NOPASSWD (verifypw=all), so one
@@ -767,8 +741,7 @@ cmd_e2e() {
     fi
     local root_env=(env "PATH=$PATH" "GOMODCACHE=$(go env GOMODCACHE)" "GOCACHE=/tmp/dt-e2e-root-gocache"
         "GOPROXY=off" "GOFLAGS=-mod=readonly" "TMPDIR=$e2e_tmp"
-        POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DATABASE=dittofs_test
-        POSTGRES_USER=dittofs POSTGRES_PASSWORD=dittofs LOCALSTACK_ENDPOINT=http://localhost:4566
+        LOCALSTACK_ENDPOINT=http://localhost:4566
         "${envs[@]}")
     step "log: $log (written at the end; the suite's output goes to a file, as in CI)"
     step "go test -tags=e2e -count=1 -v -timeout 30m ${goargs[*]} ${pkgs[*]}"
@@ -841,7 +814,7 @@ e2e_container() {
     grep -qs " $DTC_SHARED_TMP " /proc/self/mountinfo ||
         warn "$DTC_SHARED_TMP is not bind-mounted from the Docker host (run through dtc): tests that bind-mount a temp dir into a container will fail"
     acquire_lock "e2e"   # no fixed-port check, as for native e2e: the suite picks free ports
-    docker_ok; svc_pg_up; svc_localstack_up
+    docker_ok; svc_localstack_up
     mkdir -p "$e2e_tmp"
     rpcbind -w 2>/dev/null || rpcbind 2>/dev/null || pgrep -x rpcbind >/dev/null ||
         warn "rpcbind did not start; the NLM cases will skip"
@@ -850,9 +823,7 @@ e2e_container() {
     step "[$WHERE] go test -tags=e2e -count=1 -v -timeout 30m ${goargs[*]} ${pkgs[*]}"
     local tc=(); $HOSTNET || tc=(TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal)
     E2E_LOG="$log" E2E_WALL="${E2E_WALL:-45m}" .github/scripts/run-e2e.sh \
-        env TMPDIR="$e2e_tmp" "${tc[@]}" \
-        POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DATABASE=dittofs_test \
-        POSTGRES_USER=dittofs POSTGRES_PASSWORD=dittofs LOCALSTACK_ENDPOINT=http://localhost:4566 \
+        env TMPDIR="$e2e_tmp" "${tc[@]}" LOCALSTACK_ENDPOINT=http://localhost:4566 \
         "${envs[@]}" go test -tags=e2e -count=1 -v -timeout 30m "${goargs[@]}" "${pkgs[@]}" || rc=$?
     # They share dt's mount namespace here. (e2e-linux never saw them: its container,
     # and the mounts, ended with the suite.)
@@ -910,7 +881,7 @@ cmd_e2e_linux() {
         docker build -q -t "$E2E_LINUX_IMAGE" -f "$HARNESS/docker/e2e-linux.Dockerfile" "$HARNESS/docker" >/dev/null
     fi
     acquire_lock "e2e-linux" "$STATE/e2e-linux.lock"
-    svc_pg_up; svc_localstack_up
+    svc_localstack_up
     local tmp=/tmp/dte-linux log start=$SECONDS rc=0
     mkdir -p "$tmp"
     log="$LOGS/e2e-linux-$(ts).log"
@@ -941,8 +912,6 @@ cmd_e2e_linux() {
         -v "$HARNESS/docker/fix-owner.sh:/fix-owner.sh:ro" \
         -e TMPDIR="$tmp" -e E2E_LOG="$log" -e E2E_WALL="${E2E_WALL:-45m}" \
         "${goenv[@]}" -e GOTOOLCHAIN=local \
-        -e POSTGRES_HOST="$svc" -e POSTGRES_PORT=5432 -e POSTGRES_DATABASE=dittofs_test \
-        -e POSTGRES_USER=dittofs -e POSTGRES_PASSWORD=dittofs \
         -e LOCALSTACK_ENDPOINT="http://$svc:4566" \
         "${envflags[@]}" \
         "$E2E_LINUX_IMAGE" /entry.sh "${goargs[@]}" "${pkgs[@]}" || rc=$?
@@ -1025,10 +994,10 @@ cmd_stack() {
             ;;
         down)
             $IN_CONTAINER || cmd_stack umount || true
-            stack_compose --profile s3-backend --profile postgres-backend down "${@:2}"
+            stack_compose --profile s3-backend down "${@:2}"
             info "stack down (add '-v' to also drop its volumes: dt stack down -- -v)"
             ;;
-        status) stack_compose --profile s3-backend --profile postgres-backend ps -a ;;
+        status) stack_compose --profile s3-backend ps -a ;;
         logs) stack_compose logs --tail=200 dittofs ;;
         mount)
             mkdir -p "$NFS_MNT" "$SMB_MNT"
@@ -1106,13 +1075,16 @@ cmd_cleanup() {
     host_teardown
     if docker ps -a --format '{{.Label "com.docker.compose.project"}}' | grep -qx dittofs; then
         $IN_CONTAINER || cmd_stack umount || true
-        if $volumes; then stack_compose --profile s3-backend --profile postgres-backend down -v >/dev/null 2>&1
-        else stack_compose --profile s3-backend --profile postgres-backend down >/dev/null 2>&1; fi
+        if $volumes; then stack_compose --profile s3-backend down -v >/dev/null 2>&1
+        else stack_compose --profile s3-backend down >/dev/null 2>&1; fi
         info "stopped the compose stack$($volumes && echo ' and dropped its volumes')"
     fi
     smb_stack_down
     if docker inspect dt-e2e-linux >/dev/null 2>&1; then docker rm -f dt-e2e-linux >/dev/null && info "removed the Linux e2e container"; fi
     cmd_services down
+    # The conformance Postgres that the removed postgres profiles used: retired, but
+    # an earlier harness may have left it running.
+    docker rm -f dittofs-postgres-test >/dev/null 2>&1 && info "removed the retired conformance Postgres" || true
     $volumes && docker volume rm dt-e2e-linux-gocache dt-e2e-linux-gomod >/dev/null 2>&1 && info "dropped the Linux e2e caches" || true
     rm -rf /tmp/dte/* /tmp/dte-linux/* "$DTC_SHARED_TMP"/e2e/* 2>/dev/null || true
     rm -rf "$LOCK" "$STATE"/*.lock 2>/dev/null || true
@@ -1211,7 +1183,7 @@ cmd_doctor() {
     printf '  hooksPath      %s (mode %s)\n' "$(git -C "$REPO" config --get core.hooksPath || echo unset)" \
         "$(git -C "$REPO" config --get dt.hooksmode || echo host)"
     if ! $HOSTNET; then
-        # 4566/5432/15432/5696 here are the entry script's forwarders; the services
+        # 4566/15432/5696 here are the entry script's forwarders; the services
         # themselves publish on the Docker host.
         echo "ports (this container, LISTEN):"
         for p in 8080 12049 12445; do
@@ -1219,12 +1191,12 @@ cmd_doctor() {
             else printf '  %-6s free\n' "$p"; fi
         done
         echo "ports (Docker host):"
-        for p in 8080 12049 12445 4566 5432 "$PGIT_PORT" 5696; do
+        for p in 8080 12049 12445 4566 "$PGIT_PORT" 5696; do
             if dockerhost_port_busy "$p"; then printf '  %-6s in use\n' "$p"; else printf '  %-6s free\n' "$p"; fi
         done
     else
         echo "ports (LISTEN):"
-        for p in 8080 12049 12445 4566 5432 "$PGIT_PORT" 5696; do
+        for p in 8080 12049 12445 4566 "$PGIT_PORT" 5696; do
             if port_busy "$p"; then printf '  %-6s in use by %s\n' "$p" "$(port_owner "$p")"
             else printf '  %-6s free\n' "$p"; fi
         done
