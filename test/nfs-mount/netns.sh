@@ -30,7 +30,7 @@ ns_addr() { echo "$NS_SUBNET.$(($1 + 1))"; }
 
 # ns_forward_rule — the iptables rule that lets the clients reach each other.
 # With br_netfilter loaded, traffic between two ports of one bridge passes the
-# FORWARD chain, whose policy a host running Docker sets to DROP.
+# FORWARD chain, whose policy may be DROP.
 ns_forward_rule() { echo "FORWARD -i $NS_BRIDGE -o $NS_BRIDGE -j ACCEPT"; }
 
 # client_ns_up N — create client N's namespace and attach it to the bridge.
@@ -72,8 +72,9 @@ client_ns_up() {
 # into client TO's interface, the way a shared segment would show it. nfstest
 # captures on its own client and expects to see the second client's calls in
 # that one capture; on a veth each client sees only its own. TO's stack drops
-# the copies, which are addressed to neither it nor its MAC, after tcpdump has
-# recorded them.
+# the copies of traffic between FROM and the server, which are not addressed
+# to it. Traffic between FROM and TO themselves reaches TO twice, which TCP
+# discards as duplicates.
 client_ns_mirror() {
     local from="dfsnfs$1h" to="dfsnfs$2h" dir
     tc qdisc add dev "$from" clsact || return 1
@@ -102,7 +103,7 @@ client_ns_down_all() {
     # shellcheck disable=SC2046
     if command -v iptables >/dev/null; then
         while iptables -C $(ns_forward_rule) 2>/dev/null; do
-            iptables -D $(ns_forward_rule)
+            iptables -D $(ns_forward_rule) || break
         done
     fi
     return 0
@@ -113,7 +114,7 @@ client_ns_exec() {
     local n="$1"
     shift
     ip netns exec "$(ns_name "$n")" unshare --mount --uts --propagation private \
-        bash -c "$(declare -p NS_SUBNET; declare -f ns_name ns_addr _client_ns_init); _client_ns_init $n && exec \"\$@\"" \
+        bash -c "$(declare -p NS_SUBNET; declare -f ns_name ns_addr _client_ns_init); _client_ns_init $n || { echo \"could not set up client namespace $n\" >&2; exit 1; }; exec \"\$@\"" \
         client-ns "$@"
 }
 
