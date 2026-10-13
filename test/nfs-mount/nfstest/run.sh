@@ -75,7 +75,12 @@ KNOWN_FAILURES="${DITTOFS_KNOWN_FAILURES:-}"
 
 # The modules that apply to this option set, unless --modules narrowed them.
 if [[ -z "$MODULES" ]]; then
-    MODULES="posix,dio,cache"
+    MODULES="posix,dio"
+    # nfstest_cache times attribute caching against a change from the second
+    # client. On NFSv4 that change recalls the first client's delegation, which
+    # makes it revalidate at once — correct, and fatal to every timing check
+    # the module makes. So it runs on NFSv3 only.
+    [[ "$VERSION" == 3 ]] && MODULES+=",cache"
     # lock is the slowest module after dio and found nothing that varies with
     # caching or I/O size, so it runs on the plain sets of each protocol only.
     if option_set_locks "$VARIANT" && [[ "$VARIANT" == v3 || "$VARIANT" == v4.0 || "$VARIANT" == v4.1 ]]; then
