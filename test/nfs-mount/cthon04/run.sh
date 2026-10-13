@@ -129,6 +129,27 @@ WORK="$MOUNT_POINT/cthon04-$$"
 "${AS_USER[@]}" rm -rf "$WORK"
 "${AS_USER[@]}" mkdir -p "$WORK" || { echo "the test user cannot write to the export" >&2; exit 2; }
 
+# settle_silly_renames DIR — wait, up to 30 seconds, until DIR holds no file
+# the client has silly-renamed.
+#
+# decision: the basic tests share one directory, and test6 onwards start by
+# deleting it. A file unlinked while the client still has writes for it, as
+# test5's is under a write delegation, lives on as a .nfs file until those
+# writes land, and the client refuses to delete it meanwhile, so the next test
+# fails on an artefact of the previous one rather than on what it tests.
+# Upstream's runtests does not wait. A wait that does not end is still reported,
+# so a file the client never lets go of shows up in the log.
+settle_silly_renames() {
+    local dir="$1" _
+    for _ in $(seq 1 30); do
+        "${AS_USER[@]}" find "$dir" -name '.nfs*' 2>/dev/null | grep -q . || return 0
+        [[ $_ -eq 1 ]] && echo "waiting for silly-renamed files in $dir to clear"
+        sleep 1
+    done
+    echo "silly-renamed files in $dir did not clear in 30s:"
+    "${AS_USER[@]}" find "$dir" -name '.nfs*' 2>&1
+}
+
 RESULTS=0
 # result NAME CMD... — run CMD under the per-test timeout and record its verdict.
 result() {
@@ -168,6 +189,7 @@ result() {
     "${AS_USER[@]}" mkdir -p "$NFSTESTDIR"
     RUN_DIR="$CTHON/basic"
     for t in test1 test2 test3 test4 test5 test6 test7 test8 test9; do
+        settle_silly_renames "$NFSTESTDIR"
         result "basic/$t" "./$t" -t
     done
 
