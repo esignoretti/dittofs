@@ -483,6 +483,19 @@ func TestNFSv41SessionRecoveryAfterRestart(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 
+	// Both files are still in the client's page cache, and the change attribute
+	// survives in badger, so the reads above may never have reached the server.
+	// Drop the cache so these go over the wire and the restarted share's journal
+	// has to serve the bytes.
+	require.NoError(t, os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0),
+		"dropping the page cache needs root")
+	got, err := os.ReadFile(testFile)
+	require.NoError(t, err)
+	assert.Equal(t, before, got, "file written before restart should read back from the server")
+	got, err = os.ReadFile(newFile)
+	require.NoError(t, err)
+	assert.Equal(t, after, got, "file created after restart should read back from the server")
+
 	assert.True(t, waitForLog(t, sp2, logBefore, createSessionOp, 1, 5*time.Second),
 		"the client should have created a new session on the restarted server")
 }
