@@ -141,7 +141,10 @@ result() {
         RESULTS=$((RESULTS + 1))
         return
     fi
-    timeout --kill-after=30 "$TEST_TIMEOUT" "${AS_USER[@]}" "$@"
+    # The program changes into RUN_DIR itself, as the test user: root is
+    # squashed and cannot reach the test user's directories on the export.
+    timeout --kill-after=30 "$TEST_TIMEOUT" "${AS_USER[@]}" \
+        bash -c 'cd "$1" || exit 1; shift; exec "$@"' in-dir "$RUN_DIR" "$@"
     status=$?
     case "$status" in
     0) verdict=PASS ;;
@@ -160,7 +163,7 @@ result() {
     # builds. A failure does not stop the group.
     export NFSTESTDIR="$WORK/basic"
     "${AS_USER[@]}" mkdir -p "$NFSTESTDIR"
-    cd "$CTHON/basic" || exit 2
+    RUN_DIR="$CTHON/basic"
     for t in test1 test2 test3 test4 test5 test6 test7 test8 test9; do
         result "basic/$t" "./$t" -t
     done
@@ -168,7 +171,7 @@ result() {
     # general compiles and runs programs on the mount; upstream treats the whole
     # sequence as one test, and so does this.
     export NFSTESTDIR="$WORK/general"
-    cd "$CTHON/general" || exit 2
+    RUN_DIR="$CTHON/general"
     result "general/all" sh ./runtests -t
 
     # special: the programs run from a copy on the mount, as upstream's
@@ -176,7 +179,7 @@ result() {
     export NFSTESTDIR="$WORK/special"
     "${AS_USER[@]}" mkdir -p "$NFSTESTDIR"
     "${AS_USER[@]}" make -s -C "$CTHON/special" copy DESTDIR="$NFSTESTDIR" >/dev/null
-    cd "$NFSTESTDIR" || exit 2
+    RUN_DIR="$NFSTESTDIR"
     umask 0
     result special/op_unlk env TMPDIR= ./op_unlk
     result special/op_ren env TMPDIR= ./op_ren
@@ -200,7 +203,7 @@ result() {
     if option_set_locks "$VARIANT"; then
         export NFSTESTDIR="$WORK/lock"
         "${AS_USER[@]}" mkdir -p "$NFSTESTDIR"
-        cd "$CTHON/lock" || exit 2
+        RUN_DIR="$CTHON/lock"
         result lock/tlocklfs ./tlocklfs -r "$NFSTESTDIR"
         result lock/tlock64 ./tlock64 -r "$NFSTESTDIR"
     else

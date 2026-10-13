@@ -54,13 +54,14 @@ client_ns_up() {
     ip netns exec "$ns" ip link set lo up || return 1
     ip netns exec "$ns" ip addr add "$addr/24" dev "$ns_if" || return 1
     ip netns exec "$ns" ip link set "$ns_if" up || return 1
-    # The bridge port takes a moment to start forwarding.
+    # The bridge port takes a moment to start forwarding. The probe is the
+    # host's rpcbind, which every client needs to reach anyway.
     local _
     for _ in $(seq 1 20); do
-        ip netns exec "$ns" ping -c1 -W1 "$NS_SERVER_ADDR" >/dev/null 2>&1 && return 0
+        ip netns exec "$ns" nc -z -w 1 "$NS_SERVER_ADDR" 111 2>/dev/null && return 0
         sleep 0.5
     done
-    echo "client namespace $ns cannot reach $NS_SERVER_ADDR" >&2
+    echo "client namespace $ns cannot reach rpcbind on $NS_SERVER_ADDR" >&2
     return 1
 }
 
