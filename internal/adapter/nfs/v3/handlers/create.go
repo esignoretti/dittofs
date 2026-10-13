@@ -167,7 +167,7 @@ func (h *Handler) Create(
 	var fileHandle metadata.FileHandle
 	var fileAttr *metadata.FileAttr
 	// createDirWcc holds the parent-directory WCC captured atomically when a new
-	// file is created (H9). Nil for the truncate-existing path (parent dir
+	// file is created (H9). Nil for the resize-existing path (parent dir
 	// unchanged) and for early returns.
 	var createDirWcc *metadata.DirWcc
 
@@ -326,7 +326,7 @@ func (h *Handler) Create(
 	nfsFileAttr := h.convertFileAttrToNFS(fileHandle, fileAttr)
 
 	// H9: prefer the parent-directory WCC captured atomically with the create.
-	// For the truncate-existing path (createDirWcc nil) the parent dir is
+	// For the resize-existing path (createDirWcc nil) the parent dir is
 	// unchanged, so dirWccPair falls back to a fresh read.
 	dirWccBefore, nfsDirAttr := h.dirWccPair(ctx, metaSvc, parentHandle, createDirWcc, dirWccBefore)
 
@@ -462,9 +462,13 @@ func createNewFile(
 // it. Every other attribute in the request is ignored, and without a size the
 // file is left exactly as it is. This is what knfsd does (it masks the
 // attributes down to the size for an existing file), and what a client needs:
-// the Linux client sends CREATE UNCHECKED for open(O_CREAT) and sets a size of
+// a client may send CREATE UNCHECKED for open(O_CREAT) and sets a size of
 // zero only for O_TRUNC, so applying the request wholesale would empty a file
 // opened for append and reset its mode and ownership.
+//
+// On a read-only share it fails with ErrReadOnly even without a size, as knfsd
+// fails any CREATE on a read-only export: a client opening the file for writing
+// learns it at open, not at its first write.
 //
 // Parameters:
 //   - authCtx: Authentication context for permission checking
@@ -483,10 +487,15 @@ func resizeExistingFile(
 	req *CreateRequest,
 ) (*metadata.FileAttr, error) {
 	fileHandle, _ := metadata.EncodeFileHandle(existingFile)
+	if metaSvc.ShareIsReadOnly(authCtx, fileHandle) {
+		return nil, &metadata.StoreError{Code: metadata.ErrReadOnly, Message: "read-only share"}
+	}
 	// decision: with no size there is no permission check here, because nothing
-	// changes: the reply only reports the file's current attributes, which a
+	// changes: the reply only reports the name's current attributes, which a
 	// LOOKUP would return too. Writing to the file is still gated by WRITE and
-	// ACCESS. Revisit if this path ever applies anything besides the size.
+	// ACCESS. That includes an existing directory or symlink, which is answered
+	// with its own handle and attributes rather than an error, as knfsd answers
+	// it. Revisit if this path ever applies anything besides the size.
 	if req.Attr == nil || req.Attr.Size == nil {
 		current, err := metaSvc.GetFile(authCtx.Context, fileHandle)
 		if err != nil {
@@ -514,8 +523,8 @@ func resizeExistingFile(
 		if existingFile.PayloadID != "" {
 			// Thread the file's pre-truncate FileAttr.Blocks snapshot so the
 			// engine reaps RefCount on every block dropped past targetSize —
-			// without it the truncated tail chunks leak on the remote forever
-			// (#832). existingFile was fetched (via Lookup → GetFile) BEFORE
+			// without it the truncated tail chunks leak on the remote forever.
+			// existingFile was fetched (via Lookup → GetFile) BEFORE
 			// SetFileAttributes pruned the store copy, so its Blocks list still
 			// reflects the full pre-truncate extent. Returned []ChunkRef is
 			// discarded — the canonical FileAttr.Blocks is reconciled at flush.
