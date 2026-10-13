@@ -69,14 +69,19 @@ Only the mount is root's; the tests run as `dfsnfstest` (uid 64000). See
 | Suite | Option set | Runs |
 |---|---|---|
 | cthon04 | all | basic `test1`–`test9`, general, special (15 programs), lock `tlocklfs`, `tlock64` |
-| nfstest | all | `nfstest_posix`, `nfstest_dio`, `nfstest_cache` |
+| nfstest | all | `nfstest_posix`, `nfstest_dio` |
+| nfstest | `v3` | + `nfstest_cache` |
 | nfstest | v4 sets | + `nfstest_delegation` |
 | nfstest | `v3`, `v4.0`, `v4.1` | + `nfstest_lock` |
 
 cthon04's own `runtests` stops a group at its first failure. [`cthon04/run.sh`](cthon04/run.sh)
 runs each program on its own instead, so one failure cannot hide the tests after it.
 
-`nfstest_cache` and the recall tests of `nfstest_delegation` drive the second client. Any other
+`nfstest_cache` and the recall tests of `nfstest_delegation` drive the second client. The second
+client's traffic is mirrored into the first client's interface, because nfstest checks both in the
+one capture it takes, as on a shared segment. `nfstest_cache` runs on NFSv3 only: on NFSv4 the
+second client's change recalls the first client's delegation, and the first revalidates at once,
+which is correct and defeats every timing check the module makes. Any other
 module runs with `--modules`, e.g. `--modules posix,alloc`.
 
 ## Grading
