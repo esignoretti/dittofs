@@ -7,17 +7,15 @@
 # row is about the kernel client rather than DittoFS.
 #
 # Not a CI gate: it measures a third-party server, so its verdict says nothing
-# about any given commit. Runs on demand, and on a PR only when the baseline
-# itself changes.
+# about any given commit. It takes as long as the nfstest cells it is compared
+# with, so it runs nightly beside them, and on demand, never on a PR.
 
 name: nfstest knfsd baseline
 
 on:
-  pull_request:
-    branches: [develop, main]
-    paths:
-      - '.github/workflows/nfs-knfsd-baseline.yml'
-      - 'test/nfs-mount/nfstest/baseline-knfsd.sh'
+  schedule:
+    # Nightly at 04:43 UTC, staggered from the other protocol suites.
+    - cron: '43 4 * * *'
   workflow_dispatch:
     inputs:
       variants:
@@ -29,8 +27,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   baseline:
