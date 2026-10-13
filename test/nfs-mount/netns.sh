@@ -68,6 +68,21 @@ client_ns_up() {
     return 1
 }
 
+# client_ns_mirror FROM TO — copy every frame client FROM sends or receives
+# into client TO's interface, the way a shared segment would show it. nfstest
+# captures on its own client and expects to see the second client's calls in
+# that one capture; on a veth each client sees only its own. TO's stack drops
+# the copies, which are addressed to neither it nor its MAC, after tcpdump has
+# recorded them.
+client_ns_mirror() {
+    local from="dfsnfs$1h" to="dfsnfs$2h" dir
+    tc qdisc add dev "$from" clsact || return 1
+    for dir in ingress egress; do
+        tc filter add dev "$from" "$dir" matchall \
+            action mirred egress mirror dev "$to" || return 1
+    done
+}
+
 # client_ns_down_all — remove every client namespace and the bridge. Kills what
 # still runs inside first, which also drops the mounts held there. Safe to run
 # when nothing exists, so it doubles as cleanup before setup.
