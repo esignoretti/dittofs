@@ -9,6 +9,7 @@
 #
 # Usage:
 #   ./setup-posix.sh [config-type] [--nfs-version 3|4|4.0|4.1] [--no-mount]
+#                    [--squash MODE] [--test-user NAME:UID] [--system-rpcbind]
 #
 # Config types:
 #   memory         - In-memory BadgerDB metadata store (default)
@@ -30,6 +31,14 @@
 # speak the protocol themselves (pynfs). Nothing then needs privilege, so the
 # root check is skipped too.
 #
+# The remaining flags serve suites that run as an ordinary user on a client in
+# its own network namespace (test/nfs-mount/), and change nothing for pjdfstest:
+#   --squash MODE         export squash instead of root_to_admin
+#   --test-user NAME:UID  a DittoFS user NAME with uid and gid UID and a
+#                         read-write grant on the export
+#   --system-rpcbind      register MOUNT and NLM with this host's rpcbind, so a
+#                         kernel NFSv3 client on another network stack can lock
+#
 # Example:
 #   sudo ./setup-posix.sh memory
 #   sudo ./setup-posix.sh memory --nfs-version 4
@@ -45,6 +54,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFIG_TYPE="memory"
 NFS_VERSION="3"
 NO_MOUNT=false
+SQUASH="root_to_admin"
+TEST_USER=""
+SYSTEM_RPCBIND=false
 
 # Parse positional and named arguments
 POSITIONAL_ARGS=()
@@ -62,6 +74,18 @@ while [[ $# -gt 0 ]]; do
             NO_MOUNT=true
             shift
             ;;
+        --squash)
+            SQUASH="${2:?--squash requires a value}"
+            shift 2
+            ;;
+        --test-user)
+            TEST_USER="${2:?--test-user requires NAME:UID}"
+            shift 2
+            ;;
+        --system-rpcbind)
+            SYSTEM_RPCBIND=true
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [config-type] [--nfs-version 3|4|4.0|4.1] [--no-mount]"
             echo ""
@@ -70,6 +94,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --no-mount   Provision the server but do not mount (does not need root)"
+            echo "  --squash MODE          Export squash (default root_to_admin)"
+            echo "  --test-user NAME:UID   Also create user NAME (uid=gid=UID) with a read-write grant"
+            echo "  --system-rpcbind       Register MOUNT/NLM with the host rpcbind (needs root)"
             echo ""
             echo "Examples:"
             echo "  sudo $0 memory                     # NFSv3 with memory stores"
@@ -80,7 +107,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -*)
             echo "Unknown option: $1"
-            echo "Usage: $0 [config-type] [--nfs-version 3|4|4.0|4.1] [--no-mount]"
+            echo "Usage: $0 [config-type] [--nfs-version 3|4|4.0|4.1] [--no-mount] [--squash MODE] [--test-user NAME:UID] [--system-rpcbind]"
             exit 1
             ;;
         *)
@@ -134,8 +161,13 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# Mounting is the only step that needs privilege.
-if [[ $EUID -ne 0 && "$NO_MOUNT" != true ]]; then
+if [[ -n "$TEST_USER" && ! "$TEST_USER" =~ ^[a-z_][a-z0-9_-]*:[0-9]+$ ]]; then
+    echo "Error: --test-user takes NAME:UID, got '$TEST_USER'"
+    exit 1
+fi
+
+# Mounting and starting rpcbind are the only steps that need privilege.
+if [[ $EUID -ne 0 && ( "$NO_MOUNT" != true || "$SYSTEM_RPCBIND" == true ) ]]; then
     log_error "This script must be run as root (sudo)"
     exit 1
 fi
@@ -335,9 +367,10 @@ configure_via_api() {
     # anonymous identity), which strips that bypass and breaks the harness setup.
     # POSIX conformance inherently requires a privileged root, so this export
     # explicitly opts into no_root_squash — the legitimate root_to_admin use case,
-    # not a workaround for the new default.
-    log_info "Setting export squash to root_to_admin (pjdfstest requires a privileged root)..."
-    "$DITTOFSCTL_BIN" share nfs-config set /export --squash root_to_admin
+    # not a workaround for the new default. A suite that runs its tests as an
+    # ordinary user passes --squash to keep root's bypass out of them.
+    log_info "Setting export squash to $SQUASH..."
+    "$DITTOFSCTL_BIN" share nfs-config set /export --squash "$SQUASH"
 
     # Create and gate-grant the principals pjdfstest operates as.
     #
@@ -358,6 +391,26 @@ configure_via_api() {
         "$DITTOFSCTL_BIN" user create --username "pjdfstest-${uid}" --password pjdfstest --uid "$uid" --gid "$uid"
         "$DITTOFSCTL_BIN" share permission grant /export --user "pjdfstest-${uid}" --level read-write
     done
+
+    # The same grant for a suite's own test user, whose uid and gid must match
+    # the local account the suite runs as.
+    if [[ -n "$TEST_USER" ]]; then
+        local name="${TEST_USER%%:*}" uid="${TEST_USER##*:}"
+        log_info "Creating test user $name (uid $uid)..."
+        "$DITTOFSCTL_BIN" user create --username "$name" --password "$name" --uid "$uid" --gid "$uid"
+        "$DITTOFSCTL_BIN" share permission grant /export --user "$name" --level read-write
+    fi
+
+    # Both settings are read when the adapter starts, so they go in before it
+    # is enabled. A kernel NFSv3 client asks the server's rpcbind where the lock
+    # manager is; without the registration it reaches no lock manager at all.
+    if [[ "$SYSTEM_RPCBIND" == true ]]; then
+        if ! rpcinfo -p 127.0.0.1 >/dev/null 2>&1; then
+            log_info "Starting rpcbind..."
+            rpcbind || { log_error "rpcbind failed to start"; return 1; }
+        fi
+        "$DITTOFSCTL_BIN" adapter settings nfs update --portmapper-register-with-system --udp-enabled
+    fi
 
     # Enable NFS adapter
     log_info "Enabling NFS adapter..."
@@ -390,6 +443,20 @@ configure_via_api() {
         return 1
     fi
     log_info "NFS port $NFS_PORT is listening"
+
+    if [[ "$SYSTEM_RPCBIND" == true ]]; then
+        local _
+        for _ in $(seq 1 30); do
+            rpcinfo -p 127.0.0.1 2>/dev/null | grep -qE '^ *100021 ' && break
+            sleep 1
+        done
+        if ! rpcinfo -p 127.0.0.1 2>/dev/null | grep -qE '^ *100021 '; then
+            log_error "the lock manager (100021) never registered with rpcbind"
+            rpcinfo -p 127.0.0.1 2>&1 || true
+            return 1
+        fi
+        log_info "Lock manager registered with rpcbind"
+    fi
 
     log_info "API configuration complete"
 }
