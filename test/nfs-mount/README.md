@@ -142,8 +142,9 @@ then can't be removed, and later runs block in `sync()`. Restarting the Docker V
 
 ## Comparing against knfsd
 
-Many nfstest `dio` and `delegation` assertions check what the kernel *client* sends: which
-WRITEs, whether it caches them, when it returns a delegation. A failure there only points at
+Many nfstest `dio`, `delegation` and `cache` assertions check what the kernel *client* sends or
+sees: which WRITEs, whether it caches them, when it returns a delegation, when it notices another
+client's change. `cache` runs on NFSv3 only, as in the DittoFS cells. A failure there only points at
 DittoFS if the Linux kernel server passes the same assertion on the same kernel.
 [`nfstest/baseline-knfsd.sh`](nfstest/baseline-knfsd.sh) runs those modules through the same
 `run.sh` against knfsd, under every option set, grades each set against DittoFS's tables, and
