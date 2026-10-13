@@ -109,6 +109,7 @@ if [[ -z "${DITTOFS_CLIENT_NS:-}" ]]; then
     test_user_copy "$FETCHED" "$NFSTEST" || { echo "could not copy nfstest" >&2; exit 2; }
     client_ns_up 1 || exit 2
     client_ns_up 2 || exit 2
+    client_ns_mirror 2 1 || { echo "could not mirror the second client's traffic" >&2; exit 2; }
 
     # The second client: sshd in namespace 2, which nfstest reaches as the
     # test user. Every command it runs there, mount included, runs in that
