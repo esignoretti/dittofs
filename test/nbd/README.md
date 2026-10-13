@@ -256,6 +256,17 @@ The script prints the accelerator, the export name and size, the share's
 this topology the guest's kernel NBD client speaks TCP directly to DittoFS, so
 there is no QEMU block layer and a `-drive`'s `cache=` mode is irrelevant.
 
+**`switch_root` is where a first boot legitimately ends.** The rig mkfs's the
+export, mounts it as the guest root and switches to it — and then the kernel
+panics with `Attempted to kill init! exitcode=0x00000100`, because a filesystem
+that was just `mkfs`'d contains no `/sbin/init`. That panic is the SUCCESS path
+of a first boot, not a failure: everything the rig exists to prove (handshake,
+size, addressing, read, write, flush, mount) has already happened and been
+printed. It is called out here because a panic at the end of a boot is exactly
+what a broken rig looks like, and the two must not be confused. A `--no-mkfs`
+boot of a volume that already holds a filesystem does not panic at this point —
+it mounts and switches, and the guest's own init takes over.
+
 **Do not run `fsck` from inside the guest.** The guest's root *is* the volume
 under test, so an `fsck` there judges a crash it is also recovering from. The
 check belongs on the host, against the volume read as a file over NFS — the B1

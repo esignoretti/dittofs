@@ -440,7 +440,26 @@ step "write pattern and FLUSH it (the flush is what makes the bytes the server's
 printf '%s' "$pattern" | dd of="$device" bs=1 count="${#pattern}" conv=fsync status=none ||
 	die "the initial write to $device failed. Check the adapter identity: the volume and volumes/ must be owned by UID/GID 65534, or the write is refused with AccessDenied. A 'CAS object missing ... chunk not found' here instead means the volume was written by a server whose in-memory remote tier has since restarted — a different cause with the same symptom, which is why the export size and identity are printed above."
 sync
-printf '  wrote %s bytes, flushed\n' "${#pattern}"
+# conv=fsync pushes the bytes to the SERVER but does NOT evict them from the
+# guest's page cache, and a buffered dd reading the same range is then a cache
+# hit that returns in elapsed=0s — the read never reaches NBD, so it cannot
+# pause, and the whole rig proves nothing. (Measured in the manual run that
+# worked: the read only paused once the buffer cache was dropped.)
+#
+# `blockdev --flushbufs` is the targeted fix and is what the working manual run
+# used. Falling back to the global drop_caches is deliberate and is NOT a silent
+# degradation: the fallback prints which one was used, and the pause assertion
+# below still fails the run if the read does not actually block.
+if command -v blockdev >/dev/null 2>&1 && blockdev --flushbufs "$device" 2>/dev/null; then
+	cache_dropped="blockdev --flushbufs $device"
+elif [ -w /proc/sys/vm/drop_caches ] && sync && echo 3 >/proc/sys/vm/drop_caches 2>/dev/null; then
+	cache_dropped="echo 3 > /proc/sys/vm/drop_caches"
+else
+	cache_dropped=""
+fi
+[ -n "$cache_dropped" ] ||
+	die "could not evict the guest page cache (no blockdev, and /proc/sys/vm/drop_caches is not writable). Without eviction the read below is served from cache and never reaches NBD, so it cannot pause and this run would prove nothing. Run as root on a host where one of the two works."
+printf '  wrote %s bytes, flushed; cache evicted with: %s\n' "${#pattern}" "$cache_dropped"
 
 step "SIGKILL the server FIRST, before issuing the read"
 # Killing before the read is load-bearing: a read issued first is served from the
@@ -485,18 +504,30 @@ while kill -0 "$read_pid" 2>/dev/null; do
 	# Restart inside the window, once, while the read is demonstrably blocked.
 	if [ "$keep_dead" = 0 ] && [ "$blocked_samples" -ge 20 ] && [ "${restarted:-0}" = 0 ]; then
 		restarted=1
-		restart_at=$elapsed
+		restart_started=$elapsed
 		step "restart the server inside the window (at t=${elapsed}s, window ${dead_timeout}s)"
 		if ! sh -c "$restart_cmd"; then
 			die "the restart command failed: $restart_cmd. The read cannot resume without it."
 		fi
-		printf '  server restarted at t=%ss\n' "$restart_at"
+		# Measured AFTER the command returns, not before it starts. Taking the
+		# timestamp first made the window assertion below vacuous: a restart
+		# command that took 30s still reported a small restart_at, so a server
+		# that came back outside the window was recorded as inside it.
+		restart_at=$((SECONDS - read_start))
+		printf '  restart command returned at t=%ss (started at t=%ss, window %ss)\n' \
+			"$restart_at" "$restart_started" "$dead_timeout"
 	fi
 	sleep 0.2
 done
 
-wait "$read_pid"
-read_status=$?
+# `wait` on a failing child is itself a failing command, so under `set -e` the
+# script would EXIT right here — before read_status is captured — and neither
+# branch below would ever run. Measured: `set -euo pipefail; (exit 7) & p=$!;
+# wait "$p"; s=$?` exits 7 immediately and never reaches `s=$?`. That made the
+# --keep-dead negative control unreachable and turned the single most important
+# positive failure ("it blocked but never resumed", i.e. broken -p) into a bare
+# nonzero exit with no message at all.
+wait "$read_pid" && read_status=0 || read_status=$?
 read_elapsed=$((SECONDS - read_start))
 
 if [ "$keep_dead" = 1 ]; then
