@@ -115,12 +115,18 @@ DittoFS if the Linux kernel server passes the same assertion on the same kernel.
 [`nfstest/baseline-knfsd.sh`](nfstest/baseline-knfsd.sh) runs those modules through the same
 `run.sh` against knfsd, under every option set, grades each set against DittoFS's tables, and
 writes [`nfstest/baseline-knfsd.md`](nfstest/baseline-knfsd.md). A row knfsd fails too is about
-the client; a row knfsd passes is ours. It needs the in-kernel nfsd, so it runs on a Linux host
-or in CI:
+the client; a row knfsd passes is ours. It needs the in-kernel nfsd, so it runs on a Linux host,
+or in CI: nightly beside the nfstest cells, or on demand:
 
 ```bash
 gh workflow run nfs-knfsd-baseline.yml            # every option set
 gh workflow run nfs-knfsd-baseline.yml -f variants=v4.0,v4.1
 ```
 
-The workflow uploads the generated file; commit it from the artifact.
+The workflow uploads the report and the run's results. Commit the report from the artifact. After
+editing a known-failure table, rebuild the report from those results instead of running again,
+which needs neither Linux nor root:
+
+```bash
+test/nfs-mount/nfstest/baseline-knfsd.sh --report-only <artifact>/results/baseline-knfsd-<time>
+```
