@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/marmos91/dittofs/internal/adapter/nfs/types"
@@ -69,7 +70,7 @@ func readAll(t *testing.T, fx *handlertesting.HandlerTestFixture, handle []byte)
 
 // TestCreate_UncheckedExistingFile_NoSizeKeepsFile tests that an UNCHECKED
 // CREATE naming an existing file, with no size in its attributes, leaves the
-// file as it is. That is what the Linux client sends for open(O_CREAT) without
+// file as it is. That is what a client sends for open(O_CREAT) without
 // O_TRUNC, as for an append: the attributes it carries must not reset the
 // file, and the size returned must be the real one, because an O_APPEND write
 // is placed at it.
@@ -97,6 +98,32 @@ func TestCreate_UncheckedExistingFile_NoSizeKeepsFile(t *testing.T) {
 	assert.Equal(t, []byte("ABCDEabcde"), readAll(t, fx, resp.FileHandle), "an append must land after the existing data")
 }
 
+// TestCreate_UncheckedExistingFile_ReadOnlyShare tests that an UNCHECKED
+// CREATE naming an existing file on a read-only share fails with ROFS even
+// without a size, so a client opening the file for writing learns it at open.
+func TestCreate_UncheckedExistingFile_ReadOnlyShare(t *testing.T) {
+	fx := handlertesting.NewHandlerFixture(t)
+	fx.CreateFile("existing.txt", []byte("ABCDE"))
+
+	store, err := fx.MetadataService.GetStoreForShare(fx.ShareName)
+	require.NoError(t, err)
+	opts, err := store.GetShareOptions(context.Background(), fx.ShareName)
+	require.NoError(t, err)
+	readOnly := *opts
+	readOnly.ReadOnly = true
+	require.NoError(t, store.UpdateShareOptions(context.Background(), fx.ShareName, &readOnly))
+
+	resp, err := fx.Handler.Create(fx.ContextWithUID(0, 0), &handlers.CreateRequest{
+		DirHandle: fx.RootHandle,
+		Filename:  "existing.txt",
+		Mode:      types.CreateUnchecked,
+		Attr:      &metadata.SetAttrs{},
+	})
+	require.NoError(t, err)
+	assert.EqualValues(t, types.NFS3ErrRofs, resp.Status)
+	assert.Equal(t, []byte("ABCDE"), fx.ReadContent("existing.txt"), "the existing data must survive")
+}
+
 // TestCreate_UncheckedExistingFile_NilAttrKeepsFile tests the same with no
 // attributes at all.
 func TestCreate_UncheckedExistingFile_NilAttrKeepsFile(t *testing.T) {
@@ -110,7 +137,7 @@ func TestCreate_UncheckedExistingFile_NilAttrKeepsFile(t *testing.T) {
 }
 
 // TestCreate_UncheckedExistingFile_ZeroSizeTruncates tests that a size of
-// zero, which the Linux client sends for O_TRUNC, empties the existing file.
+// zero, which a client sends for O_TRUNC, empties the existing file.
 func TestCreate_UncheckedExistingFile_ZeroSizeTruncates(t *testing.T) {
 	fx := handlertesting.NewHandlerFixture(t)
 	fx.CreateFile("existing.txt", []byte("original content"))
