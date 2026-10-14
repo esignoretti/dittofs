@@ -55,7 +55,7 @@ func uncheckedCreate(t *testing.T, fx *handlertesting.HandlerTestFixture, name s
 		Attr:      attr,
 	})
 	require.NoError(t, err)
-	require.EqualValues(t, types.NFS3OK, resp.Status, "UNCHECKED CREATE of an existing file should succeed")
+	require.EqualValues(t, types.NFS3OK, resp.Status, "UNCHECKED CREATE of an existing entry should succeed")
 	return resp
 }
 
@@ -96,6 +96,33 @@ func TestCreate_UncheckedExistingFile_NoSizeKeepsFile(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, types.NFS3OK, wresp.Status)
 	assert.Equal(t, []byte("ABCDEabcde"), readAll(t, fx, resp.FileHandle), "an append must land after the existing data")
+}
+
+// TestCreate_UncheckedExistingDirectory_NoSize tests that an UNCHECKED CREATE
+// naming an existing directory, with no size, answers with the directory's
+// own handle and attributes rather than an error, and leaves it in place.
+func TestCreate_UncheckedExistingDirectory_NoSize(t *testing.T) {
+	fx := handlertesting.NewHandlerFixture(t)
+	dir := fx.CreateDirectory("existing-dir")
+
+	resp := uncheckedCreate(t, fx, "existing-dir", &metadata.SetAttrs{})
+
+	assert.Equal(t, []byte(dir), []byte(resp.FileHandle), "the reply must carry the directory's own handle")
+	assert.EqualValues(t, types.NF3DIR, resp.Attr.Type)
+	assert.Equal(t, metadata.FileTypeDirectory, fx.GetFile("existing-dir").Type, "the directory must stay a directory")
+}
+
+// TestCreate_UncheckedExistingSymlink_NoSize tests the same for an existing
+// symlink: its own handle and attributes, and its target unchanged.
+func TestCreate_UncheckedExistingSymlink_NoSize(t *testing.T) {
+	fx := handlertesting.NewHandlerFixture(t)
+	link := fx.CreateSymlink("existing-link", "some/target")
+
+	resp := uncheckedCreate(t, fx, "existing-link", &metadata.SetAttrs{})
+
+	assert.Equal(t, []byte(link), []byte(resp.FileHandle), "the reply must carry the symlink's own handle")
+	assert.EqualValues(t, types.NF3LNK, resp.Attr.Type)
+	assert.Equal(t, "some/target", fx.GetFile("existing-link").LinkTarget, "the symlink's target must not change")
 }
 
 // TestCreate_UncheckedExistingFile_ReadOnlyShare tests that an UNCHECKED
