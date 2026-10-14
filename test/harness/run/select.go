@@ -1,6 +1,7 @@
 package run
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -44,7 +45,8 @@ func Select(root string, r *registry.Registry, target, option, tier string, only
 		if err != nil {
 			return nil, err
 		}
-		if len(tests) > 0 && !unit.Tests.Set() {
+		goTests := unit.Format == "go-json" // go test finds its tests; TEST names them
+		if len(tests) > 0 && !unit.Tests.Set() && !goTests {
 			if len(suites) > 1 {
 				continue // a group's suites without tests have none to pick
 			}
@@ -61,7 +63,18 @@ func Select(root string, r *registry.Registry, target, option, tier string, only
 				continue
 			}
 			cell := Cell{Cell: c, Unit: unit, Tier: at}
-			if len(tests) > 0 {
+			switch {
+			case len(tests) > 1 && goTests && slices.ContainsFunc(tests, func(n string) bool { return strings.Contains(n, "/") }):
+				// One -run pattern for several names would filter every
+				// matched test's subtests by each subtest name.
+				return nil, errors.New("name subtests one at a time")
+			case len(tests) > 0 && goTests:
+				// A name go test doesn't find runs nothing, which the cell reports.
+				cell.Tests = tests
+				for _, name := range tests {
+					found[name] = true
+				}
+			case len(tests) > 0:
 				if cell.Tests, err = chosen(root, cell, tests, found); err != nil {
 					return nil, err
 				}

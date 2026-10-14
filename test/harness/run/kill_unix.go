@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // killTree makes cancelling the command kill everything it started: its own
@@ -61,4 +62,19 @@ func groupsUnder(pid int) []int {
 		queue = append(queue, children[p]...)
 	}
 	return groups
+}
+
+// interruptTree is killTree for a command whose tests run as root, which dt
+// can't kill: cancelling sends SIGINT to every process group under it, which
+// sudo passes on to the tests so their cleanup runs, and kills the command
+// only if it hasn't ended within grace.
+func interruptTree(cmd *exec.Cmd, grace time.Duration) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		for _, g := range groupsUnder(cmd.Process.Pid) {
+			_ = syscall.Kill(-g, syscall.SIGINT)
+		}
+		return nil
+	}
+	cmd.WaitDelay = grace
 }
