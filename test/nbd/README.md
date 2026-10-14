@@ -153,12 +153,67 @@ output for `--- SKIP` and exits non-zero. The absence of a prerequisite is
 reported as a failure here and as a skip in `go test ./...`, which keeps the unit
 suite green on a machine without QEMU without letting this rig pass vacuously.
 
+## `fetch-artifacts.sh` — the kernel and initramfs `boot-qemu.sh` needs
+
+```
+./test/nbd/fetch-artifacts.sh                  # -> test/nbd/artifacts/
+./test/nbd/fetch-artifacts.sh --dest /tmp/nbd  # somewhere else
+./test/nbd/fetch-artifacts.sh --force          # re-fetch
+```
+
+`boot-qemu.sh` boots a real Linux kernel whose root filesystem is the DittoFS
+export. Nothing in this repository builds such a kernel, so before this script
+existed the artifacts had to be assembled by hand and kept somewhere like `/tmp`
+— where a cleanup silently removed the ability to run the rig at all. This fetches
+them from Alpine's mirrors and assembles a tree `boot-qemu.sh` can boot directly
+via `--initramfs-dir`.
+
+**It takes the kernel and its modules from the same package** (`linux-virt`),
+which is what guarantees their `vermagic` agrees. The obvious shortcut — Alpine's
+netboot `initramfs-virt` — does not work: measured, the v3.20 netboot kernel is
+6.6.134 while the `linux-virt` package is 6.6.142, so an `insmod` of the
+mismatched `nbd.ko` fails on vermagic, and the netboot initramfs carries no
+`nbd.ko` at all.
+
+**Modules are extracted at their real nested paths**, not flattened. That matters:
+the guest's module lookup is glob-based, and an earlier version of `boot-qemu.sh`
+was missing the compressed one-level pattern, so `crc16`, `libcrc32c`,
+`crc32c_generic` and `mbcache` were silently not found against a real
+distribution tree. Every boot passed anyway, because the hand-built initramfs had
+flattened the modules into `/lib/modules/*.ko`. The recipe's layout is what makes
+that class of bug visible.
+
+Versions resolve from `APKINDEX` at fetch time rather than being pinned, so a
+point release does not turn the recipe into a 404. `--release`, `--mirror` and
+`ALPINE_ARCH` override the defaults.
+
+Requires `curl` (or `wget`), `tar` and `gzip`. `cpio` is not needed — the recipe
+writes a packed `initramfs.cpio.gz` if it can, but `--initramfs-dir` is the path
+that carries a current `/init`, which `boot-qemu.sh` generates itself from the
+same source that documents it.
+
+The fetched tree is **not** committed (`.gitignore` covers `test/nbd/artifacts/`);
+it is roughly 30MB of kernel and modules.
+
 ## `boot-qemu.sh` — a real kernel client boots off the export
 
 ```
-./test/nbd/boot-qemu.sh --kernel Image --initramfs initramfs.cpio.gz \
-    --volume-path /mnt/dittofs/export --export export/boot
+# One-time: fetch a kernel and initramfs (Alpine linux-virt + busybox).
+./test/nbd/fetch-artifacts.sh --dest test/nbd/artifacts
+
+# First boot: format the export and write the readback file.
+./test/nbd/boot-qemu.sh --kernel test/nbd/artifacts/Image \
+    --initramfs-dir test/nbd/artifacts/initramfs \
+    --volume-path /mnt/dittofs/export --export export/boot --mkfs
+
+# Second boot: no mkfs. This is the one that proves durability.
+./test/nbd/boot-qemu.sh --kernel test/nbd/artifacts/Image \
+    --initramfs-dir test/nbd/artifacts/initramfs \
+    --volume-path /mnt/dittofs/export --export export/boot --no-mkfs
 ```
+
+Exit status is the verdict: **0 PASS, 1 FAIL, 2 INCONCLUSIVE**, derived from the
+guest transcript. See "Reading the verdict" below.
 
 Topology, exactly as spec §9.5 — there is no data disk and the root filesystem
 arrives over NBD:
@@ -181,11 +236,11 @@ NBD:        the root filesystem
   defaults to TCG and `host` is meaningless → `Invalid CPU model: host`);
   `-cpu max` is the portable substitute via `NBD_QEMU_CPU=max`.
 - An aarch64 kernel `Image` and an initramfs containing `nbd-client` **and**
-  `nbd.ko`. Nothing in this repo builds either. Build the initramfs from a
-  directory with `--initramfs-dir DIR` (needs `cpio` + `gzip`), or point at a
-  prebuilt one with `--initramfs`. Either way the script verifies both members
-  are present and refuses otherwise, because a boot without them never reaches
-  the handshake.
+  `nbd.ko`. **`fetch-artifacts.sh` builds both** — see below. To supply your own,
+  build the initramfs from a directory with `--initramfs-dir DIR` (needs `cpio` +
+  `gzip`), or point at a prebuilt one with `--initramfs`. Either way the script
+  verifies both members are present and refuses otherwise, because a boot without
+  them never reaches the handshake.
 - A provisioned share, a running DittoFS with the NBD adapter enabled, and a
   volume reachable through the share's own NFS/SMB mount.
 
@@ -252,20 +307,44 @@ export size and adapter identity before starting, and never treats one message
 
 The script prints the accelerator, the export name and size, the share's
 `CommitAck` (`DITTOFS_COMMIT_ACK`), and the guest's page-cache state and
-`nbd0/queue/write_cache` before `switch_root` — so the run is self-describing. In
-this topology the guest's kernel NBD client speaks TCP directly to DittoFS, so
-there is no QEMU block layer and a `-drive`'s `cache=` mode is irrelevant.
+`nbd0/queue/write_cache` — so the run is self-describing. In this topology the
+guest's kernel NBD client speaks TCP directly to DittoFS, so there is no QEMU
+block layer and a `-drive`'s `cache=` mode is irrelevant.
 
-**`switch_root` is where a first boot legitimately ends.** The rig mkfs's the
-export, mounts it as the guest root and switches to it — and then the kernel
-panics with `Attempted to kill init! exitcode=0x00000100`, because a filesystem
-that was just `mkfs`'d contains no `/sbin/init`. That panic is the SUCCESS path
-of a first boot, not a failure: everything the rig exists to prove (handshake,
-size, addressing, read, write, flush, mount) has already happened and been
-printed. It is called out here because a panic at the end of a boot is exactly
-what a broken rig looks like, and the two must not be confused. A `--no-mkfs`
-boot of a volume that already holds a filesystem does not panic at this point —
-it mounts and switches, and the guest's own init takes over.
+**The exit status is derived from the transcript**, and there are three outcomes:
+
+| Exit | Verdict | Meaning |
+| --- | --- | --- |
+| 0 | `PASS` | the guest printed `INIT: OK`, and on a `--no-mkfs` boot the readback matched |
+| 1 | `FAIL` | the guest printed `INIT-FAIL`, or a `--no-mkfs` boot could not read the file back, or the watchdog fired before any terminal line |
+| 2 | `INCONCLUSIVE` | the boot reached neither — it proves nothing either way |
+
+QEMU runs in the background and is stopped as soon as a terminal line appears, so
+a success finishes in seconds and a failure is bounded by `NBD_BOOT_TIMEOUT`
+(default 180s) rather than hanging. That bound is necessary, not a convenience:
+every failure path ends in `exec sh`, and with no init that shell simply waits —
+a failing run used to sit there until an operator killed it, and its exit status
+said nothing. The full transcript is echoed at the end and its path printed.
+
+**Where the boot ends, and why it no longer panics.** A volume holding a bare
+filesystem has no `/sbin/init`, so `switch_root` cannot succeed and the kernel
+panics with `Attempted to kill init! exitcode=0x00000100`. That used to be the
+end of every run — a legitimate outcome, but indistinguishable in a transcript
+from a broken rig, and it made the exit status useless. The generated init now
+checks: if `/sbin/init` exists on the volume it switches to it, and otherwise it
+prints `INIT: OK …`, syncs, and powers off. So a normal run ends with a clean
+`VERDICT: PASS` and no panic. A panic in the transcript now means something is
+actually wrong.
+
+**What each boot proves.** The `--mkfs` boot proves the handshake, the
+negotiated size, READ, WRITE, FLUSH and the mount are all correct enough to
+format and mount a filesystem. The `--no-mkfs` boot is the load-bearing one: a
+different VM process, a different kernel instance, no page cache shared with the
+first, reading back a filesystem the first boot created. It proves the bytes are
+**durable** and that the export size reaches the kernel correctly (ext4 sized
+itself from `nbd0`'s sector count). The rig writes `hello.txt` on the first boot
+and fails the second boot if it cannot read it back — `--expect-file` and
+`--expect-content` override both.
 
 **Do not run `fsck` from inside the guest.** The guest's root *is* the volume
 under test, so an `fsck` there judges a crash it is also recovering from. The
@@ -346,7 +425,9 @@ development machine is macOS arm64 (Apple silicon).
 | Half | Status on this host | Why |
 | --- | --- | --- |
 | `boot-qemu.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses cleanly without kernel/initramfs/volume |
-| `boot-qemu.sh` live boot off NBD | **PROVEN on this host, 2026-10-12, by the script itself** | see the recorded run below; a real aarch64 kernel booted via `hvf`, and the guest's ext4 root was the DittoFS export, remounted with `hello.txt` intact |
+| `boot-qemu.sh` live boot off NBD | **PROVEN on this host, by the script itself** | a real aarch64 kernel booted via `hvf` and the guest's ext4 root was the DittoFS export |
+| `boot-qemu.sh` durability verdict | **PROVEN on this host, 2026-10-14** | `--mkfs` writes `hello.txt`, `--no-mkfs` reads it back in a fresh VM: both exit 0 `PASS` in ~3s. The negative control — `--expect-file not-there.txt` — exits 1 `FAIL` in ~6s |
+| `fetch-artifacts.sh` | **PROVEN on this host, 2026-10-14** | fetched Alpine `linux-virt` 6.6.142 + busybox from a clean directory, and the resulting tree booted the export end to end with nothing from a hand-built `/tmp` |
 | `crash-restart.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses on Darwin naming the missing Linux block layer, and refuses without a `master` `nbd-client`, root, netlink, init netns, or a provisioned volume |
 | `crash-restart.sh` crash/reconnect verdict | **the mechanism was PROVEN manually, not by this script** | the recipe was run by hand inside a Linux container (`--network=host`, Docker Desktop's kernel has `CONFIG_BLK_DEV_NBD=y`) against a live DittoFS: with `-persist -T 60` a read stayed blocked at t=4s/8s/12s, the server returned at t=16s, and the read completed `exit=0 elapsed=14s` returning the pre-crash bytes with `Successfully reconnected after 4 attempts` in the client log. The **script** has not been run end to end; it needs a Linux host with root and a `master`-built `nbd-client` |
 | Host-side `fsck` after the crash | **not run here** | follows the crash run; needs the Linux host |
@@ -414,6 +495,15 @@ line), with the artifacts above, against the same live server — the script's o
 gate chain passed, its launch line was identical in substance, and the guest
 reported the same filesystem UUID and the same `hello.txt` contents. So the rig
 is not merely syntactically valid: it works.
+
+**The readback is now produced by the rig, not quoted from that hand-run.** The
+generated init originally mounted the export and `switch_root`ed without ever
+reading it, so the durability result above could only be quoted from a manual
+run — a weaker claim than the same script producing it. The init now writes
+`hello.txt` on a `--mkfs` boot, reads it back on a `--no-mkfs` one, and the script
+derives a PASS/FAIL verdict from the transcript. Re-run on 2026-10-14 with
+artifacts from `fetch-artifacts.sh` alone, both boots pass with the same UUID
+`853580a8-d9e6-4789-ace8-94180888d0e2`.
 
 **A defect this run exposed in the script's own gate.** The initramfs check used
 `gzip -dc -- "$initramfs" | grep -aq 'nbd-client'` under `set -o pipefail`. That
