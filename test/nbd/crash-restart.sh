@@ -123,7 +123,6 @@ Options:
                        the run.
   --pattern STR        Pattern written and flushed before the kill
                        (default PRE-CRASH-PATTERN-AAAA).
-  --write-size BYTES   Bytes written (default 4096).
   --keep-dead          Do not restart; expect the I/O to FAIL at the window.
                        This is the negative control: it proves -T reached the
                        kernel even when -p cannot reconnect.
@@ -142,6 +141,13 @@ EOF
 
 die() {
 	printf 'crash-restart.sh: REFUSING: %s\n' "$*" >&2
+	# The kernel's own reason for a failed read ("I/O error", "Buffer I/O error")
+	# is the difference between a harness problem and a real durability finding.
+	# It used to be written to a file nobody read.
+	if [ -n "${read_out_err:-}" ] && [ -s "$read_out_err" ]; then
+		printf 'crash-restart.sh: the read reported: %s\n' \
+			"$(tr '\n' ' ' <"$read_out_err")" >&2
+	fi
 	exit 1
 }
 
@@ -161,7 +167,6 @@ dfs_pattern=${DITTOFS_DFS_PATTERN:-dfs}
 restart_cmd=${DITTOFS_RESTART_CMD:-}
 volume_path=${DITTOFS_VOLUME_PATH:-/mnt/dittofs/export}
 pattern=${NBD_PATTERN:-PRE-CRASH-PATTERN-AAAA}
-write_size=${NBD_WRITE_SIZE:-4096}
 nbd_client=${NBD_CLIENT:-nbd-client}
 keep_dead=0
 
@@ -218,8 +223,7 @@ while [ $# -gt 0 ]; do
 		shift 2
 		;;
 	--write-size)
-		[ $# -ge 2 ] || die "--write-size needs bytes"
-		write_size=$2
+		die "--write-size was removed: it never had any effect. The bytes written ARE the pattern, so its length sets the size. Use --pattern 'TEXT' (default '$pattern'), which is also what gets read back and compared."
 		shift 2
 		;;
 	--keep-dead)
@@ -411,8 +415,16 @@ cleanup() {
 	if [ -n "${read_pid:-}" ] && kill -0 "$read_pid" 2>/dev/null; then
 		kill "$read_pid" 2>/dev/null || true
 	fi
+	# The persist client is a foreground monitor that never returns on its own
+	# (the persist branch exits before daemon()), so a run that dies early leaves
+	# it holding the device. `nbd-client -d` alone may not reap it.
+	if [ -n "${client_pid:-}" ] && kill -0 "$client_pid" 2>/dev/null; then
+		kill "$client_pid" 2>/dev/null || true
+	fi
 	"$nbd_client" -d "$device" >/dev/null 2>&1 || true
 	[ -n "${client_log:-}" ] && rm -f "$client_log"
+	[ -n "${read_out:-}" ] && rm -f "$read_out"
+	[ -n "${read_out_err:-}" ] && rm -f "$read_out_err"
 }
 trap cleanup EXIT
 
@@ -478,8 +490,9 @@ printf '  server pid %s killed\n' "$dfs_pid"
 
 step "issue the read — it must PAUSE, not fail (that is -T reaching the kernel)"
 read_out=$(mktemp)
+read_out_err=$(mktemp)
 read_start=$SECONDS
-dd if="$device" bs=1 count="${#pattern}" status=none >"$read_out" 2>"$read_out.err" &
+dd if="$device" bs=1 count="${#pattern}" status=none >"$read_out" 2>"$read_out_err" &
 read_pid=$!
 
 blocked_samples=0

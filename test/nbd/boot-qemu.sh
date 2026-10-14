@@ -61,6 +61,13 @@ Options:
   --mkfs               mkfs.ext4 /dev/nbd0 in the guest before mounting (the
                        first boot of a fresh volume). Default: on, unless
                        --no-mkfs.
+  --expect-file NAME   File written on a --mkfs boot and read back on a --no-mkfs
+                       one (default: hello.txt). This is what makes the second
+                       boot prove DURABILITY rather than just a successful mount:
+                       a different VM process, a different kernel instance and no
+                       shared page cache. Set it to "" to skip the check.
+  --expect-content STR What the file should contain (default:
+                       written-by-the-kernel-client).
   --no-mkfs            Do not mkfs; the export already holds a filesystem.
   --export NAME        Export name, <share>/<volume> (default $DITTOFS_NBD_EXPORT,
                        else export/boot). -N is mandatory; see the header.
@@ -110,6 +117,12 @@ qemu_cpu=${NBD_QEMU_CPU:-host}
 commit_ack=${DITTOFS_COMMIT_ACK:-unknown}
 do_mkfs=1
 dry_run=0
+# The file the rig writes on a --mkfs boot and reads back on a --no-mkfs one. It is
+# the difference between proving the export can be MOUNTED and proving bytes
+# written by an earlier VM are still there — the durability claim. Named after the
+# earlier hand-run so the recorded transcript and a fresh run are comparable.
+expect_file=${NBD_EXPECT_FILE:-hello.txt}
+expect_content=${NBD_EXPECT_CONTENT:-written-by-the-kernel-client}
 
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -131,6 +144,16 @@ while [ $# -gt 0 ]; do
 	--mkfs)
 		do_mkfs=1
 		shift
+		;;
+	--expect-file)
+		[ $# -ge 2 ] || die "--expect-file needs a filename"
+		expect_file=$2
+		shift 2
+		;;
+	--expect-content)
+		[ $# -ge 2 ] || die "--expect-content needs a string"
+		expect_content=$2
+		shift 2
 		;;
 	--no-mkfs)
 		do_mkfs=0
@@ -291,7 +314,9 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 # `find` at all. A shell glob plus `set --` needs nothing but the shell itself.
 nbd_mod=""
 for d in /lib/modules/nbd.ko /lib/modules/nbd.ko.gz /lib/modules/*/nbd.ko /lib/modules/*/nbd.ko.gz \
-         /lib/modules/*/kernel/drivers/block/nbd.ko /lib/modules/*/kernel/drivers/block/nbd.ko.gz; do
+         /lib/modules/*/kernel/*/nbd.ko /lib/modules/*/kernel/*/nbd.ko.gz \
+         /lib/modules/*/kernel/*/*/nbd.ko /lib/modules/*/kernel/*/*/nbd.ko.gz \
+         /lib/modules/*/kernel/*/*/*/nbd.ko /lib/modules/*/kernel/*/*/*/nbd.ko.gz; do
 	[ -e "$d" ] && { nbd_mod=$d; break; }
 done
 if [ -z "$nbd_mod" ]; then
@@ -324,19 +349,29 @@ EOF
 load_mod() {
 	_name=$1
 	_path=""
+	# EVERY depth must be listed in BOTH the compressed and uncompressed form.
+	# The compressed 1-level pattern (/lib/modules/*/kernel/*/X.ko.gz) was missing,
+	# and it is the one a real distribution tree actually uses: measured against
+	# Alpine's linux-virt layout, crc16 and libcrc32c (kernel/lib/),
+	# crc32c_generic (kernel/crypto/) and mbcache (kernel/fs/) all live there and
+	# were NOT FOUND, while the 2-level ones (nbd, jbd2, ext4, virtio_net) were.
+	# The failure is silent-then-loud: load_mod returns 1, the caller ignores it,
+	# and the boot dies at mount time naming the filesystem instead of the module.
 	for _d in /lib/modules/$_name.ko /lib/modules/$_name.ko.gz \
 	          /lib/modules/*/$_name.ko /lib/modules/*/$_name.ko.gz \
-	          /lib/modules/*/kernel/*/$_name.ko /lib/modules/*/kernel/*/*/$_name.ko \
-	          /lib/modules/*/kernel/*/*/$_name.ko.gz; do
+	          /lib/modules/*/kernel/*/$_name.ko /lib/modules/*/kernel/*/$_name.ko.gz \
+	          /lib/modules/*/kernel/*/*/$_name.ko /lib/modules/*/kernel/*/*/$_name.ko.gz \
+	          /lib/modules/*/kernel/*/*/*/$_name.ko /lib/modules/*/kernel/*/*/*/$_name.ko.gz; do
 		[ -e "$_d" ] && { _path=$_d; break; }
 	done
 	[ -n "$_path" ] || { echo "INIT: no $_name.ko found under /lib/modules"; return 1; }
 	case "$_path" in *.gz) gunzip -c "$_path" >/tmp/$_name.ko && _path=/tmp/$_name.ko ;; esac
-	# An insmod that fails because the module is ALREADY loaded is benign and
-	# common: a dependency pulls it in first. Measured, libcrc32c is loaded by
-	# crc32c_generic, so the explicit insmod afterwards fails with EEXIST and
-	# printed "INIT: insmod libcrc32c failed" — an alarming line for a healthy
-	# boot, in a rig whose whole value is that its output can be believed.
+	# An insmod that fails because the module is ALREADY loaded is benign: a
+	# dependency can pull it in first. This tolerance is for that case only, and
+	# it must not be used to excuse a real failure — an earlier version of this
+	# comment cited libcrc32c as an EEXIST example, which was simply wrong: that
+	# module failed with "unknown symbol in module" and is not loaded by anything
+	# here at all. Any other error is reported and propagated to the caller.
 	if ! _err=$(insmod "$_path" 2>&1); then
 		case "$_err" in
 		*"File exists"*|*EEXIST*|*"already loaded"*)
@@ -360,8 +395,22 @@ done
 # size check both SUCCEED and the failure surfaces at mount time as
 # "mount: mounting /dev/nbd0 on /root failed", which reads like a filesystem or
 # a device problem rather than a missing module. Measured: exactly that.
-for m in crc16 libcrc32c crc32c_generic mbcache jbd2 ext4; do
-	load_mod "$m"
+# libcrc32c is deliberately NOT in this list. It is a dependency of xfs, btrfs,
+# ceph and netfilter, not of ext4 (ext4's own depends= is "jbd2,mbcache,crc16"),
+# and nothing else loaded here pulls it in. Loading it anyway produced a REAL
+# failure, not a benign one: measured in a guest, "insmod libcrc32c failed:
+# unknown symbol in module", which the EEXIST tolerance below cannot absorb. An
+# unnecessary module that fails loudly in a healthy boot is worse than absent —
+# this rig's whole value is that its output can be believed.
+for m in crc16 crc32c_generic mbcache jbd2 ext4; do
+	load_mod "$m" || {
+		echo "INIT-FAIL: required module $_name did not load, so ext4 cannot be"
+		echo "  mounted. Without it the handshake and the size check both succeed"
+		echo "  and the failure surfaces at mount time as a filesystem error, which"
+		echo "  names the wrong cause. Check the kernel's modules match the booted"
+		echo "  kernel (vermagic) and that the module tree was copied whole."
+		exec sh
+	}
 done
 EOF
 	cat <<'EOF'
@@ -413,6 +462,10 @@ if [ -z "$sz" ] || [ "$sz" = 0 ]; then
 	exec sh
 fi
 EOF
+	# Values the readback block below needs, baked in as guest-side literals: the
+	# block is a QUOTED heredoc, so host variables do not expand inside it.
+	printf 'do_mkfs=%s\nexpect_file=%s\nexpect_content=%s\n' \
+		"$do_mkfs" "$expect_file" "$expect_content"
 	if [ "$do_mkfs" = 1 ]; then
 		cat <<'EOF'
 echo "INIT: mkfs.ext4 /dev/nbd0 (first boot)"
@@ -429,8 +482,67 @@ echo "INIT: mount /dev/nbd0 /root ok"
 echo "INIT: guest page cache: $(grep -i '^Cached:' /proc/meminfo)"
 echo "INIT: nbd0 write_cache: $(cat /sys/block/nbd0/queue/write_cache 2>/dev/null || echo unavailable)"
 echo "INIT: nbd0 size (512b sectors): $(cat /sys/block/nbd0/size 2>/dev/null || echo unavailable)"
-echo "INIT: switching root; the root filesystem is the DittoFS NBD export"
-exec switch_root /root /sbin/init
+
+# READ THE VOLUME BACK. Without this the script proves only that the export can be
+# MOUNTED, and the durability claim ("the bytes written on the previous boot are
+# still there") cannot be produced by the rig at all — it had to be quoted from a
+# hand-run, which is a weaker claim than the same script producing it. Measured:
+# before this step the generated init contained no `ls` and no `cat /root`, so a
+# --no-mkfs run printed nothing about the filesystem's contents.
+if [ "$do_mkfs" = 1 ] && [ -n "$expect_file" ]; then
+	# Write what the NEXT boot will read back. This is the first half of the
+	# durability claim; the readback below is the second.
+	if printf '%s' "$expect_content" >"/root/$expect_file" 2>/dev/null; then
+		sync
+		echo "INIT: WROTE $expect_file with [$expect_content] and synced"
+	else
+		echo "INIT-FAIL: could not write /root/$expect_file (the volume mounted r/w?)"
+		exec sh
+	fi
+fi
+
+echo "INIT: root directory listing:"
+ls -la /root 2>&1 | sed 's/^/INIT:   /'
+if [ -n "$expect_file" ]; then
+	if [ -f "/root/$expect_file" ]; then
+		echo "INIT: READBACK $expect_file: [$(cat "/root/$expect_file" 2>/dev/null)]"
+	else
+		# Not a hard failure: a first (--mkfs) boot legitimately has no such file.
+		# It IS a failure on a --no-mkfs boot, which is the whole point of that
+		# flag, so the distinction is made by the host-side verdict below.
+		if [ "$do_mkfs" = 1 ]; then
+			echo "INIT: READBACK $expect_file: ABSENT (expected on a first/--mkfs boot)"
+		else
+			echo "INIT-FAIL: --no-mkfs but /root/$expect_file is ABSENT."
+			echo "  The volume mounted, so the handshake, the size and the mount are all"
+			echo "  fine — but the bytes written by the previous boot did not survive."
+			echo "  That is a DURABILITY failure, not a harness problem. Check the"
+			echo "  share's CommitAck (a 'memory' commit ack does not survive a restart)"
+			echo "  and whether the server was restarted between the two boots."
+			exec sh
+		fi
+	fi
+fi
+
+# Where a bare data volume has no OS, switch_root cannot succeed: the kernel
+# panics with "Attempted to kill init! exitcode=0x00000100" because the freshly
+# mounted root has no /sbin/init. That is a legitimate end for a bootability test,
+# but it is indistinguishable from a broken rig in a transcript, and it makes the
+# exit status useless. A file that marks a real root (the file this rig reads
+# back) is exactly the case where switching is meaningful, so switch only when
+# /sbin/init actually exists and otherwise power off cleanly with a status.
+if [ -x /root/sbin/init ]; then
+	echo "INIT: switching root; /sbin/init exists on the volume"
+	exec switch_root /root /sbin/init
+fi
+if [ "$do_mkfs" = 1 ]; then
+	echo "INIT: OK first boot — mkfs, mount, read and write all succeeded over NBD"
+else
+	echo "INIT: OK remount — the filesystem and its contents survived a fresh VM"
+fi
+echo "INIT: no /sbin/init on the volume, so there is nothing to switch to; powering off"
+sync
+exec poweroff -f
 EOF
 }
 
@@ -467,7 +579,7 @@ if [ -n "$initramfs_dir" ]; then
 	command -v cpio >/dev/null 2>&1 || die "cpio not found; it is required to build the initramfs from '$initramfs_dir'"
 	command -v gzip >/dev/null 2>&1 || die "gzip not found; it is required to build the initramfs from '$initramfs_dir'"
 	[ -x "$initramfs_dir/bin/nbd-client" ] ||
-		die "initramfs source '$initramfs_dir' has no executable bin/nbd-client. The guest cannot connect to NBD without it. Build nbd-client from master (see test/nbd/README.md) and place it at '$initramfs_dir/bin/nbd-client'."
+		die "initramfs source '$initramfs_dir' has no executable bin/nbd-client. The guest cannot connect to NBD without it. Easiest: run test/nbd/fetch-artifacts.sh, which builds a tree that includes it. To supply your own, note that for BOOTING a busybox nbd-client applet is sufficient (a symlink to busybox passes this check) — only crash-restart.sh needs one built from master (see test/nbd/README.md)."
 	[ -n "$(find "$initramfs_dir/lib/modules" -name 'nbd.ko*' -print -quit 2>/dev/null)" ] ||
 		die "initramfs source '$initramfs_dir' has no nbd.ko under lib/modules/. The guest kernel cannot speak NBD without the nbd module. Install the matching kernel modules (e.g. /lib/modules/\$(uname -r)/kernel/drivers/block/nbd.ko) into '$initramfs_dir/lib/modules/'."
 	# A dynamically linked nbd-client (or busybox) needs its ELF interpreter
@@ -559,4 +671,97 @@ if [ -z "$initramfs_dir" ]; then
 	printf '  then mkfs (first boot only), mount /dev/nbd0 /root, switch_root.\n'
 fi
 
-exec "$qemu" "${qemu_args[@]}"
+# The verdict. The header above claims "exit status is the verdict", which cannot
+# be true while the guest's own failures are invisible to the shell: a guest that
+# prints INIT-FAIL then drops to `exec sh` HANGS (there is no init), so QEMU is
+# killed by the operator and its status says nothing. Measured. So the transcript
+# is captured and judged here.
+#
+# A timeout is used because the hang above is the expected shape of a failure, and
+# a rig that waits forever on a broken run is a rig nobody runs twice.
+transcript=${NBD_TRANSCRIPT:-${TMPDIR:-/tmp}/boot-qemu.$$.log}
+: >"$transcript"
+
+# Bounded run. The guest init drops to `exec sh` on every failure path, which is a
+# useful debugging affordance when a human is watching and an infinite hang when a
+# script is — there is no init, so the shell just sits there and the host-side
+# verdict below is never reached. Measured: a run whose guest printed INIT-FAIL was
+# still alive when the operator killed it, and its exit status said nothing.
+#
+# So QEMU runs in the background and is stopped as soon as the transcript shows a
+# terminal line, or after the timeout. Both bounds are needed: the first makes a
+# success fast, the second makes a failure finite.
+boot_timeout=${NBD_BOOT_TIMEOUT:-180}
+case "$boot_timeout" in
+*[!0-9]*) die "NBD_BOOT_TIMEOUT must be a whole number of seconds, got '$boot_timeout'" ;;
+esac
+
+"$qemu" "${qemu_args[@]}" >"$transcript" 2>&1 &
+qemu_pid=$!
+stop_reason=""
+
+# Stop as soon as the rig has reached a terminal line. The extra sleep gives the
+# poweroff path a moment to flush the rest of the transcript before the kill.
+elapsed=0
+while kill -0 "$qemu_pid" 2>/dev/null; do
+	if grep -qE 'INIT: OK |INIT-FAIL' "$transcript" 2>/dev/null; then
+		sleep 2
+		stop_reason="the guest reached a terminal line"
+		break
+	fi
+	if [ "$elapsed" -ge "$boot_timeout" ]; then
+		stop_reason="timeout after ${boot_timeout}s"
+		break
+	fi
+	sleep 2
+	elapsed=$((elapsed + 2))
+done
+
+if kill -0 "$qemu_pid" 2>/dev/null; then
+	kill "$qemu_pid" 2>/dev/null || true
+	wait "$qemu_pid" 2>/dev/null
+	qemu_status=$?
+else
+	wait "$qemu_pid" 2>/dev/null
+	qemu_status=$?
+fi
+[ -n "$stop_reason" ] && printf 'boot-qemu.sh: stopped QEMU: %s\n' "$stop_reason"
+
+# The transcript is echoed at the end rather than streamed, so the verdict below
+# can be read without scrolling past the boot. Streaming would also mean the
+# reader has already seen the failure before the verdict names it.
+cat "$transcript"
+printf 'boot-qemu.sh: transcript: %s\n' "$transcript"
+
+verdict=0
+if [ "$stop_reason" = "timeout after ${boot_timeout}s" ] &&
+	! grep -qE 'INIT: OK |INIT-FAIL' "$transcript" 2>/dev/null; then
+	printf '\nboot-qemu.sh: VERDICT: FAIL — the guest never reached a terminal line\n' >&2
+	printf '  within %ss. It did not report a failure and did not succeed, so it is\n' "$boot_timeout" >&2
+	printf '  stuck. The usual causes are a handshake that never completes (the guest\n' >&2
+	printf '  sits in the size wait) or a mount that blocks. Read %s.\n' "$transcript" >&2
+	verdict=1
+elif grep -q 'INIT-FAIL' "$transcript" 2>/dev/null; then
+	printf '\nboot-qemu.sh: VERDICT: FAIL — the guest reported a failure:\n' >&2
+	grep 'INIT-FAIL' "$transcript" | sed 's/^/  /' >&2
+	verdict=1
+elif [ -n "$expect_file" ] && [ "$do_mkfs" != 1 ] &&
+	! grep -q "READBACK $expect_file: \[" "$transcript" 2>/dev/null; then
+	printf '\nboot-qemu.sh: VERDICT: FAIL — a --no-mkfs boot must read %s back,\n' "$expect_file" >&2
+	printf '  and no successful readback line appeared. The mount may have worked;\n' >&2
+	printf '  durability is what this boot exists to check.\n' >&2
+	verdict=1
+elif grep -q 'INIT: OK ' "$transcript" 2>/dev/null; then
+	printf '\nboot-qemu.sh: VERDICT: PASS\n'
+	grep -E 'INIT: (OK|READBACK|WROTE|mount)' "$transcript" | sed 's/^/  /'
+else
+	printf '\nboot-qemu.sh: VERDICT: INCONCLUSIVE — no INIT: OK line and no INIT-FAIL.\n' >&2
+	printf '  The boot did not reach the end of the rig, so it proves nothing either\n' >&2
+	printf '  way. Read %s.\n' "$transcript" >&2
+	verdict=2
+fi
+
+[ "$qemu_status" != 0 ] && [ "$verdict" = 0 ] && {
+	printf 'boot-qemu.sh: note: QEMU exited %s (a poweroff path exits 0; a kill does not).\n' "$qemu_status" >&2
+}
+exit "$verdict"
