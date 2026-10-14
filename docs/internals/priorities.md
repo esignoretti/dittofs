@@ -9,6 +9,10 @@ The rules cover both kinds of item on the board: repository issues and draft ite
 what must not be public yet, security findings above all, so triage reads them like any issue but
 never copies their content anywhere public: not into an issue, a comment, a commit or a PR.
 
+Two kinds of issue are out of scope, and triage never sets or proposes their priority: sub-issues,
+and issues labelled `epic`. They are how roadmap items are defined, so their priority is set by
+hand.
+
 The rules are tuned to the project's current stage: one first use case, described below, and
 a lot of weight on the test suites. They will change as the use cases do. Re-tiering the board
 after a change is a proposal for a person to approve, item by item, never a bulk rewrite.
@@ -20,15 +24,20 @@ What triage may do depends on whether the item has a priority, and whether it is
 | The item | Triage |
 | --- | --- |
 | Has no `Priority` | Sets one with the rules below. |
-| Has a `Priority`, no `priority-pinned` label | Leaves the field unchanged. If the rules place it elsewhere, it proposes the change to a person, who decides. |
-| Has the `priority-pinned` label | Leaves it alone and does not question it: the priority was set by hand on purpose. A pinned item with no `Priority` stays without one. |
+| Has a `Priority`, not pinned | Leaves the field unchanged. If the rules place it elsewhere, it proposes the change to a person, who decides. |
+| Is pinned | Leaves it alone and does not question it: the priority was set by hand on purpose. A pinned item with no `Priority` stays without one. |
 
-`priority-pinned` is the human override. Use it when a priority was decided for a reason the
-rules do not capture, or must hold even if the rules change later: a pinned item keeps its
-priority through any future revision of this file.
+A pin is the human override. Use it when a priority was decided for a reason the rules do not
+capture, or must hold even if the rules change later: a pinned item keeps its priority through any
+future revision of this file. An item is pinned when it carries the `priority-pinned` label, or
+when a line of its body starts with `priority-pinned:` followed by the reason. A draft cannot carry
+a label, so the body line is how a draft is pinned, and it keeps working on an issue converted
+from that draft.
 
-A draft cannot carry a label, so it can never be pinned: once it has a priority, triage can
-propose a change but never apply one. Converting a draft to an issue to pin it makes it public.
+**Planned feature work** is new functionality that someone is building or has committed to build,
+such as the implementation of a design RFC. Triage may place it with the rules below like any other
+item, but its actual priority is agreed among the people doing the work, who are free to disregard
+the one triage set.
 
 Walk the tiers top-down and stop at the **first** one that matches. Write one line saying which
 rule matched, so the next reader can disagree with the reasoning and not just with the label.
@@ -38,8 +47,8 @@ If no rule matches, leave the priority unset and, when possible, ask a person.
   whose real content is "a new share inherits a deleted share's files" doesn't make it a docs issue.
 - **Not reproduced doesn't lower a tier.** A finding from code reading with a concrete mechanism
   ranks as if it were reproduced. Only a body that shows the mechanism cannot happen lowers it.
-- **Umbrella and audit issues** (a list of findings, a tracker with sub-issues) take P2. Split out
-  any child that matches a higher tier and prioritize that child on its own.
+- **Umbrella and audit issues** (a list of findings, a tracker with sub-issues) take P2. Their
+  sub-issues are out of scope like any other: a person sets their priority by hand.
 - **When unsure between two tiers, take the lower one.** P0 has to stay short, or it stops
   meaning "drop everything".
 
@@ -135,7 +144,7 @@ Any one of these:
 10. **Tests for the first use case**: a missing, skipped or broken test of anything the use case
    exercises, such as SMB through a Linux CIFS mount, several users on one file at once, or domain
    users against a domain controller.
-11. **Non-conformance** with POSIX.
+11. **Non-conformance with POSIX**, whichever protocol it was found through.
 
 ## P2 — Medium
 
@@ -145,7 +154,9 @@ Any one of these:
 2. **Non-conformance with a protocol spec or a design RFC**, when no P0 or P1 rule applies. That
    covers the NFS RFCs (RFC 1813, 7530, 8881), the SMB specifications (MS-SMB2, MS-FSA, MS-DTYP)
    and the DittoFS design documents under `docs/`. SMB behaviour usually hits P1.1 first.
-3. **NFS**: NFSv3 and v4.x bugs, conformance gaps and audit findings outside the first use case.
+3. **NFS only**: NFSv3 and v4.x bugs, conformance gaps and audit findings whose effect cannot reach
+   anything but NFS clients, such as protocol state, delegations or grace. A wrong POSIX result
+   found through NFS is P1.11, because what it breaks is shared with SMB.
 4. **Security that needs more than a client**: an attacker who can already read the bucket or log
    in to the server host, such as metadata exposed in an encrypted bucket, and hardening with no
    known way to exploit it.
@@ -158,8 +169,8 @@ Any one of these:
 
 1. **Low impact**: a wrong error code or message with no further consequence, a race on a field
    with no observable effect, goroutines that outlive shutdown, cosmetic CLI output.
-2. **Enhancements outside the current roadmap**: features marked post-1.0, integrations, and
-   field observations that ask for nothing yet.
+2. **Feature requests nobody has planned**: integrations, and field observations that ask for
+   nothing yet. Planned feature work is outside these rules.
 3. **Test hygiene and refactors** with no coverage at stake.
 
 ## Calibration
@@ -177,7 +188,7 @@ Replace an anchor once its issue is closed.
 | #3056: editing a store that is in use makes the share unreadable after restart | P1 | P1.2, an admin action that should be refused |
 | #3051: uploads to a missing bucket fail silently | P1 | P1.3, silent durability failure |
 | #3094: no test has two SMB users, or a domain user, on one file at once | P1 | P1.10, a test for the first use case |
-| #3099: a directory's nlink reads one short right after an NFSv3 MKDIR | P1 | P1.11, POSIX |
+| #3099: a directory's nlink reads one short right after an NFSv3 MKDIR | P1 | P1.11, POSIX, found through NFS |
 | #2897: crafted content colliding with the compression magic is unreadable | P1 | P1.2, content built to collide with an internal format |
 | #3078: REMOVE does not recall another client's delegation | P2 | P2.2, protocol spec (RFC 8881) |
 | #3080: grace status reports 0 expected clients | P2 | P2.3, NFS |
