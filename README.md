@@ -300,6 +300,7 @@ Full docs live in [`docs/`](docs/), split by audience.
 - [Implementing Stores](docs/internals/implementing-stores.md) — metadata/block store contracts
 - [Testing](docs/internals/testing.md) — Windows VM setup, WPTS & smbtorture conformance
 - [Debugging](docs/internals/debugging.md) — protocol interop and pcap-diff playbook
+- [Issue priority triage](docs/internals/priorities.md) — how board items get their priority
 - [Contributing](docs/internals/contributing.md) · [Releasing](docs/internals/releasing.md)
 
 ### Product
