@@ -495,13 +495,16 @@ func resizeExistingFile(
 	// LOOKUP would return too. Writing to the file is still gated by WRITE and
 	// ACCESS. That includes an existing directory or symlink, which is answered
 	// with its own handle and attributes rather than an error, as knfsd answers
-	// it. Revisit if this path ever applies anything besides the size.
+	// it. With a size, a directory gets ISDIR and a symlink INVAL from
+	// SetFileAttributes, where knfsd answers OK and changes nothing; a client
+	// refuses O_TRUNC on a directory before sending, so only a hand-built request
+	// sees the difference. Revisit if this path ever applies anything besides
+	// the size.
+	//
+	// existingFile comes from this request's Lookup, which reads through
+	// GetFile and so already carries the size of writes not yet committed.
 	if req.Attr == nil || req.Attr.Size == nil {
-		current, err := metaSvc.GetFile(authCtx.Context, fileHandle)
-		if err != nil {
-			return nil, fmt.Errorf("get file attributes: %w", err)
-		}
-		return &current.FileAttr, nil
+		return &existingFile.FileAttr, nil
 	}
 	targetSize := *req.Attr.Size
 
