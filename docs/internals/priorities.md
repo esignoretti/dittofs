@@ -32,7 +32,7 @@ propose a change but never apply one. Converting a draft to an issue to pin it m
 
 Walk the tiers top-down and stop at the **first** one that matches. Write one line saying which
 rule matched, so the next reader can disagree with the reasoning and not just with the label.
-If no rule matches, propose P2 and ask a person to decide; do not set it.
+If no rule matches, leave the priority unset and, when possible, ask a person.
 
 - **What the issue describes decides, not how it is phrased.** A `documentation` label on an issue
   whose real content is "a new share inherits a deleted share's files" doesn't make it a docs issue.
@@ -139,12 +139,12 @@ Any one of these:
 
 ## P2 — Medium
 
-1. **Documentation**: wrong, missing or outdated docs, including the DittoFS design RFCs in
-   `docs/internals/rfcs/`. Install and first-start
+1. **Documentation**: wrong, missing or outdated docs anywhere under `docs/`, design RFCs
+   included. Install and first-start
    docs that a user cannot follow to a working server are P1.5.
 2. **Non-conformance with a protocol spec or a design RFC**, when no P0 or P1 rule applies. That
    covers the NFS RFCs (RFC 1813, 7530, 8881), the SMB specifications (MS-SMB2, MS-FSA, MS-DTYP)
-   and the DittoFS design RFCs in `docs/internals/rfcs/`. SMB behaviour usually hits P1.1 first.
+   and the DittoFS design documents under `docs/`. SMB behaviour usually hits P1.1 first.
 3. **NFS**: NFSv3 and v4.x bugs, conformance gaps and audit findings outside the first use case.
 4. **Security that needs more than a client**: an attacker who can already read the bucket or log
    in to the server host, such as metadata exposed in an encrypted bucket, and hardening with no
