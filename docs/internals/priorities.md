@@ -1,4 +1,4 @@
-# Issue priority
+# Issue priority triage
 
 How an open item gets its `Priority` in the DittoFS project board. The rules are written to be
 applied by a person or an agent from the item's title, body, labels and board status alone, and
@@ -21,7 +21,7 @@ What triage may do depends on whether the item has a priority, and whether it is
 | --- | --- |
 | Has no `Priority` | Sets one with the rules below. |
 | Has a `Priority`, no `priority-pinned` label | Leaves the field unchanged. If the rules place it elsewhere, it proposes the change to a person, who decides. |
-| Has the `priority-pinned` label | Leaves it alone and does not question it: the priority was set by hand on purpose. |
+| Has the `priority-pinned` label | Leaves it alone and does not question it: the priority was set by hand on purpose. A pinned item with no `Priority` stays without one. |
 
 `priority-pinned` is the human override. Use it when a priority was decided for a reason the
 rules do not capture, or must hold even if the rules change later: a pinned item keeps its
@@ -32,6 +32,7 @@ propose a change but never apply one. Converting a draft to an issue to pin it m
 
 Walk the tiers top-down and stop at the **first** one that matches. Write one line saying which
 rule matched, so the next reader can disagree with the reasoning and not just with the label.
+If no rule matches, propose P2 and ask a person to decide; do not set it.
 
 - **What the issue describes decides, not how it is phrased.** A `documentation` label on an issue
   whose real content is "a new share inherits a deleted share's files" doesn't make it a docs issue.
@@ -64,22 +65,23 @@ backed by S3:
 
 Any one of these:
 
-1. **Data loss, corruption or unreadable data** reachable through client I/O, or through a normal
+1. **Data loss, corruption or unreadable data** triggered by what a client does, or by a normal
    background process (sync, GC, eviction, compaction, restart, recovery) in a supported
-   configuration. Client I/O includes unusual but legitimate patterns, such as a program that keeps
-   writing to a file after making it read-only, or names that differ only by case across SMB and
-   NFS. Corruption includes a deleted file coming back and a read that returns wrong bytes or zeros.
-   Unreadable data is still stored but can no longer be read back, for example after a restart or
-   an upgrade. Content built to collide with an internal format is P1.2, not this rule, even
-   though it is written through client I/O.
+   configuration. What a client does includes unusual but legitimate patterns, such as a program
+   that keeps writing to a file after making it read-only, or names that differ only by case across
+   SMB and NFS. Corruption includes a deleted file coming back and a read that returns wrong bytes
+   or zeros. Unreadable data is still stored but can no longer be read back, for example after a
+   restart or an upgrade. The trigger has to be the operation, not the bytes: when the loss needs
+   file content chosen to collide with an internal format, it is P1.2.
 2. **Stability:** a crash, panic, deadlock or hang, an operation that fails permanently from then on,
    or resource growth that exhausts disk or memory within days of normal use.
    **Loss of availability that needs manual intervention** belongs here too: the server or a share
    stays down, or keeps failing, until an operator acts. An outage that recovers on its own is not
    P0 through this rule.
 3. **A blocked shared gate:** CI on `develop`, the release build or the nightly suite cannot run, or
-   reports a pass without testing anything (a false green), or becomes flaky. A problem in one
-   developer's local setup is not a shared gate.
+   reports a pass without testing anything (a false green), or becomes flaky: a test in it passes
+   less than 90% of the time on unchanged code. A problem in one developer's local setup is not a
+   shared gate.
 4. **Security reachable from the network without credentials**: access without authentication,
    an authentication bypass, or a privilege escalation, over any protocol: SMB, NFS or the control
    plane API.
@@ -87,10 +89,11 @@ Any one of these:
    crash the server, exhaust its memory, disk or cache, or stop it serving other clients. A
    handshake that is never finished but leaves state behind counts.
 6. **Denial of service through a legitimate workload**: an ordinary user, with no special rights
-   and no crafted requests, stops the service for everyone through the way they use it. The usual
-   shape is write amplification: a mass rewrite fills the local cache or journal faster than
+   and no crafted requests, stops the service for other users through the way they use it. The
+   usual shape is write amplification: a mass rewrite fills the local cache or journal faster than
    backpressure slows that user down, and writes start failing or stalling for all users. Slowing
-   down only the user who causes the load is backpressure working, not this rule.
+   down or stalling only the user or file that causes the load is not this rule: backpressure
+   working is fine, and a defect confined to that file is placed by the other rules.
 7. **A test with the wrong verdict**: a test that passes while the behaviour it checks is broken,
    or fails while it works, every time and not by chance. It hides a bug or sends people chasing
    one that does not exist, wherever it runs.
@@ -104,12 +107,14 @@ Any one of these:
    access control on SMB.
 2. **Data loss or unreadable data with an unusual trigger**: either an admin action the system
    should have refused, such as moving a store that is in use, two stores on one bucket, or
-   deleting a share together with its snapshots; or content built to collide with an internal
-   format, such as a file that starts with the compression frame marker. Both stay P1 although
-   P0.1 also covers data loss: there, the trigger is ordinary client I/O or a background process.
-3. **Degradation of durability**: the system loses or stops uploading data and does not report
-   it. Examples are a missing bucket, a journal that disappeared, and a health check that stays
-   green while uploads fail. Unless it leads to data loss (p0/p1).
+   deleting a share together with its snapshots; or file content chosen to collide with an internal
+   format, such as a file that starts with the compression frame marker. P0.1 is triggered by the
+   operation a client performs or by a background process; here the trigger is the admin action
+   or the content itself.
+3. **Silent durability failure**: the system stops uploading data, or stops being able to, and
+   does not report it, while nothing is lost yet. Examples are a missing bucket, a journal that
+   disappeared, and a health check that stays green while uploads fail. Once data is actually lost,
+   P0.1 or P1.2 places it.
 4. **Storage leaks on the remote**: objects that are never reclaimed, so the bucket grows without
    limit under the first use case's overwrite pattern.
 5. **Installation and first start**: a documented install path (package, Docker image, build from
@@ -124,7 +129,8 @@ Any one of these:
    protocol.
 9. **Denial of service that needs an authenticated client**: a client with valid credentials
    sends crafted or hostile requests, such as an oversized count or a malformed structure, that
-   crash the server, exhaust a resource or stop it serving others. A heavy but legitimate workload
+   crash the server, exhaust a resource or stop it serving others, over any protocol: SMB, NFS or
+   the control plane API. A heavy but legitimate workload
    is P0.6, not this rule.
 10. **Tests for the first use case**: a missing, skipped or broken test of anything the use case
    exercises, such as SMB through a Linux CIFS mount, several users on one file at once, or domain
@@ -146,7 +152,7 @@ Any one of these:
 5. **Test and CI gaps outside the first use case that are not a blocked gate**: a suite that
    skips, a fixture that leaks, a flaky test that does not gate a release, a runner that fails
    locally only.
-6. **Investigations and spikes** on the 1.0 path.
+6. **Investigations and spikes.**
 
 ## P3 — Low
 
