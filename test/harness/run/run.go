@@ -1,6 +1,7 @@
 // Package run runs the cells of a dt run: each test's commands under the
 // test's and the cell's limits, with their output passed through and logged,
-// and each test's results kept in the run's summary.
+// and each test's results kept in the run's summary
+// (docs/internals/rfcs/rfc-29-test-harness.md).
 package run
 
 import (
