@@ -2,3 +2,4 @@
 # a \r to every expected line.
 test/common/testdata/** text eol=lf
 test/harness/**/testdata/** text eol=lf
+pkg/block/journalv2/testdata/** text eol=lf
