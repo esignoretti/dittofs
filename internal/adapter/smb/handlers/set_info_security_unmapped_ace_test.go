@@ -29,12 +29,18 @@ func TestSetSecurityInfo_UnmappedACETypeRefused(t *testing.T) {
 	}
 	objectBody = append(objectBody, bob...)
 
+	// An allow ACE whose AceSize (4) is below the 8-byte header: its SID slice
+	// would start past its end.
+	shortAllow := buildACE(accessAllowedACEType, 0, fileAllAccess, bob)
+	shortAllow[2], shortAllow[3] = 4, 0
+
 	for _, tc := range []struct {
 		name string
 		deny []byte
 	}{
 		{"callback_deny", buildACE(deniedCallback, 0, fileWriteData, bob)},
 		{"object_deny", buildACE(deniedObject, 0, fileWriteData, objectBody)},
+		{"short_allow", shortAllow},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, openFile, authCtx := setupACLToggleTest(t, "/unmapped-ace-"+tc.name, true)

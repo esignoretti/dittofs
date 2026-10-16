@@ -923,6 +923,9 @@ func parseACEs(data []byte) ([]acl.ACE, error) {
 			return nil, fmt.Errorf("ACE %d header parse error: %w", i, aceR.Err())
 		}
 
+		if aceSize < aceHeaderSize {
+			return nil, fmt.Errorf("ACE %d size %d is smaller than its header", i, aceSize)
+		}
 		if offset+int(aceSize) > len(data) {
 			return nil, fmt.Errorf("ACE %d size %d extends beyond ACL data", i, aceSize)
 		}
