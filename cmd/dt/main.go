@@ -1,5 +1,5 @@
 // Command dt runs DittoFS's test suites from one registry, test/suites.yaml.
-// Its design is docs/internals/rfc-test-harness.md.
+// Its design is docs/internals/rfcs/rfc-29-test-harness.md.
 package main
 
 import (
@@ -47,7 +47,7 @@ func newRoot(out io.Writer) *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.SetOut(out)
-	root.AddCommand(newList(), newPlan(), newRun(), newDoctor(), alias("unit"), alias("integration"), alias("e2e"))
+	root.AddCommand(newList(), newPlan(), newRun(), newReport(), newDoctor(), alias("unit"), alias("integration"), alias("e2e"))
 	root.AddCommand(newEnv()...)
 	return root
 }
