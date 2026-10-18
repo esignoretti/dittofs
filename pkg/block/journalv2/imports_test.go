@@ -16,6 +16,7 @@ const (
 	modulePath    = "github.com/marmos91/dittofs"
 	journalv2Path = modulePath + "/pkg/block/journalv2"
 	journalv1Path = modulePath + "/pkg/block/journal"
+	clockPath     = modulePath + "/pkg/clock"
 	simPath       = modulePath + "/pkg/sim"
 	xsysPath      = "golang.org/x/sys"
 )
@@ -27,7 +28,8 @@ const (
 //   - the standard library and the journal's own packages are allowed
 //     everywhere;
 //   - golang.org/x/sys is allowed in internal/platform only;
-//   - the shared clock and fault package is allowed in journalv2test only;
+//   - the set's clock and test-clock packages are allowed in journalv2test
+//     only;
 //   - the previous journal package is forbidden everywhere;
 //   - anything else is forbidden.
 //
@@ -80,11 +82,13 @@ func packageImports(t *testing.T, dir string) []importRef {
 	pkg, err := build.ImportDir(dir, 0)
 
 	if err != nil {
+		// A directory whose Go files are all for another platform is a
+		// NoGoError, but its IgnoredGoFiles are still listed and checked
+		// below. A directory with no Go files at all lists nothing.
 		var noGo *build.NoGoError
-		if errors.As(err, &noGo) {
-			return nil
+		if !errors.As(err, &noGo) {
+			t.Fatalf("build.ImportDir %s: %v", dir, err)
 		}
-		t.Fatalf("build.ImportDir %s: %v", dir, err)
 	}
 
 	// build.ImportDir resolves build constraints and _GOOS/_GOARCH suffixes
@@ -138,11 +142,11 @@ func forbidden(rel, path string) string {
 			return ""
 		}
 		return "golang.org/x/sys is allowed in internal/platform only"
-	case within(path, simPath):
+	case within(path, clockPath), within(path, simPath):
 		if within(rel, "journalv2test") {
 			return ""
 		}
-		return "the shared clock and fault package is allowed in journalv2test only"
+		return "the set's clock and test-clock packages are allowed in journalv2test only"
 	case isStdlib(path):
 		return ""
 	default:
