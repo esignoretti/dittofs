@@ -34,7 +34,8 @@ type Change struct {
 	Extent  Extent  // the held extent, or the extent a removal marker covers
 	Version Version // the content version of the change
 	Mtime   int64   // a write's modification time as WriteAt was given it; 0 for every other kind
-	Clone   *CloneSpec
+	// Clone is the clone target's spec; nil for every other kind.
+	Clone *CloneSpec
 }
 
 // ChangeKind is what a Change reports. The zero ChangeKind names none.
@@ -71,11 +72,12 @@ func (h *Handle) SetSyncPolicy(policy SyncPolicy) error {
 	return ErrNotImplemented
 }
 
-// Reserve takes, at once, everything writes writes of n record bytes in all
-// need, so an operation that must not fail part-way finds every refusal before
-// it changes anything: the bytes against the share's limit and the journal's
-// maximum, index entries against the extent limit, writes versions below the
-// version limit, and the spare segments its bytes roll into. The reservation
+// Reserve takes, at once, everything needed by the given number of writes
+// carrying n record bytes in total, so an operation that must not fail
+// part-way finds every refusal before it changes anything: the bytes against
+// the share's limit and the journal's maximum, index entries against the
+// extent limit, one version per write below the version limit, and the spare
+// segments its bytes roll into. The reservation
 // holds them until its Close.
 //
 // A refusal is a NoSpaceError naming LimitShare, LimitJournal, LimitIndex,
@@ -222,6 +224,10 @@ func (h *Handle) Extents(id FileID) ([]Extent, error) {
 
 // Files yields the share's files that hold an extent, an unsettled removal
 // marker or an unsettled synced loss.
+//
+// decision: the stub yields nothing because the signature has no error to
+// carry ErrNotImplemented. An empty result reads as "no files", so no caller
+// may depend on it until the index lands.
 func (h *Handle) Files() iter.Seq[FileID] {
 	return func(func(FileID) bool) {}
 }
@@ -230,6 +236,10 @@ func (h *Handle) Files() iter.Seq[FileID] {
 // unset, each with the write time of its oldest dirty byte. It is served from
 // a list the journal maintains, costs O(dirty files), and neither walks the
 // placement index nor reads a record.
+//
+// decision: the stub yields nothing because the signature has no error to
+// carry ErrNotImplemented. An empty result reads as "no dirty files", so no
+// caller may depend on it until the index lands.
 func (h *Handle) DirtyFiles() iter.Seq2[FileID, time.Time] {
 	return func(func(FileID, time.Time) bool) {}
 }
