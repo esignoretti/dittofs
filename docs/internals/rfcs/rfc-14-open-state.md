@@ -1848,7 +1848,7 @@ type Sink interface {
 
 No method reads the wall clock: every lease, deadline, poll, fence, grace and
 `Timeout` here is read from `Deps.Clock`. `Revocation`, `RevokeReason`,
-`ClientStatus`, `LockReq`, `LockRange` and `StateRef` are declared here and
+`ClientStatus`, `LockReq` and `StateRef` are declared here and
 aliased by `pkg/vfs`
 ([RFC 17 §3.0](rfc-17-vfs.md#3.0%20Value%20types)), since open state cannot
 import vfs. The import rule — only the filesystem service imports this package
@@ -1916,7 +1916,7 @@ Close(ctx, c ClientID, o OpenID) (CloseResult, error)           // CloseResult{O
 Flushed(ctx, c ClientID, o OpenID, loss uint64) error
 Disconnect(ctx, c ClientID, s SessionRef) error                 // closes the session's volatile opens; starts the rest's Timeout
 
-Lock(ctx, c ClientID, f FileID, r LockReq) error                // LockReq{Owner; Open; Ranges []LockRange; Wait, Reclaim bool; Seq *LockSequence}: all ranges or none
+Lock(ctx, c ClientID, f FileID, r LockReq) error                // LockReq{Owner; Open; Range ByteRange; Exclusive, Wait, Reclaim bool; Seq *LockSequence}: one range
 CancelLock(ctx, c ClientID, f FileID, o LockOwner, r ByteRange) (granted bool, err error)
 WaitAnswered(ctx, c ClientID, w LockWaiter, refused bool) error // the NLM host's answer to LockWaitOver
 TestLock(ctx, c ClientID, f FileID, o LockOwner, r ByteRange, exclusive bool) (*Lock, error)
@@ -1971,7 +1971,10 @@ type ClientStatus struct {
 `OpenRef` names an open (`OpenID`), a delegation (`GrantID`) or the anonymous
 open, with the handle; `StateRef` ([§2.1](#2.1%20Client)) is its stateid form.
 `LockReq` is passed by value; `Owner.Owner` is copied only when a lock or
-waiter is stored, so a refused or tested request allocates nothing. A conflict
+waiter is stored, so a refused or tested request allocates nothing. A request
+naming several ranges is
+[RFC 17 §5.11](rfc-17-vfs.md#5.11%20Locks)'s: the service locks them one call
+each and unlocks the ones taken if a later one is refused. A conflict
 with `Wait` records a waiter and answers `ErrLocked` (NFSv4) or `ErrBlocked`
 (NLM, SMB); a recall of another client's grant answers `ErrBlocked` with a
 waiter (NLM, SMB with `Wait`) or a `DelayError` (every other request)
