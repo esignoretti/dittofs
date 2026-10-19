@@ -284,7 +284,7 @@ carry, are refused at the translation (§6.4).
 > ponytail: an alarm entry is an audit entry. Neither protocol defines what an
 > alarm does beyond "raise an alarm", and the access-event stream is the one
 > channel the service has. Give alarms their own event type when
-> [RFC 25 §4.1](rfc-25-observability.md#4.1%20Three%20streams), which defines no
+> [RFC 25 §4.1](rfc-25-observability.md#4.1%20Four%20streams), which defines no
 > second consumer today, gains one that must tell them apart.
 
 ### 2.3 Principals
