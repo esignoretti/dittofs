@@ -714,8 +714,8 @@ The filesystem service exposes both to adapters as lookups, so an adapter
 asks and never decides:
 
 ```go
-// Identities is the group of vfs.Service an adapter calls to encode and
-// decode principals (RFC 17 §3.1). It holds no policy: squashing and grants
+// Identities is the part of vfs.Service an adapter calls to encode and
+// decode principals: its Spell and Find methods (RFC 17 §3.1). It holds no policy: squashing and grants
 // are applied at admission, not here.
 type Identities interface {
 	// Spell returns p's spelling in scheme, or ErrNoSpelling.
