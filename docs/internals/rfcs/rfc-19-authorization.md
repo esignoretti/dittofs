@@ -1076,15 +1076,17 @@ bits have the same values in both versions.
 | `XAREAD`, `XALIST` | read extended attributes | read extended attributes |
 | `XAWRITE` | write extended attributes | write extended attributes |
 
-A bit with no right on that file type is never reported.
+A bit with no right on that file type is never reported. The `XAREAD`,
+`XAWRITE` and `XALIST` bits exist only in NFSv4.2
+([RFC 8276](https://www.rfc-editor.org/rfc/rfc8276.html)) and are never reported
+on an earlier version.
 
 ### 7.4 `mode` and `acl` in one `SETATTR`
 
-A `SETATTR` naming `mode` and `acl` (or `dacl`) stores the ACL, takes setuid,
-setgid and sticky from `mode`, and stores `Mode` as the ACL's `Mode(o)` with
-those bits (§4.3). Its permission bits are not merged: the client sent the ACL it
-wants, and merging a mode into it would change it. `mode_set_masked` changes only
-the bits its mask names, as a `chmod` of those bits.
+A `SETATTR` naming `mode` and `acl` (or `dacl`) is §4.3's request that sets
+both: its permission bits are not merged, since the client sent the ACL it wants,
+and merging a mode into it would change it. `mode_set_masked` changes only the
+bits its mask names, as a `chmod` of those bits.
 
 ## 8. A worked example across protocols
 
@@ -1142,8 +1144,12 @@ The parent's entries all carry file inherit, so the file gets the three as
 effective copies with no inherit flags and the inherited flag; the create mode
 is an **and** that limits the named allows to its group bits, `rw-`, so alice
 and `builders` keep every inherited right but execute, and adds no entry
-(RFC 7 §2.6). The file's `Mode` is the inherited ACL's `Mode` for its owner,
-0660.
+(RFC 7 §2.6). The file's `Mode` is the inherited ACL's `Mode(build)` (§4.2). No
+entry names `build`, and the ACL holds no `OWNER@` or `EVERYONE@` entry, so the
+owner class is empty; the group class is alice's and `builders`' `rw-`. `Mode`
+is 0060, and `ls -l` shows `----rw----`: `build` reaches its own file only as a
+member of `builders`. A parent that should give each creator owner bits carries
+an inheritable CREATOR OWNER entry (§4.4).
 
 **5. bob is refused over both protocols.** bob opens `release/notes.txt` from
 his Windows desktop asking `GENERIC_WRITE`. The request maps to
@@ -1156,11 +1162,12 @@ refused, `STATUS_ACCESS_DENIED`. From his Linux laptop over NFSv4, the `OPEN`
 for write runs the same walk and is refused, `NFS4ERR_ACCESS`, and an `ACCESS`
 asking `MODIFY` and `EXTEND` reports neither. A read succeeds over both.
 
-**6. build01 writes, and cannot re-permission.** `build` writes
-`notes.txt`: entry 3 grants write data. `nfs4_setfacl -a` on it asks write the
-ACL, which modify does not hold; it is refused. Had `build` been granted it, the
-tool would read the three entries, append one, and write four back, bob's deny
-first and intact.
+**6. build01 writes, and re-permissions its own file.** `build` writes
+`notes.txt`: entry 3 grants write data. `nfs4_setfacl -a` on `notes.txt` asks
+write the ACL. Modify does not hold it, but `build` owns the file and holds it
+implicitly (§3.1 step 5). The tool reads three entries, appends one and writes
+four back, bob's deny first and intact. The same tool on `release`, which alice
+owns, is refused.
 
 **7. alice runs `chmod 750 release` from a Linux box.** RFC 7's merge applies
 (§4.3): the named allows for alice and `builders` are each split into an
@@ -1186,7 +1193,7 @@ without inherit flags out of that case.
 | Z4 | `Authorize(want)` succeeds exactly when `want` is within `Granted`, and `Granted` is within the share ceiling but for the system-security right, which only §3.5 grants. |
 | Z5 | No file ACL widens a share ceiling, and no share ceiling is written into a file's ACL, stored or shown. |
 | Z6 | The ACL a client is shown is the ACL the walk reads, `ACLFromMode` of the mode where none is stored. |
-| Z7 | `ACLFromMode(m).Mode(o) == m`, and `a.WithMode(a.Mode(o), o)` grants what `a` grants on a file owned by `o`, for every `a` §4.2 names. |
+| Z7 | `ACLFromMode(m, d).Mode(o) == m`, and `a.WithMode(a.Mode(o), o, d)` grants what `a` grants on a file owned by `o`, for every `a` §4.2 names. |
 | Z8 | Reading an ACL through either protocol and writing back what was read stores the same ACL, less entries naming deleted principals; over SMB, a named entry with no inherit flags for the file's current owner or group comes back as `OWNER@` or `GROUP@` (§6.3). |
 | Z9 | Every principal an entry can name has a SID and an NFSv4 `who`; no entry is left out of a read for want of a spelling. |
 | Z10 | Audit and alarm entries never change a decision; the system-security right is granted only to an identity with `admin` set. |
