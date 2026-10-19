@@ -451,8 +451,9 @@ package identity
 type Authenticator interface {
 	// VerifyNTLM checks an NTLMv2 AUTHENTICATE message against the challenge
 	// the adapter sent: locally against the principal's NT hash, or by
-	// pass-through to a domain controller (§3.5).
-	VerifyNTLM(ctx context.Context, m NTLMAuthenticate, challenge [8]byte) (Proof, error)
+	// pass-through to a domain controller (§3.5). client is the connection's
+	// remote address, for throttling (below).
+	VerifyNTLM(ctx context.Context, m NTLMAuthenticate, challenge [8]byte, client netip.Addr) (Proof, error)
 	// AcceptKerberos accepts a Kerberos AP-REQ for one of the installation's
 	// service names, using the keytab's keys, and verifies a PAC if present
 	// (§3.3, §3.4).
@@ -499,6 +500,31 @@ type Proof struct {
 - A proof is valid until the connection's security context ends, or until
   `Expires`. A request on a context past `Expires` **MUST** be refused with
   the protocol's expired-credential answer, so the client renews its ticket.
+- **Repeated logon failures are throttled here**, not in an adapter: the
+  authenticator sees every attempt from both protocols with the client's
+  address ([RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity)). Past 10
+  `ErrLogonFailure` results in 10 minutes for one (principal name, client
+  address), every further attempt from that pair **MUST** fail
+  `ErrLogonFailure` without being checked, until the window has passed with
+  fewer. The answer is the ordinary logon failure, so it tells a guesser
+  nothing, and no account is locked: a local account is never locked by
+  failures, and a domain account's lockout is the domain's, which counts the
+  pass-through failures itself.
+- **Each attempt emits one logon event** to
+  [RFC 25](rfc-25-observability.md#4.1%20Four%20streams)'s `logon` stream:
+  success or failure with its error, the flavour, the principal name as
+  presented and the principal mapped on success, and the client address. It
+  **MUST NOT** carry the credential — no response, ticket, hash or session key.
+- **Bearer tokens** are not accepted: no NFS or SMB client presents one. When a
+  client protocol does, a `VerifyToken` is added to this interface returning a
+  `Proof`; no adapter changes beyond the one that carries the token
+  ([RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity)).
+
+> ponytail: throttling is in memory, per node. A restart forgets it, each
+> `protocol` node counts alone, and a guesser who spreads one name across many
+> addresses, or many names across one, stays under it. Keep the counts in the
+> metadata store, or add a per-address limit across names, when the logon
+> stream shows a spray that this rule did not slow.
 
 ### 3.2 AUTH_SYS and AUTH_NONE prove nothing
 
