@@ -796,9 +796,9 @@ lists what a quota event is for, but not its fields; §10 asks it to add
 
 ![The service calls the sink at the chokepoint and at quota enforcement and never waits; the sink stamps node, boot and sequence and puts the event in a fixed ring per stream, dropping and counting when full; one writer per stream appends batches to spool files every second, writing a gap record for anything dropped; the spool is bounded by age and bytes and is read by a shipper tailing the files or by an auditor through the management API](img/rfc25-events.svg)
 
-1. **The service calls the sink and returns.** `Events.Access` and
-   `Events.Quota` take a value, as does `Events.Logon`, which RFC 18's
-   authenticator calls, and put it into the stream's ring; they **MUST NOT**
+1. **The service calls the sink and returns.** `Events.Emit` takes an access
+   or quota event, and a logon event from RFC 18's authenticator, and puts
+   it into its stream's ring; they **MUST NOT**
    allocate on the caller's path beyond the copy of the name, take a lock a
    request path also takes, or wait
    ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)).
