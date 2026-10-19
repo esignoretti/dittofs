@@ -105,8 +105,8 @@ With this RFC:
   Kerberos (over RPCSEC_GSS or SMB), NTLMv2, or an anonymous SMB session.
   `AUTH_SYS` and `AUTH_NONE` prove nothing; the others prove a name (§3).
 - **proof** — what one handshake established: the flavour, the name, the
-  verified group SIDs it carried, the session key. The adapter keeps it in the
-  connection's security context and builds each request's `Identity` from it
+  verified group SIDs it carried; the session keys travel beside it, never in
+  it. The adapter keeps it in the connection's security context and builds each request's `Identity` from it
   (§3.1).
 - **directory** — an external source of users and groups, such as Active
   Directory over LDAP, consulted when the store has no record (§5).
@@ -502,49 +502,49 @@ a directory. It is what [RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity) calls
 ```go
 package identity
 
-// Authenticator is what an adapter calls during a handshake. It returns a
-// Proof, which the adapter keeps in the connection's security context and
-// copies into every request's Identity (RFC 17 §3). It never returns a
-// principal's uid, groups or grants: those are the service's, per call (§6).
 type Authenticator interface {
-	// VerifyNTLM checks an NTLMv2 AUTHENTICATE message against the challenge
-	// the adapter sent: locally against the principal's NT hash, or by
-	// pass-through to a domain controller (§3.5). client is the connection's
-	// remote address, for throttling (below).
-	VerifyNTLM(ctx context.Context, m NTLMAuthenticate, challenge [8]byte, client netip.Addr) (Proof, error)
-	// AcceptKerberos accepts a Kerberos AP-REQ for one of the installation's
-	// service names, using the keytab's keys, and verifies a PAC if present
-	// (§3.3, §3.4).
-	AcceptKerberos(ctx context.Context, apreq []byte, service Service, client netip.Addr) (Proof, AcceptResult, error)
+	VerifyNTLM(ctx context.Context, m NTLMAuthenticate, challenge [8]byte, client netip.Addr) (Proof, Keys, error)
+	AcceptKerberos(ctx context.Context, apreq []byte, service Service, client netip.Addr) (Proof, Keys, error)
 }
 
-// Proof is what one handshake established, and nothing more.
+// Proof is what one handshake established, and nothing more. It holds no
+// key, so it is safe to copy into every request's Identity.
 type Proof struct {
-	Flavor     Flavor        // krb5, ntlm (an anonymous session and AUTH_SYS need no call)
-	Name       string        // canonical: "alice@CORP.EXAMPLE", "CORP\\alice", a local user name
-	Principal  Principal     // what sign-in mapped Name to; every call acts as it (below)
-	SIDs       []SID         // from a verified PAC or a pass-through reply: user SID first; else empty
-	DenyOnly   []SID         // group SIDs marked SE_GROUP_USE_FOR_DENY_ONLY: deny entries only (§3.4)
-	Machine    bool          // §2.4
-	SessionKey []byte        // for the adapter's signing and encryption; never copied into an Identity
-	Expires    time.Time     // the ticket's end time; zero for NTLM
+	Flavor    metadata.AuthFlavor // krb5 or ntlm
+	Name      string              // canonical: "alice@CORP.EXAMPLE", "CORP\\alice", a local user name
+	Principal metadata.Principal  // what sign-in mapped Name to; every call acts as it (below)
+	SIDs      []SID               // from a verified PAC or a pass-through reply: user SID first; else empty
+	DenyOnly  []SID               // SE_GROUP_USE_FOR_DENY_ONLY: deny entries only (§3.4)
+	Expires   time.Time           // the ticket's end time; zero for NTLM
 }
+
+// Keys is what the adapter's mechanism needs for the AP-REP and for signing
+// and encryption. It is never copied into an Identity.
+type Keys struct{ Session, Subkey, APRep []byte }
+
+type Service uint8 // NFS, CIFS, Host: the keytab service name a ticket is for
+type Scheme uint8  // UID, GID, SID, Krb, UserName, GroupName, Owner (name@domain), Qualified (DOMAIN\name)
+// Spelling is one protocol's name for a principal: Num, SID or Text is set, by Scheme.
+type Spelling struct{ Scheme Scheme; Num uint32; SID SID; Text string }
+// NTLMAuthenticate is the decoded AUTHENTICATE message the adapter's NTLM mechanism hands over.
+type NTLMAuthenticate struct{ User, Domain, Workstation string; NTResponse, EncryptedSessionKey, MIC []byte }
 ```
 
-- Every error from the interface **MUST** be one of: the credential is wrong
-  (`ErrLogonFailure`), the account cannot sign in (`ErrAccountDisabled`), the
-  message is malformed (`ErrInvalid`), or the answer could not be decided
-  (`ErrUnavailable` — a store, keytab or directory fault). The adapter answers
-  the first three as the protocol's logon failure and the last as a retryable
-  failure where the protocol has one; none of them as success.
+- Every error from the interface **MUST** be one of:
+  `ErrLogonFailure`, for a wrong credential or an account that cannot sign in
+  (the logon event's outcome says which, §10.2); `ErrInvalid`, for a malformed
+  message; or `ErrUnavailable`, for an answer that could not be decided (a
+  store, keytab or directory fault). The adapter answers each as the protocol's
+  logon failure ([RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity)), and none
+  of them as success.
 - An adapter **MUST NOT** turn any of these errors into a guest or anonymous
   session (§3.6).
 - The authenticator reads only the `Principals` view, the directory cache
   (§5.2) and the secret provider
   ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer),
   [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)), writes only the records
-  a first sign-in mints (§2.4, §5.1), and runs on the `protocol` node that
-  holds the connection.
+  a first sign-in mints (§2.4, §5.1), through `Minter`'s create-only writes,
+  and **(cluster)** runs on the `protocol` node that holds the connection.
 - **A proof is bound to one principal for its life.** Before it returns a
   proof, the authenticator **MUST** map it to a principal and set
   `Principal`: a local NTLM user by the record it verified against, a
@@ -744,7 +744,8 @@ no user, or a guest one, naming the guest account.
 
 - A principal whose record is `Disabled`, or marked deleted
   ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)),
-  **MUST** fail authentication with `ErrAccountDisabled`, and **MUST** be
+  **MUST** fail authentication with
+  `ErrLogonFailure` (logon outcome `disabled`), and **MUST** be
   refused at resolution on every call, whatever proof its connection holds.
   The second rule is what stops a session or GSS context set up before the
   change; it takes effect within §7.2's bound.
@@ -772,14 +773,15 @@ The filesystem service exposes both to adapters as lookups, so an adapter
 asks and never decides:
 
 ```go
-// Identities is the part of vfs.Service an adapter calls to encode and
-// decode principals: its Spell and Find methods (RFC 17 §3.1). It holds no policy: squashing and grants
-// are applied at admission, not here.
+// Identities maps principals to protocol spellings and back (§4). It is not a
+// vfs.Service method: it acts on no share and is not admitted. The composition
+// root hands it to adapters beside the service, as core.Deps.Names (§2.6).
 type Identities interface {
-	// Spell returns p's spelling in scheme, or ErrNoSpelling.
+	// Spell returns p's spelling in scheme, or ErrUnknownPrincipal.
 	Spell(ctx context.Context, p metadata.Principal, scheme Scheme) (Spelling, error)
-	// Find returns the principal holding s, or ErrUnknownPrincipal.
-	Find(ctx context.Context, s Spelling) (metadata.Principal, error)
+	// Find returns the principal holding s, or ErrUnknownPrincipal. It mints a
+	// directory principal (§4.4) only for an authenticated id.
+	Find(ctx context.Context, id Identity, s Spelling) (metadata.Principal, error)
 }
 ```
 
@@ -789,6 +791,11 @@ type Identities interface {
 - A lookup error other than "not found" **MUST** reach the client as a server
   failure, never as "unknown principal": a store outage that made every owner
   `nobody` would be read by a client as data.
+
+RFC 19's translation declares its own narrow `Spelling`
+([RFC 19 §5.1](rfc-19-authorization.md#5.1%20One%20translation%2C%20two%20spellings)). The adapter builds one
+over `Identities` for each request, binding its `ctx` and `Identity`, and passes `ErrUnknownPrincipal` and every
+other error through unchanged.
 
 ### 4.2 Kerberos names
 
@@ -1029,13 +1036,32 @@ flavour and client rules have admitted the call, and before `Authorize`:
 4. **Resolve** its share access from the grants (§6.4).
 5. **Set** `authenticated`, `admin` and the privileged flag (§6.5).
 
+```go
+// Identity is what the adapter authenticated for one request; pkg/vfs aliases it
+// (RFC 17 §3.0), so the adapter still imports one package.
+type Identity struct {
+	Protocol Protocol
+	Flavor   metadata.AuthFlavor
+	Level    metadata.KerberosLevel
+	UID, GID uint32   // as an AUTH_SYS credential sent them; zero otherwise
+	GIDs     []uint32
+	Proof    Proof    // zero for AUTH_SYS, AUTH_NONE and an anonymous session
+	Client   netip.Addr
+}
+
+// Resolver is admission's step 4 (RFC 17 §4.9); the front is its only caller.
+type Resolver interface {
+	Resolve(ctx context.Context, id Identity, share metadata.ShareID) (*Caller, error)
+}
+```
+
 The result is the caller. The service passes it to the metadata store as the
 resolved identity [RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)
 requires:
 
 ```go
 // Caller is what one call acts as on one share. Every field any check reads
-// is here (RFC 7 §7.4), and Key covers all of them (§7.1).
+// is here (RFC 7 §7.4).
 type Caller struct {
 	Principal     metadata.Principal   // after squashing: what Authorize and grants read
 	Mapped        metadata.Principal   // step 1's, before squashing: what state protection and a client record's creator compare (RFC 14); Authorize never reads it
@@ -1045,12 +1071,15 @@ type Caller struct {
 	Authenticated bool                 // §6.5
 	Admin         bool                 // §6.5
 	Privileged    bool                 // §6.5; for SMB set per handle (RFC 7 §7.4)
-	Squashed      bool
-	Flavor        Flavor
-	Level         KerberosLevel
-	Key           CallerKey            // §7.1
 }
 ```
+
+Resolution answers with RFC 17 §4.3's errors, mapped at the front: `ErrAccess`
+for a disabled or deleted principal, a deleted `Anonymous`, or a principal over
+the group cap; `ErrUnavailable` for an undecidable lookup or an incomplete
+closure. An expired proof never reaches it, because the adapter's `auth` layer
+refuses a request on a context past `Expires`
+([RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity)).
 
 A compound or path that crosses into another share is resolved again there,
 since squashing and grants are per share.
