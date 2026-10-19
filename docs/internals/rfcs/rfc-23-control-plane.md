@@ -7,6 +7,7 @@ depends_on:
   - "[[rfc-0-data-lifecycle]]"
   - "[[rfc-8-engine]]"
   - "[[rfc-9-gc]]"
+  - "[[rfc-11-ownership]]"
   - "[[rfc-12-snapshots]]"
   - "[[rfc-13-configuration]]"
   - "[[rfc-15-topology]]"
@@ -507,8 +508,9 @@ The runtime holds two pictures: the **desired** one, read from records, and the
 | a principal, grant or export policy | nothing of its own: their generations and versions are in the identity and admission cache keys ([RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)) |
 
 The runtime learns of changes the way RFC 13 and RFC 18 already require — by
-reading the settings generation, the share list version and the principals
-generation once a second — and never from the API request that made them. A record that does not
+reading the three counters (the settings generation, the share list version and
+the principals generation) once a second — and never from the API request that
+made them. A record that does not
 validate when the component is built stops only what it configures
 ([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)), and the node reports it refused.
 
@@ -531,9 +533,10 @@ when a value changed:
 - the records it refused, each with the generation and the error;
 - the records whose restart-class field has changed since it started — its
   restart-pending set;
-- its health conditions, as [RFC 25](rfc-25-observability.md) derives them.
+- its health conditions, as [RFC 25](rfc-25-observability.md) derives them;
 - the version of each secret it holds, so that an old version is deleted only
-  once every node that resolves the secret holds the new one (RFC 13 §7).
+  once every node that resolves the secret holds the new one
+  ([RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)).
 
 A record's own generation (§4.4) counts its changes; it is not comparable with
 these counters. So every control-plane record **MUST** also carry its
@@ -606,7 +609,7 @@ that component's surface:
 | Resource | Records | Lifecycle | Written through |
 | --- | --- | --- | --- |
 | installation | `Installation`, the store format record | created by the initialisation step only; active versions raised by `:raise-format` | [RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap) |
-| node | `Node`, node status | registered at each start; drained, decommissioned by the operator | [RFC 30 §5.3](rfc-30-kubernetes.md#5.3%20Storage%20scale-down%20is%20a%20drain), RFC 11 |
+| node | `Node`, node status | registered at each start; drained, decommissioned by the operator | [RFC 30 §5.3](rfc-30-kubernetes.md#5.3%20Storage%20scale-down%20is%20a%20drain), [RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries) |
 | remote store | store configuration settings, its credential `Secret` | created; edited under RFC 13's classes; deleted only when no namespace names it | RFC 13 |
 | namespace | namespace settings and key records | created with its bound fields; deleted when no share names it and drained | [RFC 9 §7.6](rfc-9-gc.md#7.6%20A%20namespace%20no%20share%20names%20is%20drained) |
 | share | `Share` (info, state, namespaces), `ExportPolicy`, share settings | §3.2 | `ControlPlane` |
@@ -1267,7 +1270,7 @@ This is the audit of the management plane. A file client's access events
 The CLI is a client of the management API and of nothing else:
 
 - it **MUST NOT** open the metadata store, a journal or a remote store, or read
-  the server's host file. Every command is one or more API calls; a command the
+  the host's bootstrap ([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)). Every command is one or more API calls; a command the
   API cannot serve does not exist;
 - the API's wire types are a leaf package that imports nothing of the server,
   and the CLI links no package of the metadata store, the block stores or the
@@ -1310,8 +1313,8 @@ These rules bind from the single node on, where most of them cost nothing
 - **Writes go through the metadata store**, as control-plane records written by
   storage nodes only ([RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)). No node forwards a write to a
   "leader": there is none, and the store's transactions order concurrent writes.
-- **Application spreads by generation.** A node learns of a change only through
-  the settings generation, the share list version and the principals generation
+- **Application spreads by counter.** A node learns of a change only through
+  the three counters of §2.3
   ([RFC 13 §5](rfc-13-configuration.md#5.%20Binding%20classes)), and reports what it applied (§2.4). A live change
   reaches every node within 5 s; a node behind is RFC 25's
   `config_generation_behind` condition, named in the resource's status.
@@ -1415,8 +1418,10 @@ resource kind and ID and the outcome, never a body field
 ## 12. Conformance
 
 Conventions and tiers are the index's ([Test tiers](rfc-index.md#Test%20tiers)). Each check
-runs against the composed single-node harness, with the API in front, unless
-marked **(cluster)**.
+runs, with the API in front, against the node the one production root builds,
+the function the server's start command calls, unless marked **(cluster)**. No
+check builds a node any other way, and an architecture test fails on a second
+caller of `runtime.New`.
 
 | Requirement | Check | Catches |
 | --- | --- | --- |
@@ -1424,21 +1429,21 @@ marked **(cluster)**.
 | §2.2 order | Record each component's start and stop. Assert the order of §2.2, that the health endpoints answered `starting` before step 4 ended, and that an operation readable before stop is readable through the API until step 3. | an API that stops before the drain it reports |
 | §2.3 reconcile | Change a live share setting while the store is unreachable to the node's reads but not its writes; restore reads: assert the change applies at the next read, not at the next generation move. | a missed generation lost for good |
 | §2.4 applied | Freeze one node's runtime after a share setting changes. Assert the resource's status names that node as behind and, after 5 s, a health condition names it. Change a setting whose own generation is 2 while the settings generation stands at 100, and freeze a node at 100: assert the setting reads not applied there. Change a node-scoped restart-class setting, then a live one: assert the first reads not applied and the second applied on that node until it restarts. | "applied" inferred from the writing node, from a record's own generation, or past a pending restart |
+| §2.5 health | Call the unauthenticated endpoints during start, serving, drain and stop: assert `live` from the live endpoint and one of the four readiness words from the ready one, and nothing else, and that `GET /api/v1/health` without a token is `401`. **(cluster)** On a protocol-only node, assert `/api/v1/health` answers `404` and the metrics listener answers without a token. | grace state or names leaked to anonymous callers |
 | §3.2 create admits nobody | Create a share; mount it as alice over SMB and NFS: refused. Grant alice; mount: admitted. | an open default |
-| §3.2 delete | Delete a share with 10⁵ files; kill the node during phase "files"; restart: assert the same operation ID reports `running` with its count not lower than before, and ends `succeeded`. Delete again with a new key: `409` `stale`. | progress the API made up |
+| §3.2 delete | Delete a share with 10⁵ files; kill the node during phase "files" once `Done` > 0; restart: assert the same operation ID reports `running`, that `Done` is at least that value and rises, and that it ends `succeeded`. Delete again with a new key: `409` `stale`. | progress the API made up |
+| §3.5 grants | Grant `Finance` read on a share and alice, a member, `none`: assert alice refused. `DELETE` alice's grant: assert her grant gone and alice granted read through `Finance`. `PUT` a grant naming a machine principal: assert `400` `ErrInvalid` and no grant written. | `none` stored as no grant, or a machine granted file access |
 | §4.4 lost update | Two clients read a policy, both `PUT` with the same `If-Match`, sent to two API nodes at once **(cluster)** and on one node in a tight loop: assert exactly one commits and the other is `412`. Send a `PUT` without `If-Match`: `428`. Two clients `PUT` the first grant of one principal with `If-None-Match: *`: assert one commits and the other is `412`. | the Start-here lost update; a create overwriting a concurrent one |
 | §4.4 background field | Start a re-home of a share; `PUT` its spec with a stale copy that includes its old namespace: assert the namespace is unchanged and the `PUT` refused. | a `PUT` reverting a component's write |
 | §4.5 idempotency | Send a `DELETE` with a key, drop the answer, resend: assert one operation, the same ID and body. Resend with the same key and another body: `422`. Send a create that fails validation, fix it and resend with the same key: accepted. Sign in, refresh and create an API token, each twice; read the store's raw keys: assert no idempotency record exists for them and no token value or password appears; assert the second refresh revoked the session. | double application on retry; a credential kept in a replay record |
 | §4.6 runner claim | **(cluster)** Start a credential rotation; kill the node that claims it; assert another storage node claims it after the claim expires and it completes, deleting the old version once. | an operation lost with its node |
 | §4.7 error table | For every error value in every closed set, provoke it through the API, or inject it at the seam where none can be provoked; assert each has a status and code, and `api_unmapped_errors_total` stays 0. | an error with no row |
 | §5.1 roles grant nothing | With the bootstrap admin and every role, mount every share over every flavour: assert every mount refused. Read the admin's record: no uid, gid, SID, Kerberos name or grant. | an API role leaking into file access ([RFC 18 §11](rfc-18-identity.md#11.%20Conformance)) |
-| §3.5 grants | Grant `Finance` read on a share and alice, a member, `none`: assert alice refused. `DELETE` alice's grant: assert her grant gone and alice granted read through `Finance`. `PUT` a grant naming a machine principal: assert `400` `ErrInvalid` and no grant written. | `none` stored as no grant, or a machine granted file access |
-| §5.2 roles | For every route, call it as `viewer`, `operator` and `admin`; assert the table of §5.2, `404` where the caller may not read. As an operator, give yourself `admin`: refused. As an operator, write the password secret of an admin account, and the signing key, through every secret-bearing route: refused, and neither changed. Demote the last admin: `409` `last_admin`. | a route missing its check; privileged credentials replaced through a secret write |
+| §5.2 roles | Read the route list from the router and compare it with §4.1's resources and Actions table; a route in neither fails the check. For every route, call it as `viewer`, `operator` and `admin`; assert the table of §5.2, `404` where the caller may not read. As an operator, give yourself `admin`: refused. As an operator, write the password secret of an admin account, and the signing key, through every secret-bearing route: refused, and neither changed. Demote the last admin: `409` `last_admin`. | a route missing its check; privileged credentials replaced through a secret write |
 | §5.3 revocation | Sign in on two nodes; disable the account; assert every call on both is refused within 1 s, with the access token unexpired. Reuse an already-rotated refresh token: assert the session is revoked. | a token outliving its account |
 | §5.4 first password | Initialise without a password; assert it is printed by the step and appears in no log. Sign in: every call but the password change is `403`. Change it without the current password: refused. | a first-login token setting a password alone |
 | §6 audit | Run every mutating route once, applied and refused. Assert one audit record each, with generations before and after, and no secret value; fault the commit of one change and assert neither the change nor its record exists. | a change with no record |
-| §2.5 health | Call the unauthenticated endpoints during start, serving, drain and stop: assert `live` from the live endpoint and one of the four readiness words from the ready one, and nothing else, and that `GET /api/v1/health` without a token is `401`. | grace state or names leaked to anonymous callers |
-| §7 CLI | Run the CLI's whole suite with the server's host file and store unreadable to the CLI's user: assert every command still works. Assert the generated reference matches the command tree. | a command that bypasses the API |
+| §7 CLI | Run the CLI's whole suite with the host's bootstrap and the store unreadable to the CLI's user: assert every command still works. Assert the generated reference matches the command tree. Assert `go list -deps` of the CLI names no package of the metadata store, the block stores or the control-plane server. | a command that bypasses the API |
 | §9 schema gate | **(cluster)** With one node not upgraded, send a field the new schema adds: refused `400` naming the version. Raise the version after upgrading it: accepted. | a record an old node refuses |
 
 ## 13. Open questions
