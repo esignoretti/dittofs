@@ -1389,6 +1389,16 @@ names, on the composed single-node harness of the [index](rfc-index.md#Test%20ha
 5. **Condition delays.** The registry's 5- and 15-minute delays are starting
    values; the first months of alert history should replace them, as a
    proposed default is replaced by its measurement.
+6. **Where the `request` set starts.** A KV call, a journal-hit read or a cached
+   attribute read may all land in the first, 100 µs, bucket. Starting at 25 µs
+   (proposed) would resolve them but costs two boundaries near the top, where
+   pacing waits sit. A profile of the reference box settles it.
+7. **A bound on the node-status record.** §3.8 writes a node's conditions, and
+   its primary shares', into one record at most once a second; a share's
+   `file_offload_failing` names FileIDs. A cap — 256 conditions and 8 FileIDs per
+   condition, each with the count of the rest, proposed — must keep exact counts
+   per severity so the installation status (§3.3) stays right; the numbers wait
+   for a measured record size at 10⁴ shares.
 
 ## Appendix A — prior art
 
