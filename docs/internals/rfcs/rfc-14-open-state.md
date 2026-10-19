@@ -48,13 +48,6 @@ the word "lease", and nothing else:
 - a **client lease**: is this client still alive? 90 s for NFSv4;
 - an **SMB lease**: a promise that the client may cache the file.
 
-File protocols do more than name files and move bytes. A client opens a file
-and may forbid others to open it while it does; it locks byte ranges; it caches
-reads and writes under a promise from the server that nobody else is using the
-file; it asks to hear when a directory changes. This RFC owns all of that
-state: who holds each file open, what each holder may do, what the server has
-promised, and what happens to it when a client, a server or a node goes away.
-
 In outline: clients reach DittoFS over NFS (Network File System) or SMB (Server
 Message Block); writes land in a local journal and are later uploaded to an
 S3 (Simple Storage Service) bucket ([RFC 0](rfc-0-data-lifecycle.md)). Every
@@ -101,9 +94,8 @@ alice-pc chose.
    records name reclaim what they held. alice-pc reclaims its persistent open,
    whose record survived the restart, with every write it was told was done;
    grace then ends on its own, early once every recorded client has reclaimed.
-   Had the open been merely durable, it would not survive the restart: the
-   reconnect is answered as if the open did not exist, and alice-pc opens the
-   file again.
+   Had the open been merely SMB durable, it would not survive the restart: the
+   reconnect finds no open, and alice-pc opens the file again.
 
 Without locks, a deny mode or a lease, two clients writing one file get exactly
 this and nothing more: each write request is applied whole; where two overlap,
@@ -113,45 +105,24 @@ breaks.
 
 ![alice-pc and a second desktop over SMB and build01 over NFS all reach, through the filesystem service, one table for ODFC_alice.vhdx held in memory at N1, the file's primary: alice-pc's persistent open o1 with read+write and deny write, and lease L1 with read, write and handle caching at epoch 3, no locks; the second desktop's open meets o1's deny mode and gets a sharing violation, never a downgrade; an open with the same app instance and a higher version closes o1 and its lease first; the persistent open is the one record written to the metadata store, an ordinary open of a named file writes none; the same process runs the file's I/O; if N1 restarts the table is gone and a grace period admits only reclaims for one lease period](img/rfc14-table.svg)
 
-### The words you need
+### Terms
 
-- **Open** and **deny mode**: one open of one file, with the access it was
-  granted and the access it denies to later opens; a deny mode is checked once,
-  when an open is granted ([§2.2](#2.2%20Open), [§6](#6.%20A%20deny%20mode%20is%20checked%20at%20open)).
-- **Byte-range lock**: a lock on a range of a file, held by a lock owner.
-  SMB locks are mandatory, NFS locks advisory ([§2.3](#2.3%20Lock)).
-- **Caching grant**: the server's promise that nobody else is using the file —
-  an NFS delegation, an SMB oplock or lease — taken back by a recall within a
-  deadline ([§5](#5.%20Caching%20grants)).
-- **Client lease**: how long the server keeps a silent client's state. "Lease"
-  also names SMB's caching grant and a node's lease
-  ([RFC 11 §3.1](rfc-11-ownership.md#3.1%20The%20primary%20is%20fenced%20by%20an%20epoch));
-  the three are unrelated ([§4.1](#4.1%20A%20client%20lease)).
+- **Primary and shard.** This RFC says *primary* for the node that serves a
+  file, and *shard* only for RFC 11's record (the unit whose primary changes).
+- **Open-state step.** The per-file serialisation every call below runs under
+  at the file's primary ([§11](#11.%20Interface)).
 - **Grace period** and **reclaim**: after a primary loses open state, the
   window in which only former holders may take state, by reclaiming it
-  ([§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe)).
-- **Durable** and **persistent open**: an SMB open kept across a disconnect for
-  its timeout; a persistent one also survives a restart or failover of its
-  primary, because it is written down and its writes are stable; a durable one
-  does not ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)).
+  ([§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe)). Each loss opens a
+  new **grace instance** ([§4.4](#4.4%20Grace%20is%20per%20shard)).
 - **Delete pending**: SMB's delete on close. The name stays until the last
   open closes; new opens are refused meanwhile ([§9.4](#9.4%20Delete%20on%20close)).
+- **SMB durable and persistent opens**: an SMB durable open survives a
+  disconnect; a persistent one also survives its primary's restart or
+  failover, because it has a durable record and stable writes
+  ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)).
 
-### What this RFC promises
-
-- One table per file, at the file's primary, seen by both protocols: an SMB
-  deny mode or lock refuses an NFS request it forbids, and the reverse where
-  [§7](#7.%20Conflicts%20across%20protocols) says so.
-- No client waits forever on another: a recall ends at its deadline, by
-  acknowledgement or revocation, and a client silent for its whole lease loses
-  all its state at once.
-- After open state is lost, nobody takes what another client held: grace admits
-  only reclaims, and grace ends without an operator.
-- An unlinked file that is still open stays readable until its last close, and
-  a crash does not release it early. Opening and closing a file that has a name
-  writes no open record, unless the open is persistent.
-- Writers that do not coordinate get whole writes, ordered byte by byte by
-  arrival at the primary, and nothing more; applications that need more lock.
+On a first read, skip §2.5–§2.10, §4.4–§4.5, §10, §11 and §13 onward.
 
 ### Scenarios
 
@@ -169,17 +140,6 @@ breaks.
 
 One table serves both protocols, and each lock means what its own protocol says.
 
-**A laptop sleeps holding a lock.**
-
-1. A laptop holds an NFSv4 lock on `todo.txt`, then goes to sleep.
-2. It renews nothing. After one lease period, 90 s, it is treated as gone
-   ([§4.1](#4.1%20A%20client%20lease)).
-3. Its lease owner expires it and releases every open, lock and grant it held,
-   at every shard, in one step ([§4.1](#4.1%20A%20client%20lease), [§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere)).
-4. A colleague's lock on the same range now succeeds.
-
-No client waits forever on one that left.
-
 **A caching grant that is never returned.**
 
 1. build01 holds an NFS write delegation on `config.json` and buffers its writes
@@ -194,49 +154,8 @@ No client waits forever on one that left.
 A promise the server made is always taken back in bounded time; an SMB break
 waits 35 s.
 
-**A failover in the middle of the day.**
-
-1. N1, primary of shard A, dies, and N2 takes A over
-   ([RFC 11 §3.1](rfc-11-ownership.md#3.1%20The%20primary%20is%20fenced%20by%20an%20epoch)).
-2. A's table was in memory, so N2 runs a grace period for A only. Other shards
-   keep granting ([§4.4](#4.4%20Grace%20is%20per%20shard)).
-3. N2 tells each client its records name to reclaim: NFSv4.1 by a flag on its
-   next reply, SMB by breaking the connection ([§4.4](#4.4%20Grace%20is%20per%20shard)).
-4. alice-pc reclaims its persistent open; build01 reclaims its lock, then sends
-   `RECLAIM_COMPLETE` ([§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe)).
-5. Grace ends early once every recorded client has finished. An NFSv4.0 or NLM
-   client keeps it the full 90 s ([§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe)).
-
-Nobody takes what another client held. An SMB open that was durable but not
-persistent is not reclaimed ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)).
-
-**A file deleted while still open.**
-
-1. build01 has `run.log` open, and another client deletes its only name.
-2. In the unlink's own transaction, the open is made durable and the file's
-   pending release is written ([§9.1](#9.1%20An%20open%20keeps%20a%20file%20alive)).
-3. build01 keeps reading and writing. A crash of the primary cannot free the
-   file early: the durable open record still names it ([§9.1](#9.1%20An%20open%20keeps%20a%20file%20alive)).
-4. At build01's last close the record goes, and the file is released
-   ([§9.1](#9.1%20An%20open%20keeps%20a%20file%20alive)).
-
-Delete-while-open behaves as on a local disk, in a cluster too.
-
-### How the rest is organised
-
-[§2](#2.%20The%20entities) defines the entities: client, open, lock, caching
-grant, watch, layout, copy, NFSv4.0 owner sequences and unconfirmed clients, and lock waiters. [§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)
-is the one rule everything rests on: one table per file, at one primary.
-[§4](#4.%20Client%20leases%2C%20grace%20and%20reclaim) covers client leases,
-grace and reclaim, NLM (Network Lock Manager) locks included;
-[§5](#5.%20Caching%20grants) caching grants; [§6](#6.%20A%20deny%20mode%20is%20checked%20at%20open)
-deny modes; [§7](#7.%20Conflicts%20across%20protocols) conflicts across
-protocols and writers that do not coordinate. [§8](#8.%20What%20is%20durable)
-says what is written down; [§9](#9.%20Open%20state%20and%20the%20life%20of%20a%20file)
-how open state keeps a file alive and how delete on close works;
-[§10](#10.%20Shard%20placement) what happens when a file's primary changes.
-[§12](#12.%20Invariants) lists the invariants. On a first read, skip §2.5–§2.10,
-§4.4–§4.5, §10, §11 and §13 onward.
+A profile container's day across a blip and a restart is
+[RFC 22 §2](rfc-22-smb.md#2.%20A%20profile%20container%2C%20end%20to%20end)'s.
 
 ## 1. Purpose
 
@@ -346,41 +265,30 @@ than a second session.
 
 **A bearer ID with room is unguessable.** An ID a client presents with nothing
 else to prove it is the presenter's — an NFSv4 stateid, whose 12-byte `other`
-names an open (`Open.Nonce`), a lock state, a delegation (`GrantID`), a layout
-(`LayoutID`) or a copy (`CopyID`), and an NFSv4.0 confirm verifier (§2.9) —
-carries at least 64 random bits; a client that sees one cannot derive
-another's. **A stateid is found without a file handle.** `TEST_STATEID` and
-`FREE_STATEID` name stateids with no current file handle (RFC 8881 §18.48,
-§18.38), so a stateid's non-random part carries the number of the shard that
-holds its record, the random bits are unique within that shard, and each primary
-keeps an index from random bits to the record (open, lock state, grant, layout or
-copy) and its file. A stateid is resolved by shard number, then by that index;
-a request whose file handle names another file than the record's is refused as a
-bad stateid. The 12 bytes of `other` are laid out as: byte 0, the type tag in
-its low 3 bits and, in its high 5, the low 5 bits of the shard's **grace
-instance** the record was minted under
-([§4.4](#4.4%20Grace%20is%20per%20shard)); bytes 1–3, the shard number,
-big-endian; bytes 4–11, the record's 64 random bits. The grace instance is
-held in the shard record's `GraceInstance`
-([RFC 16 §2.3](rfc-16-metadata-store.md#2.3%20Server-wide%20and%20control-plane%20entities)),
-which advances, to the shard's incarnation, only when the shard's open state is
-lost — a restart, a failover that loses the table, or a handover whose table
-never arrived ([§4.4](#4.4%20Grace%20is%20per%20shard)); a handover or a batch move that ships the table
-keeps it, so a stateid it carries over still reads as current, and so does the
-grace a moved address holds (§4.5). A stateid is judged against the grace
-instance of the shard its bytes 1–3 name while its record is there. Once a
-batch move has taken the record to another shard, the giving shard's
-forwarding entry records the receiving shard's `GraceInstance` at the batch's
-commit and the re-routed call carries it, and the receiving shard judges a miss
-against that recorded instance: stale while it is in grace or its own
-`GraceInstance` has moved past it, since it then lost state the client must
-reclaim; bad otherwise ([§10](#10.%20Shard%20placement)).
+names an open (`Open.Nonce`), a lock state or a delegation (`GrantID`), and an
+NFSv4.0 confirm verifier (§2.9) — carries at least 64 random bits; a client
+that sees one cannot derive another's. **A stateid is found without a file
+handle.** `TEST_STATEID` and `FREE_STATEID` name stateids with no current file
+handle (RFC 8881 §18.48, §18.38).
+
+**A state reference names its shard and grace instance.** Open state mints and
+resolves a neutral `StateRef`: `{Type StateType /* open, lock state, grant */;
+Shard ShardID; Instance uint8 /* low bits of the grace instance it was minted
+under (§4.4) */; Token uint64 /* ≥ 64 random bits, unique within Shard */}`.
+Its wire spelling is `pkg/vfs`'s
+([RFC 17 §3.4](rfc-17-vfs.md#3.4%20IDs%20and%20their%20encodings),
+[RFC 21 §5.2](rfc-21-nfs.md#5.2%20Stateids)). Each primary keeps an index from
+`Token` to the record and its file, so a reference resolves by shard, then
+token, with no file handle. A request whose file handle names another file is
+refused `ErrBadState`. A reference a batch move carried is judged against the
+receiving shard's instance as recorded at the batch's commit
+([§10](#10.%20Shard%20placement)).
 
 **A stateid that misses is stale or bad.** A stateid whose record the index does
 not hold is answered stale (`ErrStaleState`) when it may name state the shard
 lost, so the client reclaims, and bad (`ErrBadState`) otherwise:
 
-- **stale** while the shard is in grace, or when its 5 bits name an earlier
+- **stale** while the shard is in grace, or when its `Instance` names an earlier
   grace instance than the shard's current one: it may name state that loss
   took;
 - **bad** for every other miss: an expired client's released state, a revoked
@@ -403,31 +311,17 @@ Every call naming any of them is also checked against its holder and the
 caller's principal (§10).
 
 > decision: 64 random bits is the floor because it is what a 12-byte stateid
-> `other` holds beside the type tag, the grace-instance bits and the shard number,
+> `other` holds beside what `StateRef` carries,
 > and a guesser answered at a server's request rate expects no hit within an
 > installation's life. It is not measured against an attack. Raise it if a
 > format with room for more is adopted, or if a reachable guessing rate is shown
 > to give a hit within that life.
 
-> ponytail: 5 bits hold the low bits of the incarnation a loss copies into
-> `GraceInstance`, and the incarnation also rises at every handover, so they
-> repeat after 32 incarnation raises, not 32 losses. A stateid presented when
-> the current instance's low bits match its own, with no grace running, reads
-> as current and is answered bad, which costs its locks' reclaim exactly as
-> before the bits existed. Take bits from the shard number if clients are seen
-> presenting stateids that old.
-
-**The server's identity is the installation's.** Every `protocol` node of an
-installation reaches the same state at the same primaries ([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)), so to a client
-they are one server. The NFSv4.1 server owner's major ID and the server scope
-**MUST** be the installation's identity ([RFC 16 §2.3](rfc-16-metadata-store.md#2.3%20Server-wide%20and%20control-plane%20entities)) on every node, and the
-minor ID **MUST** be the node's own: a client may then use one client ID through
-several nodes, and does not try to share a session between nodes, whose session
-state each node holds alone. Client IDs are minted unique across the
-installation and never reused, and a client record is durable ([§8](#8.%20What%20is%20durable)), so a
-client ID stays valid across a `protocol` node's restart; what a loss
-invalidates is the state in the shards that lost it ([§4.4](#4.4%20Grace%20is%20per%20shard)), never the client
-ID itself.
+Every `protocol` node of an installation is one server to a client: one server
+owner major ID and scope, its own minor ID
+([RFC 21 §3.3](rfc-21-nfs.md#3.3%20Trunking%2C%20server%20owner%20and%20scope)).
+Client IDs are unique across the installation, never reused, and outlive a
+node's restart, since the record is durable ([§8](#8.%20What%20is%20durable)).
 
 `Shards` lists every shard the client has held state in. A reclaim in a
 shard the list does not name is refused ([§4.4](#4.4%20Grace%20is%20per%20shard)): a client that held state
@@ -496,7 +390,7 @@ unless the caller's principal is the open's, or, for an NFSv4.1 client under
 machine-credential state protection, the client's machine principal for the
 operations it protects. An NFSv4.0 stateid crosses the wire in clear and binds
 no session, so without the per-call check anyone who sees one writes with the
-opener's access. The same holds for a lock state and a layout.
+opener's access. The same holds for a lock state.
 
 **I/O under a delegation stateid is the client's, and authorised afresh.** An
 NFSv4 client may use its delegation's stateid for I/O by any of its open-owners,
@@ -516,20 +410,14 @@ state's; a request naming an older seqid than the current one is refused as old,
 a newer one as bad. `StateSeq` and `LockState.Seq` hold them, and change in the
 step that applies the request.
 
-**A time can be suspended per open.** SMB lets a client set a time, in a
-set-information request on an open, to a sentinel: -1 suspends the automatic
-update of that time for I/O through this open, -2 resumes it. `Suspended` holds
-the times so suspended — `Modify` and `Access`, never the change time. A
-suspension of the change time is accepted and not applied: NFS clients revalidate
-their caches by the change attribute, and a frozen one would hide SMB writes from
-them ([RFC 17 §5.7](rfc-17-vfs.md#5.7%20GetAttr)). A write or read through
-an open **MUST NOT** advance a time its `Suspended` names; the same I/O through
-any other open, and every explicit set, still does. The filesystem service
-reads `Suspended` when it admits the write and passes the times to leave alone
-with it, so the existence commit that records the write leaves them unchanged
-([RFC 17 §5.1](rfc-17-vfs.md#5.1%20Write)). `Suspended` is volatile with the open, and durable only
-when the open is persistent ([§8](#8.%20What%20is%20durable)); a lost suspension costs only a time
-the client asked not to move.
+**A time can be suspended per open.** `Suspended` names `Modify` and `Access`
+only, never the change time
+([RFC 22 §9.3](rfc-22-smb.md#9.3%20Timestamps%2C%20allocation%20and%20sparse%20files)
+spells the sentinels). A write or read through that open **MUST NOT** advance a
+time it names; I/O through any other open, and every explicit set, still does.
+The service passes the times to leave alone with the write
+([RFC 17 §5.1](rfc-17-vfs.md#5.1%20Write)). Volatile with the open, durable
+only with a persistent one.
 
 ### 2.3 Lock
 
@@ -616,8 +504,9 @@ reconnected open finds its lease as it left it.
 
 ```go
 // Watch is a client's request to hear about changes under a directory: SMB
-// CHANGE_NOTIFY and NFSv4.1 directory notifications. It ends with its
-// client's lease and is never reclaimed (§8).
+// CHANGE_NOTIFY; NFSv4.1 directory notifications need a directory delegation,
+// which is not offered (RFC 21 §5.3). It ends with its client's lease and is
+// never reclaimed (§8).
 // A change is delivered only if the watch's client may traverse to it
 // (RFC 17's callbacks).
 type Watch struct {
@@ -634,8 +523,7 @@ in that shard. **A recursive watch whose subtree crosses into another shard
 (cluster)** also leaves a marker, volatile like the watch, at the primary of each
 descendant shard whose root lies under it: a change there that the filter
 matches is reported to the watch's primary, which completes the watch with
-*enumerate directory* — SMB's `STATUS_NOTIFY_ENUM_DIR`, NFSv4.1's equivalent
-notification that the directory must be read again — rather than a change list,
+*enumerate directory* — SMB's `STATUS_NOTIFY_ENUM_DIR` — rather than a change list,
 since the change's names are another primary's. The client rescans; no change
 under a descendant shard is lost, though its detail is. A shard created or moved
 under the watched subtree after registration gets its marker when it starts
@@ -644,64 +532,21 @@ the same primary, and changes are delivered with their detail.
 
 ### 2.6 Layout
 
-A **layout** (cluster) is a pNFS client's grant to send I/O for a byte range of a file
-straight to the data servers it names ([RFC 15 §5.1](rfc-15-topology.md#5.1%20pNFS)). It is open state like
-the others: held by the client under an open, in the file's table, released
-with the client's lease, recalled on conflict. It also records the (shard,
-epoch) it was granted under, and is recalled when that shard changes primary or
-the file moves to another shard ([§10](#10.%20Shard%20placement)).
-
-```go
-// Layout is what an NFSv4.1 layout stateid names: one client's layouts of one
-// file, granted under one open.
-type Layout struct {
-	ID     LayoutID // at least 64 random bits (§2.1)
-	Client ClientID
-	Open   OpenID
-	Ranges []LayoutRange // byte ranges held, each read or read-write
-	Shard  ShardID
-	Epoch  uint64 // the shard's primary epoch it was granted under (§10)
-	Seq    uint32 // the layout stateid's seqid
-}
-```
-
-**The layout stateid's seqid is state.** `Seq` rises by one with every
-`LAYOUTGET` that grants, every `LAYOUTRETURN` and every layout recall, in the
-step that applies it, and the new value goes out with the reply or the recall.
-A recall carries it so the client can tell whether a `LAYOUTGET` reply it holds
-was sent before or after the recall, and so never uses a range the recall took
-back. A request naming a seqid above the current one is refused as bad. Like an
-open's, the layout is used only by its opener's principal (§2.2).
+A **layout** (cluster) is reserved: a single node offers none, and every layout
+operation is answered not supported
+([RFC 21 §2.1](rfc-21-nfs.md#2.1%20Versions%20served)). A pNFS RFC adds it as
+open state of the file's table, held under an open, released with the client's
+lease, bound to the (shard, epoch) it was granted under, and recalled when that
+shard changes primary or the file moves
+([RFC 15 §5.1](rfc-15-topology.md#5.1%20pNFS),
+[RFC 17 §10](rfc-17-vfs.md#10.%20Open%20questions) Q2).
 
 ### 2.7 Copy
 
-```go
-// Copy is one server-side copy running after its request was answered: an
-// NFSv4.2 COPY with an asynchronous reply. Held in the destination file's
-// table. An SMB copychunk completes within its request and has none.
-type Copy struct {
-	ID             CopyID // what the copy stateid names
-	Client         ClientID
-	Src, Dst       FileID
-	SrcOff, DstOff int64
-	Length         int64
-	Done           int64     // bytes copied so far: OFFLOAD_STATUS's answer
-	State          CopyState // running, done, failed, cancelled
-}
-```
-
-The copy reports its end to the client by `CB_OFFLOAD` and is forgotten once the
-client has heard it or its lease has expired. A cancel (`OFFLOAD_CANCEL`) stops
-it at the next batch; the bytes already copied stay. A copy is volatile, and a
-copy that is lost is unknown, never done: a status or cancel for it is answered
-`ErrNoCopy`, and the client runs the copy again. Copying the same bytes to the
-same place twice is harmless, so a partial copy left behind needs no cleanup.
-
-> decision: an asynchronous copy is not persisted. Persisting it costs a write
-> at start and at every progress mark, to spare a client re-running a copy only
-> after a failover or restart that landed mid-copy; the client already recovers
-> from it. Persist it, with its progress, if copies in a workload run long
-> enough that failovers routinely land inside them.
+Asynchronous copy is not offered: every copy is answered synchronously and
+issues no copy stateid ([RFC 21 §9.4](rfc-21-nfs.md#9.4%20Async%20COPY),
+[RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)). A copy holds no open
+state.
 
 ### 2.8 NFSv4.0 owner sequences
 
@@ -729,39 +574,25 @@ advanced against the open-owner's `OwnerSeq`, at the open-owner's home primary,
 as an `OPEN` is; its reply advances the open-owner's sequence under the rule
 below, refusals included, and only a granted lock creates the lock-owner's
 `OwnerSeq` with `Next` one past the seqid it carried. Every later `LOCK` and
-`LOCKU` of that lock-owner carries the lock-owner's seqid alone. Checked against
-the lock-owner only, the open-owner's next `OPEN` or `CLOSE` would be answered
-`NFS4ERR_BAD_SEQID`, since the client counted the `LOCK` against it.
+`LOCKU` of that lock-owner carries the lock-owner's seqid alone.
 
-**Every in-sequence reply advances the sequence, refusals included.** RFC 7530
-§9.1.7 advances the seqid on every reply to an in-sequence request except
-`NFS4ERR_STALE_CLIENTID`, `NFS4ERR_STALE_STATEID`, `NFS4ERR_BAD_STATEID`,
-`NFS4ERR_BAD_SEQID`, `NFS4ERR_BADXDR`, `NFS4ERR_RESOURCE`,
-`NFS4ERR_NOFILEHANDLE` and `NFS4ERR_MOVED`, and clients count on it: a request
-refused `NFS4ERR_DELAY`, `NFS4ERR_GRACE` or `NFS4ERR_DENIED` still advances
-`Next`, or the client's next request is answered `NFS4ERR_BAD_SEQID`. A
-refusal outside that list is a reply like any other: it advances the sequence
-and is cached for replay below. When the request runs at another shard's
-primary, the home primary advances the sequence on that primary's answer, never
-before it: a refusal outside the list advances it, since the client counts that
-refusal as a reply, and an answer in the list — `NFS4ERR_STALE_STATEID` from a
-shard that failed over ([§4.4](#4.4%20Grace%20is%20per%20shard)), `NFS4ERR_BAD_STATEID`,
-`NFS4ERR_MOVED` — leaves it where it was, as the client does.
+Every in-sequence reply advances `Next`, refusals included, except those
+RFC 7530 §9.1.7 exempts; open state stays out of that list's wire names and
+reports `ErrStaleClient`, `ErrStaleState`, `ErrBadState` and `ErrBadSeqID`,
+which advance nothing
+([RFC 21 §4.2](rfc-21-nfs.md#4.2%20Owner%20sequence%20IDs) maps the rest).
 
-**Where it is held.** An owner's `OwnerSeq` is held at the primary of its
-**home shard**: the shard of the file of its first sequenced request. A
-sequenced request on a file in another shard (cluster) checks the sequence at the
+**Where it is held.** An owner's `OwnerSeq` is held at its **home primary**:
+the primary of the file of the owner's first sequenced request. **(cluster)** A
+sequenced request on a file another primary serves checks the sequence at the
 home primary first, runs at its file's primary, and then commits the advance at
-the home primary under the rule above, with the answer. A second request of the
-owner arriving between the two is answered as a replay of the first would be:
-it waits for the first's advance, since the owner's requests are serial. A lock-owner's locks are almost always on one file, so its home shard
-is that file's and the extra call does not arise.
+the home primary on that primary's answer, never before it. A second request of
+the owner arriving between the two waits for the first's advance, since the
+owner's requests are serial. A lock-owner's locks are almost always on one
+file, so the extra call does not arise.
 
-**What is the adapter's.** The reply to the owner's last request, which
-NFSv4.0 replays when the same seqid arrives again, is cached by the adapter
-that answered it, not here. It is best-effort: after the loss of that protocol
-node a replayed request finds no cached reply and is answered
-`NFS4ERR_BAD_SEQID` if it does not advance the sequence.
+The last reply, for replay, is the adapter's
+([RFC 21 §4.2](rfc-21-nfs.md#4.2%20Owner%20sequence%20IDs)).
 
 `OwnerSeq` is volatile, like the opens and locks it sequences. A home primary
 that is lost loses it; in the grace that follows, an owner with no `OwnerSeq`
@@ -771,8 +602,8 @@ is new, and its first sequenced request sets `Next`, as for any new owner.
 
 ```go
 // Unconfirmed is an NFSv4.0 SETCLIENTID, or an NFSv4.1 EXCHANGE_ID, not yet
-// confirmed. Volatile, held by the protocol node that answered it; never
-// written to the metadata store.
+// confirmed. Held by the front of the protocol node that answered, as open
+// state's client half (§11), never written to the store.
 type Unconfirmed struct {
 	Owner     []byte    // the SETCLIENTID id string or EXCHANGE_ID co_ownerid
 	Verifier  [8]byte   // the client's boot verifier
@@ -785,45 +616,21 @@ type Unconfirmed struct {
 }
 ```
 
-An NFSv4.0 client establishes itself in two steps: `SETCLIENTID` proposes an
-owner, verifier and callback, and `SETCLIENTID_CONFIRM`, naming the answered
-client ID and confirm verifier, makes them current. Until the confirm, nothing
-of the proposal is state:
+A client is proposed by `Propose` and made current by `Connect`. Four rules
+hold the proposal:
 
-- the `protocol` node that answered `SETCLIENTID` holds the `Unconfirmed`
-  record in memory, at most one per owner — a second `SETCLIENTID` for the same
-  owner replaces it — and drops it at `Expires`. A `SETCLIENTID` with a
-  confirmed owner's own verifier and principal is one too: it answers the
-  existing client ID with a new confirm verifier, and its confirm keeps the ID
-  and its state and records the new callback (RFC 7530 §16.33.5);
-- no `Client` record is written and no existing client's state changes: a
-  proposal with a new verifier under a known owner does not yet expire the old
-  client ID, and a proposal of a new callback does not yet rewrite `Callback`;
-- the confirm is accepted only from the proposal's principal, with its client
-  ID and confirm verifier, before `Expires`. It then does, in one step, what
-  `Connect` does for any client ([§2.1](#2.1%20Client)) — writes the record,
-  expires the old client ID on a reboot, records the callback ([§4.1](#4.1%20A%20client%20lease))
-  — and drops the `Unconfirmed` record;
-- a confirm that finds a matching record but comes from another principal is
-  answered `NFS4ERR_CLID_INUSE` (`ErrClientInUse`, RFC 7530 §16.34.5) and
-  leaves the record in place;
-- a confirm that finds no matching record — expired, replaced, sent to another
-  node, or after that node's restart — is answered `NFS4ERR_STALE_CLIENTID`,
-  and the client sends `SETCLIENTID` again.
+1. a proposal changes no state, and a new verifier does not expire the old
+   client ID until its confirm;
+2. at most one record per owner, and a later proposal replaces it;
+3. it expires one lease period after the request;
+4. a confirm is accepted only at the answering node, from the proposal's
+   principal, naming its client ID and its confirm verifier or sequence, and
+   it runs `Connect` in one step ([§2.1](#2.1%20Client)).
 
-**NFSv4.1 confirms at `CREATE_SESSION`.** An `EXCHANGE_ID` that names a new
-owner, or a known owner with a new verifier, makes an `Unconfirmed` record under
-the same rules, and changes no state: the old client ID of a rebooted client
-keeps its state until the confirm. The client's first `CREATE_SESSION` naming
-the answered client ID and `Sequence`, from the same principal, is the confirm
-(RFC 8881 §18.35.4): it calls `Connect`, writes `CSSeq` and `CSReply` in the
-same transaction ([§2.1](#2.1%20Client)), and drops the `Unconfirmed` record. One
-that finds no matching record is answered `NFS4ERR_STALE_CLIENTID`, and the
-client sends `EXCHANGE_ID` again. An `EXCHANGE_ID` with a confirmed owner's own
-verifier and principal is not a proposal: it returns the existing client ID at
-once. Any `EXCHANGE_ID` or `SETCLIENTID` whose owner a confirmed record holds
-under another principal is refused with `ErrClientInUse` and leaves no
-`Unconfirmed` record.
+A proposal for an owner a confirmed record holds under another principal is
+refused `ErrClientInUse` and leaves no record. Wire statuses and the
+NFSv4.0/4.1 walk are
+[RFC 21 §3.5](rfc-21-nfs.md#3.5%20Confirming%20a%20client)'s.
 
 > decision: an unconfirmed client is volatile and held only by the node that
 > answered `SETCLIENTID` or `EXCHANGE_ID`. Writing it would cost a metadata write per mount
@@ -896,16 +703,8 @@ How each protocol waits:
   answer by the call's deadline it calls again. A restart releases the lock with
   everything else the host held ([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)).
   The resend schedule is the NLM adapter's; the resending is a timer and holds
-  no worker.
-
-  > decision: an unacknowledged `NLM_GRANTED` is resent, never timed out. A
-  > host acts on a grant when it arrives and only the acknowledgement may be
-  > lost, so releasing the lock after a silence would leave two holders writing
-  > one range; it is the server-side timeout [§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)
-  > rejects for held locks. The cost is that section's ceiling: a host that dies
-  > before answering holds the lock until it restarts or an administrator
-  > revokes its client. Add a release only together with that section's
-  > timeout, if a deployment's NLM hosts are known to be disposable.
+  no worker. An unacknowledged grant is never released for a silence
+  ([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)'s `decision:`).
 - **SMB:** a lock request without the fail-immediately flag asks to wait; with
   it, a conflict is refused at once. The waiter is answered pending, and when
   the range frees the primary grants it in the step that frees it and completes
@@ -932,7 +731,10 @@ waiting request is exempt from the per-call deadline
 ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values)), since it
 holds no worker. A waiter is lost with its primary's table; the client's own
 retry, reclaim or reconnect replaces it, and in grace a waiting request is
-refused like any new lock.
+refused like any new lock. A waiter has no time limit of its own, since it
+holds no worker, only a record bounded at one per owner per file and by §5.5's
+per-client caps; add one, here and nowhere else, if waiter counts are seen
+growing without bound.
 
 **No adapter answers a waiting request before the waiter is gone.** An adapter
 that answers a request it was told `ErrBlocked` for with anything but the grant
@@ -945,12 +747,6 @@ order, a lock is granted after its request was answered as failed: a lock no
 client knows it holds, which refuses every other client until its owner's state
 ends.
 
-> decision: an NLM or SMB waiter has no time limit of its own; it ends on cancel,
-> close, restart, disconnect or expiry, because both protocols' clients wait for
-> a blocking lock indefinitely and the waiter holds no worker, only a record in
-> one file's table, bounded at one per owner per file. Add a limit, here and
-> nowhere else, if waiter counts are seen growing without bound.
-
 ## 3. One table per file, at one primary
 
 | State | Granted by | Conflicts with | Lifetime |
@@ -959,10 +755,9 @@ ends.
 | **deny mode** | an open | an open asking for denied access | until close |
 | **byte-range lock** | a lock request | an overlapping lock of another owner ([§2.3](#2.3%20Lock)); I/O across protocols ([§7](#7.%20Conflicts%20across%20protocols)) | until unlock, close, or lease expiry; an NLM lock until unlock or its host's restart |
 | **delete pending** | an open's close with `DeleteOnClose`, or a set-disposition | every new open; a rename of the file ([§9.4](#9.4%20Delete%20on%20close)) | until cleared, or the last close removes the name |
-| **copy** | an asynchronous copy request | nothing: its writes are ordinary writes | until reported, cancelled, or lease expiry |
 | **caching grant** | the server, on an open | any conflicting access by another client ([§5](#5.%20Caching%20grants)) | until recalled, revoked, returned or expired |
 | **watch** | a watch request | nothing | until cancelled or lease expiry |
-| **layout** (cluster) | a layout request, under an open | a conflicting open, lock or deny mode; a primary change of its shard, or a move of its file | until returned, recalled, revoked or lease expiry |
+| **layout** (cluster) | reserved ([§2.6](#2.6%20Layout)) | | |
 
 All of it is held against a **file**, never a name or a handle. A named stream
 belongs to its base file here: an open of a stream counts as an open of the base
@@ -1015,9 +810,9 @@ the protocol sets (MS-SMB2 3.3.5.9.10).
 > gaps they survive elsewhere. Either is a change to one value, not a setting,
 > since no operator can name a workload one lease suits and another does not.
 
-"Lease" names two unrelated things in this set: the client lease, here, and the
-**node lease** of [RFC 11 §3.1](rfc-11-ownership.md#3.1%20The%20primary%20is%20fenced%20by%20an%20epoch), which, with the shard record, decides which node may serve a shard. SMB
-also calls a caching grant a "lease" ([§5](#5.%20Caching%20grants)). The three share no records.
+The client lease shares no record with RFC 11's
+[node lease](rfc-11-ownership.md#3.1%20The%20primary%20is%20fenced%20by%20an%20epoch)
+or with an SMB lease ([§5](#5.%20Caching%20grants)).
 
 **One lease owner per client (cluster).** A client's requests arrive at whichever
 `protocol` nodes hold its sessions, and its state sits at many primaries; none of
@@ -1060,8 +855,8 @@ a holder that no longer exists.
 
 A primary that has lost open state **MUST** then run a **grace period** of one
 lease period from when it begins serving, ending earlier only as below. During it, it **MUST** refuse every request for open
-state that is not a reclaim — a new lock, a new open, a deny mode, a grant, a
-layout — whether or not it appears to conflict: the state it would be checked
+state that is not a reclaim — a new lock, a new open, a deny mode, a grant —
+whether or not it appears to conflict: the state it would be checked
 against is what was lost, so a conflict cannot be decided. For the same reason
 it **MUST** refuse, with `ErrGrace`, every read or write through an anonymous
 or unreclaimed open that a lost mandatory lock or deny mode might have
@@ -1073,26 +868,13 @@ restart are both granted the same lock after it, and neither is told.
 Open-state leases are extended by the grace period, so a client is not expired
 for time the server spent restarting.
 
-**The move grace is the one exception.** When a namespace move names an
-address, the receiving installation holds the moved shares in a **move grace**
-([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step), §4.5) that is narrower and bounded differently from the grace
-above: it refuses with `ErrGrace` only non-reclaim NLM locks and NFSv4 opens
-and locks on the moved shares, and admits their reclaims; SMB requests on
-those shares, I/O through any open and anonymous I/O are not refused, since
-the carried persistent opens keep their own deny modes, locks and per-client
-timers ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)). It runs from
-the shares' publish and ends at the earlier of `migration.reconnect_wait` and
-one lease period after the address arrives, not after one lease period.
-
-> decision: the move grace is NFS-only because only NFS clients follow the
-> address: an NLM host or NFSv4 client reaches B through it and must reclaim
-> before anyone else locks, while an SMB client repoints by name and brings its
-> persistent opens with it. A full grace would refuse every SMB open on the
-> moved shares for up to `migration.reconnect_wait`. The cost is that an SMB
-> client may take a byte-range lock an NLM host is still on its way to
-> reclaim, until the address arrives. Make it refuse SMB byte-range locks too if
-> a workload is shown sharing locked files between SMB clients and NFS clients
-> across a move.
+**The move grace is the one exception.** A namespace move that names an
+address holds the moved shares at the receiving installation in a narrower
+**move grace**: it refuses with `ErrGrace` only non-reclaim NLM locks and NFSv4
+opens and locks on them, admits their reclaims, and ends at the earlier of
+`migration.reconnect_wait` and one lease period after the address arrives
+([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step),
+which states why SMB is not held).
 
 A reclaim is accepted only from a client the durable client record ([§8](#8.%20What%20is%20durable))
 shows held state before the loss. Without that record, every reclaim **MUST**
@@ -1150,9 +932,10 @@ restart.
 
 ### 4.4 Grace is per shard
 
-Every open-state operation reaches the primary of the file's shard
-([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)), so a grace period is scoped to the shards whose primary lost state, and
-the rest of the cluster keeps granting. Only a failover loses state: a handover
+Every open-state operation reaches the file's primary
+([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)), so a grace
+period is scoped to the RFC 11 shards, the unit whose primary changes, that
+lost state, and the rest of the cluster keeps granting. Only a failover loses state: a handover
 or a batch move of files hands the table over and runs no grace ([§10](#10.%20Shard%20placement)).
 
 ![Grace per shard: N1, primary of shard A, dies and N2 takes A over; A runs a grace of at most 90 s while shard B keeps granting. The takeover transaction copies N2's incarnation into GraceInstance, so older stateids read stale; every client A's records name is told to reclaim — NFSv4.1 by RESTART_RECLAIM_NEEDED on SEQUENCE, NFSv4.0 by STALE_CLIENTID until it repeats SETCLIENTID, SMB by a broken connection, NLM by a raised NSM state number and a restart notification; reclaims are admitted and checked against the current ACL, new opens, locks, deny modes, grants, layouts and anonymous I/O are refused with ErrGrace; grace ends after one lease period or once every client has finished — NFSv4.1 by RECLAIM_COMPLETE for this instance, SMB when its persistent opens are reconnected or timed out, NFSv4.0 and NLM never](img/rfc14-grace.svg)
@@ -1196,7 +979,7 @@ every client whose record names the shard:
   start reboot recovery on; `NFS4ERR_STALE_STATEID` with the client ID still
   valid is answered by a `RENEW`, which succeeds, and the client loops. A
   stateid of the lost shard is still answered `NFS4ERR_STALE_STATEID` (`ErrStaleState`, by its
-  grace-instance bits, [§2.1](#2.1%20Client)): the
+  `Instance`, [§2.1](#2.1%20Client)): the
   client's `RENEW` that follows is what meets `NFS4ERR_STALE_CLIENTID`, so it
   recovers rather than loops. The loss
   marks the record's entry for the shard, durably, and the signal lasts while
@@ -1205,10 +988,8 @@ every client whose record names the shard:
   clears the marks. The client then reclaims, and a shard that lost nothing
   returns what it holds (§4.2).
 - **SMB:** break the connection, so the client reconnects and reclaims its
-  persistent opens. Durable v1 and v2 opens, like volatile ones, are not
-  reclaimed across a restart or failover of their primary: a reconnect to one is
-  answered `STATUS_OBJECT_NAME_NOT_FOUND`, as MS-SMB2 answers a durable handle the
-  server no longer holds ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)).
+  persistent opens; SMB durable and volatile opens are not reclaimed
+  ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)).
 - **NLM:** notify it of a restart, so it reclaims its locks ([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)).
 
 A reclaim is accepted only in a shard the client's record names ([§2.1](#2.1%20Client)).
@@ -1220,36 +1001,30 @@ old primary's node lease has lapsed plus the drift bound ([RFC 11 §3.1](rfc-11-
 
 ### 4.5 NLM locks and restart notification
 
-NFSv3 locks through NLM, and NLM has no lease: a host renews nothing, so its
-locks are held until it unlocks them or restarts. Restarts are told both ways by
-NSM, and both directions are this component's:
+NFSv3 locks through NLM (Network Lock Manager), which has no lease: a host's
+locks are held until it unlocks them or restarts. Open state owns the durable
+NSM state number and decides whom a loss must notify; the NFS adapter's NSM
+side spells and sends the notice
+([RFC 21 §6.2](rfc-21-nfs.md#6.2%20NSM)).
 
-- **The host restarted.** Every NLM request carries the host's NSM state number,
-  its client record's `Verifier` ([§2.1](#2.1%20Client)). A restart notification from the host, or a
-  request with a new state number, expires the old `ClientID`, releasing every
-  lock it held ([§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere)).
+- **The host restarted.** A restart notice from the host, or a request with a
+  new state number, is a `Connect` under the host's owner with a new verifier:
+  a reboot ([§2.1](#2.1%20Client)), which expires the old `ClientID`, releasing
+  every lock it held ([§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere)).
 - **The server lost locks.** The installation holds one durable **NSM state
   number**. A failover of a shard in which any NLM host held locks **MUST**
-  raise it, durably, before the shard's grace begins, and then send a restart
-  notification carrying it to every NLM host whose client record names the
-  shard, at the record's `Notify`. The durable NLM client records are the
-  monitor list; there is no second one. The host then reclaims its locks, which
-  grace admits as it admits every reclaim ([§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe)), and a non-reclaim lock
-  in grace is refused with `ErrGrace`.
-- **An address arrives from another installation.** When a namespace move
-  hands A's address to B ([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)), the address's arrival at B is
-  the loss, not B's first serving of the moved shares. At that step B raises
-  its NSM state number, durably, above both A's — which the move's delta
-  carries — and its own, keeps the moved shares' grace, which has held since B
-  published when the move named the address, open for one lease period from
-  the arrival, or opens a new one if `migration.reconnect_wait` ended it first
-  ([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)), and only then notifies every NLM host the delta names, sent
-  from that address. That grace is §4.2's move grace, not a full one. A host
-  ignores a notification whose number is not above the last it saw from the
-  address, and notified from B's own address it reclaims at A's. This grace
-  does not advance the grace instance and signals no NFSv4 client: it exists
-  for NLM reclaims and so that no NFS lock is granted first, and an NFSv4
-  client arriving by the address holds no record at B ([§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe)).
+  raise it, durably, before the shard's grace begins, and then report the
+  loss, through `Revoked` with reason `RevokedShardState`, to every NLM client
+  whose record names the shard; the adapter sends the notice to its `Notify`.
+  The durable NLM client records are the monitor list; there is no second one.
+  The host then reclaims its locks, which grace admits as it admits every
+  reclaim ([§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe)), and a
+  non-reclaim lock in grace is refused with `ErrGrace`.
+- **An address arrives from another installation.** A namespace move raises
+  the number when the move's address arrives, above both installations',
+  inside the move grace
+  ([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)
+  step 10).
 
 > decision: an NLM lock has no lease, so a host that dies and never comes back
 > holds its locks until an administrator revokes its client. This is the NLM
@@ -1313,31 +1088,33 @@ with the grants, and grace then signals the loss as a lost shard's state (§4.4)
 ![A recall's timeline: build01 holds a write delegation on config.json; alice-pc opens it for writing over SMB; the primary recalls the delegation in build01's own protocol, starting a deadline of one lease period, 90 s, for an NFS delegation or 35 s for an SMB break, and answers alice-pc ErrDelay without holding a worker. If build01 acknowledges, it first sends its buffered writes as ordinary writes and alice-pc's open proceeds with nothing merged. If it never answers, an NFS delegation is revoked and its later writes refused with ErrRevoked, an SMB lease or oplock is downgraded to none with its opens kept, alice-pc's open proceeds, and build01 is offered no grants for 90 s](img/rfc14-recall.svg)
 
 **An administrator's revoke follows the same path** (RFC 8881 §8.2.4). It
-releases every open, lock, grant and layout the client holds, as an expiry does
+releases every open, lock and grant the client holds, as an expiry does
 ([§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere)),
 so other clients may take them at once, but keeps each one's stateid in the
 revoked set, marked with its cause, and keeps the client record and its
 sessions. A call naming one is answered `ErrRevoked`, which the NFS adapter
 answers `ADMIN_REVOKED` for every stateid an administrator revoked, a
-delegation's or layout's included, and `DELEG_REVOKED` only for a grant revoked
+delegation's included, and `DELEG_REVOKED` only for a grant revoked
 at its recall deadline, as RFC 8881 §15.1 defines the two, with
 `SEQ4_STATUS_ADMIN_STATE_REVOKED` set until `FREE_STATEID` has freed each.
-`FREE_STATEID` reaches the service as `FreeRevoked` (§11). An NFSv4.0 client
+`FREE_STATEID` reaches the service as `FreeState` (§11). An NFSv4.0 client
 has no `FREE_STATEID` and an SMB client nothing like it, so for them the
-adapter calls `FreeRevoked` once it has answered the stateid revoked, and the
+adapter calls `FreeState` once it has answered the stateid revoked, and the
 stateid is bad after; the SMB record is then released as §4.1 says once it
-holds nothing. The client
-then opens afresh under its own client ID. Deleting the record instead
-would leave the client nothing to free and no ID its next `EXCHANGE_ID` could
-name differently; keeping the record but answering stale client loops it.
+holds nothing. The client then opens afresh under its own client ID.
 
-The revoked set lives at each shard's primary, but the flags a `SEQUENCE`
-reply carries are the client's: in the step that adds to or frees from its
-revoked set, each primary reports to the client's lease owner (§4.1) whether
-its set still holds admin-cause and deadline-cause entries, and the lease
-owner keeps the OR of those reports per shard. That aggregate is the
+**(cluster)** The revoked set lives at each shard's primary, but the flags a
+`SEQUENCE` reply carries are the client's: in the step that adds to or frees
+from its revoked set, each primary reports to the client's lease owner (§4.1)
+whether its set still holds admin-cause and deadline-cause entries, and the
+lease owner keeps the OR of those reports per shard. That aggregate is the
 `ClientStatus` `Renew` returns (§11), which the answering node caches for at
-most one renewal interval, so it costs no call per `SEQUENCE`.
+most one renewal interval.
+
+> decision: a cached `ClientStatus` may be one renewal interval stale, so a
+> revoked-state flag can reach the client up to that late. It costs no call
+> per `SEQUENCE`. Read the aggregate per reply if a client is seen acting on
+> state it was not yet told is revoked.
 
 **A revoke outlives a restart.** The revoked set is volatile, but the revoke is
 not: the revoke's transaction marks, durably, each of the client's per-shard
@@ -1348,15 +1125,11 @@ client next takes state there by an ordinary, non-reclaim request, whose
 transaction clears the mark. Without it, a restart before the client sees
 `SEQ4_STATUS_ADMIN_STATE_REVOKED` forgets the revoke while the per-shard key
 remains, and the client reclaims in grace the open and lock another client
-took after the revoke. An NLM host has no `FREE_STATEID` and no lease, so its
-revoke is an expiry ([§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere)):
-it releases the host's locks and deletes its client record, so no later
-restart notifies the host or admits its reclaim, and its next lock request
-makes a new record; a reclaim it is driven to send meets no record and is
-`ErrNoReclaim`, so `ErrReclaimRevoked` is never raised for NLM. Nor for SMB:
-an administrator's revoke releases a client's persistent opens with the rest,
-so a reconnect finds no open and is `ErrNoReclaim` as any reconnect to a gone
-open is. The mark is checked for NFSv4 reclaims only.
+took after the revoke. `ErrReclaimRevoked` is checked for NFSv4 reclaims
+only: an NLM host's revoke is an expiry that deletes its record
+([§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere)),
+and an SMB revoke releases its persistent opens, so a later reclaim or
+reconnect meets no record (`ErrNoReclaim`).
 
 Waiting indefinitely for a
 client that has stopped answering blocks every other client of that file, on
@@ -1505,16 +1278,13 @@ One table ([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)) makes 
 | an NFS byte-range lock | SMB or NFS I/O across its range | allowed: NFS locks are advisory and gate lock requests only |
 | a caching grant of either protocol | a conflicting open, write, set-attribute, rename or unlink from another client, through either protocol | the grant is recalled within its deadline ([§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time)) before the request proceeds |
 | a write grant | a read from another client | recalled to read |
-| a caching grant held by another client — an NFS delegation, an SMB oplock or lease with read or write caching | a byte-range lock request of either protocol, NLM included | the grant is recalled to none, as MS-FSA 2.1.5.7 breaks it, and the lock is decided only after the recall ends; a blocking NLM or SMB request waits as a waiter answered `ErrBlocked`, any other is answered `ErrDelay` ([§2.10](#2.10%20Lock%20waiters)). Without it, an NLM lock and the local lock a write delegation's holder took are both exclusive over one range |
+| a caching grant held by another client — an NFS delegation, an SMB oplock or lease with read or write caching | a byte-range lock request of either protocol, NLM included | recalled to none, as MS-FSA 2.1.5.7 breaks it, before the lock is decided ([§2.10](#2.10%20Lock%20waiters)) |
 | an SMB open whose deny mode includes delete | an NFS `REMOVE` of a name of the file, or a `RENAME` of it or over it | refused, `ErrShareViolation`; checked per operation, as anonymous I/O is ([§6](#6.%20A%20deny%20mode%20is%20checked%20at%20open)) |
 | SMB opens that all share delete | an NFS `REMOVE` of the file's name | the name goes now; the opens keep the file alive until the last close ([§9.1](#9.1%20An%20open%20keeps%20a%20file%20alive)) |
 | a delete-pending file | an open, through either protocol | refused, `ErrDeletePending` ([§9.4](#9.4%20Delete%20on%20close)) |
 
 A caching grant is recalled by the server in the holder's own protocol, whatever
 protocol caused the conflict ([RFC 17](rfc-17-vfs.md)'s callbacks).
-
-A layout is recalled when a mandatory lock or deny mode is granted over its
-range, so pNFS I/O, which bypasses the primary, never crosses one.
 
 ### 7.1 Writers that do not coordinate
 
@@ -1553,9 +1323,8 @@ the keys [RFC 16](rfc-16-metadata-store.md) lists; volatile state never is.
 | **CachingGrant** | **volatile**, never reclaimed; an SMB lease survives only inside a persistent open, with its key, parent key, kind and epoch ([§2.4](#2.4%20CachingGrant)) | a lost grant costs a client its cache, never correctness |
 | **delete pending** | **volatile** with the opens — **durable** while the file has a persistent open ([§9.4](#9.4%20Delete%20on%20close)) | a pending delete is a promise to the client that set it, which only a persistent open carries across a failover |
 | **Watch** | **volatile**, never reclaimed | the client re-registers; the NFSv4.1 specification does not allow reclaiming directory notifications |
-| **Layout** (cluster) | **volatile**, reclaimed in grace; recalled, never handed over, when its shard's primary changes or its file moves | a lost layout costs a `LAYOUTGET`; a stale one is refused by epoch |
-| **Copy** | **volatile**, never reclaimed ([§2.7](#2.7%20Copy)) | the client runs a lost copy again |
-| **Unconfirmed** | **volatile**, at the `protocol` node that answered `SETCLIENTID`, for one lease period ([§2.9](#2.9%20NFSv4.0%20unconfirmed%20clients)) | a lost one costs the client a repeated `SETCLIENTID` |
+| **Layout** (cluster) | reserved ([§2.6](#2.6%20Layout)) | |
+| **Unconfirmed** | **volatile**, at the front of the answering node, one lease period ([§2.9](#2.9%20NFSv4.0%20unconfirmed%20clients)) | a lost one costs the client a repeated `SETCLIENTID` |
 | **LockWaiter** | **volatile**, never reclaimed ([§2.10](#2.10%20Lock%20waiters)) | the client's poll, reclaim or reconnect asks again |
 | **grant budget count** | **volatile**, per primary, starting at zero ([§5.5](#5.5%20A%20client%27s%20grants%20are%20bounded)) | grants are volatile too; the count is rebuilt as they are offered |
 | **NSM state number** | **durable**, one per installation ([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)) | an NLM host recognises a server restart only by a higher number |
@@ -1578,22 +1347,15 @@ written when the client first takes state in a shard, not per open, and is
 bounded: a client past the bound is recorded as holding state in every shard of
 the share, which widens its grace and never loses a reclaim.
 
-**An imported client record merges by owner.** A namespace move carries the
-client records its persistent opens and NLM locks name
+**An imported client record merges by owner.** A namespace move's imported
+client record merges by (protocol, owner): a record the receiver holds keeps
+its `ClientID` and gains the imported shards, any other is minted there, and
+the imported opens are rewritten to that ID. An NLM record is imported
+unchanged, and a receiver's record for the same host under a lower state
+number is expired as a restart would expire it
+([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)). Node fields are
+never imported
 ([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)).
-The receiving installation finds each by (protocol, owner): a record it already
-holds keeps its own `ClientID` and gains the imported shards, and any other is
-written under a `ClientID` minted there; the imported opens are rewritten to
-that ID. An NLM record is the exception: its `ClientID` is not minted but is
-the host's name with its NSM state number (§2.1), so it is imported unchanged
-and its locks keep it; a record the receiver holds for the same host under
-another state number is a different instance of the host, and the lower
-number's is expired as a restart notification would expire it
-([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)). The node fields — `LeaseOwner`, `Callback`, `PathDown`, `Sessions` —
-are never imported, since they name the giving installation's nodes; the
-receiver sets them at the client's first contact. Imported as written, an SMB
-record would sit beside the receiver's own record for the same `ClientGuid`,
-and a reconnect would match neither.
 
 ### 8.1 SMB durable and persistent opens
 
@@ -1603,18 +1365,26 @@ What the server keeps, and for how long, is set per open by its create request:
 | Kind | Survives | Held as |
 | --- | --- | --- |
 | volatile | nothing: a disconnect closes it | the primary's table |
-| durable (v1, v2) and resilient | a disconnect, for `Timeout`; a handover. Not a restart or failover of its primary: a reconnect after one is answered `STATUS_OBJECT_NAME_NOT_FOUND`, as MS-SMB2 answers a durable handle the server no longer holds | the primary's table |
+| SMB durable (v1, v2) | a disconnect, for `Timeout`; a handover. Not a restart or failover of its primary: a reconnect after one finds no open ([RFC 22 §6.4](rfc-22-smb.md#6.4%20Durable%20and%20persistent%20handles) spells it) | the primary's table |
 | persistent | a disconnect, for `Timeout`; a handover; a restart or failover of its primary | a durable record ([§8](#8.%20What%20is%20durable)) with every field of the open, its locks and its lease |
 
+RFC 22 §6.4 draws what a reconnect finds after each kind of loss.
+
 **Writes that survive a restart are stable.** Every write through a persistent
-open, and every write through any open on a share that offers continuous
-availability, **MUST** be stable: synced to the journal before it is acknowledged
-([RFC 1 §5.2](rfc-1-journal.md#5.2%20Sync%20policy)), as if the client had asked for write-through. SMB has no
-write verifier, so a handle that survives the loss of acknowledged unstable
-writes would reconnect over the gap and the client would never resend them: a
-profile container would be silently corrupt. A durable v1 or v2 open does not
-survive its primary's restart, so its unstable writes need no such rule — the
-client finds the open gone and knows its cached state is lost.
+open, and through any open on a continuously available share, **MUST** be
+stable before it is acknowledged
+([RFC 1 §5.2](rfc-1-journal.md#5.2%20Sync%20policy); the service's rule,
+[RFC 17](rfc-17-vfs.md#6.%20Invariants%2C%20and%20the%20test%20of%20each) V19):
+SMB has no write verifier, so only stable writes let an open survive a lost
+primary.
+
+> decision: continuous availability, and with it persistent opens, is opt-in per
+> share and off by default ([RFC 15 §5.3](rfc-15-topology.md#5.3%20Client%20addressing)). A share holding per-user profile
+> containers **SHOULD** enable it in a cluster: only a persistent open survives
+> its primary's failover ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)), so on any other share a failover breaks
+> every open container. Only the shares that need it pay for stable writes and
+> one store record per open. Overturned if measured persistent-open cost is low
+> enough to make it the cluster default.
 
 **A loss without a restart reaches the SMB opens that wrote it.** The journal
 also loses acknowledged unstable writes while its process keeps running: a record
@@ -1664,19 +1434,16 @@ reconnect through another node finds it attached to no live session.
 that session made close; losing one channel of a multichannel session while
 another stays up closes nothing (MS-SMB2 3.3.7.1). `ClientGuid` names a machine,
 so a disconnect is scoped by the open's `Session`, never by the client record:
-one machine's other sessions keep their opens. Its durable, resilient and persistent opens stay, with every lock, deny
+one machine's other sessions keep their opens. Its SMB durable and persistent opens stay, with every lock, deny
 mode and lease they hold, and conflict as before; each is closed when `Timeout`
 has passed since the disconnect without a reconnect. A close by timeout is a
 close: it releases what the open held and can run a pending delete
 ([§9.4](#9.4%20Delete%20on%20close)). A new primary counts every persistent open as disconnected from
 the moment it began serving, so the disconnect time is never written. A
-persistent open a namespace move carried is the exception: its `Timeout`
-starts at its own client's (its `ClientGuid`'s) first tree connect to its share
-at the receiving installation, bounded by `migration.reconnect_wait`
-([RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings),
-[RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)),
-since the client cannot reach it before the operator moves its name there, and
-one client reconnecting starts no other client's timer.
+persistent open a namespace move carried starts its `Timeout` at its own
+client's first tree connect to its share at the receiving installation,
+bounded by `migration.reconnect_wait`
+([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)).
 
 **A reconnect matches an open only when all of these do:** the client
 (`ClientGuid`), the principal, the open's `CreateGUID` for a v2 request, and the
@@ -1693,7 +1460,7 @@ and a restarted node may number one again.
 
 **Replays are answered, never applied twice.** A `CREATE` marked as a replay
 whose `CreateGUID` names an existing open of the same client returns that open.
-A lock request on a resilient, durable v2 or persistent open names an index
+A lock request on an SMB durable v2 or persistent open names an index
 and a sequence; if `LockSeq` at that index already holds that sequence, the
 request is a replay and is answered success without being applied, and
 otherwise the sequence is stored with the lock's result. For a persistent open,
@@ -1701,34 +1468,13 @@ otherwise the sequence is stored with the lock's result. For a persistent open,
 survives a failover. Without it, a lock re-sent after a lost reply conflicts
 with itself.
 
-Every other request naming the open, on 3.x, is checked as MS-SMB2
-3.3.5.2.10 does, against `ChannelSeq` and two counts of requests in flight,
-under `ChannelSeq` and under earlier sequences. Not flagged as a replay: equal
-is counted; newer (16-bit difference ≤ 0x7FFF) **adds** the current count to
-the earlier one, counts the request as the only current one and raises
-`ChannelSeq`; older refuses a write, set-information or control request and
-runs any other. Flagged as a replay: equal runs, counted under `ChannelSeq`,
-only while no earlier-sequence request is in flight, and is otherwise refused
-with both counts left as they were; newer adds the current count to the
-earlier one and raises `ChannelSeq` as above, then, while an earlier-sequence
-request is in flight, leaves the current count at 0 and refuses it, else
-counts it as the only current one; older is refused. Each refusal here is of a
-write, set-information or control request, answered
-`STATUS_FILE_NOT_AVAILABLE`, never held, so a replay never runs beside the
-original it repeats. A request leaving the primary lowers the count it was
-counted under (MS-SMB2 3.3.5.2.10;
-RFC 22 §6.5 states the wire side). `ChannelSeq` and `Outstanding` are held in the
-open at its primary, so a replay reaching the primary through another
-`protocol` node is checked against the same state. For a persistent open
-`ChannelSeq` is durable: a raise is written before the request that carries it
-runs — a read too, which has no transaction of its own — so a stale replayed
-write is still refused after a failover. A client raises it only when it moves
-to another channel, so this is one write per move, not per request. `Outstanding` is
-never written: it counts requests in flight at one primary, which a failover
-ends, so a new primary starts both counts at zero. A durable count would need a
-write when each request starts as well as when it ends, and a count restored
-after a failover would name requests no node is running, holding `ChannelSeq`
-back for good.
+`ChannelSeq` and `Outstanding` are held in the open at its primary and checked
+as MS-SMB2 3.3.5.2.10 checks them
+([RFC 22 §6.5](rfc-22-smb.md#6.5%20Replay) states the rule), so a replay
+reaching the primary through another node is checked against the same state. A
+persistent open's `ChannelSeq` is written before the request that raises it
+runs, a read included; `Outstanding` is never written, and a new primary
+starts both counts at zero.
 
 **An app instance replaces its predecessor.** A create carrying an
 `AppInstance` that an open of the same file already holds closes that open
@@ -1796,20 +1542,11 @@ each record ([RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C
 report each file left with no entry and no holder to the filesystem service,
 which runs its release. A persistent open not reconnected is closed the same way
 once its `Timeout` has passed since the primary began serving (§8.1). A
-**clone's source open** — the durable open a clone writes on its source in its
-first phase ([RFC 8 §9.1](rfc-8-engine.md#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)) — is held by no client, so no client reclaims it:
-its record is of kind clone source and names the destination and the clone's
-version (§2.2), so the source's new primary finds it through that index and
-under the source's own prefix, and rebuilds the table entry and the source range registration from it
-and the clone spec in the destination's `Removal` record before it serves the
-file, keeps it through grace, and only the batch that sets the clone's removal
-done closes it. **(cluster)** A by-reference clone or copy whose source and
-destination sit in two shards is refused `ErrCrossShard` at admission, whatever
-their primaries are then
-([RFC 8 §9.1](rfc-8-engine.md#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)):
-a later failover or handover could part the primaries, and no two-primary
-call defines a clone. So the source's primary always reaches the destination's
-spec. The adapters fall back to a byte copy where their protocol allows. Swept at grace end, it would let an unlinked source be released
+clone's source open is held by no client, rebuilt by the new primary from the
+destination's `Removal` record, kept through grace, and closed only by the
+clone's last batch
+([RFC 8 §9.1](rfc-8-engine.md#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally),
+which also refuses a clone across shards at admission). Swept at grace end, it would let an unlinked source be released
 mid-clone and carry `Lost` into the destination. Without this step a record whose open died with its primary is the file's only holder
 for good, and its content is never released.
 
@@ -1833,13 +1570,10 @@ was opened through, and the principal that marked it (`DeleteBy`): the one that
 asked for delete on close at create, or that set the disposition. That
 principal's delete access was checked when it marked the file, and the deferred
 unlink runs as it — whoever closes last, a close by timeout included — never as
-the last closer, who may hold no delete access at all. That delete access is
-decided at open against the file **and** the directory the open resolved
-through: the file's own ACL or mode granting delete, or that directory granting
-delete-a-child, grants it, as MS-FSA 2.1.5.1.2.1 does
-([RFC 7 §7.7](rfc-7-namespace-metadata.md#7.7%20What%20a%20caller%20may%20be%20asked%20for%2C%20and%20what%20removing%20a%20name%20needs)); decided on the file alone, a group member of a 0775
-directory could not delete or rename a file from an SMB client that `rm` over
-NFS removes.
+the last closer, who may hold no delete access at all. That principal's delete
+access is decided at open against the file and the directory it was opened
+through
+([RFC 7 §7.7](rfc-7-namespace-metadata.md#7.7%20What%20a%20caller%20may%20be%20asked%20for%2C%20and%20what%20removing%20a%20name%20needs)).
 
 While a file is delete pending:
 
@@ -1861,10 +1595,9 @@ therefore keeps that reference with the entry and the principal, and so does
 its durable record. An unlink still refused — the directory gained an entry, or
 the file's or directory's rights changed since the mark — is reported to no
 client, since the close it rode on has been answered or had none behind it: it
-is logged at `Warn` and counted (`namespace_deferred_unlink_refused_total`,
-and `vfs_deferred_unlink_refusals_total` at the filesystem service,
-[RFC 17 §7](rfc-17-vfs.md#7.%20Observability)), and the entry and the file stay
-([RFC 7 §8.2](rfc-7-namespace-metadata.md#8.2%20A%20delete%20on%20close%20is%20an%20ordinary%20unlink%2C%20later)).
+is logged and counted
+([RFC 7 §8.2](rfc-7-namespace-metadata.md#8.2%20A%20delete%20on%20close%20is%20an%20ordinary%20unlink%2C%20later),
+[RFC 17 §7](rfc-17-vfs.md#7.%20Observability)), and the entry and the file stay.
 A delete with POSIX semantics (`FILE_DISPOSITION_POSIX_SEMANTICS`) is not
 delete pending: it unlinks the name at once, and the opens keep the file alive
 ([§9.1](#9.1%20An%20open%20keeps%20a%20file%20alive)), exactly as an NFS `REMOVE` does. Delete pending is not a
@@ -1908,11 +1641,11 @@ allows both.
 
 ## 10. Shard placement
 
-Open state is held by the **primary of the file's shard** ([RFC 15 §3](rfc-15-topology.md#3.%20One%20primary%20per%20shard)) and
+Open state is held by the **file's primary** ([RFC 15 §3](rfc-15-topology.md#3.%20One%20primary%20per%20shard)) and
 moves with it. It is fenced by that primary's epoch: an open-state change carried
 by a superseded primary is refused, and every open-state call carries the
-`ClientID` it acts for, which the primary checks owns the open, lock, grant, watch
-or layout named.
+`ClientID` it acts for, which the primary checks owns the open, lock, grant or
+watch named.
 
 Every rule of this section is a cluster rule (cluster) except the last
 paragraph's, which binds a single node's restart too
@@ -1946,37 +1679,17 @@ paragraph's, which binds a single node's restart too
   A failover of the receiving shard at any moment after the commit therefore asks
   those clients to reclaim; added after the commit, a failover between the two
   would lose their state with no client told. No grace runs. A stateid and an
-  SMB persistent `FileId` name the shard that held their record when they were
-  issued (§2.1), so the batch's commit also writes, at the giving shard, a
-  durable **forwarding entry** for each moved record naming the receiving shard
-  ([RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries) step 4, [RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)). The giving primary answers a stateid
-  or `FileId` that names one with a routing error naming the receiving shard,
-  where the front-end re-routes it, never with bad stateid. The entry also
-  records the receiving shard's `GraceInstance` at the commit, which the
-  routing error carries to it, so a miss there is judged as §2.1 says: stale
-  while the receiving shard is in grace or has lost state since, bad
-  otherwise. The state it names
-  ends at the receiving shard, which the giving shard never sees, and a delete
-  on close would write the giving shard's durable key on the close path, which
-  L7 forbids. So an entry is deleted lazily, and only on a bad answer: the
-  front-end whose re-routed call the receiving shard answered bad reports it
-  to the giving primary, which asks the receiving shard itself and deletes the
-  entry in its own transaction if it answers bad again; a stale answer keeps
-  it, so the client's calls during the receiving shard's grace still reach it.
-  A periodic sweep asks the receiving shard the same about entries older than
-  one open-state lease ([RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries)). A record moved on again leaves a
-  chain, one extra routing error per hop until the lazy delete reaches the
-  first entry; a move back to the giving shard deletes its own entries for the
-  returning records, so nothing loops.
+  SMB persistent `FileId` name the shard that held their record when issued
+  (§2.1), so the batch's commit writes at the giving shard a durable
+  **forwarding entry** naming the receiving shard and its `GraceInstance` at
+  the commit; a call naming one is answered with a routing error, never bad
+  stateid, and a miss at the receiving shard is judged as §2.1 says. The entry
+  is deleted lazily, never on the close path (L7); its life is
+  [RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries) step 4's.
   `TEST_STATEID`, `FREE_STATEID` and a durable reconnect after a move find
   their state there, a failover of the giving shard included.
 - **A failover** loses the volatile table, and starts grace for that shard
   ([§4.4](#4.4%20Grace%20is%20per%20shard)).
-- **A layout** is bound to the (shard, epoch) it was granted under. When that
-  shard changes primary, by handover or failover, or the file moves to another
-  shard, the layout **MUST** be recalled, and
-  revoked at the recall deadline; a `LAYOUTCOMMIT` for it then fails with
-  `NFS4ERR_BADLAYOUT` ([RFC 15 §5.1](rfc-15-topology.md#5.1%20pNFS)).
 
 When a shard's primary changes, or any node serving it starts — every start,
 in the start transaction (§4.4) — the shard incarnation rises and the NFS write
@@ -2303,25 +2016,13 @@ with the client and file.
 
 ## 15. Open questions
 
-1. **Recall deadlines as settings.** The values are not settings: 35 s for an
-   SMB break is Windows' value, which SMB clients are built against, and an NFS delegation's deadline is one lease
-   period ([§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time)), so it moves only with the lease's own
-   `decision:` ([§4.1](#4.1%20A%20client%20lease)). Open is whether a measured
-   workload needs an NFS recall deadline shorter than the lease.
-2. **The cost of persistent opens**: a synchronous store write per open, grant
-   change and close, unmeasured. Which shares allow them is decided below.
-
-> decision: continuous availability, and with it persistent opens, is opt-in per
-> share and off by default ([RFC 15 §5.3](rfc-15-topology.md#5.3%20Client%20addressing)). A share holding per-user profile
-> containers **SHOULD** enable it in a cluster: only a persistent open survives
-> its primary's failover ([§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens)), so on any other share a failover breaks
-> every open container. Only the shares that need it pay for stable writes and
-> one store record per open. Overturned if measured persistent-open cost is low
-> enough to make it the cluster default.
+1. **Recall deadlines.** Whether a measured workload needs an NFS recall
+   deadline shorter than the lease
+   ([§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time)).
+2. **The cost of persistent opens**, unmeasured;
+   [§13.3](#13.3%20Benchmarks) measures it.
 3. **Byte-range lock splitting** across protocols with different range
    semantics (SMB's 64-bit ranges against NFS's end-of-file locks).
-4. **Directory grants** (NFSv4.1 directory delegations, SMB directory leases):
-   offered at all, and what breaks them.
 
 ## Appendix A — prior art
 
