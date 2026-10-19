@@ -178,12 +178,12 @@ Outcome: one address cannot lock other clients out of the node.
 a move for 20 s, and the SMB adapter holds each write pending
 ([RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests)).
 
-1. Each SMB write the service holds keeps its receive reservation while its
+1. Each SMB write the adapter holds keeps its receive reservation while its
    connection is within its floor of 256 requests and 32 MiB
    ([RFC 22 §3.3](rfc-22-smb.md#3.3%20Sizes%20and%20credits)).
-2. Past the floor, the held write's bytes move from the receive pool to the hold
-   pool, a sixteenth of *L* (§4.3); the receive pool gets them back for other
-   clients.
+2. Past the floor, the held write's whole charge is reserved from the hold pool,
+   a sixteenth of *L*, and only then released from the receive pool (§4.3); the
+   receive pool gets it back for other clients.
 3. With the hold pool full too, the adapter answers a further past-floor write
    `STATUS_INSUFFICIENT_RESOURCES` at once, as RFC 20 §4.6 and RFC 22 state.
 
@@ -406,10 +406,6 @@ type Pools struct{ Receive, Reply, Conn, Hold *Budget }
   `Reserve` serves both. A refusing budget ignores `key`; its callers pass the
   zero `netip.Addr`.
 - `Reservation` is a value, so taking one allocates nothing.
-
-> ponytail: one mutex per budget over the count and its turns. Take the fast
-> path as one atomic step with no waiter when B1 shows the lock limiting
-> `GETATTR` rate at 64 cores.
 - A reservation is in bytes of memory held, rounded up to the buffer class
   (§3.1) where a pooled buffer backs it.
 - **Charged, not measured.** No pool reads the heap to decide. A charge is
@@ -418,6 +414,10 @@ type Pools struct{ Receive, Reply, Conn, Hold *Budget }
 - Every reservation **MUST** be released on every path, a cancelled context and
   a panic included. A pool's reserved bytes are exported (§10), and a pool that
   reads above zero on an idle node is a leak.
+
+> ponytail: one mutex per budget over the count and its turns. Take the fast
+> path as one atomic step with no waiter when B1 shows the lock limiting
+> `GETATTR` rate at 64 cores.
 
 ### 2.6 Reservations are taken in one order
 
