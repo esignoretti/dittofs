@@ -93,8 +93,10 @@ type Txn interface {
 	// guards are shared like point guards.
 	GuardRange(prefix []byte) error
 	// Now is store time for this transaction: strictly increasing across
-	// transactions that commit in order, within a stated bound of real time,
-	// and fixed for the transaction's life. Reading it writes no key.
+	// transactions that commit in order, on every node of a replicated store,
+	// within a stated bound of real time, and fixed for the transaction's
+	// life. A replicated backend keeps it increasing across nodes by raising
+	// a shared highest time at commit, a write that conflicts with nothing.
 	Now() time.Time
 }
 

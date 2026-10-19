@@ -230,8 +230,13 @@ func (s *Store) attempt(ctx context.Context, fn func(kv.Txn) error) error {
 		return mapErr(err)
 	}
 	t := &txn{reader: reader{s: s, snap: tr.Snapshot(), own: backend.Overlay{}}, tr: tr, now: s.time.Now()}
+	// Issued now and waited on only if fn asks the time.
+	t.latest = tr.Snapshot().Get(s.key(keys.Time))
 	if err := fn(t); err != nil {
 		return mapErr(err)
+	}
+	if t.timeErr != nil {
+		return mapErr(t.timeErr)
 	}
 	if len(t.own) == 0 {
 		// Nothing to commit: FoundationDB checks no conflict of a
@@ -254,6 +259,12 @@ func (s *Store) attempt(ctx context.Context, fn func(kv.Txn) error) error {
 		} else {
 			tr.SetVersionstampedValue(key, stamped(w.Value))
 		}
+	}
+	if t.timed {
+		// Raise the highest time handed out to this transaction's. An
+		// atomic maximum conflicts with nothing, and a later transaction
+		// on any node then reads at least this time.
+		tr.Max(s.key(keys.Time), binary.LittleEndian.AppendUint64(nil, uint64(t.now.UnixNano())))
 	}
 	if err := tr.Commit().Get(); err != nil {
 		// decision: an unknown commit result is returned, not retried. The
@@ -523,6 +534,10 @@ type txn struct {
 	tr  fdb.Transaction
 	now time.Time
 
+	latest  fdb.FutureByteSlice // the highest store time handed out, read untracked
+	timed   bool                // Now was asked, so the commit raises the highest time
+	timeErr error               // the read of the highest time failed: the attempt fails
+
 	bytes int // TxnBytes, as kv counts it
 	size  int // FoundationDB's size of it: mutations and conflict ranges, prefix included
 }
@@ -596,7 +611,32 @@ func (t *txn) GuardRange(prefix []byte) error {
 
 func (t *txn) Set(key, value []byte) error { return t.write(key, value, false) }
 func (t *txn) Delete(key []byte) error     { return t.write(key, nil, true) }
-func (t *txn) Now() time.Time              { return t.now }
+
+// Now is the node's store time, raised past the highest time any node has
+// handed out in a committed transaction, so store time keeps increasing
+// across nodes whatever their clocks. The read is a snapshot read and the
+// commit raises the key with an atomic maximum, so neither conflicts.
+//
+// ponytail: every transaction that asks the time writes the one key, so its
+// commits all land on one storage server. Shard the key per node and read the
+// maximum of them when a profile shows that server hot.
+func (t *txn) Now() time.Time {
+	if t.timed {
+		return t.now
+	}
+	t.timed = true
+	v, err := t.latest.Get()
+	if err != nil {
+		t.timeErr = err
+		return t.now
+	}
+	if len(v) == 8 {
+		if hi := time.Unix(0, int64(binary.LittleEndian.Uint64(v))).Add(time.Nanosecond); hi.After(t.now) {
+			t.now = hi
+		}
+	}
+	return t.now
+}
 
 // write records the write in the overlay. A key written twice is counted
 // twice, as the conflict range and mutation each attempt adds would be once

@@ -722,6 +722,31 @@ func testVersions(t *testing.T, s kv.KV) {
 	}
 }
 
+// NowAcrossStores checks a replicated backend's store time across nodes:
+// open makes a store over the same data each call, its clock offset by skew.
+// A transaction that starts after another committed gets a later Now, even
+// when the node that committed first runs its clock ahead.
+func NowAcrossStores(t *testing.T, open func(t *testing.T, skew time.Duration) kv.KV) {
+	ahead, behind := open(t, 5*time.Millisecond), open(t, 0)
+	now := func(s kv.KV, key string) time.Time {
+		t.Helper()
+		var n time.Time
+		if err := s.Update(ctx(t), func(tx kv.Txn) error {
+			n = tx.Now()
+			return tx.Set([]byte(key), []byte("1"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for i := range 20 {
+		first := now(ahead, fmt.Sprintf("a%d", i))
+		if second := now(behind, fmt.Sprintf("b%d", i)); !second.After(first) {
+			t.Fatalf("round %d: a store whose clock is 5ms behind gave %v after the other committed %v", i, second, first)
+		}
+	}
+}
+
 func testNow(t *testing.T, s kv.KV) {
 	var prev time.Time
 	for range 50 {

@@ -168,6 +168,10 @@ const IDLen = 16
 // Format is the store format record's key.
 var Format = []byte("\x00format")
 
+// Time is a replicated backend's highest store time handed out: little-endian
+// unsigned nanoseconds, which an atomic maximum compares as numbers.
+var Time = []byte("\x00time")
+
 // ErrMalformed is a key that does not decode as the component asked for.
 var ErrMalformed = errors.New("keys: malformed key")
 
