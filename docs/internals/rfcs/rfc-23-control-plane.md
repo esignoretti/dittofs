@@ -216,7 +216,8 @@ not guessed.
   applies records by their binding class and reports the generation it runs.
 - A resource is addressed by ID. Reads are consistent; lists page by an opaque
   cursor. Every update and delete carries `If-Match` with the generation read;
-  every create and action but a credential call carries an idempotency key.
+  every create and action carries an idempotency key, except the credential
+  calls (§4.5).
 - Work longer than one request is an operation: `202`, an operation ID, progress
   read from the owning component's durable cursor, readable from any node, and
   resumed after a crash by the component that owns the work.
@@ -773,7 +774,8 @@ parts in every resource:
 - **`status`** is what the system records — a share's state and namespaces, a
   location's check outcome, per-node application (§2.4). A write that sets a
   status field is refused, as RFC 13 §2.4 refuses a file that declares a system
-  field.
+  field. A listing page reads the node-status records once and computes
+  every row's `applied` from them.
 - **Paths take IDs, never names.** `/shares/sh_7Qk2…`, not `/shares/builds`. A
   name is found by `GET /shares?name=builds`, which answers a list of zero or
   one.
@@ -784,13 +786,35 @@ parts in every resource:
 > with the list filter. Overturned only if a resource ever lacks a stable ID,
 > which no record in RFC 16 does.
 
-**Actions** that are not a field change — quiesce, rehome, rebuild-index,
-raise-format, set-password, drain — are `POST` on `{resource}:{verb}`.
+**Actions** that are not a field change are `POST` on `{resource}:{verb}`, and
+this table is all of them:
+
+| Verb | Resource | Role (§5.2) | Operation (§4.6) | Owning RFC |
+| --- | --- | --- | --- | --- |
+| `quiesce`, `resume` | share | `operator` | no | [RFC 16 §2.3.1](rfc-16-metadata-store.md#2.3.1%20Share%20names%2C%20paths%20and%20state) |
+| `rehome` | share | `admin` | yes | [RFC 27 §2.7](rfc-27-namespace-migration.md#2.7%20Moving%20one%20share%20out%20of%20a%20shared%20namespace) |
+| `rebuild-index` | namespace | `operator` | yes | [RFC 9 §7.4](rfc-9-gc.md#7.4%20The%20index%20can%20be%20dropped%20and%20rebuilt) |
+| `rebuild-reverse-index` | share | `operator` | yes | [RFC 9 §7.4](rfc-9-gc.md#7.4%20The%20index%20can%20be%20dropped%20and%20rebuilt) |
+| `raise-format` | installation | `admin` | no | [RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap) |
+| `rotate-signing-key` | installation | `admin` | yes | §5.3 |
+| `reload-provisioning` | node | `admin` | yes | [RFC 13 §2.4](rfc-13-configuration.md#2.4%20Records%20can%20be%20declared%20in%20a%20provisioning%20file) |
+| `set-password` | user | `operator`; `admin` for an account with a role | no | §3.5, [RFC 18 §8](rfc-18-identity.md#8.%20Management-API%20users) |
+| `drain` | node | `operator` | yes | [RFC 30 §5.3](rfc-30-kubernetes.md#5.3%20Storage%20scale-down%20is%20a%20drain) |
+| `decommission` | node | `admin` | no | [RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap) |
+| `cancel` | operation | the role that may start its kind | no | §4.6 |
+
+An operation's `Kind` is an `OpKind`, a closed set read from this table and
+§4.6's list: one value per action above that is an operation, and one per
+create or delete §4.6 makes one. So `api_operations{kind}` is a closed set
+([RFC 25 §2.4](rfc-25-observability.md#2.4%20Labels)), and `operation_running`
+keys on the same value.
 
 ### 4.2 Reads and listings
 
 - **A read is consistent.** A `GET` reads the metadata store, not a node's
-  cache, so a write acknowledged by any node is visible to a read on any node.
+  cache, so a write acknowledged by any node is visible to a read on any node,
+  except the node-local reads, which name their node: a node's open connections
+  (below) and the event streams (§6).
 - **A listing pages by cursor.** `?limit=` (default 100, at most 1,000) and
   `?after=`, an opaque cursor the previous page returned; the page ends with
   `next` when more follow. A cursor resumes from a key, never an offset, so a
@@ -803,7 +827,7 @@ raise-format, set-password, drain — are `POST` on `{resource}:{verb}`.
   not offered.
 - **Secrets are never read.** A secret-bearing field reads as its reference and
   version, never its value ([RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)).
-- **A node's open connections are the one live read.**
+- **A node's open connections are a node-local read.**
   `GET /nodes/{id}/connections` answers what each adapter's `Connections()`
   lists now — protocol, remote address, session, since
   ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)) — from that node, not
@@ -814,13 +838,11 @@ raise-format, set-password, drain — are `POST` on `{resource}:{verb}`.
 
 | Method | Meaning | Precondition |
 | --- | --- | --- |
-| `POST /collection` | create | `Idempotency-Key` |
+| `POST /collection` | create | `Idempotency-Key`, except §4.5's credential calls |
 | `PUT /resource` | replace the whole `spec` | `If-Match`; `If-None-Match: *` to create a resource whose path the client names |
 | `PATCH /resource` | merge patch of `spec` (RFC 7396): a field present is set, `null` resets it to its default | `If-Match` |
 | `DELETE /resource` | delete, or start the deletion | `If-Match` and `Idempotency-Key` |
-| `POST /resource:verb` | an action | `Idempotency-Key`; and `If-Match` when the action changes the resource's `spec` |
-
-A credential call (§4.5) takes no `Idempotency-Key`.
+| `POST /resource:verb` | an action | `Idempotency-Key`, except §4.5's credential calls; and `If-Match` when the action changes the resource's `spec` |
 
 **One request is one transaction.** A write validates with the components'
 validators ([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)), then commits its records, the generation they
@@ -830,6 +852,14 @@ step that way and returns an operation (§4.6). A write **MUST NOT** answer
 success before its transaction commits, and **MUST NOT** depend on any call to
 a running component.
 
+**Validators are pure and handed in.** Each component exports, from its
+settings package, one function per record kind it reads. The function takes the
+value and the current values of the settings a cross-setting rule relates it
+to, read tracked in the write's transaction
+([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)). It imports nothing that
+runs. The root hands the API a table of them, keyed by setting prefix, so the
+API imports no component. A prefix with no validator is refused `400`.
+
 **Unknown fields are refused**, in requests as in records
 ([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)): `400`, naming the field.
 
@@ -837,8 +867,18 @@ a running component.
 data path's pools ([RFC 24](rfc-24-resources.md)). A node runs at most 64 API
 calls at once, a fixed value, and answers the next `503` with `Retry-After`, so
 a script in a loop cannot take memory or store transactions from file clients.
+A long poll (`?wait=`) holds no call slot while it waits: it is parked, and a
+node parks at most a fixed number of them (proposed: 256, settled by the
+parked count the conformance harness reaches with every CLI of a deployment
+running `--wait`), the next answered `503`. Both bounds are fixed values
+[RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings)
+lists.
 
-### 4.4 Concurrency: the generation is the entity tag
+> ponytail: one node-wide bound of 64, no per-account share. One script can
+> hold every slot. Give each account a fair share of the 64 when an operator is
+> refused `503` while another account's script runs.
+
+### 4.4 Concurrency: the entity tag is what the write expects
 
 Every resource read returns an `ETag` that is the value RFC 16's write of that
 record takes as `expect`
@@ -878,8 +918,9 @@ state it expects.
 
 ### 4.5 Idempotency
 
-Every `POST` and every `DELETE` but the credential calls below **MUST** carry an `Idempotency-Key`, a client
-value unique per intended action; one without is refused `428`. The server
+Every `POST` and every `DELETE` **MUST** carry an `Idempotency-Key`, a client
+value unique per intended action, except the credential calls below; one
+without is refused `428`. The server
 keeps, per (account, key), the digest of the request — method, path, body — and
 the answer it gave, written in the request's own transaction:
 
@@ -940,7 +981,7 @@ first durable step and answers `202 Accepted` with `Location:
 // when, and the answer.
 type Operation struct {
 	ID       OperationID
-	Kind     string     // "share.delete", "user.delete", "share.rehome", "namespace.rebuild-index", ...
+	Kind     OpKind     // closed set (§4.1): "share.delete", "user.delete", "share.rehome", "namespace.rebuild-index", ...
 	Target   ResourceRef
 	Account  Principal  // who started it
 	State    OpState    // pending, running, succeeded, failed, cancelling, cancelled
@@ -1187,8 +1228,10 @@ Every management action leaves an **audit record**:
   taken over by a live storage node
   ([RFC 25 §4.3](rfc-25-observability.md#4.3%20From%20the%20emit%20point%20to%20the%20spool)).
 - **The event streams** are read at `GET /api/v1/events/{stream}`, filtered by
-  share, time and sequence range, from the spool
-  ([RFC 25 §4.7](rfc-25-observability.md#4.7%20Export)), with the roles of §5.2.
+  share, time and sequence range, from the spool of the node that answers
+  ([RFC 25 §4.7](rfc-25-observability.md#4.7%20Export)), with the roles of §5.2. The spool is
+  node-local ([RFC 25 §4.3](rfc-25-observability.md#4.3%20From%20the%20emit%20point%20to%20the%20spool)), so this is a node-local read (§4.2); a
+  per-node path needs RFC 25 §4.7, which names this one.
 
 This is the audit of the management plane. A file client's access events
 ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) are a separate stream, and what an ACL's audit entries select is
@@ -1237,7 +1280,8 @@ These rules bind from the single node on, where most of them cost nothing
   `storage` node ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)); a protocol-only node serves the health
   endpoints only (§2.5). A client may send any call to any API node and gets
   the same answer, because every read and every precondition is evaluated
-  against the store.
+  against the store, except the node-local reads of §4.2, which name their
+  node.
 - **Writes go through the metadata store**, as control-plane records written by
   storage nodes only ([RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)). No node forwards a write to a
   "leader": there is none, and the store's transactions order concurrent writes.
@@ -1376,7 +1420,9 @@ marked **(cluster)**.
 4. **The API on protocol-only nodes.** A split deployment exposes the API only
    on storage nodes. Whether a protocol node should serve reads, forwarding
    writes over the shard service's `ControlPlane` calls, depends on whether
-   operators reach the storage tier's network.
+   operators reach the storage tier's network. Until it is settled, the
+   node-local reads of §4.2 cannot reach a protocol node's spool or adapters,
+   since a protocol node serves no API (§8).
 5. **Server-sent changes.** Clients poll operations and resources. A watch
    (a stream of changes from a generation) would serve the Kubernetes operator
    better; whether it is worth a second read path is open.
