@@ -33,7 +33,7 @@ fi
 
 # CI on the commit being released. Not a gate: a flaky conformance run does not
 # block a tag, so it is listed for the confirmation below to weigh.
-not_green="$(gh run list --commit "$(git rev-parse HEAD)" --json name,status,conclusion \
+not_green="$(gh run list --commit "$(git rev-parse HEAD)" --limit 100 --json name,status,conclusion \
   --jq '.[] | select(.conclusion != "success" and .conclusion != "skipped") | "  \(.name): \(if .conclusion == "" then .status else .conclusion end)"' |
   sort -u)" || not_green="  (could not ask gh)"
 echo "CI on $(git rev-parse --short HEAD):"
@@ -58,5 +58,7 @@ fi
 
 # develop and main move together, without the tag even under push.followTags,
 # so release.yml never starts on a tag main does not contain.
-git push --atomic --no-follow-tags origin HEAD:develop HEAD:main
-git push origin "$tag"
+# A rerun after a failed push stops at "tag already exists", so name what is left.
+git push --atomic --no-follow-tags origin HEAD:develop HEAD:main ||
+  die "push failed; nothing was published. Finish with: git push --atomic --no-follow-tags origin HEAD:develop HEAD:main && git push origin $tag"
+git push origin "$tag" || die "branches pushed, tag not; finish with: git push origin $tag"
