@@ -1187,7 +1187,7 @@ older content served as newer.
 > ponytail: every stable overwrite of committed content waits for a group
 > commit, so on a continuously available share — every write stable, almost
 > every one an overwrite — each write pays one metadata transaction, shared
-> across the burst ([§15.4](#15.4%20Benchmarks), E9). If E9 shows that cost, commit a coarse
+> across the burst ([§15.4](#15.4%20Benchmarks), B9). If B9 shows that cost, commit a coarse
 > write-intent record per region and dirty period instead: a write inside a
 > region already marked needs no transaction, and the region's overwrite
 > records are written when it is cleaned.
@@ -1201,7 +1201,7 @@ older content served as newer.
   be committed in one transaction, not one per write or per file.
 - A batch **MUST** be bounded: at most `G` files, and at most the key budget `K`
   of [RFC 6 §5.2](rfc-6-block-metadata.md#5.2%20Cost%20per%20commit%20is%20bounded%20by%20what%20changed) in keys written. `G` is the `group_commit.max_files` setting ([RFC 13](rfc-13-configuration.md);
-  proposal: 256), overturned by E5's transactions per stability point rising at
+  proposal: 256), overturned by B5's transactions per stability point rising at
   the bound. One file whose pending
   existence alone needs more than `K` keys — many scattered overwrites since its
   last commit — is committed over several transactions in version order, each
@@ -1958,7 +1958,7 @@ whole (S5, [§7.4](#7.4%20The%20speculator)).
 > decision: the quarter is fixed, not a setting, and borrowed from prior art
 > rather than measured; a wrong threshold costs bytes fetched or one round trip,
 > never correctness. Overturned by comparing bytes fetched and read latency
-> across a few thresholds in E4 ([§15.4](#15.4%20Benchmarks)).
+> across a few thresholds in B4 ([§15.4](#15.4%20Benchmarks)).
 
 ## 8. Truncate, deallocate and release
 
@@ -2453,7 +2453,7 @@ over a 10 s window, and *r*₀ is 1 MiB/s.
 > decision: these three are fixed, not settings: they change how soon and how
 > steeply a writer slows, not how much the journal admits, so no operator can
 > name a workload one value serves and another fails. They are proposals, not
-> measurements; overturned by a curve that keeps E3's p99
+> measurements; overturned by a curve that keeps B3's p99
 > submission latency lower at the same throughput ([§15.4](#15.4%20Benchmarks)).
 
 ### 10.3 Repack is triggered here
@@ -2892,14 +2892,23 @@ the work queue [§6.1](#6.1%20The%20work%20queue), the offload pipeline [§6.3](
 
 | Requirement | Check |
 | --- | --- |
-| [§2.2](#2.2%20Capabilities%20are%20parameters%2C%20never%20assertions) no assertions | Remove one method from each capability's provider. Assert the build fails, not the behaviour. |
+| [§2.2](#2.2%20Capabilities%20are%20parameters%2C%20never%20assertions) no assertions | An architecture test scans the engine package: no type assertion or type switch on a value of a `Deps` interface type ([§2.6](#2.6%20Dependencies%20and%20wiring)), no `interface{ … }` literal in an assertion, no setter on `*Engine`. Seed one violation; assert it is reported. |
 | [§2.4](#2.4%20Settings%20are%20validated%20once%2C%20and%20refused%20rather%20than%20replaced) settings | Configure `Min ≥ Target`. Assert construction fails. Change a share's profile. Assert it is reported as a migration. |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) reseed | Restart with a ledger bit no ref justifies. Assert the bit is reported and cleared, the extent is re-offered rather than released, and extents of other files are evicted as soon as the reseed has visited them. |
-| [§2.1](#2.1%20Content%20composition) declared interfaces | Assert the engine's declared interfaces hold exactly the methods [§2.1](#2.1%20Content%20composition)'s table names, and that removing a row's method from a component fails the build. |
+| [§2.1](#2.1%20Content%20composition) declared interfaces | The architecture test lists every method of every `Deps` interface ([§2.6](#2.6%20Dependencies%20and%20wiring)) and fails on one the engine never calls. Seed an unused method; assert it is reported. |
 
 A sink that always succeeds **MUST NOT** stand in for Group A or for the
 pipeline's checks, and a single-file rig **MUST NOT** stand in for [§8.3](#8.3%20A%20pass%20in%20flight%20survives%20a%20removal%20under%20it):
 it needs two passes in flight at once.
+
+> ponytail: the pure parts — read resolution ([§7.1](#7.1%20Resolution%20asks%20the%20journal%20first%2C%20then%20metadata)), the group-commit split
+> ([§5.2](#5.2%20Group%20commit%20is%20bounded%2C%20and%20retries%20only%20the%20files%20that%20conflict)), the pacing law ([§10.2.1](#10.2.1%20Writes%20are%20paced%20before%20the%20limit%2C%20not%20stopped%20at%20it)), the work queue ([§6.1](#6.1%20The%20work%20queue)) and `Copy`'s
+> extents — are checked by the tables above, not by fuzz or model targets.
+> Proposal, unmeasured: add fuzz targets for each against a reference model —
+> zeros only for a hole or zero ref; every non-failing file committed within
+> 1 + ⌈log₂ G⌉ transactions; a pacing delay monotonic in *M*; one entry per
+> key; a copy's count equal to the bytes the destination holds — when a table
+> check misses a bug a random input would have found.
 
 ### 15.4 Benchmarks
 
@@ -2917,20 +2926,26 @@ change and each real service daily.
 
 | # | Measures | Setup | Target |
 | --- | --- | --- | --- |
-| E1 | offload throughput | sustained writes of non-deduplicating data larger than the journal | offloaded MiB/s ≥ 80% of the sizing tool's raw figure ([RFC 3 §2.11](rfc-3-syncer.md#2.11%20Pool%20sizes%20are%20measured%20once%2C%20by%20a%20tool)) for the same store and pool sizes |
-| E2 | small files | create, write and close 10^4 and 10^5 files of 64 KiB | files/s within 20% across directory sizes; puts per file ≤ 64 KiB / block target, rounded up |
-| E3 | pacing | E1 below and above the soft threshold ([§10.2.1](#10.2.1%20Writes%20are%20paced%20before%20the%20limit%2C%20not%20stopped%20at%20it)) | p99 submission latency ≤ 50 ms, max ≤ 500 ms, offloaded throughput within 10% of E1 |
-| E4 | cold reads | random 4 KiB and sequential reads of evicted content | random: one request per read, p99 ≤ 2 store round trips; sequential: bytes fetched per byte read ≤ 1.1 |
-| E5 | group commit | 64 appending writers, `fsync` every 1 MiB; again with 64 writers overwriting committed content | appending: no metadata transaction on any `fsync`'s path, and metadata transactions ≤ 1 per journal per existence interval; overwriting: transactions ≤ 1 per journal per burst of concurrent `fsync`s, never one per file |
-| E6 | one large file | one file sequentially written to 20× the journal's capacity | offloaded MiB/s over the last tenth within 10% of the first tenth; extents made offloaded while the file is still being written, block by block ([§6.8](#6.8%20The%20callback%20returns%20only%20what%20committed)), never only at the end of a pass |
-| E7 | group commit under a `chmod` storm | E5, with 10³ `chmod`/s on random files of the same journal | `fsync` p99 within 2× of E5's; transactions per stability point ≤ 1 + conflicting files × log₂ `G` |
-| E8 | time to first byte | cold sequential 8 MiB reads | p99 first byte ≤ one chunk's fetch and verification plus 10% |
-| E9 | stable overwrites on a continuously available share | 64 writers of the profile workload over SMB with every write stable, rewriting committed content in place, against the same run with unstable writes and one flush per second | p99 and mean write latency, and metadata transactions per write; target: p99 within 2× of the unstable run, transactions ≤ 1 per journal per burst of concurrent writes. A miss is the evidence for the write-intent upgrade of [§5.1](#5.1%20Commit%20is%20answered%20by%20the%20journal). Run once more with a snapshot cut every 10 s: report the p99 of the writes acknowledged across a cut, each of which waits for the gate to reopen; target within `snapshots.gate_max` of the run without cuts |
+| B1 | offload throughput | sustained writes of non-deduplicating data larger than the journal | offloaded MiB/s ≥ 80% of the sizing tool's raw figure ([RFC 3 §2.11](rfc-3-syncer.md#2.11%20Pool%20sizes%20are%20measured%20once%2C%20by%20a%20tool)) for the same store and pool sizes |
+| B2 | small files | create, write and close 10^4 and 10^5 files of 64 KiB | files/s within 20% across directory sizes; puts per file ≤ 64 KiB / block target, rounded up |
+| B3 | pacing | B1 below and above the soft threshold ([§10.2.1](#10.2.1%20Writes%20are%20paced%20before%20the%20limit%2C%20not%20stopped%20at%20it)) | p99 submission latency ≤ 50 ms, max ≤ 500 ms, offloaded throughput within 10% of B1 |
+| B4 | cold reads | random 4 KiB and sequential reads of evicted content | random: one request per read, p99 ≤ 2 store round trips; sequential: bytes fetched per byte read ≤ 1.1 |
+| B5 | group commit | 64 appending writers, `fsync` every 1 MiB; again with 64 writers overwriting committed content | appending: no metadata transaction on any `fsync`'s path, and metadata transactions ≤ 1 per journal per existence interval; overwriting: transactions ≤ 1 per journal per burst of concurrent `fsync`s, never one per file |
+| B6 | one large file | one file sequentially written to 20× the journal's capacity | offloaded MiB/s over the last tenth within 10% of the first tenth; extents made offloaded while the file is still being written, block by block ([§6.8](#6.8%20The%20callback%20returns%20only%20what%20committed)), never only at the end of a pass |
+| B7 | group commit under a `chmod` storm | B5, with 10³ `chmod`/s on random files of the same journal | `fsync` p99 within 2× of B5's; transactions per stability point ≤ 1 + conflicting files × log₂ `G` |
+| B8 | cold sequential reads | cold sequential 8 MiB reads, their chunks fetched at once ([§7.2](#7.2%20The%20reply%20holds%20only%20verified%20chunks%2C%20in%20file%20order)) | p99 ≤ the slowest chunk's fetch and verification plus 10% |
+| B9 | stable overwrites on a continuously available share | 64 writers of the profile workload over SMB with every write stable, rewriting committed content in place, against the same run with unstable writes and one flush per second | p99 and mean write latency, and metadata transactions per write; target: p99 within 2× of the unstable run, transactions ≤ 1 per journal per burst of concurrent writes. A miss is the evidence for the write-intent upgrade of [§5.1](#5.1%20Commit%20is%20answered%20by%20the%20journal). Run once more with a snapshot cut every 10 s: report the p99 of the writes acknowledged across a cut, each of which waits for the gate to reopen; target within `snapshots.gate_max` of the run without cuts |
+
+> ponytail: no benchmark measures the engine's own cost per call. Proposal,
+> unmeasured: a 4 KiB `Write` and `Read` of held content through `*Engine`
+> against the journal handle directly, collocated, with a target of p50 within
+> 5 µs and zero allocations above the journal's. Add it when a profile shows
+> engine time on the request path.
 
 Method: measure the raw link, raw object storage and the full stack on the same
 hosts at the same time, and report each as a fraction of the one below; use data
 that does not deduplicate; stop the clock once offloaded ([§11.4](#11.4%20How%20far%20behind%20offload%20is%2C%20is%20observable)); report every
-stage's occupancy beside E1; record the network distance to the store; run long
+stage's occupancy beside B1; record the network distance to the store; run long
 enough to exhaust the local device's write cache.
 
 ## 16. Open questions
