@@ -39,6 +39,7 @@ var (
 	_ = func(h *Handle) ([]Extent, error) { return h.Extents(FileID{}) }
 	_ = func(h *Handle) iter.Seq[FileID] { return h.Files() }
 	_ = func(h *Handle) iter.Seq2[FileID, time.Time] { return h.DirtyFiles() }
+	_ = func(h *Handle) Stats { return h.Stats() }
 
 	_ = func(r *Reservation) (Version, error) { return r.WriteAt(FileID{}, int64(0), []byte(nil), int64(0)) }
 	_ = func(r *Reservation) error { return r.Close() }
