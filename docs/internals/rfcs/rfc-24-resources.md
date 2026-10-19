@@ -26,7 +26,7 @@ tags:
 ---
 # RFC 24 — resources and concurrency
 
-**Status:** draft. [§12](#12.%20Open%20questions) lists what is known to be undecided.
+**Status:** draft. [§11](#11.%20Open%20questions) lists what is known to be undecided.
 **Audience:** anyone adding a buffer, a cache, a queue, a goroutine or a worker
 to any component, and anyone sizing a node or reading why it refused work.
 
@@ -120,8 +120,8 @@ across clients, shares, held requests, connections and open state. §5 is
 backpressure: the queue inventory and the chain from the socket to the remote
 tier. §6 is goroutines, CPU and file descriptors. §7 composes the storage RFCs'
 bounds into the budget. §8 says what the reference box measures to set the
-defaults. §9 to §11 are invariants, metrics and conformance; §12 lists open
-questions. Appendix A is prior art, Appendix B where the current code differs.
+defaults. §9 is the invariants and the test of each, §10 the metrics; §11
+lists open questions. Appendix A is prior art, Appendix B where the current code differs.
 
 ### Scenarios
 
@@ -220,7 +220,7 @@ This RFC **MUST NOT** be read as specifying:
 - quotas, which are logical limits on what users store
   ([RFC 17 §5.6](rfc-17-vfs.md#5.6%20Quota)), not resources of a node;
 - per-share or per-user quality-of-service weights; all clients and shares
-  weigh the same (§12);
+  weigh the same (§11);
 - the protocols' own flow-control numbers — slots, credits, transfer sizes —
   which are [RFC 21](rfc-21-nfs.md)'s and [RFC 22](rfc-22-smb.md)'s; this RFC
   states what they cost.
@@ -281,8 +281,8 @@ process, or to its container, are not pooled:
 Two bounded consumers are not pooled either, because they are fixed by count:
 
 - **the event rings** of [RFC 25 §4.3](rfc-25-observability.md#4.3%20From%20the%20emit%20point%20to%20the%20spool):
-  16,384 `access` and 4,096 `quota` entries of at most 1 KiB each, allocated at
-  start — at most 20 MiB per node, whatever the load;
+  16,384 `access`, 4,096 `quota` and 4,096 `logon` entries of at most 1 KiB
+  each, allocated at start — at most 24 MiB per node, whatever the load;
 - **management-API calls**, at most 64 at once
   ([RFC 23 §4.3](rfc-23-control-plane.md#4.3%20Writes)), which draw on none of
   the pools.
@@ -405,6 +405,10 @@ type Pools struct{ Receive, Reply, Conn, Hold *Budget }
   `Reserve` serves both. A refusing budget ignores `key`; its callers pass the
   zero `netip.Addr`.
 - `Reservation` is a value, so taking one allocates nothing.
+
+> ponytail: one mutex per budget over the count and its turns. Take the fast
+> path as one atomic step with no waiter when B1 shows the lock limiting
+> `GETATTR` rate at 64 cores.
 - A reservation is in bytes of memory held, rounded up to the buffer class
   (§3.1) where a pooled buffer backs it.
 - **Charged, not measured.** No pool reads the heap to decide. A charge is
@@ -972,7 +976,7 @@ from here. The inventory, from the socket down:
 | held SMB requests | the floor per connection, the hold pool | [RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests), §4.3 | `STATUS_INSUFFICIENT_RESOURCES`, from the adapter |
 | blocked lock waiters | the open-state pool | [RFC 14](rfc-14-open-state.md), §4.6 | `DelayResources` |
 | callbacks to clients | the writer's queue, the callback deadline | [RFC 20 §3.3](rfc-20-adapters.md#3.3%20Callbacks%20are%20the%20adapter%27s%20to%20deliver) | the client is not answering |
-| access-audit and quota events | rings of 16,384 and 4,096 entries of at most 1 KiB, allocated at start (§2.2) | [RFC 25 §4.4](rfc-25-observability.md#4.4%20Bounds%2C%20drops%20and%20gap%20records) | dropped, counted, a gap record written |
+| access-audit, quota and logon events | rings of 16,384, 4,096 and 4,096 entries of at most 1 KiB, allocated at start (§2.2) | [RFC 25 §4.4](rfc-25-observability.md#4.4%20Bounds%2C%20drops%20and%20gap%20records) | dropped, counted, a gap record written |
 | a write paced before capacity | the caller's deadline | [RFC 8 §10.2.1](rfc-8-engine.md#10.2.1%20Writes%20are%20paced%20before%20the%20limit%2C%20not%20stopped%20at%20it) | `ErrDelay` |
 | group commit | `G` files | [RFC 8 §5.2](rfc-8-engine.md#5.2%20Group%20commit%20is%20bounded%2C%20and%20retries%20only%20the%20files%20that%20conflict) | the next group |
 | background work items | one entry per key, and a fixed total per scheduler instance | [RFC 8 §6.1.1](rfc-8-engine.md#6.1.1%20The%20shared%20work%20scheduler) | coalesced; past the total, dropped, counted and re-derived by its source |
@@ -1177,32 +1181,47 @@ Each proposed value here is settled on the reference box
 | M1 | heap per request in flight beyond its buffer, and p99 stack per request in flight, at 1,000 and 10,000 small requests in flight per protocol; the share of transfer-class buffers less than half used on the mixed workload | the per-request overhead, 8 KiB; whether a fourth buffer class is needed |
 | M2 | heap per idle connection, per protocol and dialect, with an empty and a typical ID table, with and without transport encryption; heap per NFSv4.1 session and per slot with a zero-size reply cache, and per SMB session | the connection cost, 64 KiB; the session cost, 4 KiB; the slot cost, 256 bytes |
 | M3 | the metadata store's hit rate and operation latency against its pool size, at 1/16, 3/16 and 5/16 of *L*, on the many-small-files and the profile workloads | the metadata store's fraction |
-| M4 | resident memory and collector CPU against *L* in the overload soak (§11, R2), at 2 GiB and 16 GiB | the unpooled quarter, and the claim that pools at their ceilings stay under *L* |
+| M4 | resident memory and collector CPU against *L* in the overload soak (§9, R2), at 2 GiB and 16 GiB | the unpooled quarter, and the claim that pools at their ceilings stay under *L* |
 | M5 | foreground p99 latency and offload throughput with compressible data, at a quarter, half and three quarters of the cores in background work | the background CPU fraction |
 | M6 | heap per open, per lock range, per grant and per waiter, at 10⁵ of each | the open-state costs, 1 KiB and 256 bytes |
 | M7 | small-operation rate and 1 MiB throughput on one NFSv3 connection at caps of 32, 64 and 128 | the per-connection cap, 64 |
 
+Three benchmarks bound what the budget itself costs:
+
+| # | Measures | Target |
+| --- | --- | --- |
+| B1 | `Reserve`/`Release` pairs per second on the receive pool, in parallel at 8 and 64 cores, with no waiters and with 1,000 | zero allocations |
+| B2 | 4 KiB `GETATTR` rate and 1 MiB `READ` throughput with the budgets on and off | *proposed, settled by the reference box:* the budgets cost under 2% |
+| B3 | p99 latency of one grant by the turns, with 10⁴ waiting keys | *proposed, settled by the reference box:* under 10 µs |
+
 A fraction of *L* that a measurement moves is changed here, for every node; it
 does not become a setting (§2.3's ponytail).
 
-## 9. Invariants
+## 9. Invariants, and the test of each
 
-| # | Invariant |
-| --- | --- |
-| R1 | The process memory limit is learned once at start, the lowest of the runtime's soft limit, the container's and the host's memory, and the runtime is told fifteen sixteenths of it. |
-| R2 | The pools' ceilings — each pool's larger of its fraction of *L* and its floor — sum to at most three quarters of *L*, and during grace one sixteenth more (§4.6); where they sum to more, the node raises a health condition naming that sum. |
-| R3 | Memory held on behalf of a request, a connection, a session, open state or a held call is reserved from its pool before it is held, and released on every path; a size-bounded owner stays within the figure it was handed (§7). |
-| R4 | No wait is entered while holding a reservation later in §2.6's order; a refusing pool may be charged anywhere. |
-| R5 | No queue, wait list or table that grows with load is unbounded; each has a row in §5.1 or in the RFC it cites. |
-| R6 | At the receive ceiling the socket is not read; no request is read that cannot be reserved, and a record in several fragments is reserved at its protocol's largest class before its first fragment is read. |
-| R7 | No client key is granted bytes of the receive or reply pool that take it past three quarters while another key waits; waiting keys are granted in turns. |
-| R8 | While the receive or reply pool is more than half full, no call is admitted that would take its share past three quarters of it, counting the call's own reservations and checked atomically with their charge; it is refused with `DelayResources` at once. A call that only releases or reclaims state is exempt (§4.2). |
-| R9 | A held call past its connection's floor holds its bytes in the hold pool, not the receive pool, charged its whole receive reservation — buffer class and overhead — never less. |
-| R10 | No address holds more than a quarter of the connection limit. |
-| R11 | A close, unlock, grant return, or reclaim of durable state is never refused for memory; a reclaim of volatile state is refused, retry-later, only once the open-state pool holds twice its ceiling. |
-| R12 | No held request, blocked lock, queued transfer, work item or waiting reader has a goroutine of its own. |
-| R13 | Background CPU work holds at most three quarters of the runtime's parallelism at once; request-path CPU takes no token. |
-| R14 | A configured worker count or index bound that does not fit its pool is refused at start, never reduced silently. |
+The tests are evidence for the requirements that fail silently. They run at the
+tiers [RFC 29 §4.3](rfc-29-test-harness.md#4.3%20Tiers) names, `pr` unless a
+row says otherwise; a timing claim runs on the reference box only. Every
+system-level one runs on the composed node, against a real journal and a remote
+that can be slowed and stopped, because a fake store that always answers at
+once cannot fill a pool.
+
+| # | Invariant | Test |
+| --- | --- | --- |
+| R1 | The process memory limit is learned once at start, the lowest of the runtime's soft limit, the container's and the host's memory, and the runtime is told fifteen sixteenths of it. | Start in a container limited to 512 MiB with no runtime limit set: assert *L* is 512 MiB, source `container`, and the runtime's soft limit reads 480 MiB, fifteen sixteenths of it. Set the runtime limit to 256 MiB: assert it wins. Set the runtime limit to 1 GiB in a 512 MiB container: assert *L* is 512 MiB, source `container`. |
+| R2 | The pools' ceilings — each pool's larger of its fraction of *L* and its floor — sum to at most three quarters of *L*, and during grace one sixteenth more (§4.6); where they sum to more, the node raises a health condition naming that sum. | *Daily.* In a 2 GiB container, for an hour: 200 NFS clients writing 1 MiB, the `builds` remote stalled, an SMB share frozen every five minutes, 10⁵ opens, a metadata walk of 10⁷ entries. Assert the process is never killed, resident memory stays under *L*, every pool stays within its ceiling, every request is answered or retried, and the goroutine count stays within §6.1's bounds. Revert the receive pool's reservation to a no-op — 200 clients at 64 requests of 1 MiB is 12.5 GiB against a 2 GiB *L* — and assert the run fails on resident memory. |
+| R3 | Memory held on behalf of a request, a connection, a session, open state or a held call is reserved from its pool before it is held, and released on every path; a size-bounded owner stays within the figure it was handed (§7). | Every pipeline test ends asserting every budget's reserved bytes are zero ([RFC 20 §6.8](rfc-20-adapters.md#6.8%20Buffer%20pools%2C%20in%20code)); a fuzz of the frame stage with random cancellations and panics asserts the same. |
+| R4 | No wait is entered while holding a reservation later in §2.6's order; a refusing pool may be charged anywhere. | Fill the reply pool with replies to a client that stops reading, and the receive pool with writes waiting on a stalled journal: assert both drain once the write deadline closes the stalled client, and no reservation waits past its deadline. |
+| R5 | No queue, wait list or table that grows with load is unbounded; each has a row in §5.1 or in the RFC it cites. | Under constant write load, stop the remote for ten minutes: assert every pool's reserved bytes and every counted queue's length stay within their bound at every sample. Insert an unbounded queue at offload's posting in a test build: assert it is caught by its own length gauge, not by a heap slope. Remove 10⁶ files with the remote stopped: assert the engine's scheduler holds at most its total, `engine_work_items_dropped_total` rises, and every removal completes once the remote returns. |
+| R6 | At the receive ceiling the socket is not read; no request is read that cannot be reserved, and a record in several fragments is reserved at its protocol's largest class before its first fragment is read. | An RPC record in three fragments whose first is 1 KiB: assert the receive pool is charged the transfer class before the first fragment is read, and a fragment past the cap closes the connection with the reservation released. A fuzz over record marks and fragment sequences asserts no reservation leaks and the cap holds. |
+| R7 | No client key is granted bytes of the receive or reply pool that take it past three quarters while another key waits; waiting keys are granted in turns. | A unit property test of `Budget`: for random waiters over N keys, each waiting key is granted at least once in every N grants, and no key past three quarters is granted while another waits. As a smoke test, one address with 16 connections at their caps of 1 MiB writes and 20 other addresses sending `GETATTR`: assert each other address is served, and the busy address is granted nothing further while above three quarters of the receive pool. |
+| R8 | While the receive or reply pool is more than half full, no call is admitted that would take its share past three quarters of it, counting the call's own reservations and checked atomically with their charge; it is refused with `DelayResources` at once. A call that only releases or reclaims state is exempt (§4.2). | `builds`'s remote black-holed, build01 reading cold at depth 64 on four connections, alice-pc writing to `profiles`: assert `builds` holds at most three quarters of the reply pool, build01 is answered `NFS3ERR_JUKEBOX` and `memory_pool_refusals_total{reason="share_cap"}` rises. With `builds` one call below its cap, 64 1 MiB reads on new connections arriving at once: assert `builds` still holds at most three quarters. Close an open and unlock a range on `builds`: assert both succeed. On the reference box, alice-pc's p99 write latency stays within twice its unloaded figure. |
+| R9 | A held call past its connection's floor holds its bytes in the hold pool, not the receive pool, charged its whole receive reservation — buffer class and overhead — never less. | With the receive pool at 64 MiB, freeze `profiles` and hold 300 64 KiB writes on one connection: assert the receive pool holds the floor's 256 and the hold pool the rest. Repeat with 100 KiB writes: assert the hold pool is charged a transfer-class buffer and its overhead per write past the floor. |
+| R10 | No address holds more than a quarter of the connection limit. | One address opening connections in a loop: assert it is held at a quarter of the limit and another address still connects. |
+| R11 | A close, unlock, grant return, or reclaim of durable state is never refused for memory; a reclaim of volatile state is refused, retry-later, only once the open-state pool holds twice its ceiling. | Fill the open-state pool to nine tenths, restart with half the *L*, reclaim: assert every reclaim succeeds and a new open is `DelayResources` until the pool falls. Then have one eligible NFSv4.0 client reclaim opens it never held: assert its reclaims are refused `DelayResources` once the pool reaches twice its ceiling, resident memory stays under *L*, and a persistent open's reconnect still succeeds. |
+| R12 | No held request, blocked lock, queued transfer, work item or waiting reader has a goroutine of its own. | Covered by R2's assertion that the goroutine count stays within §6.1's bounds. |
+| R13 | Background CPU work holds at most three quarters of the runtime's parallelism at once; request-path CPU takes no token. | Offload compressible data with 128 workers on four cores while a client sends `GETATTR`: assert the tokens' high-water mark, kept in test builds, is at most three. On the reference box, the `GETATTR` p99 stays within twice its idle figure. |
+| R14 | A configured worker count or index bound that does not fit its pool is refused at start, never reduced silently. | Set `upload_workers` to 4096 under a 1 GiB *L*, and an `ExtentLimit` past the index pool: assert each start is refused, naming the pool and the figure. |
 
 ## 10. Observability
 
@@ -1212,20 +1231,20 @@ labels and histogram buckets follow
 
 | Answers | Metric | Type |
 | --- | --- | --- |
-| What limit is the node running under, and where did it come from? | `memory_limit_bytes{source}` | gauge |
+| What limit is the node running under, and where did it come from? | `memory_limit_bytes{source}` — `source` one of `runtime`, `container`, `host` | gauge |
 | How full is each pool, against its ceiling? | `memory_pool_reserved_bytes{pool}`, `memory_pool_ceiling_bytes{pool}` | gauge, gauge |
-| How often, and how long, does a reservation wait? | `memory_pool_waits_total{pool}`, `memory_pool_wait_seconds{pool}` | counter, histogram (`request`) |
-| How often is a call refused for memory, and by which rule? | `memory_pool_refusals_total{pool, rule}` — `rule` one of `share_cap`, `ceiling`, `deadline` | counter |
-| How close is the heap to the limit? | `memory_heap_live_bytes`, `memory_resident_bytes` | gauge, gauge |
+| How often, and how long, does a reservation wait? | `memory_pool_wait_seconds{pool}` | histogram (`request`) |
+| How often is a call refused for memory, and why? | `memory_pool_refusals_total{pool, reason}` — `reason` one of `share_cap`, `ceiling`, `deadline`, `reclaim_allowance`, every series exported from start at zero | counter |
 | Is background work dropping hints for want of room? | `engine_work_items_dropped_total{source}` ([RFC 8 §6.1.1](rfc-8-engine.md#6.1.1%20The%20shared%20work%20scheduler)) | counter |
 | Is background work waiting for CPU? | `cpu_background_tokens_in_use`, `cpu_background_waits_total` | gauge, counter |
-| How many descriptors are open, against the limit? | `fd_open`, `fd_open_limit` | gauge, gauge |
 
 Connections closed at accept for a pool, the limit or the per-address quarter
 are `adapter_connection_closes_total{reason}`
 ([RFC 20 §10](rfc-20-adapters.md#10.%20Observability)), with the reasons
 `pool`, `limit` and `per_address`. Held-request metrics are the adapters'
-([RFC 20 §10.1](rfc-20-adapters.md#10.1%20Metrics)).
+([RFC 20 §10.1](rfc-20-adapters.md#10.1%20Metrics)). Resident memory and open
+descriptors are the stock process collectors'
+([RFC 25 §2.1](rfc-25-observability.md#2.1%20Names)).
 
 No metric carries a share or client label. A share refused by its cap, and an
 address at its connection quarter, are named in a log line at warning, at most
@@ -1238,29 +1257,7 @@ and `memory_near_limit` while resident memory stays above the runtime's soft
 limit for a minute — which, with every pool within its ceiling, means memory
 outside the pools has grown, and is a bug.
 
-## 11. Conformance
-
-The checks below are evidence for the requirements that fail silently. They run
-at the tiers [RFC 29 §4.3](rfc-29-test-harness.md#4.3%20Tiers) names; every one
-runs on the composed node, against a real journal and a remote that can be
-slowed and stopped, because a fake store that always answers at once cannot fill
-a pool.
-
-| Check | Does | Catches |
-| --- | --- | --- |
-| R1 limit learned | Start in a container limited to 512 MiB with no runtime limit set: assert *L* is 512 MiB, source `container`, and the runtime's soft limit reads 480 MiB, fifteen sixteenths of it. Set the runtime limit to 256 MiB: assert it wins. Set the runtime limit to 1 GiB in a 512 MiB container: assert *L* is 512 MiB, source `container`. | a node sized from the host inside a container, or a runtime never told |
-| R2 overload soak *(daily)* | In a 2 GiB container, for an hour: 200 NFS clients writing 1 MiB, the `builds` remote stalled, an SMB share frozen every five minutes, 10⁵ opens, a metadata walk of 10⁷ entries. Assert the process is never killed, resident memory stays under *L*, every pool stays within its ceiling, every request is answered or retried, and the goroutine count stays within §6.1's bounds. Revert one pool's reservation to a no-op: assert the run fails on resident memory. | a pool that does not hold its memory, or memory outside every pool |
-| R5 no unbounded queue | Under constant write load, stop the remote for ten minutes: assert the heap plateaus within the first minute and does not grow after it. Insert an unbounded queue at offload's posting in a test build: assert the check fails on the slope. Remove 10⁶ files with the remote stopped: assert the engine's scheduler holds at most its total, `engine_work_items_dropped_total` rises, and every removal completes once the remote returns. | a queue the inventory missed, which grows only while something downstream is stopped |
-| R4 no cycle | Fill the reply pool with replies to a client that stops reading, and the receive pool with writes waiting on a stalled journal: assert both drain once the write deadline closes the stalled client, and no reservation waits past its deadline. | a wait entered while holding a later reservation |
-| R7 turns | One address with 16 connections at their caps of 1 MiB writes; 20 other addresses sending `GETATTR`: assert each other address's operation is granted within one round, and the busy address holds at most three quarters of the receive pool. | fairness counted per connection, or no cap |
-| R8 share cap | `builds`'s remote black-holed, build01 reading cold at depth 64 on four connections, alice-pc writing to `profiles`: assert `builds` holds at most three quarters of the reply pool, build01 is answered `NFS3ERR_JUKEBOX` and `memory_pool_refusals_total{rule="share_cap"}` rises, and alice-pc's p99 write latency stays within twice its unloaded figure. With `builds` one call below its cap, 64 1 MiB reads on new connections arriving at once: assert `builds` still holds at most three quarters. Close an open and unlock a range on `builds`: assert both succeed. | a hung share taking the node; a cap checked before the call's own bytes, or not atomically; a release refused for memory |
-| R9 held bytes move | With the receive pool at 64 MiB, freeze `profiles` and hold 300 64 KiB writes on one connection: assert the receive pool holds the floor's 256 and the hold pool the rest. Repeat with 100 KiB writes: assert the hold pool is charged a transfer-class buffer and its overhead per write past the floor. | held writes past the floor kept in the receive pool, or moved at less than the buffer they keep |
-| R10 per-address | One address opening connections in a loop: assert it is held at a quarter of the limit and another address still connects. | one client locking out the rest |
-| R11 reclaim allowance | Fill the open-state pool to nine tenths, restart with half the *L*, reclaim: assert every reclaim succeeds and a new open is `DelayResources` until the pool falls. Then have one eligible NFSv4.0 client reclaim opens it never held: assert its reclaims are refused `DelayResources` once the pool reaches twice its ceiling, resident memory stays under *L*, and a persistent open's reconnect still succeeds. | a restart that loses locks; a reclaim that takes the node past its limit |
-| R13 CPU tokens | Offload compressible data with 128 workers on four cores while a client sends `GETATTR`: assert at most three tokens are held at once, and the `GETATTR` p99 stays within twice its idle figure. | background work taking every core |
-| R14 refused at start | Set `upload_workers` to 4096 under a 1 GiB *L*, and an `ExtentLimit` past the index pool: assert each start is refused, naming the pool and the figure. | a setting silently reduced or allowed past memory |
-
-## 12. Open questions
+## 11. Open questions
 
 1. **Fractions that move.** Fixed fractions waste a role's idle pools (§2.3). A
    budget that lends an idle pool's ceiling to a busy one must take it back
@@ -1312,7 +1309,7 @@ a pool.
 
 | § | This RFC | The code today |
 | --- | --- | --- |
-| §2.1 | one limit, from the runtime limit, the container or the host; the runtime told | a system detector reads the cgroup v2 `memory.max` only (no `memory.high`, no cgroup v1), else `/proc/meminfo` or `sysctl`, with a 4 GiB fallback on failure; nothing reads or sets `GOMEMLIMIT` |
+| §2.1 | one limit, from the runtime limit, the container or the host; the runtime told | a system detector reads the cgroup v2 `memory.max` only (no `memory.high`, no cgroup v1), else `/proc/meminfo` or `sysctl`, with a silent 4 GiB fallback on failure; nothing reads or sets `GOMEMLIMIT` |
 | §2.3 | one budget, fixed shares | each consumer sizes itself from the detected memory, independently, and nothing sums them: a per-share read buffer of 1/8 of memory **each** (64 MiB floor), Badger block and index caches of 15% and 7.5% **per store** (clamped to 512–4096 and 256–2048 MiB), and a per-share append-log pressure budget of 1/4 of memory (on disk) |
 | §3.1, §3.2 | charged at frame, before the body is read | a three-class `sync.Pool` (4 KiB, 64 KiB, 1 MiB), neither bounded nor charged; NFS reads each record into a pooled buffer before taking its per-connection semaphore, so one record past the cap is held per connection; SMB reads each message into a fresh allocation of up to `max_message_size`, 64 MiB by default, before its semaphore, then copies it into a pooled buffer |
 | §3.3 | reply reserved before the call | no reply accounting; NFS replies are copied into a fresh buffer |
