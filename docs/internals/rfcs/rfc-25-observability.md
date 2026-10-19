@@ -131,7 +131,7 @@ Outcome: one page, no restart, and a monitoring system that is still standing.
 - **page**, **ticket** — the two alert classes: a person now, or a person soon
   (§7).
 - **event stream** — an ordered record of decisions for a consumer outside the
-  node: access events, quota events, administrative events (§4).
+  node: access, quota, logon and administrative events (§4).
 - **spool** — the node-local, bounded, append-only files a stream is written to
   before it is exported (§4.3).
 - **gap record** — a record a stream writes in place of events it had to drop, so
@@ -157,12 +157,14 @@ Outcome: one page, no restart, and a monitoring system that is still standing.
 - Audit data is readable only by those allowed to audit; it never appears in a
   log or a metric.
 - No log line, span or metric carries a secret or file content; file names
-  appear only in the debug level, which turns itself off.
+  appear only in the debug level, which turns itself off when turned on at run
+  time and raises a condition when set at start.
 
 **How the rest is organised.** §1 is purpose and boundaries. §2 is the metric
 conventions, §3 health derivation, §4 the event streams, §5 logs, §6 tracing and
-§7 alerting. §8 is the components that carry them and their lifecycle, §9 the invariants, §10 this RFC's own metrics, and §11 the audit
-of every other RFC's table against §2, as edits. §12 is conformance and §13 open
+§7 alerting. §8 is the components that carry them and their lifecycle, §9 the
+invariants, §10 this RFC's own metrics, and §11 the audit of every other RFC's
+table against §2, as edits. §12 is conformance and §13 open
 questions. Appendix A is prior art; Appendix B where the current code differs.
 
 ### Scenarios
@@ -197,56 +199,7 @@ older records is itself recorded.
 
 Outcome: the question is answered, and no metric grows by the number of shares.
 
-**A node restarts and enters grace.**
-
-1. While its journals recover the node is live but not ready (§3.6).
-2. Once its adapters accept clients it is ready, though in grace: clients must
-   reach it to reclaim their state, so grace is a reason to be ready, not one to
-   refuse ([RFC 30 §4.4](rfc-30-kubernetes.md#4.4%20Health)).
-3. The grace period appears in the health report as information, not as a
-   condition, and pages no one.
-
-Outcome: clients reclaim; nothing alerts on a restart behaving as designed.
-
-**A write from alice-pc reaches P1 and runs on S2.**
-
-1. P1's adapter opens the request span; the service call is its child (§6.1).
-2. The service forwards through the shard service. The route envelope carries the
-   trace context beside the request ID, never inside it
-   ([RFC 15 §4.3](rfc-15-topology.md#4.3%20The%20route%20envelope), §6.2).
-3. On S2 the service's span is a child of P1's, and parents the engine's and the
-   metadata store's spans.
-
-Outcome: one trace shows both nodes, and a retried write keeps its request ID
-whatever the tracing says.
-
-## In short
-
-- Metric names are `<component>_<what>_<unit>`, counters end `_total`, units are
-  seconds and bytes, and every prefix has one owning RFC.
-- No share, shard, client, principal, file or connection label on any counter or
-  histogram. Configured objects — stores, namespaces, journals, pools — may label
-  anything, capped at 64 values per metric. Per-share gauges are exported for the
-  worst 20 shares and summed; every share's are read through the management API.
-- A node exports at most 50,000 series at the reference profile and no metric more
-  than 10,000; the conformance run counts them.
-- Histograms use one of four fixed bucket sets; summaries are not used.
-- Health is the worst severity among current conditions in scope. Store and
-  namespace conditions flow to their shares; shares do not make a node unhealthy.
-- Liveness fails only on a stalled process. Readiness fails only while the node
-  can serve no share at all: starting, draining, or with its metadata store lost.
-- Four event streams — access, quota, logon, administrative — are written to
-  node-local spool files and exported as JSON lines. Access, quota and logon events pass
-  through a fixed ring: a drop never blocks an operation and always leaves a gap
-  record. Administrative records are read from the control plane's durable audit.
-- Logs: constant messages, fixed keys, a trace ID on every request-scoped line;
-  no secrets, contents or file names above debug; debug turns itself off.
-- One span per service call, parented across nodes through the route envelope;
-  head sampling, off unless an export endpoint is set.
-- Pages are for clients failing, data at risk, or a state only an operator can
-  leave; everything else is a ticket.
-
----
+A restart in grace is §3.6's table, row "in grace"; a trace across nodes is §6.2.
 
 ## 1. Purpose
 
@@ -260,25 +213,9 @@ component can own: how health combines, and how the event streams leave the node
 
 ### 1.1 Non-goals
 
-This RFC **MUST NOT** be read as specifying:
-
-- any component's own metrics, conditions or log lines: each is its owner's,
-  listed in its Observability section. This RFC audits those tables (§11) and does
-  not restate them;
-- the management API: which endpoints exist, their paths and their
-  authentication are [RFC 23](rfc-23-control-plane.md)'s. This RFC fixes what the
-  health, readiness and liveness answers report and how they are derived (§3.7),
-  and what reading an event stream requires (§4.8);
-- which operations produce an access event — the audit policy is a share setting
-  ([RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings)),
-  applied by [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) and
-  [RFC 19 §3.7](rfc-19-authorization.md#3.7%20Audit%20entries%20select%20events);
-- what an access or quota event carries: [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)
-  fixes that. This RFC adds only what the sink stamps on (§4.2);
-- a monitoring, alerting, log-shipping or trace backend. DittoFS exports; it does
-  not store metrics history, route alerts or archive audit records;
-- profiling, which [RFC 16 §7.3](rfc-16-metadata-store.md#7.3%20Profiling) and the
-  benchmark rules of the [index](rfc-index.md#Test%20tiers) cover.
+DittoFS exports; it does not store metric history, route alerts, archive audit records
+or profile ([RFC 16 §7.3](rfc-16-metadata-store.md#7.3%20Profiling)). Everything else
+not specified here has its owner in §1.2.
 
 ### 1.2 Who owns what
 
@@ -292,6 +229,7 @@ This RFC **MUST NOT** be read as specifying:
 | the endpoints that serve them, and who may call them | [RFC 23](rfc-23-control-plane.md) |
 | the Kubernetes probes and the cluster resource's conditions | [RFC 30 §4.4](rfc-30-kubernetes.md#4.4%20Health), reading §3.5–§3.6 |
 | where access and quota events are emitted, and their fields | [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) |
+| which operations produce an access event: the share's audit policy | [RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings), applied by [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) |
 | where logon events are emitted, and logon throttling | [RFC 18 §3.1](rfc-18-identity.md#3.1%20The%20authentication%20interface) |
 | which decisions an audit entry selects | [RFC 19 §3.7](rfc-19-authorization.md#3.7%20Audit%20entries%20select%20events) |
 | delivery, bounds, drops, retention, format and access of the streams | this RFC, §4 |
@@ -383,10 +321,10 @@ they are the one exception, so that stock dashboards read them.
   the installation".
 - A ratio is exported as a gauge only when its parts are not metrics already.
   Where both are counters, both are exported and the consumer divides.
-- **Every series whose label values are a closed set is exported from start, at
-  zero.** A counter that first appears at 1 is invisible to a rate, so an alert
-  written as "any increase" would miss the first event — the one that matters for
-  every counter whose owner says "any nonzero value is an alert".
+- **A counter an alert reads is exported from start, at zero**, for every value of its
+  closed labels: every bug counter of §7 and every counter its owner calls an alert.
+  Other series appear on first use. A counter that first appears at 1 is invisible to
+  a rate, so an "any increase" alert would miss the first event.
 
 ### 2.4 Labels
 
@@ -634,9 +572,9 @@ owner.
 - Each raise logs once at `Warn` (`Error` for an unhealthy one) and each clear
   once at `Info`, with the condition's name, subject, cause and duration, and is
   counted in `health_condition_transitions_total{condition}` (§10).
-- An operator may **silence** a condition's alerts for a stated time, through the
-  management API. Silencing changes no status: the condition still shows, marked
-  silenced, and the silence ends at its time.
+
+> decision: silencing is the alert router's, not the node's. Overturned by a
+> deployment with no alert router that still needs a silence.
 
 ### 3.5 Liveness
 
@@ -706,7 +644,7 @@ serves three answers. Their content is this:
   to a probe that holds no credential
   ([RFC 23 §2.5](rfc-23-control-plane.md#2.5%20Health%20and%20readiness%20endpoints)).
 - **health** (`GET /api/v1/health`): the status of the installation, of this node and of each scope in
-  it; every current condition with its fields (§3.1), whether it is silenced, and
+  it; every current condition with its fields (§3.1) and
   its alert class; the counts of shares by status and the worst 20 shares; and
   the information section — grace periods and their remaining time, snapshots and
   backups running, drains. With a share or store named, the same for that subject
@@ -770,6 +708,7 @@ row.
 | `metrics_label_capped` | §2.4 | node | degraded | ticket |
 | `event_spool_high` | §4.6 | node | degraded, above 80% of the spool bound | ticket |
 | `event_gap` | §4.4 | node, naming the stream (any stream) | degraded | page for the access stream while any share's audit policy is on; ticket otherwise |
+| `debug_logging_on` | §5.2 | node, naming the component | degraded | ticket |
 | `replication_under_floor` **(cluster)** | [RFC 10 §14](rfc-10-journal-replication.md#14.%20Observability) | share | degraded | page at 5 min |
 | `shard_relinquished` **(cluster)** | [RFC 10 §14](rfc-10-journal-replication.md#14.%20Observability) | share | unhealthy; waits for a replica or the operator | page at once |
 | `node_lost` **(cluster)** | [RFC 11 §9](rfc-11-ownership.md#9.%20Failure), §3.8 | installation | degraded while its shards fail over | page at 5 min |
@@ -1028,13 +967,16 @@ and the project's rules have it: a client can produce them at any rate.
   	s.log.LogAttrs(ctx, slog.LevelDebug, "lookup refused", slog.Uint64("file", uint64(f)))
   }
   ```
-- `Debug` may be turned on for one component at a time through the management
-  API, and turns itself off after 15 minutes unless renewed. A debug level set in
-  the configuration file holds for the first hour after start only.
+- `Debug` turned on through the management API, for one component at a time, turns
+  itself off after 15 minutes unless renewed. A level set in configuration or the
+  environment stays, and the node raises `debug_logging_on` while it does.
 
-> decision: debug expires. Debug lines carry file names (§5.4) and cost a line per
-> request; one left on after an incident fills the disk and the log store with
-> user content. Overturned by nothing likely: a longer investigation renews it.
+> decision: debug turned on at run time expires; debug set at start is visible as a
+> condition. Debug lines carry file names (§5.4) and cost a line per request; one
+> left on after an incident fills the disk and the log store with user content,
+> while a level set at start is a developer's or a test's choice and expiring it
+> would silently drop what they asked for. Overturned by a debug level left in a
+> deployment's configuration that filled a disk despite the condition.
 
 ### 5.3 Structure and correlation
 
@@ -1158,8 +1100,7 @@ rediscover both.
   `gc_verify_refusals_total`, `engine_ledger_mismatches_total`,
   `codec_verify_failures_total` net of the syncer's recovered re-gets
   ([RFC 4 §4.12](rfc-4-remote-tier.md#4.12%20What%20a%20store%20makes%20observable)).
-- **nothing** — information: grace, drains, snapshots running, conditions
-  silenced.
+- **nothing** — information: grace, drains, snapshots running.
 
 Each condition's class and delay are in the registry (§3.9). An alert names the
 condition, the subject, the cause and `since`, and links the troubleshooting
@@ -1357,14 +1298,14 @@ What this RFC itself exports. Metric names are shown without the prefix.
 | shares by status, on this node | `health_shares{state}` | gauge |
 | condition raises and clears | `health_condition_transitions_total{condition, transition}` | counter |
 | exports that omitted a component (§2.8) | `health_export_partial_total{component}` | counter |
-| series exported, and entity labels capped (§2.4) | `health_series`, `health_label_capped_total{metric}` | gauge, counter |
+| entity labels capped (§2.4) | `health_label_capped_total{metric}` | counter |
 | spans dropped by the export queue (§6.3) | `health_spans_dropped_total` | counter |
 | records accepted, by stream | `events_records_total{stream}` | counter |
 | records dropped, by stream and reason (`ring_full`, `spool_full`, `trimmed`, `restart`) | `events_dropped_total{stream, reason}` | counter |
 | ring occupancy against its size | `events_ring_entries{stream}`, `events_ring_entries_limit{stream}` | gauge, gauge |
 | spool bytes against its bound, and the oldest file's age | `events_spool_bytes`, `events_spool_bytes_limit`, `events_spool_oldest_seconds` | gauge, gauge, gauge |
 | time from accept to synced in the spool | `events_write_seconds{stream}` | histogram (`request`) |
-| build and roles | `build_info{version, commit}` | info |
+| build | `build_info{version, commit}` | info |
 
 `condition` takes the registry's names, a closed set; `health_conditions` is
 exported at zero for every registered condition (§2.3). `events_dropped_total`
@@ -1460,8 +1401,8 @@ names, on the composed single-node harness of the [index](rfc-index.md#Test%20ha
   attribute names, and the `traceparent` encoding §6.2 means by "the standard
   trace-context encoding"; its exponential histograms are §2.6's upgrade.
 - **Ceph's health checks** — named checks with a severity (`HEALTH_WARN`,
-  `HEALTH_ERR`), the cluster status as the worst of them, and muting a check for a
-  time without hiding it: the model for §3.1–§3.4 and silencing.
+  `HEALTH_ERR`), and the cluster status as the worst of them: the model for
+  §3.1–§3.4.
 - **Kubernetes probes** — the advice that liveness must not depend on
   dependencies, since a restart loop amplifies an outage, and readiness that
   removes a pod from service endpoints: §3.5–§3.6.
