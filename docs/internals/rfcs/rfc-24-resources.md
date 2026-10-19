@@ -495,7 +495,7 @@ before it reads the first fragment, and **MUST NOT** grow that reservation
 later; a fragment that would take the record's total past that cap, or a
 record past a fixed number of fragments, is a framing error and closes the
 connection ([RFC 20 §5.2](rfc-20-adapters.md#5.2%20Decoding%20is%20bounded)).
-The remaining fragments **MUST** arrive within the request deadline
+The remaining fragments **MUST** arrive within the frame deadline
 ([RFC 20 §6.4](rfc-20-adapters.md#6.4%20Deadlines%20and%20limits)), counted
 from the first fragment's header; a record still partial then closes the
 connection and releases its reservation. So no reader waits for receive bytes
@@ -568,10 +568,10 @@ reply's wait never waits on a receive reservation (§2.6).
 
 ### 3.4 The per-connection cap for protocols without flow control
 
-Where the protocol has no flow control of its own — NFSv3, NFSv4.0,
-NFS's auxiliary services (MOUNT, NLM, NSM) and the port mapper — and on every
-NFS connection, since the minor version and slot are known only after the
-arguments are decoded, the per-connection cap of
+On every NFS connection, NFSv4.1's included, and on NFS's auxiliary services
+(MOUNT, NLM, NSM) — since the minor version and slot are known only after the
+arguments are decoded, and NFSv3 and NFSv4.0 have no flow control of their
+own — the per-connection cap of
 [RFC 20 §6.3](rfc-20-adapters.md#6.3%20Flow%20control%20is%20the%20protocol%27s%20own)
 is **64 requests in flight**, fixed: the same as one NFSv4.1 session's fore
 channel ([RFC 21 §3.1](rfc-21-nfs.md#3.1%20Slot%20tables)), so a connection
@@ -735,7 +735,8 @@ three-quarter cap per key.
 ### 4.4 Connections
 
 **Each connection is charged a fixed cost** to the connection-state pool at
-accept — its reader's and writer's state, its ID tables when empty, its
+accept — its reader's and writer's state, the reader's small-class read buffer
+([RFC 20 §6.8](rfc-20-adapters.md#6.8%20Buffer%20pools%2C%20in%20code)) included, its ID tables when empty, its
 security context — proposed at 64 KiB and settled by §8's M2. A connection that
 cannot be charged is closed at accept, before any byte is read
 ([RFC 20 §3.2](rfc-20-adapters.md#3.2%20A%20connection%27s%20lifecycle)).
@@ -967,7 +968,8 @@ Every goroutine the process runs is one of these, and no other:
 | a connection's reader and writer | two per connection: `connection_limit` × 2 |
 | an admitted request | the receive pool over the smallest charge (§3.1) |
 | a pool worker — syncer halves, the work scheduler's runs, GC's | the pools' sizes ([RFC 3](rfc-3-syncer.md), [RFC 8 §6.1.1](rfc-8-engine.md#6.1.1%20The%20shared%20work%20scheduler)) |
-| a fixed loop — listeners, a journal's sync and seal loops, timers, health | a constant per component, or per journal |
+| a fixed loop — listeners, a journal's sync and seal loops, timers, health, each sidecar's loop ([RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars)) | a constant per component, or per journal |
+| an outbound NLM callback connection's reader and writer | two per host with a grant or reply to send ([RFC 20 §3.3](rfc-20-adapters.md#3.3%20Callbacks%20are%20the%20adapter%27s%20to%20deliver)), closed after; counted in `connection_limit` |
 
 A held request, a blocked lock, a queued transfer, a work item, a waiting reader
 and a pending callback **MUST NOT** have a goroutine of their own: each is a
