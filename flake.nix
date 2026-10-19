@@ -384,6 +384,10 @@
             pjdfstest
             # Docker client for PostgreSQL testing (daemon must be running on host)
             docker-client
+            # FoundationDB's client library and headers: Linux builds with cgo
+            # compile the fdbkv backend, which links libfdb_c. Any 7.3 client
+            # speaks to any 7.3 server.
+            foundationdb
             # Helper scripts that need the Linux NFS client, /proc/mounts or
             # pjdfstest. The docker-only helpers live in commonBuildInputs.
             dfs-mount
