@@ -830,20 +830,42 @@ functions over neutral types that both adapters import
 [RFC 20 §2.3](rfc-20-adapters.md#2.3%20What%20an%20adapter%20may%20import)):
 
 ```go
-// Spelling resolves principals for the translation. It is RFC 18's mapping,
-// passed in; the translation does no lookup of its own.
+// Spelling resolves principals for the translation: RFC 18's mapping, bound to
+// one call's caller, so a who is spelled for that call's flavour (RFC 18 §4.5).
+// The translation does no lookup of its own.
 type Spelling interface {
-	SID(p metadata.Principal) (SID, error)              // every principal an entry can name has one
-	PrincipalBySID(s SID) (metadata.Principal, error)   // RFC 18's Find: ErrUnknownPrincipal for a SID no principal holds
-	Who(p metadata.Principal) (string, error)           // NFSv4 who: OWNER@…, name@domain, or SID@domain
+	SID(p metadata.Principal) (SID, error)            // every principal an entry can name has one
+	PrincipalBySID(s SID) (metadata.Principal, error) // ErrUnknownPrincipal for a SID no principal holds
+	Who(p metadata.Principal) (string, error)         // NFSv4 who: OWNER@…, the owner string for the flavour, or SID@domain
 	PrincipalByWho(who string, group bool) (metadata.Principal, error)
 }
 
-func DescriptorFromACL(a metadata.ACL, owner, group metadata.Principal, parts SecurityInfo, sp Spelling) ([]byte, error)
-func ACLFromDescriptor(sd []byte, current metadata.ACL, f metadata.File, sp Spelling) (Descriptor, error) // §6
-func NFSv4FromACL(a metadata.ACL, attr NFSv4ACLAttr, admin bool, sp Spelling) (NFSv4ACL, error)
-func ACLFromNFSv4(v NFSv4ACL, attr NFSv4ACLAttr, current metadata.ACL, admin bool, sp Spelling) (metadata.ACL, error) // §7
+type SID []byte // a SID's binary form (MS-DTYP 2.4.2.2)
+type Attr uint8 // the NFSv4 attribute: acl, dacl or sacl (§7.1)
+
+// NFSv4ACE is one nfsace4, as the NFS adapter's codec decodes it.
+type NFSv4ACE struct {
+	Type, Flags, Mask uint32
+	Who               string
+}
+
+// Normalised is what a set had cleared or replaced to fit the model; the adapter counts it (§10).
+type Normalised struct{ MaskBits, EntryFlags, DeletedPrincipals, NullDACL int }
+
+// owner, group: the file's before the set (§6.3). a holds only the lists the caller may read (§3.5).
+func DescriptorFromACL(a metadata.ACL, owner, group metadata.Principal, p metadata.ACLParts, sp Spelling) ([]byte, error)
+func ACLFromDescriptor(sd []byte, owner, group metadata.Principal, sp Spelling) (metadata.ACLSet, Normalised, error)
+func NFSv4FromACL(a metadata.ACL, attr Attr, sp Spelling) (v []NFSv4ACE, sidWhos int, err error)
+func ACLFromNFSv4(v []NFSv4ACE, attr Attr, owner, group metadata.Principal, sp Spelling) (metadata.ACLSet, Normalised, error)
 ```
+
+A set names the parts it changes (`metadata.ACLSet`: owner, group, each list's
+entries and flags, and the request to recompute inheritance). The store applies
+it by those parts in one transaction
+([RFC 7 §11.1](rfc-7-namespace-metadata.md#11.1%20Interface)'s `SetACL`), so a
+part the set does not name is left as stored. That covers the audit list a
+caller without the system-security right cannot read, and an adapter never reads
+a part to write it back.
 
 The translation **MUST**:
 
@@ -856,8 +878,9 @@ The translation **MUST**:
   and writing back what was read stores `a`, and so does the same through the
   other protocol, for a caller allowed to see both lists.
 
-The translation decides nothing about access. Whether the caller may read or
-write the ACL is the chokepoint's, asked with the rights §6.1 and §7.1 name.
+The translation decides nothing about access: whether the caller may read or
+write a part, and which lists it is handed, are the chokepoint's, asked with the
+rights §6.1 and §7.1 name.
 
 ### 5.2 Principals on the wire
 
@@ -890,6 +913,12 @@ match no caller (§3.3). They are shown with that spelling, and on a set an entr
 naming the null SID, or NFSv4's spelling of it, is left out and counted. This is
 the one entry a set may leave out: it matched no caller before the set and
 cannot match one after it, so no request is answered differently.
+
+> decision: an entry naming a deleted principal is left out of a set, the one
+> exception to §2.8, because it matched no caller before and cannot after.
+> Overturned the day a deleted principal can be restored under its ID: the
+> dropped entries would then be grants and denies the restore should have
+> revived.
 
 > decision: a principal NFS cannot name is spelled by its SID rather than left
 > out. Leaving it out makes every read-modify-write from an NFS client a silent
@@ -961,24 +990,15 @@ way:
   one naming the group's SID as `GROUP@`. Every other entry is stored with the
   principal it names.
 
-The fold is what makes the write the inverse of the read for an inheritable
-`OWNER@`: without it, writing back the two entries one read produced would store
-`OWNER@` and a separate CREATOR OWNER, two entries where there was one. The fold
-changes no decision: on the file both forms grant the owner the same rights, and
-below it CREATOR OWNER's effective copy names `OWNER@` (§4.4), as the folded
-entry's copy does. Because a fold is lossless, both translations apply it — an
-NFSv4 `acl` naming `OWNER@` then CREATOR OWNER's `who` folds the same way
-(§7.2) — and no stored ACL holds an unfolded pair. A pair the client did not
-mean as one is still stored as one, which no request can tell apart.
-
-So the Security tab shows alice's own SID for the `OWNER@` entry of a
-mode-derived ACL, and writing the tab back keeps it `OWNER@`, which RFC 7's
-`chmod` merge rewrites from the owner bits rather than limiting as a named
-entry. The write is not the read's inverse in one case, which the decision below
-accepts: a stored named entry for the principal that now owns the file, with no
-inherit flags — set by name over NFS, or for bob before a `chown` to bob — is
-shown with the owner's SID and written back as `OWNER@`. It grants the same until
-the next `chown`.
+The fold makes a write the inverse of a read for an inheritable `OWNER@`, and
+changes no decision. On the file both forms grant the owner the same rights.
+Below it, CREATOR OWNER's effective copy names `OWNER@` (§4.4), as the folded
+entry's does. Both translations apply the fold (§7.2), so no stored ACL holds an
+unfolded pair. A pair the client did not mean as one is still stored as one,
+which no request can tell apart. A write is not a read's inverse in one case: a
+stored named entry with no inherit flags for the principal that now owns the
+file. It is shown as the owner's SID and written back as `OWNER@`, and it grants
+the same until the next `chown`. The decision below accepts that.
 
 > decision: an effective entry naming the owner's SID is stored as `OWNER@`.
 > Without it, every Explorer edit of a file with a mode-derived ACL turns the
@@ -996,8 +1016,8 @@ the next `chown`.
 | callback (conditional) entries, allow, deny or audit | refused `ErrInvalid` |
 | mandatory-label, resource-attribute and scoped-policy entries, and the label, attribute and scope security-information parts | a query returns none; a set carrying any is refused `ErrInvalid` |
 | an entry kind or revision the model does not hold | refused `ErrInvalid` |
-| more than 128 entries in a list, or a list over 64 KiB | refused `ErrInvalid` |
-| a null DACL | stored as allow `EVERYONE@` every right, and read back so (§2.6) |
+
+Plus everything §2.8 refuses.
 
 The status code each refusal is answered with is RFC 22's.
 
