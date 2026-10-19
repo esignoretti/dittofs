@@ -767,7 +767,7 @@ lists what a quota event is for, but not its fields; §11 asks it to add
 
 ### 4.3 From the emit point to the spool
 
-![The service calls the sink at the chokepoint and at quota enforcement and never waits; the sink stamps node, boot and sequence and puts the event in a fixed ring per stream, dropping and counting when full; one writer per stream appends batches to spool files every second, writing a gap record for anything dropped; the spool is bounded by age and bytes and is read by a shipper tailing the files or by an auditor through the management API](img/rfc25-events.svg)
+![The service calls the sink at quota enforcement and with each authorisation decision, the authenticator at each logon, and neither waits; the sink stamps node, boot and sequence and puts the event in a fixed ring per stream, dropping and counting when full; one writer per stream appends batches to spool files every second, writing a gap record for anything dropped; the spool is bounded by age and bytes and is read by a shipper tailing the files or by an auditor through the management API; the admin stream is the control plane's audit, pulled by position with no ring and no spool](img/rfc25-events.svg)
 
 1. **Emitters call the sink and return.** The sink is a concrete type with one method
    per stream — `Access`, `Quota`, `Logon` — each taking a pointer to the event; a nil

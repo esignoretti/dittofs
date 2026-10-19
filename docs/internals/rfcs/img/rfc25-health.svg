@@ -82,8 +82,8 @@
   <text x="52" y="460" class="s">turned within 60 s; no condition, no store</text>
   <rect x="320" y="410" width="260" height="62" rx="5" class="ok"/>
   <text x="332" y="430" class="h">readiness: ready</text>
-  <text x="332" y="446" class="s">false only while starting, draining,</text>
-  <text x="332" y="460" class="s">or with the metadata store lost</text>
+  <text x="332" y="446" class="s">false only while starting, draining, the</text>
+  <text x="332" y="460" class="s">metadata store lost, or a listener down</text>
   <rect x="600" y="410" width="260" height="62" rx="5" class="am"/>
   <text x="612" y="430" class="h">registry: one page</text>
   <text x="612" y="446" class="s">store_put_unhealthy, unhealthy by cause,</text>

@@ -53,7 +53,7 @@ order: each part builds on the ones before it.
 | **Operations** | | | |
 | RFC 23 | control plane | planned | runtime, share lifecycle, management API; applies RFC 13's configuration |
 | RFC 24 | resources and concurrency | planned | memory budgets, buffer pools, admission, backpressure |
-| [RFC 25](rfc-25-observability.md) | observability | draft | metric naming, units, labels and cardinality; the condition registry and health derivation; liveness and readiness; the access, quota and admin event streams' delivery, retention, export and access; logs; tracing; alerting |
+| [RFC 25](rfc-25-observability.md) | observability | draft | metric naming, units, labels and cardinality; the condition registry and health derivation; liveness and readiness; the access, quota, logon and admin event streams' delivery, retention, export and access; logs; tracing; alerting |
 | **Testing** | | | |
 | [RFC 29](rfc-29-test-harness.md) | test harness | reviewed | the `dt` runner, the suite registry, fixtures, tiers, grading against known failures, the result format and how red is reported |
 | [RFC 30](rfc-30-kubernetes.md) | deployment on Kubernetes | draft | the operator's cluster resource with protocol and storage pools, tiers mapped to Deployment and StatefulSet, storage identity on its volume, drain before removal, autoscaling the protocol pool and operator-paced storage, service or floating-IP addressing |
