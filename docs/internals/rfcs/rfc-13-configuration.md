@@ -1132,9 +1132,9 @@ supplies one before the setting is built.
 | `identity.directory_ttl`, `identity.directory_negative_ttl`: how long a positive and a "no such entry" directory answer stay fresh | RFC 18 §5.2 | installation | live | 5 min; 30 s, so a user just created in the directory signs in soon after |
 | `identity.directory_timeout`: a directory query unanswered this long is an error, never "no such entry" | RFC 18 §5.2 | installation | live | 5 s |
 | `identity.directory_stale_grace`: how long past the TTL an entry may be served while the directory fails | RFC 18 §5.3 | installation | live | 15 min; a policy, not a measurement: the window an operator accepts a disabled directory account keeping access through an outage, 0 where it must stop within the TTL |
-| export policy `Squash`, `Anonymous`, `ManageGIDs`, `ReadOnly`: who is squashed, the principal a squashed or anonymous caller acts as, whether an `AUTH_SYS` caller's gids are replaced by its store memberships, and whether every caller is narrowed to read-only | RFC 18 §6.2, §3.2; [RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees) | share | live: the policy's version is in every resolved caller's key | `root`; the well-known anonymous principal; off; off |
+| export policy defaults (fields of RFC 16's `ExportPolicy` record, written by `PutExportPolicy`, not `Setting` rows): `Squash`, `Anonymous`, `ManageGIDs`, `ReadOnly` — who is squashed, the principal a squashed or anonymous caller acts as, whether an `AUTH_SYS` caller's gids are replaced by its store memberships, and whether every caller is narrowed to read-only; its other fields default empty | RFC 18 §6.2, §3.2; [RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees) | share | live: the policy's version is in every resolved caller's key | `root`; the well-known anonymous principal; off; off |
 | process memory limit *L*: the runtime's soft limit, else the container's, else the host's memory | RFC 24 §2.1 | — | bootstrap ([§2.2](#2.2%20A%20host%20holds%20only%20its%20bootstrap)), read once at start | the first source set |
-| node memory pools: share of *L*, and floor | RFC 24 §2.3, §2.4 | — | fixed | receive, reply, hold, connection state, open state 1/16 each; metadata store 3/16; journal index 1/8; transfers 1/8; a quarter unpooled. Floors: receive and reply 16 MiB, connection and open state 4 MiB, metadata store 64 MiB. The metadata store's share is proposed, settled by: RFC 24 §8's M3; the unpooled quarter by M4 |
+| node memory pools: share of *L*, and floor | RFC 24 §2.3, §2.4 | — | fixed | receive, reply, hold, connection state, open state 1/16 each; metadata store 3/16; journal index 1/8; transfers 1/8; a quarter unpooled. Floors: receive and reply 16 MiB, connection and open state 4 MiB, metadata store 64 MiB, transfers eight workers per half and the staging they imply. The metadata store's share is proposed, settled by: RFC 24 §8's M3; the unpooled quarter by M4 |
 | buffer classes | RFC 24 §3.1 | — | fixed | 4 KiB, 64 KiB, 1 MiB, 8 MiB |
 | per-request overhead charged beside a request's buffer | RFC 24 §3.1 | — | fixed | proposed: 8 KiB; settled by: RFC 24 §8's M1 |
 | connection cost charged at accept | RFC 24 §4.4 | — | fixed | proposed: 64 KiB; settled by: RFC 24 §8's M2 |
@@ -1162,7 +1162,14 @@ supplies one before the setting is built.
 | `tracing.sample_ratio`: the fraction of requests sampled at the adapter | RFC 25 §6.3 | node | live | proposed: 0.01 |
 | metric limits: values per entity label per metric per node; series per node and per metric at the reference profile | RFC 25 §2.4, §2.5 | — | fixed | 64; 50 000 and 10 000 |
 | histogram bucket sets | RFC 25 §2.6 | — | fixed | `request`, `background`, `size`, `count`, as RFC 25 §2.6 lists them |
-| event rings: entries per stream, size per entry | RFC 25 §4.3 | — | fixed | 16 384 for `access`, 4 096 for `quota`; 1 KiB |
+| event rings: entries per stream, size per entry | RFC 25 §4.3 | — | fixed | 16 384 for `access`, 4 096 each for `quota` and `logon`; 1 KiB |
 | event spool: rotation; sync interval; high-water warning | RFC 25 §4.3, §4.6 | — | fixed | 64 MiB or one hour, whichever first; 1 s; 80% of `events.max_bytes` |
 | quota hard-refusal coalescing window | RFC 25 §4.4 | — | fixed | 60 s |
 | liveness watchdog: how long an internal loop may go without a turn before liveness fails | RFC 25 §3.5 | — | fixed | 60 s |
+
+> ponytail: proposed, not yet agreed — the fixed rows copy values RFC 23, 24 and 25 tabulate
+> themselves — about 25 rows, a count not yet checked against those tables — so
+> that this appendix stays the one list of every number inside a MUST, as the
+> index requires. A copy drifts: replace the trust in the copy with a test that
+> diffs these rows against the owners' tables once a copied row is found
+> drifted again.

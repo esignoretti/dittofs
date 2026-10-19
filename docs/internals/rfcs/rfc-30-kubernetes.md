@@ -254,7 +254,7 @@ files.
 
 Storage pods **MUST** be upgraded one at a time, each handing its shards over
 before it stops ([RFC 10 §9.4](rfc-10-journal-replication.md#9.4%20Handover)) and the next waiting until the upgraded pod is
-ready and has no shard under `replication_under_floor` or `shard_relinquished`. The operator runs this itself
+ready and has no shard with the `replication_under_floor` or `shard_relinquished` condition (RFC 25 §3.9). The operator runs this itself
 (`updateStrategy: OnDelete`) rather than the StatefulSet's rolling update,
 which waits for readiness but not for handovers. A storage pod's `preStop`
 hook **MUST** run the same handover, so an eviction the operator did not start
