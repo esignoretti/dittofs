@@ -29,12 +29,25 @@ IMAGE="docker.io/foundationdb/foundationdb:$VERSION"
 
 client() {
     local base="https://github.com/apple/foundationdb/releases/download/$VERSION"
-    mkdir -p "$CLIENT/lib" "$CLIENT/include/foundationdb"
-    curl -fsSL -o "$CLIENT/lib/libfdb_c.so" "$base/libfdb_c.x86_64.so"
-    curl -fsSL "$base/fdb-headers-$VERSION.tar.gz" | tar -xz -C "$CLIENT/include/foundationdb"
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    curl -fsSL -o "$tmp/libfdb_c.so" "$base/libfdb_c.x86_64.so"
+    curl -fsSL -o "$tmp/headers.tar.gz" "$base/fdb-headers-$VERSION.tar.gz"
     # fdb_c.h includes fdb_c_types.h, which the release's header tarball leaves out.
-    curl -fsSL -o "$CLIENT/include/foundationdb/fdb_c_types.h" \
+    curl -fsSL -o "$tmp/fdb_c_types.h" \
         "https://raw.githubusercontent.com/apple/foundationdb/$VERSION/bindings/c/foundationdb/fdb_c_types.h"
+    # The release's own digests (and the tagged header's), so a tampered
+    # download never reaches LD_LIBRARY_PATH. Another FDB_VERSION needs its own.
+    (cd "$tmp" && sha256sum -c - <<EOF) || exit 1
+617572467897d0360f76ffc33f24b58090ee691e3273750d2ff334cc71aae3fa  libfdb_c.so
+73b1efca62bf1779e0d4d62131514c96f689db82865695618086e73a057ea385  headers.tar.gz
+82ea67e61592873c637e228764f5921179a710826be558ee0d1703023913e14d  fdb_c_types.h
+EOF
+    mkdir -p "$CLIENT/lib" "$CLIENT/include/foundationdb"
+    mv "$tmp/libfdb_c.so" "$CLIENT/lib/"
+    tar -xzf "$tmp/headers.tar.gz" -C "$CLIENT/include/foundationdb"
+    mv "$tmp/fdb_c_types.h" "$CLIENT/include/foundationdb/"
     echo "client $VERSION in $CLIENT"
 }
 

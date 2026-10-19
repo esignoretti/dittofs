@@ -76,12 +76,14 @@ A Linux build with cgo compiles the FoundationDB metadata backend, which links
 `foundationdb/fdb_c.h: No such file or directory` until the client is
 installed. macOS builds leave the backend out and need nothing.
 
-On Debian or Ubuntu, install the same release CI uses (use `aarch64` in place
-of `amd64` on ARM):
+On Debian or Ubuntu, install the same release CI uses, checked against the
+digest CI pins (on ARM, use `aarch64` and the arm64 digest from
+`.github/actions/fdb-client/action.yml`):
 
 ```bash
 v=7.3.77
 curl -fLO https://github.com/apple/foundationdb/releases/download/$v/foundationdb-clients_${v}-1_amd64.deb
+echo "b6c263723009bddbc30b6ae8cf9854340bd35cef14152abb0da8fb5af2b91254  foundationdb-clients_${v}-1_amd64.deb" | sha256sum -c -
 sudo dpkg -i foundationdb-clients_${v}-1_amd64.deb
 ```
 
