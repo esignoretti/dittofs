@@ -137,7 +137,7 @@ Outcome: one page, no restart, and a monitoring system that is still standing.
 - **gap record** — a record a stream writes in place of events it had to drop, so
   a consumer knows the stream is incomplete and where (§4.4).
 - **entity label** — a label whose values are configured objects (a store, a
-  namespace, a journal, a pool), allowed but capped (§2.4).
+  namespace, a journal, a backup location), allowed but capped (§2.4).
 - **worst-n gauge** — a per-share gauge exported only for the shares worst by
   that gauge (§2.5).
 
@@ -364,9 +364,9 @@ they are the one exception, so that stock dashboards read them.
 - **A count of things has no unit word**: `syncer_workers`, `gc_trash_blocks`.
 - **One metric has one unit.** A label **MUST NOT** select between units: a
   histogram of entries and bytes is two histograms.
-- A value that is a setting's current value is exported under the measured
-  metric's name with `_limit` (`memory_pool_ceiling_bytes` aside, whose RFC names
-  it), so the two plot on one axis.
+- A value that bounds a measured metric — a setting's current value or a derived
+  ceiling — is exported under that metric's name with `_limit`, so the two plot on
+  one axis.
 
 ### 2.3 Types
 
@@ -393,21 +393,33 @@ they are the one exception, so that stock dashboards read them.
 A label's values **MUST** be a set whose size is known before deployment. There
 are three kinds of allowed label, and a list of forbidden ones.
 
-1. **Closed sets**, named in the owning RFC's table: `op`, `protocol`, `outcome`,
-   `reason`, `result`, `kind`, `direction`, `state`, `role`, `cause`, `stage`
-   (the pipeline stages of [RFC 20 §4.1](rfc-20-adapters.md#4.1%20One%20pipeline)). Values are
+1. **Closed sets**, named in the owning RFC's table — for example `op`, `protocol`,
+   `outcome`, `result`, `reason`, `kind`, `direction`, `state`, `role`, `cause`,
+   `stage` (the pipeline stages of [RFC 20 §4.1](rfc-20-adapters.md#4.1%20One%20pipeline)),
+   `pool` (RFC 24's fixed pools). Values are
    lower-case words; an error label takes the names of the closed error set it
    reports ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values),
    [RFC 4 §4.8](rfc-4-remote-tier.md#4.8%20Errors%20are%20a%20closed%20set)). The
    `protocol` label takes `nfs3`, `nfs4` or `smb` — minor versions are not
    separate values — and NFS's auxiliary services (MOUNT, NLM, NSM) and
    the port mapper count under `nfs3`.
+
+   **One name per concept across the set.** `outcome` is the class of an answer
+   (`ok`, `error`, `delay`); `result` is `ok` or the name from a closed error set;
+   `reason` is why something was refused or dropped; `cause` is the cause an error
+   value carries.
 2. **Entity labels**, whose values are configured objects: `store`, `namespace`,
-   `journal`, `pool`, `location`, `transform`, `node`. Any metric may carry them.
-   Each metric exports at most **64** values of each entity label per node; past
-   64 the rest are summed into the value `_other`, and the node raises
-   `metrics_label_capped` naming the metric (§3.9). An entity label takes the
-   object's name, not an internal ID, so a dashboard reads.
+   `journal`, `location`, `transform`, and `node`, only on a metric about another
+   node (a replica, a peer's lease). Any metric may carry them.
+   Each metric exports at most **64** values of each entity label per node, chosen in the
+   order the entities were added and never re-chosen while the process runs; later ones
+   are summed into `_other`, which only ever adds, and the node raises
+   `metrics_label_capped` naming the metric (§3.9). When an entity is removed, the
+   component that created its series deletes them, freeing its place. An entity label
+   takes the object's name, not an internal ID. A share re-homed into a namespace of its
+   own ([RFC 27](rfc-27-namespace-migration.md)) makes `namespace` grow with shares, so
+   on namespace-labelled metrics ([RFC 9 §10](rfc-9-gc.md#10.%20Observability)) the cap is
+   the bound that holds.
 3. **`share` and `shard`, on gauges only**, under the worst-n rule of §2.5.
 
 **Forbidden on every metric:** `client`, `principal`, `user`, `group`, `file`,
@@ -1362,38 +1374,31 @@ RFC 17 (§11).
 ## 11. Audit of the set's tables
 
 Every Observability section was read against §2. Each row is an edit for the
-owning RFC; none is applied here.
+owning RFC; none is applied here. Rows already applied in their owning RFC have
+been removed.
 
 | RFC | Finding | Edit |
 | --- | --- | --- |
-| [RFC 1 §3.9](rfc-1-journal.md#3.9%20Metrics) | counters are named as `Stats` fields with no prefix or `_total`; per-share fields are labelled by share with no worst-n rule | "The engine exports each counter as `journal_<field>_total` — `written_bytes` as `journal_written_bytes_total`, `syncs` as `journal_syncs_total` — and each gauge as `journal_<field>`, labelled with the journal; per-share fields follow RFC 25's worst-n rule." |
-| [RFC 3 §2.12](rfc-3-syncer.md#2.12%20What%20the%20syncer%20makes%20observable) | `syncer_store_throughput_bytes` is a rate named as a size; "queue metrics are also reported per flow", which the engine labels by share, includes the histogram `syncer_queue_wait_seconds` and the counter `syncer_throttled_seconds_total` | rename to `syncer_store_throughput_bytes_per_second`; "Queue gauges (`syncer_queue_depth`, `syncer_waiters`) are also reported per flow, which the engine exports by share under RFC 25's worst-n rule; queue histograms and counters are reported summed only." |
-| [RFC 5 §6](rfc-5-transforms.md#6.%20Observability), Appendix B.6 | `encryption_chunks_total` is labelled by data key ID and `transform_census_blocks` by material ID, both growing with every rotation; `encryption_key_available` is one series per key | drop the key label from `encryption_chunks_total`; label `transform_census_blocks` by transform and version only, the per-material census being read through the management API; replace `encryption_key_available` with `encryption_keys_unavailable`, a count, with `material_unavailable` naming the keys |
-| [RFC 6 §10.2](rfc-6-block-metadata.md#10.2%20Observability) | `blockmeta_history_refs` "per share" states no rule | "per share, under RFC 25's worst-n rule" |
-| [RFC 7 §11.2](rfc-7-namespace-metadata.md#11.2%20Observability), §7.6 | `namespace_events_dropped_total` counts the drop RFC 17 also counts, at a sink neither owns; §7.6 still calls delivery "a planned RFC's" | remove the row; "events dropped are counted at the sink (RFC 25)". In §7.6: "are RFC 25's" |
-| [RFC 8 §14](rfc-8-engine.md#14.%20Observability) | "a stated rule selects (the worst *n* by each figure)" points nowhere; the self-fence the engine owns has no counter, while RFC 10 and RFC 11 each count one | "under RFC 25's worst-n rule"; add `engine_self_fences_total{reason}`, `reason` = `store`, and **(cluster)** `lease`, `unreachable`, `clock`, the one count of self-fences |
-| [RFC 9 §10](rfc-9-gc.md#10.%20Observability) | `gc_audit_coverage_age_seconds` is "per hash range", a label of unstated size | export the oldest range's age per namespace only |
-| [RFC 10 §14](rfc-10-journal-replication.md#14.%20Observability) | "every metric is labelled by shard … and by share", histograms and counters included; `journal_applied_bytes_total` uses RFC 1's prefix; `node_self_fences_total` duplicates RFC 11's; `node_` has no owner | "Gauges that are per shard are exported under RFC 25's worst-n rule; no histogram or counter carries a shard or share label"; rename to `replication_applied_bytes_total`; remove `node_self_fences_total` in favour of RFC 8's; rename `node_clock_offset_seconds` to `replication_clock_offset_seconds` |
-| [RFC 11 §13](rfc-11-ownership.md#13.%20Observability) | `shard_self_fences_total` duplicates the self-fence count | remove; link RFC 8's `engine_self_fences_total` |
-| [RFC 12 §6](rfc-12-snapshots.md#6.%20Observability) | `snapshot_gate_seconds` is "per shard" on a histogram; `snapshot_lock_overrides_total` is "labelled by principal"; per-share gauges state no rule; "any value is an audit event" names no stream | drop the shard label; drop the principal label — the override is an `admin` record (RFC 25 §4.1); "per share, under RFC 25's worst-n rule" on `snapshot_held_bytes` and `snapshot_history_bytes` |
-| [RFC 13 §8](rfc-13-configuration.md#8.%20Observability) | `config_generation` is labelled by record — one per share — and `config_secret_version` by reference — one per user secret | replace `config_generation` with RFC 23's `runtime_applied_generation{kind}`, read against the store's current generation per kind, and add `config_generation_lag_seconds{kind}`; replace `config_secret_version` with `config_secrets_behind`, a count; the `config_generation_behind` condition names the records |
-| [RFC 16 §8](rfc-16-metadata-store.md#8.%20Observability) | `metadata_txn_size{kind=entries\|bytes}` and `…_txn_limit` select a unit by label; "On fold, they follow RFC 25's conventions; until then they start `metadata_`" is stale | split into `metadata_txn_entries`, `metadata_txn_bytes` histograms and `metadata_txn_entries_limit`, `metadata_txn_bytes_limit` gauges; "Metric names follow RFC 25's conventions, under the prefix `metadata_`." |
 | [RFC 17 §7](rfc-17-vfs.md#7.%20Observability), §3.3 | `outcome` on `vfs_op_seconds` has no stated values, and the full error set would cost about 70,000 series; `vfs_events_dropped_total` is the sink's; §3.3 defines no `QuotaEvent`, and says "planned observability RFC" | "`outcome` = `ok`, `error` or `delay`; the error itself is counted in `vfs_errors_total{op, error}`"; remove the drop row, "events dropped are RFC 25's `events_dropped_total`"; add a `QuotaEvent` type with RFC 25 §4.2's quota fields; "belong to RFC 25" |
-| [RFC 19 §1.1](rfc-19-authorization.md#1.1%20Non-goals), §10 | "the planned RFC 25's"; "events dropped are RFC 7's" | link [RFC 25 §4](rfc-25-observability.md#4.%20Event%20streams); "events dropped are RFC 25's" |
-| [RFC 24 §5.1](rfc-24-resources.md#5.1%20No%20queue%20is%20unbounded), §2.2 | the events row's bound is "the stream's fixed buffer"; §2.2 does not list the rings as outside the pools | "access-audit, quota and logon events \| rings of 16,384, 4,096 and 4,096 entries of at most 1 KiB, allocated at start \| RFC 25 §4.4 \| dropped, counted, a gap record written"; add the event rings to §2.2's list |
-| [RFC 26 §7](rfc-26-catalog-backups.md#7.%20Observability) | `backup_newest_age_seconds` "per share" states no rule | "per share, under RFC 25's worst-n rule, with the oldest unlabelled" |
-| [RFC 27 §6](rfc-27-namespace-migration.md#6.%20Observability) | `namespace_owned` and `namespace_claim_copy_total` use RFC 7's prefix, `gc_claim_refusals_total` RFC 9's; `rehome_old_refs` per share states no rule | rename to `claim_owned`, `claim_copy_total` and `claim_gc_refusals_total`; worst-n for `rehome_old_refs` |
-| [RFC 15 §4.3](rfc-15-topology.md#4.3%20The%20route%20envelope) | the envelope has no trace context | add a row: "trace context \| the sender's trace ID, parent span ID and sampled flag ([RFC 25 §6.2](rfc-25-observability.md#6.2%20Propagation%20across%20nodes)); never part of the request ID" |
+| [RFC 24 §5.1](rfc-24-resources.md#5.1%20No%20queue%20is%20unbounded), [§2.2](rfc-24-resources.md#2.2%20What%20is%20outside%20the%20budget) | §2.2 and §5.1 list two rings and 20 MiB | add the `logon` ring, 4,096 entries, for three rings and 24 MiB |
+| [RFC 7 §8.2](rfc-7-namespace-metadata.md#8.2%20A%20delete%20on%20close%20is%20an%20ordinary%20unlink%2C%20later), [§11.2](rfc-7-namespace-metadata.md#11.2%20Observability) / [RFC 17 §7](rfc-17-vfs.md#7.%20Observability) | `namespace_deferred_unlink_refused_total` and `vfs_deferred_unlink_refusals_total` count one event (§2.7) | remove RFC 7's; link RFC 17's |
+| [RFC 21 §13](rfc-21-nfs.md#13.%20Observability) / [RFC 20 §10.1](rfc-20-adapters.md#10.1%20Metrics) | `nfs_replay_hits_total` duplicates `adapter_replay_hits_total{protocol}` | remove RFC 21's; link RFC 20's |
+| [RFC 22 §3.3](rfc-22-smb.md#3.3%20Sizes%20and%20credits), [§18](rfc-22-smb.md#18.%20Observability) / [RFC 20 §10.1](rfc-20-adapters.md#10.1%20Metrics) / [RFC 17 §7](rfc-17-vfs.md#7.%20Observability) | `vfs_held_calls`, `vfs_held_bytes`, `vfs_hold_pool_bytes` and `vfs_hold_refusals_total` are defined nowhere; RFC 17 §7 and RFC 24 §10 say held requests are RFC 20 §10.1's, which lists none | RFC 20 §10.1 adds `adapter_held_requests{protocol}`, `adapter_held_bytes{protocol}` and `adapter_hold_refusals_total{protocol}`; the hold pool's fill is RFC 24's `memory_pool_reserved_bytes{pool="hold"}`; RFC 22 uses those names |
+| [RFC 24 §5.1](rfc-24-resources.md#5.1%20No%20queue%20is%20unbounded), [§10](rfc-24-resources.md#10.%20Observability) | `work_items_dropped_total{source}`: the prefix `work_` has no owner, and the drop is decided by [RFC 8 §6.1.1](rfc-8-engine.md#6.1.1%20The%20shared%20work%20scheduler)'s scheduler | `engine_work_items_dropped_total{source}` in RFC 8 §14; RFC 24 links it |
+| [RFC 24 §10](rfc-24-resources.md#10.%20Observability) | `memory_pool_ceiling_bytes{pool}` is a ceiling not named by §2.2's `_limit` rule | `memory_pool_reserved_bytes_limit{pool}` (§2.2) |
+| [RFC 11 §13](rfc-11-ownership.md#13.%20Observability) | `shard_capacity_share` is a fraction without `_ratio` | `shard_capacity_ratio` |
+| [RFC 13 §8](rfc-13-configuration.md#8.%20Observability) | `config_provisioning_applied`: a hash is no gauge value and no fixed info label | `config_provisioning_applied_timestamp_seconds`; the hash goes in the node-status record ([RFC 23 §2.4](rfc-23-control-plane.md#2.4%20What%20a%20node%20reports)) |
+| [RFC 13 §8](rfc-13-configuration.md#8.%20Observability) | `format_supported_range`: one gauge cannot hold a range | `format_supported_min`, `format_supported_max` |
+| [RFC 8 §14](rfc-8-engine.md#14.%20Observability) | `engine_oldest_unoffloaded_seconds` breaks §2.2's age suffix | `engine_unoffloaded_oldest_seconds` |
+| [RFC 2 §2.3](rfc-2-carver.md#2.3%20What%20a%20pass%20makes%20observable) | `carver_chunk_size_bytes` buckets at a per-namespace `Target`, which one labelled vector cannot hold | the `size` set (§2.6); the average against `Target` is already `carver_bytes_total` ÷ `carver_chunks_total` |
+| [RFC 26 §7](rfc-26-catalog-backups.md#7.%20Observability) | `backup_folder_*` are "per block folder", with the label unnamed | label `location` |
+| [RFC 20 §10.1](rfc-20-adapters.md#10.1%20Metrics) | `adapter_requests_in_flight` spells what `vfs_inflight_calls` and `syncer_inflight_bytes` spell otherwise | `adapter_inflight_requests` (one rename instead of two) |
+| [RFC 20 §10.2](rfc-20-adapters.md#10.2%20Spans) | span names `nfs4 COMPOUND`, `SEQUENCE` | `adapter.nfs4.COMPOUND`, `adapter.nfs4.SEQUENCE` (§6.1) |
 
-Tables found to follow §2 as written: [RFC 2](rfc-2-carver.md#2.3%20What%20a%20pass%20makes%20observable),
-[RFC 4](rfc-4-remote-tier.md#4.12%20What%20a%20store%20makes%20observable),
+Tables found to follow §2 as written: [RFC 4](rfc-4-remote-tier.md#4.12%20What%20a%20store%20makes%20observable),
 [RFC 14](rfc-14-open-state.md#14.%20Observability),
-[RFC 15](rfc-15-topology.md#10.%20Observability),
-[RFC 18](rfc-18-identity.md#10.2%20Metrics),
-[RFC 20](rfc-20-adapters.md#10.%20Observability),
-[RFC 21](rfc-21-nfs.md#13.%20Observability),
-[RFC 22](rfc-22-smb.md#18.%20Observability) and
-[RFC 24](rfc-24-resources.md#10.%20Observability), with their histograms to take
+[RFC 15](rfc-15-topology.md#10.%20Observability) and
+[RFC 18](rfc-18-identity.md#10.2%20Metrics), with their histograms to take
 the `request` or `background` set of §2.6.
 
 ## 12. Conformance
