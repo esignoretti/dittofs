@@ -658,6 +658,12 @@ NFSv4.0/4.1 walk are
 > Write it, or route the confirm to the answering node, if mounts are seen
 > failing because confirms routinely land on another node.
 
+> ponytail: a front holds at most 4,096 `Unconfirmed` records, and 16 per
+> source address; past either a proposal is answered `ErrDelay`, charged to
+> RFC 24's connection-state pool. `Owner` is at most 1,024 bytes, the
+> protocols' own opaque limit. Both counts are proposals. Raise them if mounts
+> are refused below them.
+
 ### 2.10 Lock waiters
 
 ```go
@@ -800,6 +806,11 @@ files except each primary's stateid index and per-client index, which are taken
 after a file's step and only to add or remove an entry. `CheckIO` on a file
 with no entry is one map read and allocates nothing.
 
+> ponytail: a file's byte-range locks are a slice sorted by start, so a
+> conflict check and an insert are O(n) in the file's ranges. Replace it with
+> an interval tree when a profile shows that scan on a file holding more than
+> 1,024 ranges.
+
 **Who owns the table.** The table is the concrete `*openstate.Table` in the
 service's `Deps`, built and wired as
 [§11.1](#11.1%20Package%2C%20dependencies%20and%20wiring) says, and the only
@@ -841,7 +852,7 @@ or with an SMB lease ([§5](#5.%20Caching%20grants)).
 `protocol` nodes hold its sessions, and its state sits at many primaries; none of
 them alone sees all its activity. So exactly one node, the client record's
 `LeaseOwner`, renews and expires the client: each node that serves the client
-reports activity to it at most once per renewal interval, never per request, and
+reports activity to it at most once per **renewal interval**, never per request, and
 no primary expires a client on its own. When the lease owner expires the client,
 it releases the client's state at every shard its record names (§4.3). The lease
 owner is chosen when the record is created, among the nodes holding the client's
@@ -853,6 +864,11 @@ node makes to the store
 ([RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)).
 Without one owner, a primary that sees nothing from a client busy elsewhere
 expires it and revokes state the client is still using.
+
+> decision: the renewal interval is 10 s, a ninth of the lease: how often a
+> serving node reports a client's activity to its lease owner, and the longest
+> a cached `ClientStatus` is stale. It is a proposal, not measured; shorten it
+> if revoked-state flags are seen arriving late enough to matter.
 
 **The back channel has a home (cluster).** Recalls and notifications go out over
 the client's back channel, which one `protocol` node holds: the record's
@@ -948,10 +964,15 @@ grace still refuses it.
 ### 4.3 An expired lease releases everything it held, everywhere
 
 When a client's lease expires or its state is revoked, every open, deny mode,
-lock, lock waiter ([§2.10](#2.10%20Lock%20waiters)), grant, layout and watch it held **MUST** be released, in every view that records
-it, in the same step. State one protocol dropped and another still counts
-refuses conflicting requests against a holder that no longer exists, until a
-restart.
+lock, lock waiter ([§2.10](#2.10%20Lock%20waiters)), grant and watch it held
+**MUST** be released, in every view that records it. The release is a mark,
+not a scan: the client is marked ended at each primary under that primary's
+client index, and from then on every check treats its state as absent. The
+entries are then removed file by file, each under that file's step, from the
+per-client index, without blocking requests on other files. No request sees
+part of an ended client's state. State one protocol dropped and another still
+counts refuses conflicting requests against a holder that no longer exists,
+until a restart.
 
 **A share's removal or move ends its state.** `DropShare` ends every open,
 lock, lock waiter (NLM ones included), grant and watch under the share,
@@ -1259,6 +1280,13 @@ browse does), builds and version control in a home directory, single-user
 shares. They are never offered for files many clients share, and a client that
 never gets one still works.
 
+> decision: a file on which 16 clients already hold read grants is offered no
+> further grant, and a recall fan-out is sent from a per-primary queue of at
+> most 4,096 outstanding callbacks, never under the file's step. The
+> conflicting request is answered `ErrDelay` whether or not its recalls have
+> been sent. Both values are proposals; raise them if a measured workload
+> loses grants it would have used.
+
 ### 5.5 A client's grants are bounded
 
 Every grant is a table entry at a primary and a recall the primary may one day
@@ -1278,9 +1306,14 @@ on its files and keeps the count within a **grant budget** of 4096 per client:
   deadline like any other.
 
 A grant is **used** by every open, I/O or lock the primary admits under it; the
-primary orders each client's grants by last use, in memory. Recalling the oldest
+primary keeps a last-use time on each grant, written atomically at 1 s
+resolution on admission; at the budget it scans the client's grants for the
+oldest, once per recall batch. Recalling the oldest
 grant instead would take back the profile container or mailbox a session opened
 at sign-in and has used ever since, and keep the files it touched once.
+
+> ponytail: a scan of up to 4,096 timestamps per budget hit. Keep a per-client
+> LRU list if budget recalls appear in a profile.
 
 The count is the primary's alone and volatile: a client may hold up to the
 budget at each primary it reaches, and a new primary starts every count at zero.
@@ -1294,6 +1327,16 @@ budget at each primary it reaches, and a new primary starts every count at zero.
 > no traffic between nodes. Make the values settings
 > ([RFC 13](rfc-13-configuration.md)) if a workload is shown to lose throughput
 > at the budget, or a primary's memory is shown to be pressed below it.
+
+**Every other per-client count is bounded too.**
+
+> decision: each primary holds, per client, at most 16,384 opens, 65,536 lock
+> ranges, 4,096 lock owners and 1,024 waiters, proposed, settled with RFC 24's
+> M6. A request past one is refused `ErrDelay` (`DelayResources`) before it
+> changes anything; a close, unlock or cancel never is. The caps sit under
+> [RFC 24 §4.6](rfc-24-resources.md#4.6%20Open%20state)'s pool so one client cannot spend
+> another's share. Make them settings if a measured client is refused below
+> them.
 
 ## 6. A deny mode is checked at open
 
@@ -1343,6 +1386,9 @@ One table ([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)) makes 
 | an SMB open whose deny mode includes delete | an NFS `REMOVE` of a name of the file, or a `RENAME` of it or over it | refused, `ErrShareViolation`; checked per operation, as anonymous I/O is ([§6](#6.%20A%20deny%20mode%20is%20checked%20at%20open)) |
 | SMB opens that all share delete | an NFS `REMOVE` of the file's name | the name goes now; the opens keep the file alive until the last close ([§9.1](#9.1%20An%20open%20keeps%20a%20file%20alive)) |
 | a delete-pending file | an open, through either protocol | refused, `ErrDeletePending` ([§9.4](#9.4%20Delete%20on%20close)) |
+
+Each protocol's lock semantics — mandatory, stacking, owner-is-the-open — is
+one value per protocol; the matrix is a function of the two.
 
 A caching grant is recalled by the server in the holder's own protocol, whatever
 protocol caused the conflict ([RFC 17](rfc-17-vfs.md)'s callbacks).
@@ -1404,9 +1450,12 @@ so a durable open written anywhere else is a holder the release cannot see.
 
 Client records are held globally, not per shard, because one client's state spans
 many shards; the shard list in each is what scopes its reclaims. The list is
-written when the client first takes state in a shard, not per open, and is
-bounded: a client past the bound is recorded as holding state in every shard of
-the share, which widens its grace and never loses a reclaim.
+written when the client first takes state in a shard, not per open.
+
+> ponytail: the shard list is bounded by a fixed count, proposed 256. Past it
+> the client is recorded as holding state in every shard of the share, which
+> widens its grace and loses no reclaim. Raise the count if grace is measured
+> widened by it.
 
 **An imported client record merges by owner.** A namespace move's imported
 client record merges by (protocol, owner): a record the receiver holds keeps
@@ -2163,7 +2212,11 @@ with the client and file.
 2. **The cost of persistent opens**, unmeasured;
    [§13.3](#13.3%20Benchmarks) measures it.
 3. **Byte-range lock splitting** across protocols with different range
-   semantics (SMB's 64-bit ranges against NFS's end-of-file locks).
+   semantics (SMB's 64-bit ranges against NFS's end-of-file locks). Default:
+   every range is held as [offset, end] over 64 bits, an NFS length of all
+   ones or zero meaning to end of file; conflicts are computed on that form.
+   Open: whether a lock past 2⁶³ from an NFS client and an SMB one must ever
+   meet.
 
 ## Appendix A — prior art
 
