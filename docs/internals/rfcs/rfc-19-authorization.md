@@ -1204,30 +1204,45 @@ without inherit flags out of that case.
 Metric names are shown without the `dittofs_` prefix the exporter adds
 ([RFC 25 §2.1](rfc-25-observability.md#2.1%20Names)). Decision counts and
 latency are the filesystem service's; events dropped are RFC 25's
-`events_dropped_total`.
+`events_dropped_total`. Access events are counted by RFC 25's
+`events_records_total{stream="access"}`; a record's `selected_by` says whether
+the policy or an entry selected it.
 
 | Answers | Metric | Type |
 | --- | --- | --- |
 | ACL sets refused, and why (`kind`, `principal`, `limit`, `deny_unmatched`) | `acl_set_refused_total{protocol, reason}` | counter |
-| mask or flag bits cleared on a set (§2.4, §2.5) | `acl_bits_cleared_total{protocol, field}` | counter |
+| what a set had cleared or replaced to fit the model (§2.4, §2.5, §2.6, §5.2) | `acl_set_normalised_total{protocol, kind}`: `mask_bit`, `entry_flag`, `deleted_principal`, `null_dacl` | counter |
 | reads spelled with a SID fallback `who` (§5.2) | `acl_who_sid_fallback_total` | counter |
 | decisions refused by the share ceiling and not by the file | `acl_ceiling_refusals_total` | counter |
-| access events selected by audit entries | `acl_audit_selected_total{outcome}` | counter |
 
-`acl_bits_cleared_total` and `acl_who_sid_fallback_total` are not errors; a
+`acl_set_normalised_total` and `acl_who_sid_fallback_total` are not errors; a
 sudden rise names a client sending what the model does not hold, or principals
 RFC 18 cannot name. No metric carries a share or principal label
 ([RFC 7 §11.2](rfc-7-namespace-metadata.md#11.2%20Observability)).
+
+The chokepoint
+([RFC 7 §7.1](rfc-7-namespace-metadata.md#7.1%20One%20chokepoint)) increments
+the decision counters, since it makes the decision. The adapter increments the
+set and spelling counters from what the translation returns (§5.1). This RFC
+opens no span ([RFC 25 §6.1](rfc-25-observability.md#6.1%20Spans)), and a
+refusal is expected and logs at `Debug`.
 
 ## 11. Conformance
 
 Tiers are the harness's ([index](rfc-index.md#Test%20tiers)). Each row runs
 through both adapters on the composed node unless it names one, so the check
-sits at the consumer of the translation, not beside it.
+sits at the consumer of the translation, not beside it. `ACLFromDescriptor`
+parses client bytes, so it is a decoder under
+[RFC 20 §5.4](rfc-20-adapters.md#5.4%20How%20codecs%20are%20tested): golden
+vectors and a fuzz target. `ACLFromNFSv4` is fuzzed over generated entries.
+Neither panics, and a refused input returns `ErrInvalid`, or the lookup's error,
+and nothing else. A row that names a Windows server is a wire test of
+[RFC 20 §8](rfc-20-adapters.md#8.%20Wire%20tests), run against its reference
+server.
 
 | § | Check |
 | --- | --- |
-| §4.2 the two identities | For every nine-bit mode `m` and two owners, assert `ACLFromMode(m).Mode(o) == m`. For a generated corpus of ACLs — named users and groups, entries naming the owner, denies before and after allows, inherit-only and both-flag entries, owner rights — and each of two owners `o`, assert `a.WithMode(a.Mode(o), o)` grants every caller of a fixed population exactly what `a` grants. A `Mode` reading the group class from `GROUP@` alone fails the second on the first ACL holding a named allow. |
+| §4.2 the two identities | **Unit**, on the functions: for every nine-bit `m` and both file types `d`, assert `ACLFromMode(m, d).Mode(o) == m`. For a generated corpus of ACLs — named users and groups, entries naming the owner, denies before and after allows, inherit-only and both-flag entries, owner rights — and each of two owners `o`, assert `a.WithMode(a.Mode(o), o, d)` grants every caller of a fixed population exactly what `a` grants. A `Mode` reading the group class from `GROUP@` alone fails the second on the first ACL holding a named allow. **Through both adapters**: on a 0750 directory alice owns with an allow for `builders`, run `chmod $(stat -c %a d) d` over NFS, then read the descriptor over SMB: assert the ACL unchanged and `builders` still granted. |
 | §4.2, §4.3 the group bits are a mask | On a file owned by alice, group `staff`, set the ACL `allow bob READ_DATA`: assert `Mode` is 0040. `chmod` it to its own mode over NFS: assert a member of `staff` other than bob is still refused read, and the stored ACL unchanged. Set the same ACL on a file bob owns: assert `Mode` is 0400. A merge that adds `GROUP@` for the group bits fails the first; a `Mode` that ignores the owner fails the second. |
 | §4.1 shown is evaluated | On a 0640 file with no stored ACL, query the descriptor over SMB and `acl` over NFSv4: assert both are `ACLFromMode(0640)`, and that each listed principal is granted exactly what its entry says. On 0604: assert a group deny is shown and a group member is refused read over both. |
 | §2.8, §6.4 no partial set | Set over SMB a DACL holding a callback deny for bob and an allow for everyone; assert the set is refused and the stored ACL unchanged, and bob's read still refused or granted as before. Repeat with an object allow, and with 129 entries. |
@@ -1242,7 +1257,16 @@ sits at the consumer of the translation, not beside it.
 | §3.5 system security | As a file's owner without `admin`: SMB query of the SACL is `STATUS_PRIVILEGE_NOT_HELD`, NFS `sacl` is refused. As an `admin` over AUTH_SYS, where `admin` is never set: refused. As an authenticated `admin`: both succeed, and an SMB open asking `ACCESS_SYSTEM_SECURITY` is granted with the right in its grant; `MAXIMUM_ALLOWED` alone does not include it. Under an admission narrowed to read-only, as that `admin`: the open asking it is granted, a SACL query and a `sacl` `GETATTR` succeed, and a SACL set and a `sacl` `SETATTR` are refused. A build intersecting the right with the ceiling fails the open. |
 | §7.1, §7.4 attributes | `SETATTR` of `acl` and `dacl` together: refused. `SETATTR` of `mode` 04750 with an `acl`: assert the ACL stored as sent, setuid set, and `Mode` the ACL's own bits. |
 | §4.4 inheritance | Each row of §4.4's table, over both protocols and against a Windows server. A set with the auto-inherit request on a child whose parent changed: assert the child's inherited entries recomputed and its explicit ones kept; assert its siblings unchanged. |
-| §2.3 kinds | A user entry for a principal whose UID equals a group's GID: assert a member of that group is not matched. |
+| §2.3 kinds | A user entry for a principal whose UID equals a group's GID: assert a member of that group is not matched. This is Appendix B's regression: it fails against a matcher of `<number>@localdomain`. |
+| §2.7 stored order | Over SMB set `allow EVERYONE@ write data`, then `deny bob write data`: assert bob granted write over both protocols, and both reads return that order. A build that canonicalises fails. |
+| §6.1 owner SID | Set an owner SID no principal holds together with a DACL: assert `ErrInvalid` and the DACL unchanged. |
+| §3.1 order | An immutable file in a directory granting bob delete a child: assert bob's delete refused. |
+| §5.2 deleted principal | Delete a user named in a deny; read over NFS and SMB: assert the entry spelled with the null SID. Write back what was read: assert accepted, the entry gone, and `acl_set_normalised_total{kind="deleted_principal"}` up by one. |
+| §2.6 null DACL | Set a null DACL: assert everyone granted, and one allow-everyone entry read back. |
+| §2.8 lookup failure | Fail the principal lookup once, with an error other than `ErrUnknownPrincipal`, during an SMB set naming a SID: assert the set refused with that error, not `ErrInvalid`, and the stored ACL unchanged. |
+| Z1, §2.4 masks | Set over NFSv4 an allow whose mask holds generic read, `0x200`, `0x01000000` and a reserved bit: assert the stored mask is generic read's entry rights only, and the clearing counted. |
+| Z9 | For every principal kind RFC 18 can mint, and every well-known row, read a one-entry ACL over both protocols: assert no error and no entry missing. |
+| Z11 | Set a directory's DACL over SMB with the auto-inherit request, and its `acl` over NFSv4: assert every child's `Version` unchanged. |
 
 **What must not stand in.** A round trip through the translation alone, without
 the store between the write and the read, is not evidence for Z8: it proves only
