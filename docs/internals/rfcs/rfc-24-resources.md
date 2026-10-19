@@ -557,8 +557,10 @@ reply's wait never waits on a receive reservation (§2.6).
 
 ### 3.4 The per-connection cap for protocols without flow control
 
-Where the protocol has no flow control of its own — NFSv3, NFSv4.0 and
-NFS's auxiliary services (MOUNT, NLM, NSM) and the port mapper — the per-connection cap of
+Where the protocol has no flow control of its own — NFSv3, NFSv4.0,
+NFS's auxiliary services (MOUNT, NLM, NSM) and the port mapper — and on every
+NFS connection, since the minor version and slot are known only after the
+arguments are decoded, the per-connection cap of
 [RFC 20 §6.3](rfc-20-adapters.md#6.3%20Flow%20control%20is%20the%20protocol%27s%20own)
 is **64 requests in flight**, fixed: the same as one NFSv4.1 session's fore
 channel ([RFC 21 §3.1](rfc-21-nfs.md#3.1%20Slot%20tables)), so a connection
