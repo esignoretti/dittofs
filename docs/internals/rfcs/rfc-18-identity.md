@@ -88,8 +88,9 @@ With this RFC:
 2. Every cache of who the caller is keys on what was proved — the flavour, the
    Kerberos name, the SIDs — never on a uid alone (§7.1). bob's call misses
    alice's entry.
-3. The conformance suite signs two principals in with the same uid and asserts
-   that each gets only its own groups (§11).
+3. The conformance suite signs alice in over Kerberos, sends her uid from
+   another host over `AUTH_SYS`, and asserts that the second caller gets none
+   of her groups (§11).
 
 ![From a credential to the caller: the adapter runs the handshake, calling the authentication interface, which verifies the credential and binds it to a principal, and hands the service an Identity holding only what was proved; the service re-reads that principal, or maps an AUTH_SYS uid through the store's protocol-ID index, admits it to the share, squashes it — or an unlinked machine — if the policy says so, resolves its share grant, and sets authenticated, admin and privileged; the chokepoint reads the caller](img/rfc18-resolution.svg)
 
@@ -149,8 +150,8 @@ current code differs.
    checks its times and addresses, and verifies the ticket's PAC — the
    Windows group list the domain controller signed (§3.4).
 2. The proof is `alice@CORP.EXAMPLE`, Kerberos, her SID and twelve group SIDs.
-   Before returning it, `AcceptKerberos` maps the name through the store's
-   `krb` index to alice's principal (§4.2) and binds the proof to it (§3.1).
+   Before returning it, `AcceptKerberos` maps the name by §4.2's order to
+   alice's principal and binds the proof to it (§3.1).
    The adapter keeps it with the session's keys.
 3. Her first `CREATE` on `profiles` carries an `Identity` built from that
    proof. The service re-reads alice's record — not disabled — and maps her
@@ -184,9 +185,12 @@ server with `root_squash`.
    20 minutes — the 5-minute TTL plus a 15-minute grace — are served from the
    cache (§5.3). Kerberos keeps working for them: the
    tickets were issued earlier and verify against the keytab alone.
-3. A user the node has never resolved, or resolved too long ago, is refused —
-   `STATUS_LOGON_FAILURE` — and the refusal is counted
-   (`identity_directory_refusals_total`). Nobody is let in as a guest.
+3. A user the node has never resolved, or resolved too long ago, is refused
+   with the protocol's logon failure — `STATUS_LOGON_FAILURE` over SMB, as
+   every sign-in error is answered
+   ([RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity)) — and the refusal is
+   counted (`identity_directory_lookups_total{result="refused"}`). Nobody is
+   let in as a guest.
 
 Outcome: known users keep working for a bounded time; nobody new gets in
 until the directory answers.
@@ -342,20 +346,21 @@ The schemes are:
 > `AUTH_SYS` admission, an NFSv3 attribute, a cache key — and that is the bug
 > the opening example walks through. The cost is that an operator who creates
 > a user without a uid sees a number they did not choose; they may change it
-> before the user owns anything. Revisit never: the alternative is the bug.
+> before the user owns anything. Overturned only by a client protocol that
+> must derive a uid from another spelling and cannot be given an allocated one.
 
 **Changing a spelling.** An operator **MAY** change a user's uid or a group's
 gid. The change writes the record and its index rows in one transaction and
 touches no file. Over NFS the principal's files then show the new number;
 `AUTH_SYS` clients that still send the old one act as whoever now holds it, or
 as anonymous (§4.3). A SID **MUST NOT** change once the principal has one:
-it is what Windows clients cache and store in their own ACLs.
+it is what SMB clients cache and store in their own ACLs.
 
 ### 2.4 Machine principals
 
 A machine principal is a host or service signing in for itself: the
 `host/build01.corp.example@CORP.EXAMPLE` or `nfs/build01…` name an NFS client
-uses for its lease and state operations, or a Windows machine account
+uses for its lease and state operations, or an SMB client's machine account,
 `BUILD01$@CORP.EXAMPLE`.
 
 - A Kerberos name whose first component is a service name (`host`, `nfs`,
@@ -410,8 +415,8 @@ nested groups included, and the groups a directory or a verified PAC reports
 
 > decision: a principal over the group cap is refused, not truncated. A
 > truncated group list is a wrong answer that looks right, and it can drop the
-> group a deny entry names. 1 024 sits just above what a Windows token carries
-> by default, so a real account rarely meets it. Raise the default, or make
+> group a deny entry names. 1 024 sits at the SID limit of a directory-issued
+> access token (Appendix A), so a real account rarely meets it. Raise the default, or make
 > the cap per share, when a deployment shows accounts above it.
 
 ### 2.6 Components, wiring and lifecycle
@@ -551,7 +556,8 @@ type NTLMAuthenticate struct{ User, Domain, Workstation string; NTResponse, Encr
   Kerberos name by §4.2, an NTLM pass-through proof by its verified user SID
   (§4.4), never by its `DOMAIN\user` name. A proof that maps to no principal
   fails as §3.3 and §3.5 say. Every call on that security context then acts
-  as that `PrincipalID`: resolution re-reads its record on every call and
+  as that `PrincipalID`: resolution checks the principal's record on every
+  call, through the cache keyed on the principals generation (§7.2), and
   refuses it if disabled or deleted (§3.7), and **MUST NOT** map the name
   again. A name later linked to, or re-used by, another principal reaches the
   new one only through a fresh authentication.
@@ -573,10 +579,6 @@ type NTLMAuthenticate struct{ User, Domain, Workstation string; NTResponse, Encr
   success or failure with its error, the flavour, the principal name as
   presented and the principal mapped on success, and the client address. It
   **MUST NOT** carry the credential — no response, ticket, hash or session key.
-- **Bearer tokens** are not accepted: no NFS or SMB client presents one. When a
-  client protocol does, a `VerifyToken` is added to this interface returning a
-  `Proof`; no adapter changes beyond the one that carries the token
-  ([RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity)).
 
 > ponytail: throttling is in memory, per node. A restart forgets it, each
 > `protocol` node counts alone, and a guesser who spreads one name across many
@@ -611,8 +613,7 @@ wire answer).
 
 **Supplementary groups past 16.** `AUTH_SYS` cannot carry more than 16. A
 share whose `ExportPolicy` sets `ManageGIDs` replaces the credential's gids
-with the closure of the mapped principal's memberships (§2.5), as a Linux
-server's `--manage-gids` does: the principal is found by uid, and the gids sent
+with the closure of the mapped principal's memberships (§2.5): the principal is found by uid, and the gids sent
 are discarded. Without it, the gids sent are the caller's groups.
 
 > decision: `ManageGIDs` is off by default. With it on, a principal's groups
@@ -643,6 +644,12 @@ Both call `AcceptKerberos`.
   Kerberos implementations use), the authenticator's freshness against a
   replay cache held in the node's memory, and, over SMB, the client-address
   rule [RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in) states.
+
+> ponytail: the replay cache is in memory, per process. A restart forgets it, so an AP-REQ captured within
+> `identity.clock_skew` before a restart can be accepted once after it, and **(cluster)** each `protocol` node
+> keeps its own. A replay yields no session key, so it can sign no SMB request and compute no RPCSEC_GSS
+> verifier. Refuse authenticators stamped before the process start, or share the cache between nodes, when a
+> replay across a restart or a fail-over is shown to reach anything.
 - **The name.** The proof's `Name` is the ticket's client name and realm,
   exactly as the ticket spells them. Mapping it to a principal is §4.2's, done
   once, at sign-in (§3.1).
@@ -660,13 +667,18 @@ Both call `AcceptKerberos`.
 
 ### 3.4 The PAC
 
-A Kerberos ticket from Active Directory carries a PAC: the user's SID, its
+A Kerberos ticket from a directory that issues PACs (MS-PAC) carries one: the
+user's SID, its
 group SIDs and their attributes, signed by the domain controller.
 
 - The PAC's server signature **MUST** verify under the service key before any
   SID in it is used. A PAC that does not verify **MUST** fail the
   authentication; a ticket without a PAC is accepted, with groups then read
   from the store and the directory (§2.5).
+
+> decision: only the PAC's server signature is verified; the KDC signature is not sent to a domain controller.
+> A forged PAC needs the service key, which the keytab's seal protects. Overturned if the keytab is ever readable
+> outside the `protocol` role, or a deployment requires KDC-signature checks.
 - The proof's `SIDs` are the user SID and every group SID the PAC lists:
   its group memberships, extra SIDs and resource groups, excluding any whose
   attributes mark them disabled and any marked `SE_GROUP_USE_FOR_DENY_ONLY`.
@@ -700,7 +712,10 @@ NTLMv1 and LM are refused ([RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in)).
   whatever its password. Turning NTLM
   off **MUST** delete every stored NT hash, since an NT hash is equivalent to
   the password for NTLM. Turning it on again stores a hash only at a user's
-  next password set.
+  next password set. The deletion runs as an operation in bounded batches
+  ([RFC 23 §4.6](rfc-23-control-plane.md#4.6%20Long-running%20operations)); the
+  authenticator refuses NTLM from the setting's commit (§2.6), so a hash not
+  yet deleted is never read.
 - A local user with no NT hash **MUST** fail `ErrLogonFailure`; it never falls
   through to pass-through or to anonymous.
 - The NTLMv2 session key is weaker than a Kerberos one. Which shares may be
@@ -709,15 +724,13 @@ NTLMv1 and LM are refused ([RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in)).
   where `ntlm` is a flavour like `krb5`.
 
 > decision: NTLM is on by default. Workgroup deployments with local users have
-> no KDC, and macOS and Linux SMB clients outside a domain fall back to NTLM.
+> no KDC, and SMB clients outside a domain fall back to NTLM.
 > A deployment that has Kerberos everywhere turns it off, which also removes
 > every NT hash from the store. Revisit the default once local users are shown
 > to be rare.
 
-> ponytail: one directory, one domain for pass-through. A message naming a
-> trusted domain of the directory's forest is refused. Follow trusts — find
-> the domain's controller and route the pass-through there — when a
-> deployment shows users from a second domain signing in with NTLM.
+> ponytail: pass-through reaches only the one directory's domain;
+> §5.1's ponytail says when to follow trusts.
 
 ### 3.6 Anonymous and guest sessions
 
@@ -756,7 +769,7 @@ no user, or a guest one, naming the guest account.
 
 ## 4. Identity mapping
 
-![The mapping triangle: a principal's minted ID at the centre, joined to its uid or gid, its SID and its names — user name, Kerberos name, owner@domain — each spelling stored once with the record and as one index row back to the principal; from wire to principal through the index, from principal to wire through the record; a spelling with no principal behind it maps to anonymous for AUTH_SYS, refusal for a name, and an unknown SID for a SID](img/rfc18-mapping.svg)
+![The mapping triangle: a principal's minted ID at the centre, joined to its uid or gid, its SID and its names — user name, Kerberos name, owner@domain — the uid or gid and the SID stored with the record and indexed back, the user name indexed by name, and the Kerberos name and owner@domain derived from the name unless a krb row links one; from wire to principal through the index, from principal to wire through the record; a spelling with no principal behind it maps to anonymous for AUTH_SYS, refusal for a name, and an unknown SID for a SID](img/rfc18-mapping.svg)
 
 ### 4.1 Two directions, one mapping
 
@@ -857,7 +870,7 @@ A name with a service part (`nfs/build01`) never matches step 2 or 3.
   API-only account (§8). A local
   principal's SID is the installation's domain SID followed by a RID drawn
   from the RID counter (§2.3). A directory principal's SID is the directory's
-  when its entry has one, as Active Directory's always do; an entry with none —
+  when its entry has one; an entry with none —
   an RFC 2307 directory that holds no Windows attributes — is given a local
   SID, allocated so, when its principal is minted, and keeps it whatever the
   directory later says (ID4).
@@ -877,11 +890,18 @@ A name with a service part (`nfs/build01`) never matches step 2 or 3.
   naming a user of a domain the installation does not know — is
   `ErrUnknownPrincipal` from `Find`. What a set of such a descriptor does is
   [RFC 19 §2.8](rfc-19-authorization.md#2.8%20What%20a%20stored%20ACL%20may%20hold)'s:
-  the whole set is refused, until a principal is minted for such a SID. A SID of the directory's domain is
-  resolved through the directory first, and minted as a directory principal if
-  it names a user or group there (§5).
+  the whole set is refused, until a principal is minted for such a SID.
+  A SID of the directory's domain is resolved through the directory first. `Find` mints it as a directory
+  principal only for a caller whose `Identity` is authenticated (§6.5); for any other caller it answers
+  `ErrUnknownPrincipal` and writes nothing.
+
+> decision: a lookup by an unauthenticated caller never mints. `lsarpc` runs on `IPC$`, which an anonymous
+> session reaches ([RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in)), so minting there would let a caller that
+> proved nothing write one record per directory account. Overturned if an anonymous client is shown to need a
+> stable principal for a SID it only reads.
+
 - **A principal shown over SMB with no SID** — only a deleted one — is shown
-  as the null SID `S-1-0-0`, which Windows displays as such.
+  as the null SID `S-1-0-0`.
 
 > decision: a deleted principal is shown as the null SID, not as the SID it
 > had, because deleting a user drops its index rows
@@ -918,7 +938,7 @@ decides the mapping
 ### 4.6 Names
 
 - User and group names are compared case-insensitively, under simple Unicode
-  case folding, as Windows and Active Directory compare them, and **MUST** be
+  case folding, and **MUST** be
   unique under that comparison within their kind.
 - A user and a group may share a name
   ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer));
@@ -927,18 +947,21 @@ decides the mapping
   ([RFC 22 §5.2](rfc-22-smb.md#5.2%20IPC%24%20and%20the%20RPC%20services))
   spell a local principal as `<NetBIOS name>\<name>` and a directory one as
   `<directory domain>\<name>`. A SID that maps to no principal is answered as
-  unknown, with the raw SID, as Windows servers answer it.
+  unknown, with the raw SID.
 
 ## 5. Directory integration
 
 ### 5.1 What a directory provides
 
-A directory is one external source of users and groups — Active Directory, or
-another LDAP server with RFC 2307 attributes — named by the installation's
+A directory is one external source of users and groups — an LDAP directory
+with Windows attributes (MS-ADTS), or one with RFC 2307 attributes — named by the installation's
 directory record (`identity.directory`: its address, base, bind credential
 reference, realm, NetBIOS domain and §4.3's mode). There is at most one.
 
-A directory answers four questions, each by one bounded query:
+A directory answers four questions, each by a bounded number of queries, every
+one under `identity.directory_timeout`; a nested-group closure the directory
+cannot answer in one query is walked level by level, and one that cannot be
+finished fails whole (§2.5):
 
 | Question | Asked when |
 | --- | --- |
@@ -949,10 +972,13 @@ A directory answers four questions, each by one bounded query:
 
 - A directory principal's **record** is minted once, from the first answer,
   and holds its `PrincipalID`, name, SID, uid and gid from then on (§4.3).
-  Later answers update its name and enabled state; they never change its
+  Later answers update its name; they never change its
   `PrincipalID`, SID, uid or gid. An entry the directory gives no SID or no
   uid gets one allocated as §4.3 and §4.4 say, so a directory without Windows
   or without Unix attributes still yields principals that satisfy ID3.
+- A mint that loses the race for a spelling's protocol-ID row, which the store
+  refuses to give a second holder (§2.2), reads the principal that won and
+  binds to it. It never retries with a fresh `PrincipalID`.
 - A directory principal's **groups and enabled state** are not written to the
   store. They are cached (§5.2), so a change in the directory takes effect at
   the next lookup.
@@ -961,15 +987,18 @@ A directory answers four questions, each by one bounded query:
   **MUST** use TLS; a directory record that asks for plain LDAP is refused at
   validation.
 
-> ponytail: one directory, read directly over LDAP. No forest trusts, no
-> global catalogue, no second directory. Add them when a deployment has users
-> in two forests.
+> ponytail: one directory, read directly over LDAP: no forest trusts, no
+> global catalogue, no second directory; NTLM pass-through and SID lookups
+> reach only its domain (§3.5). Follow trusts, and route pass-through to the
+> trusted domain's controller, when a deployment has users in a second domain
+> or forest.
 
 ### 5.2 The directory cache
 
 ![Directory lookup: a lookup first checks the node's cache; an entry younger than the TTL is used; an older one triggers a directory query; when the directory answers, the entry is refreshed, or a not-found answer is cached briefly; when it fails or times out, an entry younger than the stale grace is used and counted, and anything else is refused](img/rfc18-directory.svg)
 
-Each `protocol` node keeps one cache of directory answers, in memory.
+The identity server keeps one cache of directory answers, in memory;
+**(cluster)** one per `protocol` node.
 
 - A positive answer is fresh for `identity.directory_ttl` (default
   5 minutes). A "no such entry" answer is fresh for
@@ -983,13 +1012,16 @@ Each `protocol` node keeps one cache of directory answers, in memory.
 - The cache's key is the question: (directory, scheme, spelling) for "who is
   this", the principal for "what are its groups".
 
+> ponytail: **(cluster)** one directory cache per node, so N nodes ask N times. Share answers through the
+> metadata store when the directory's query rate shows it.
+
 ### 5.3 What a stale entry may grant
 
 When the directory fails or times out:
 
 - an entry whose last successful answer is no older than the TTL plus
   `identity.directory_stale_grace` (default 15 minutes) **MAY** be used, and
-  each use is counted (`identity_directory_stale_total`);
+  each use is counted (`identity_directory_lookups_total{result="stale"}`);
 - anything else **MUST** be refused: a lookup with no entry, or with one older
   than that, fails with `ErrUnavailable`, and a sign-in that needed it fails.
 
@@ -1165,6 +1197,10 @@ in this order, stopping at the first that matches:
 > cost is that a user granted `read` alone misses a group's `read-write`.
 > Revisit if operators are shown to expect group grants to widen a user's.
 
+> ponytail: step 2 reads one grant per group, up to `identity.max_groups` point reads
+> on a cache miss. Read the share's grant list once, under its grant-list version, when a profile shows misses
+> dominated by grant reads.
+
 ### 6.5 What the flavour proved: authenticated, admin, privileged
 
 [RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)
@@ -1198,7 +1234,7 @@ the value was derived from:
 | --- | --- |
 | proof → principal | the flavour, the proof's whole `Name`, the proof's bound principal, every SID in the proof with whether it is deny-only, and for `AUTH_SYS` the uid, gid and every supplementary gid |
 | principal → groups | the principal, and for `AUTH_SYS` the credential's gids and the share's `ManageGIDs` |
-| caller, per share | all of the above, the share, `ExportPolicy.Version`, the share's grant-list version, the flavour and Kerberos level, and the principals generation (§7.2) |
+| caller, per share | all of the above, the share, `ExportPolicy.Version`, the share's grant-list version, the flavour and Kerberos level, and the principals generation (§7.2); the admission result's key is RFC 17 §4.9's, which carries every field of this row |
 | directory answers | the question (§5.2) |
 
 - **Two proofs that share every numeric ID never share an entry.** Two
@@ -1231,8 +1267,11 @@ the same transaction: the `PGEN` key, kind 0x3B
 ([RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)). Every cached mapping and caller carries the generation
 it was built under.
 
-- A node **MUST** read the principals generation at least once a second, and
-  stop serving entries built under an older one.
+- The runtime reads the principals generation once a second
+  ([RFC 23 §2.3](rfc-23-control-plane.md#2.3%20The%20runtime%20reconciles%3B%20it%20does%20not%20take%20orders))
+  and hands each new value to the identity server (`Apply`, §2.6), which does
+  not poll the store itself. An entry built under an older generation is not
+  served after the `Apply` that delivers the new one.
 - Grant and export-policy changes carry their own versions, already in the
   caller's key, and take effect at the next call.
 
@@ -1276,20 +1315,13 @@ and grants. Their sign-in — passwords, tokens, roles, sessions — is
   its next password set (§3.5).
 - An API user and a file principal **MAY** be one `User` record, sharing a
   name and password; the API reads its role, and file access reads its grants.
-  A password change updates the NT hash with it while NTLM is on (§3.5): the
-  API's node, a `storage` node, seals the NT hash under the public half of the
-  `protocol` wrapping key, which a storage-only node cannot open, and the password hash under
-  the `storage` key, which only the API's sign-in verifies
-  ([RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)).
+  A password change updates the NT hash with it while NTLM is on (§3.5);
+  which wrapping key seals each is
+  [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)'s.
 
-> decision: the two are kept apart by rule, not by separate records. One
-> record per person is what operators expect, and a separate store would
-> double every lookup. What must never happen is the API's administrator
-> reading every file because it was made root for convenience.
-> [RFC 23 §5.1](rfc-23-control-plane.md#5.1%20API%20accounts%20are%20principals%20with%20a%20role) answers the case this left open: a
-> service account with tokens only is a principal with no spellings, not a
-> second kind of user. Revisit if an API account is ever needed that is not a
-> `User` record.
+> decision: API users and file principals are one `User` record kept apart by rule: a role is never read by
+> resolution, and an account with no spelling cannot sign in over a file protocol. Overturned if an API account
+> is needed that is not a `User` record.
 
 ## 9. Failure modes
 
@@ -1420,6 +1452,8 @@ The deferrals of §3.5, §4.3, §4.4, §5.1 and §7.2 are recorded at their mark
 - **Windows** builds an access token from the PAC at sign-in, so group changes
   apply at the next sign-in; it maps a failed sign-in to no session unless the
   Guest account is enabled, which current Windows releases disable by default.
+- **Windows** caps an access token at 1 024 SIDs, so an account in more groups than
+  about 1 015 cannot sign in; §2.5's default sits at that limit.
 - **MS-PAC** defines the server and KDC signatures; a file server verifies the
   server signature with its own key and may ask a domain controller to verify
   the KDC signature.
