@@ -742,7 +742,7 @@ everything else its client holds when the client's lease expires or its state is
 revoked
 ([§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere)),
 or, for NLM, when its host restarts ([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)),
-or when `DropShare` ends its share (§11).
+or when `DropShare` ends its share (§4.3).
 Nothing else ends it: an adapter **MUST NOT** impose a timeout of its own, and a
 waiting request is exempt from the per-call deadline
 ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values)), since it
@@ -953,6 +953,20 @@ it, in the same step. State one protocol dropped and another still counts
 refuses conflicting requests against a holder that no longer exists, until a
 restart.
 
+**A share's removal or move ends its state.** `DropShare` ends every open,
+lock, lock waiter (NLM ones included), grant and watch under the share,
+without a recall or a wait for the holder: for a share being removed
+([RFC 16 §2.3](rfc-16-metadata-store.md#2.3%20Server-wide%20and%20control-plane%20entities)),
+and at a namespace move's release for each moved share
+([RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)),
+whose FileIDs a move back would meet again. Each is reported through `Revoked`
+as `RevokedShare`, with the move's address for a moved share
+([RFC 17 §3.2](rfc-17-vfs.md#3.2%20Callbacks)), and its records go with it, so
+a later stateid of the share resolves to nothing and is answered bad, with no
+revoked-state flag left to clear; a blocked lock or a pending change
+notification is answered rather than left waiting. It starts no §5.3 no-grant
+period for the client, and runs whether or not the shard is in grace.
+
 ### 4.4 Grace is per shard
 
 Every open-state operation reaches the file's primary
@@ -1108,7 +1122,8 @@ When another client opens the file in a conflicting way, the server **recalls**
 server as ordinary writes and locks as ordinary lock requests, drops or
 downgrades its cache, and acknowledges (NFS `DELEGRETURN`, SMB a break
 acknowledgement). The conflicting request **MUST NOT** hold a worker while it
-waits: it is answered with `ErrDelay` — NFS `DELAY` or `JUKEBOX`, an SMB pending
+waits: it is answered with `ErrDelay`, carrying its cause, `DelayRecall`
+([§11](#11.%20Interface)) — NFS `DELAY` or `JUKEBOX`, an SMB pending
 reply completed later — and proceeds once the acknowledgement arrives or the
 recall is revoked.
 
@@ -1826,95 +1841,111 @@ timers.
 
 ### 11.3 Methods
 
+Methods are grouped by area, and each area names where it runs. Every call
+names its client, and the primary refuses one that names another client's
+state ([§10](#10.%20Shard%20placement)).
+
 ```go
+// Clients — at the client's lease owner, the front (RFC 17 §2.2).
+Propose(ctx, c Client) (Proposal, error)                        // §2.9; changes no state
+Connect(ctx, c Client, p *Proposal) (ClientID, error)           // §2.1; nil p for SMB and NLM; a new verifier under a known owner is a reboot, an NLM restart notice included
+CreateSession(ctx, c ClientID, seq uint32, reply []byte) ([]byte, error)
+Renew(ctx, c ClientID) (ClientStatus, error)
+Expire(ctx, c ClientID) error                                   // releases everything; the record goes (§4.3)
+Revoke(ctx, c ClientID) error                                   // releases everything; keeps the record, sessions and revoked set (§5.3)
+Destroy(ctx, c ClientID, by Principal) error                    // ErrClientBusy while a session or state remains; releases nothing
+Rebind(ctx, c ClientID, node NodeID) error                      // clears PathDown; node is (cluster)
+
+// Per-file — at the file's primary.
+Open(ctx, c ClientID, f FileID, r OpenRequest) (OpenResult, error)
+Reconnect(ctx, c ClientID, id Identity, o OpenID, m ReconnectMatch, s SessionRef) (Open, error)
+Downgrade(ctx, c ClientID, o OpenID, access, deny Access) error
+ConfirmOpen(ctx, c ClientID, o OpenID, seq uint32) error
+SetDisposition(ctx, c ClientID, o OpenID, delete bool) error
+SuspendTimes(ctx, c ClientID, o OpenID, suspend, resume TimeMask) error
+Close(ctx, c ClientID, o OpenID) (CloseResult, error)           // CloseResult{Orphan bool; Unlink *PendingUnlink}: open state never unlinks; the service runs it
+Flushed(ctx, c ClientID, o OpenID, loss uint64) error
+Disconnect(ctx, c ClientID, s SessionRef) error                 // closes the session's volatile opens; starts the rest's Timeout
+
+Lock(ctx, c ClientID, f FileID, r LockReq) error                // LockReq{Owner; Open; Ranges []LockRange; Wait, Reclaim bool; Seq *LockSequence}: all ranges or none
+CancelLock(ctx, c ClientID, f FileID, o LockOwner, r ByteRange) (granted bool, err error)
+WaitAnswered(ctx, c ClientID, w LockWaiter, refused bool) error // the NLM host's answer to LockWaitOver
+TestLock(ctx, c ClientID, f FileID, o LockOwner, r ByteRange, exclusive bool) (*Lock, error)
+Unlock(ctx, c ClientID, f FileID, o LockOwner, rs []ByteRange) error
+ReleaseLockOwner(ctx, c ClientID, o LockOwner) error
+
+AckBreak(ctx, c ClientID, g GrantID, to GrantKind) error        // to GrantNone: a return (DELEGRETURN, a lease released)
+Watch(ctx, c ClientID, dir FileID, recursive bool, m ChangeMask) (WatchID, error)
+Unwatch(ctx, c ClientID, w WatchID) error
+
+ReclaimComplete(ctx, c ClientID) error                          // ends the client's part of every grace instance its shards are in
+TestState(ctx, c ClientID, s []StateRef) []error                // nothing changed
+FreeState(ctx, c ClientID, s StateRef) error                    // a revoked entry, or a lock state holding no locks
+DropShare(ctx, share ShareID, why DropReason) error             // §4.3
+CheckIO(ctx, o OpenRef, r ByteRange, write bool) error
+CheckChange(ctx, f FileID, by ClientID, what ChangeMask) error
+```
+
+The `ctx` arguments are `context.Context`; every method is on `*Table`. The
+types the methods name:
+
+```go
+// OpenRequest is what an open asks for.
+type OpenRequest struct {
+	Access, Deny  Access
+	Durability    Durability
+	Timeout       time.Duration // SMB: the timeout the create negotiated
+	DeleteOnClose bool
+	Lease         LeaseKey      // SMB: the lease key; zero: none
+	Want          GrantKind     // the grant kind asked for
+	Reconnect     *ReconnectKeys // SMB durable v2 and persistent: create GUID, app instance
+	Reclaim       bool
+	OwnerSeq      *uint32       // NFSv4.0: the open-owner's seqid, checked at its home primary (§2.8)
+	Via           FileID        // the directory it was opened through (§9.5)
+}
+
+type OpenResult struct {
+	Open     Open
+	Grant    *CachingGrant // nil: none offered
+	Replayed bool          // a replayed create answered with the open it made
+}
+
 // ClientStatus is what a renewal reports beside the lease; RFC 17's
 // ClientStatus carries the same three fields to the adapters.
 type ClientStatus struct {
 	AdminRevoked      bool // a stateid an administrator revoked, of any kind, is in the client's revoked set (§5.3): SEQ4_STATUS_ADMIN_STATE_REVOKED
 	RecallableRevoked bool // a grant revoked at its recall deadline is: SEQ4_STATUS_RECALLABLE_STATE_REVOKED
-	ReclaimNeeded bool // a shard of its state started a new grace instance (§4.4)
+	ReclaimNeeded     bool // a shard of its state started a new grace instance (§4.4)
 }
+```
 
-type OpenState interface {
-	// Clients.
-	Connect(ctx context.Context, c Client) (ClientID, error) // found by (protocol, owner): same verifier returns the ID, a new one is a reboot, another NFSv4 principal is ErrClientInUse (§2.1); called at SETCLIENTID_CONFIRM or the confirming CREATE_SESSION, never at SETCLIENTID or EXCHANGE_ID (§2.9)
-	CreateSession(ctx context.Context, c ClientID, seq uint32, reply []byte) ([]byte, error) // checks seq against CSSeq: a replay returns the cached reply, seq+1 records this one, any other is refused (§2.1)
-	Renew(ctx context.Context, c ClientID) (ClientStatus, error) // reaches the lease owner (§4.1); called by the answering node at most once per renewal interval and cached; ClientStatus is the lease owner's aggregate of the primaries' reports (§5.3)
-	Expire(ctx context.Context, c ClientID) error            // releases everything (§4.3)
-	Revoke(ctx context.Context, c ClientID) error            // an administrator's revoke: releases everything, keeps the record, its sessions and each revoked stateid in the revoked set until freed, and marks its per-shard keys durably so a reclaim there is refused; an NLM host's is an expiry that deletes its record (§5.3)
-	FreeRevoked(ctx context.Context, c ClientID, s StateRef) error // removes one entry from the client's revoked set: NFSv4.1 FREE_STATEID, and the NFSv4.0 and SMB adapters once they have answered it revoked (§5.3); a stateid not in the set is answered as any miss is (§2.1): ErrBadState, or ErrStaleState while its shard is in grace or has lost state since it was minted, as after a restart that lost the set
-	Destroy(ctx context.Context, c ClientID, by Principal) error // DESTROY_CLIENTID; ErrClientBusy while a session or any state remains, never releasing it; refused for a principal state protection excludes
-	Rebind(ctx context.Context, c ClientID, node NodeID) error   // a new back channel at node; clears PathDown (§4.1)
+`OpenRef` names an open (`OpenID`), a delegation (`GrantID`) or the anonymous
+open, with the handle; `StateRef` ([§2.1](#2.1%20Client)) is its stateid form.
+`LockReq` is passed by value; `Owner.Owner` is copied only when a lock or
+waiter is stored, so a refused or tested request allocates nothing. A conflict
+with `Wait` records a waiter and answers `ErrLocked` (NFSv4) or `ErrBlocked`
+(NLM, SMB); a recall of another client's grant answers `ErrBlocked` with a
+waiter (NLM, SMB with `Wait`) or a `DelayError` (every other request)
+([§2.10](#2.10%20Lock%20waiters)). An adapter calls `CancelLock` before any
+answer to a waiting request other than the grant. `CheckChange` recalls grants
+and never waits; on a remove or rename it also refuses with
+`ErrShareViolation` against a deny-delete, a rename of a delete-pending file
+with `ErrDeletePending`, and an SMB rename or delete of a directory with
+`ErrShareViolation` while any open was made through it
+([§7](#7.%20Conflicts%20across%20protocols),
+[§9.4](#9.4%20Delete%20on%20close),
+[§9.5](#9.5%20Open%20children%20refuse%20an%20SMB%20rename%20or%20delete%20of%20their%20directory)).
 
-	// Opens and deny modes (§6). Every call names its client, and the primary
-	// refuses one that names another client's state (§10).
-	// OpenRequest carries access, deny, durability, timeout, delete-on-close,
-	// the lease key and kind wanted, create GUID, app instance and reclaim.
-	Open(ctx context.Context, c ClientID, file FileID, r OpenRequest) (Open, *CachingGrant, error)
-	Reconnect(ctx context.Context, c ClientID, id Identity, o OpenID, m ReconnectMatch, session SessionRef) (Open, error) // §8.1; rebinds the open to session
-	Disconnect(ctx context.Context, c ClientID, session SessionRef) error                                                // closes volatile opens, times the rest (§8.1)
-	SetDisposition(ctx context.Context, c ClientID, o OpenID, delete bool) error                   // §9.4
-	SuspendTimes(ctx context.Context, c ClientID, o OpenID, suspend, resume TimeMask) error         // §2.2
-	Close(ctx context.Context, c ClientID, o OpenID) (orphan bool, err error) // the last close may unlink (§9.4); orphan reports a file left with no entry and no open, for the filesystem service to release (§9.1)
-	Flushed(ctx context.Context, c ClientID, o OpenID, loss uint64) error // SMB FLUSH: ErrLost once when loss, the file's loss sequence, is above the open's LossSeen (§8.1)
+> decision: one `*Table` with two areas, not two types. The client area runs at
+> the lease owner and the per-file area at the file's primary; on one node both
+> are one process and the boundary is per method, as RFC 17 §2.1 keeps its own.
+> Overturned when the cluster's remote primary lands: the client area becomes
+> its own type at the front.
 
-	// Byte-range locks. o is zero for an NLM lock (§2.3); seq is SMB's lock
-	// sequence, nil when the request carries none (§8.1). An NFSv4.0 request's
-	// owner seqid travels in OpenRequest and in Lock, Unlock and Close options,
-	// and is checked at the owner's home primary (§2.8): ErrBadSeqID.
-	// wait: the request may wait (§2.10); a conflict then records a waiter and
-	// answers ErrLocked (NFSv4) or ErrBlocked (NLM, SMB). A recall of another
-	// client's grant answers ErrBlocked with a waiter (NLM, SMB with wait) or
-	// ErrDelay (every other request).
-	Lock(ctx context.Context, c ClientID, file FileID, owner LockOwner, o OpenID, r ByteRange, exclusive, wait, reclaim bool, seq *LockSequence) error
-	// CancelLock is ordered with the grant: it drops the waiter, or reports
-	// granted when the lock was granted first. An adapter calls it before any
-	// answer to a waiting request other than the grant (§2.10).
-	CancelLock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange) (granted bool, err error)
-	TestLock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange, exclusive bool) (*Lock, error)
-	Unlock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange) error
-
-	// Restart notification from an NLM host (§4.5): expires its old ClientID.
-	HostRestarted(ctx context.Context, host []byte, state uint32) error
-	DropShare(ctx context.Context, share ShareID, why DropReason) error // why is removed or moved. Ends every open, lock, lock waiter (NLM ones included), grant, watch, layout and copy under the share, and every copy reading from it, without a recall or a wait for the holder: for a share being removed (RFC 16 §2.3.2), and at a namespace move's release for each moved share (RFC 27 §2.2), whose FileIDs a move back would meet again; each is reported to its adapter through Revoked as RevokedShare, the move's address set for a moved share (RFC 17 §3.2), and its records go with it, so a later stateid of the share resolves to nothing and is answered bad stateid with no revoked-state flag left for the client to clear (RFC 21 answers it so); so a blocked lock or a pending change notification is answered rather than left waiting; it starts no §5.3 no-grant period for the client, and runs whether or not the shard is in grace
-
-	// Asynchronous copies (§2.7): unused until a client is shown to need
-	// offload; the filesystem service answers every copy synchronously (RFC 17 §9).
-	// The filesystem service runs the copy and
-	// reports progress; Status and Cancel answer ErrNoCopy for a lost copy.
-	CopyBegin(ctx context.Context, c ClientID, cp Copy) (CopyID, error)
-	CopyProgress(ctx context.Context, id CopyID, done int64, s CopyState) error
-	CopyStatus(ctx context.Context, c ClientID, id CopyID) (Copy, error)
-	CopyCancel(ctx context.Context, c ClientID, id CopyID) error
-
-	// Caching grants (§5): recalls go out through the adapter's callbacks.
-	Return(ctx context.Context, c ClientID, g GrantID) error
-	AckBreak(ctx context.Context, c ClientID, g GrantID, to GrantKind) error
-
-	// Layouts (§2.6): reserved, cluster only. The filesystem service declares
-	// no layout call until a pNFS design is scheduled (RFC 17 §3.1, §10); a
-	// single node answers every layout operation not supported.
-	LayoutGet(ctx context.Context, c ClientID, o OpenID, r ByteRange, write, reclaim bool) (Layout, error)
-	LayoutCommit(ctx context.Context, c ClientID, l LayoutID, end int64, mtime time.Time) error // ErrBadLayout on a stale epoch
-	LayoutReturn(ctx context.Context, c ClientID, l LayoutID) error
-
-	// Watches.
-	Watch(ctx context.Context, c ClientID, dir FileID, recursive bool, f ChangeMask) (WatchID, error)
-	Unwatch(ctx context.Context, c ClientID, w WatchID) error
-
-	// Grace (§4.2): the client has reclaimed everything it will.
-	ReclaimComplete(ctx context.Context, c ClientID) error
-
-	// Checks run at the primary, in the process that runs the I/O (§3, §7).
-	// ErrDelay while a recall is outstanding; ErrGrace in grace.
-	CheckIO(ctx context.Context, o OpenRef, r ByteRange, write bool) error
-	// CheckChange recalls grants and never waits. On a remove or rename it also
-	// refuses with ErrShareViolation against a deny-delete, and a rename of a
-	// delete-pending file with ErrDeletePending (§7, §9.4). On an SMB rename or
-	// delete of a directory it refuses with ErrShareViolation while any open was
-	// made through that directory (§9.5).
-	CheckChange(ctx context.Context, file FileID, by ClientID, what ChangeMask) error
-}
+```go
+// DelayError is a retry-later. errors.Is(err, ErrDelay) holds for it, and
+// RFC 17 §4.3's Delay maps it one to one.
+type DelayError struct{ Cause DelayCause } // DelayRecall: a recall is outstanding; DelayResources: a cap or RFC 24's pool (§5.5)
 
 // The filesystem service returns these to adapters as RFC 17 §4.3's errors:
 // the state refusals as ErrState kinds (ErrStaleClient as StateError
@@ -1924,21 +1955,19 @@ var (
 	ErrShareViolation = errors.New("openstate: deny mode conflict")
 	ErrLocked         = errors.New("openstate: range locked")
 	ErrNoReclaim      = errors.New("openstate: nothing to reclaim")
-	ErrReclaimRevoked = errors.New("openstate: NFSv4 reclaim in a shard where an administrator revoked the client's state")
+	ErrReclaimRevoked = errors.New("openstate: reclaim in a shard where an administrator revoked the client's state")
 	ErrStaleClient    = errors.New("openstate: client expired, or marked by a loss of its shard's open state")
 	ErrRevoked        = errors.New("openstate: state revoked, by a recall past its deadline or an administrator, and not yet freed")
 	ErrBadState       = errors.New("openstate: stateid names no record")
 	ErrStaleState     = errors.New("openstate: state lost with its shard's open state")
-	ErrDelay          = errors.New("openstate: recall outstanding, retry")
-	ErrBadLayout      = errors.New("openstate: layout stale or revoked")
+	ErrDelay          = errors.New("openstate: retry later")
 	ErrNotYours       = errors.New("openstate: state held by another client")
 	ErrDeletePending  = errors.New("openstate: file is delete pending")
-	ErrNoCopy         = errors.New("openstate: copy unknown or lost")
 	ErrBadSeqID       = errors.New("openstate: owner sequence out of order")
 	ErrBlocked        = errors.New("openstate: lock waits; granted later through the callback")
 	ErrClientInUse    = errors.New("openstate: owner held by another principal")
 	ErrClientBusy     = errors.New("openstate: client still holds a session or state")
-	ErrSeqMisordered  = errors.New("openstate: create-session sequence out of order")
+	ErrSeqMisordered  = errors.New("openstate: client sequence out of order")
 )
 ```
 
