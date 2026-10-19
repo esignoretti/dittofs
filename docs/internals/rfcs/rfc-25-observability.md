@@ -418,7 +418,7 @@ a span attribute (§5, §6).
 
 **No share or shard label on any counter or histogram.** This generalises
 [RFC 16 §8.1](rfc-16-metadata-store.md#8.1%20Metrics): at 10⁴ shares, a share
-label on `vfs_op_seconds` multiplies its 8,000 series by 10⁴. A per-share count of
+label on `vfs_op_seconds` multiplies its 8,500 series by 10⁴. A per-share count of
 events is read through the management API from the component that keeps it, or
 from traces.
 
@@ -450,19 +450,19 @@ source. The same rule applies to `shard`. This is the "stated rule" that
 [RFC 8 §14](rfc-8-engine.md#14.%20Observability) and
 [RFC 16 §8.1](rfc-16-metadata-store.md#8.1%20Metrics) refer to.
 
-**Series budget.** At the reference profile — 10⁴ shares, every protocol in use,
-every role on one node — a node **MUST** export no more than **50,000** series in
+**Series budget.** At the reference profile — 10⁴ shares, every entity label at
+its cap of 64 values, every protocol in use, every role on one node — a node **MUST** export no more than **50,000** series in
 all and no single metric more than **10,000**, histogram buckets included. Both
 are fixed design limits, checked by counting after the reference workload (§12);
 a table whose metric cannot fit is a defect in that table. `vfs_op_seconds` sets
-the scale: about 45 operations × 3 protocols × 3 outcomes × 20 series per
-histogram is 8,100.
+the scale: about 45 operations × 3 protocols × 3 outcomes × 21 series per
+histogram (18 boundaries, `+Inf`, `_sum`, `_count`) is 8,505.
 
 > ponytail: the budget is checked by one count at one profile. Past it, add a
 > per-metric series limit in the exporter that drops and counts new series,
 > when a deployment shows a metric growing in a way the profile did not exercise.
 
-![The operation-latency histogram costs about 8,000 series with op, protocol and outcome; a share label would multiply that by 10,000 to about 80 million; per-share figures are gauges exported for the worst 20 shares plus an unlabelled sum, and every share is read through the management API](img/rfc25-labels.svg)
+![The operation-latency histogram costs about 8,500 series with op, protocol and outcome; a share label would multiply that by 10,000 to about 85 million; per-share figures are gauges exported for the worst 20 shares plus an unlabelled sum, and every share is read through the management API](img/rfc25-labels.svg)
 
 ### 2.6 Histogram buckets
 
@@ -473,16 +473,13 @@ across metrics and nodes:
 | --- | --- | --- |
 | `request` | 100 µs, 250 µs, 500 µs, 1 ms, 2.5 ms, 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 2.5 s, 5 s, 10 s, 30 s, 60 s | anything a client request waits on: operations, KV calls, remote calls, recalls |
 | `background` | 10 ms, 100 ms, 1 s, 5 s, 10 s, 30 s, 60 s, 5 min, 15 min, 1 h, 6 h | passes, handovers, takeovers, freezes, snapshot completion |
-| `size` | 512 B and each power of four up to 64 MiB, then 256 MiB | payload, block and transaction sizes in bytes |
+| `size` | 512 B, 2 KiB, 8 KiB, 32 KiB, 128 KiB, 512 KiB, 2 MiB, 8 MiB, 32 MiB, 128 MiB | payload, block and transaction sizes in bytes |
 | `count` | 1, 2, 4 … 4,096 | keys per transaction, files per commit, refs per batch |
 
 The `request` set ends past 30 s, the default request deadline
 ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values)), and 35 s, the
 SMB break deadline, so a request that runs out its deadline lands in a finite
-bucket. A histogram whose owning RFC states boundaries tied to its settings —
-the carver's chunk sizes at `Min`, `Target` and `Max`
-([RFC 2 §2.3](rfc-2-carver.md#2.3%20What%20a%20pass%20makes%20observable)) — uses
-those and says so.
+bucket.
 
 > ponytail: fixed buckets, 18 at most. Move to sparse exponential histograms when
 > the exposition format and the consumers in use read them, which removes the
