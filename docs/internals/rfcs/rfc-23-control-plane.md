@@ -85,8 +85,8 @@ will finish.
 
 Under this RFC:
 
-1. Every resource read returns its **generation** as an entity tag. Eli's write
-   carries the generation he read, which Dana's save has moved on; the API
+1. Every resource read returns an **entity tag**. Eli's write carries the tag
+   he read, which Dana's save has moved on; the API
    refuses it with "changed since read" (`412`), and his client shows him
    Dana's version to merge into (§4.4).
 2. Every create and every action carries an **idempotency key**. Eli's retry
@@ -109,7 +109,11 @@ Under this RFC:
 - **resource** — one thing the API names: a share, a user, a remote store, an
   operation. Each maps onto records RFC 16 defines (§3.1).
 - **generation** — the counter every record carries, raised by every change
-  ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)); the API's entity tag (§4.4).
+  ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)); the entity tag of most resources (§4.4).
+- **position** — the value of its kind's counter that a record's last change
+  raised; how "applied" is computed, and a quota's entity tag (§2.4, §4.4).
+- **node-status record** — the one record each node writes about itself: what
+  it has reconciled, refused and holds restart-pending (§2.4).
 - **operation** — a resource that stands for work longer than one request, with
   a state and progress, readable from any node until it ends (§4.6).
 - **API account** — a `User` record that holds an API role. Its role grants
@@ -180,10 +184,11 @@ Outcome: one deletion, visible throughout, finished after the restart.
 
 **Two operators edit the export policy of `builds`.**
 
-1. Dana and Eli each `GET` the policy; both see `ETag: "g14"`.
-2. Dana's `PUT` with `If-Match: "g14"` commits generation 15.
-3. Eli's `PUT` with `If-Match: "g14"` is refused `412`, code
-   `generation_mismatch`, naming generation 15. The CLI re-reads, shows the
+1. Dana and Eli each `GET` the policy; both see the same `ETag`.
+2. Dana's `PUT` with `If-Match` and that tag commits, and the policy has a new
+   tag.
+3. Eli's `PUT` with `If-Match` and the old tag is refused `412`, code
+   `generation_mismatch`, naming the current tag. The CLI re-reads, shows the
    difference, and asks Eli to apply his change to Dana's version.
 
 Outcome: no write overwrites one its author never saw.
@@ -835,31 +840,32 @@ a script in a loop cannot take memory or store transactions from file clients.
 
 ### 4.4 Concurrency: the generation is the entity tag
 
-Every resource read returns `ETag: "g<generation>"`, the generation of the
-record behind the resource's `spec` ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)). A resource built from
+Every resource read returns an `ETag` that is the value RFC 16's write of that
+record takes as `expect`
+([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)): its
+generation ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)), its version (a grant, an export policy, a
+netgroup) or its position (a quota, §2.4). A client compares it only for
+equality. A resource built from
 several records — a share's info, its state and its namespaces are three
 ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)) — takes its tag from the one its `spec` writes; the others
 change through actions that name their expected value, as quiesce names the
 state it expects.
 
-A quota record carries no generation of its own, so a quota's tag is
-`ETag: "p<position>"`, its record's position (§2.4), and a quota write names
-that position as its expected value.
-
 - **Every `PUT`, `PATCH` and `DELETE` MUST carry `If-Match`.** One without is
-  refused `428`. One whose tag is not the current generation is refused `412`,
-  code `generation_mismatch`, with the current generation in the body.
+  refused `428`. One whose tag is not the current one is refused `412`, code
+  `generation_mismatch` (RFC 16's `ErrGenerationMismatch`), with the current
+  tag in the body.
 - **A resource with no record is created by `POST` on its collection**, or —
   where the client names its path, as a grant, a setting at a scope, a
   netgroup or a quota — by `PUT` with `If-None-Match: *` in place of
   `If-Match`. That `PUT` is refused `412` `generation_mismatch` if a record
-  exists, with its generation in the body; so a retried create that had
+  exists, with its tag in the body; so a retried create that had
   committed gets `412`, and the client reads what is there. An absent resource
   has no tag, so `If-Match` on it is `412`.
 - **The check is in the transaction.** The write reads the record with conflict
-  tracking and compares its generation there ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)), so two writes
+  tracking and compares its tag there ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)), so two writes
   with the same tag on two nodes cannot both commit: one commits and the other
-  conflicts, retries, reads the new generation and is refused `412`.
+  conflicts, retries, reads the new tag and is refused `412`.
 - **A background writer is not overwritten.** The parts of a resource that a
   component changes — a share's state during a cut or removal, its namespaces
   during a re-home — are never in a `spec`, so a stale `PUT` cannot revert them.
@@ -1225,7 +1231,7 @@ role is `admin`, because a scale-down decommissions node records
 These rules bind from the single node on, where most of them cost nothing
 ([RFC 0 §1.4](rfc-0-data-lifecycle.md#1.4%20The%20single-node%20profile)); the ones marked **(cluster)** bind once there is a second node.
 
-![One API write in a cluster: the CLI sends a PUT to the API on S1; S1 validates with the component's validator, checks If-Match, and commits the record, the settings generation and the audit record in one transaction in the metadata store; every node, S1, P1 and P2, reads the settings generation each second, re-reads the record, applies it by its binding class and writes its applied generation to its node-status record; a GET on any API node joins those reports into the resource's status](img/rfc23-write-path.svg)
+![One API write in a cluster: the CLI sends a PUT to the API on S1; S1 validates with the component's validator, checks If-Match, and commits the record, the settings generation and the audit record in one transaction in the metadata store; every node, S1, P1 and P2, reads the settings generation each second, re-reads the record, applies it by its binding class and writes the position it has reconciled through to its node-status record; a GET on any API node joins those reports into the resource's status](img/rfc23-write-path.svg)
 
 - **Any API node answers any call.** The management API is composed on every
   `storage` node ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)); a protocol-only node serves the health
@@ -1356,11 +1362,13 @@ marked **(cluster)**.
    node, holds: sign-in (§5.3) and the current-password check (§5.4) verify on
    a storage-only node. The NT hash, keytabs and bind credentials stay under
    the `protocol` key; a storage-only node seals them and never opens them.
-2. **Records this RFC adds.** Operation, idempotency, session, API token, audit
-   and node-status records, and a `User`'s role and not-before time, need keys
-   and codecs in [RFC 16](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed); every control-plane record needs its position
-   (§2.4); and `SetGrant` and `SetQuota` need an expected generation, and every put an
-   expected absence, for §4.4's check to sit inside their transaction.
+2. **Which counter a position is of.** [RFC 16](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)
+   defines the records this RFC adds and their keys, a `User`'s role and
+   not-before time, every record's `Position`, and `expect` on every write,
+   `SetGrant` and `SetQuota` included. One question is left: which counter
+   (`CFGGEN`, `SL` or `PGEN`) a grant's, an export policy's, a netgroup's and a
+   quota's `Position` is of. [RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)
+   keeps grants and export policies off the principals generation.
 3. **Audit volume at scale.** An audit record per change is nothing for
    operators; a provisioning reload that rewrites 10⁴ shares writes 10⁴ records
    in its transactions. Whether a reload's records are summarised per record
