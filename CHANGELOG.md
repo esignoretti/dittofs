@@ -119,6 +119,16 @@ upgrade. See Changed below. No on-disk format changes in this release.
   Progress calls may therefore jump by more than one block, and a successful warm
   still ends with done equal to total.
 
+- **The operator now shows when the DittoFS API refuses its own account.**
+  Applying `spec.snapshotPolicies` and turning on the NFS portmapper both need
+  the admin role, so the operator's account (role `operator`) got 403 on each,
+  and that showed only in a verbose log line. A new `Authorized` condition on
+  the DittoServer is False and names each refused call. It turns True once
+  every call gets its answer, and a passing API error leaves it as it was. The
+  NFS adapter's Service now publishes port 111 only once the operator has seen
+  the portmapper on, so it no longer points at a port nothing listens on. The
+  operator still cannot apply these settings without the admin role.
+
 ## [0.35.0] — 2026-10-12
 
 The main change in 0.35.0 is that **BadgerDB is now the only metadata
