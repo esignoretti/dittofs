@@ -1,6 +1,10 @@
 package journalv2
 
-import "github.com/marmos91/dittofs/pkg/block/journalv2/internal/core"
+import (
+	"log/slog"
+
+	"github.com/marmos91/dittofs/pkg/block/journalv2/internal/core"
+)
 
 // The journal's clock, settings and descriptor budget, declared in
 // internal/core because the internal packages read them. Each one's contract
@@ -51,4 +55,16 @@ func WithSettings(s Settings) Option {
 // journal gets a budget of its own, at the default limit.
 func WithDescriptorBudget(b *DescriptorBudget) Option {
 	return Option{func(cfg *core.Config) { cfg.Budget = b }}
+}
+
+// WithTracer makes the journal trace its operations through t. Without it the
+// journal traces nothing.
+func WithTracer(t Tracer) Option {
+	return Option{func(cfg *core.Config) { cfg.Tracer = t }}
+}
+
+// WithLogger makes the journal log through l. Without it the journal logs
+// nothing.
+func WithLogger(l *slog.Logger) Option {
+	return Option{func(cfg *core.Config) { cfg.Logger = l }}
 }
