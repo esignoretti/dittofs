@@ -535,8 +535,8 @@ type Watch struct {
 }
 ```
 
-A watch is held at the primary of its directory's shard, which sees every change
-in that shard. **A recursive watch whose subtree crosses into another shard
+A watch is held at its directory's primary, which sees every change in that
+directory's shard. **A recursive watch whose subtree crosses into another shard
 (cluster)** also leaves a marker, volatile like the watch, at the primary of each
 descendant shard whose root lies under it: a change there that the filter
 matches is reported to the watch's primary, which completes the watch with
@@ -1852,10 +1852,10 @@ type Sink interface {
 
 No method reads the wall clock: every lease, deadline, poll, fence, grace and
 `Timeout` here is read from `Deps.Clock`. `Revocation`, `RevokeReason`,
-`ClientStatus`, `LockReq` and `StateRef` are declared here and
-aliased by `pkg/vfs`
+`ClientStatus` and `StateRef` are declared here and aliased by `pkg/vfs`
 ([RFC 17 §3.0](rfc-17-vfs.md#3.0%20Value%20types)), since open state cannot
-import vfs. The import rule — only the filesystem service imports this package
+import vfs; `LockReq` is open state's own, one range, beside `pkg/vfs`'s
+several-range request (§11.3). The import rule — only the filesystem service imports this package
 — is held by the architecture test
 ([RFC 20](rfc-20-adapters.md)), not by the package's location.
 
