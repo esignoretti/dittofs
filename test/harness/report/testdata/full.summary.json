@@ -79,11 +79,13 @@
           "example.com/m/a"
         ],
         "status": "skipped",
+        "rawStatus": "failed",
         "duration": 5,
         "message": "a_test.go:12: got 1, want 2",
         "extra": {
           "grade": "known",
-          "reason": "the clock has a one-second step"
+          "reason": "the clock has a one-second step",
+          "issue": "#12"
         }
       },
       {
