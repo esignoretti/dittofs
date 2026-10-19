@@ -315,7 +315,7 @@ lifecycle column names only the calls the owning RFC states.
 | clock, fault seam ([RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition)) | root | — | root | none: values | before 1 / at exit |
 | metrics registry, logger | root | the host's bootstrap | root | none: values | before 1 / at exit |
 | pools ([RFC 24 §2.3](rfc-24-resources.md#2.3%20The%20pools)) | root | the node's limit ([RFC 24 §2.1](rfc-24-resources.md#2.1%20One%20limit%2C%20learned%20once)) | root | stated by RFC 24 (pending) | before 2 / at exit |
-| metadata store ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)) | root, `metadata.Open` | the KV, the host's bootstrap | runtime | `Open`; its close stated by RFC 16 (pending) | 2 / 6 |
+| metadata store ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)) | root, `metadata.Open` | the KV, the host's bootstrap | root, once `Run` returns | `Open`; its close stated by RFC 16 (pending) | 2 / 6 |
 | remote store clients ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)) | root, one per store configuration | the store configuration, its `Secret` | the stores opened on it; the last store's `Close` releases it | a store's `Close` | 4 / 5 |
 | content subsystem: engine, journals, carver, syncer, GC ([RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition)) | root, in RFC 8 §2.1's order | RFC 8 §2.1's tables | runtime, as one unit | RFC 8 §2.5's start and stop | 4 / 5 |
 | share contexts ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) | runtime, through `Content` | the share's records | the content subsystem | `Content` (below) | 4, and while serving / 5 |
@@ -332,8 +332,10 @@ lifecycle column names only the calls the owning RFC states.
 | **(cluster)** shard placement ([RFC 11](rfc-11-ownership.md)), pNFS data server ([RFC 15 §5.1](rfc-15-topology.md#5.1%20pNFS)) | root | stated by RFC 11 and RFC 15 (pending) | runtime | stated by RFC 11 and RFC 15 (pending) | 4 / 5 |
 
 The root builds every component and hands them to the runtime, which from then
-on makes every lifecycle call; no adapter drives the service's lifecycle. Two
-exceptions are built after start, because records decide them:
+on makes every lifecycle call but the store's; no adapter drives the service's
+lifecycle. The runtime holds only a narrow view of the store, so the root opens
+it before `Run` and closes it after. Two exceptions are built after start,
+because records decide them:
 
 - share contexts, which the runtime attaches through the engine;
 - adapters, which the runtime builds through the factory of
@@ -473,7 +475,7 @@ the API, forms no cycle with it.
    handed over ([RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries)); then namespace metadata and open state; then the
    content subsystem in RFC 8 §2.5's reverse order, which joins and closes
    every share context.
-6. The metadata store closes last.
+6. The metadata store closes last, by the root once `Run` has returned.
 
 The API outlives the adapters on purpose: an operator watching a drain reads its
 progress through the API. A failure at any start step stops the start, closes
