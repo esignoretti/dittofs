@@ -124,7 +124,7 @@ upgrade. See Changed below. No on-disk format changes in this release.
   the admin role, so the operator's account (role `operator`) got 403 on each,
   and that showed only in a verbose log line. A new `Authorized` condition on
   the DittoServer is False and names each refused call. It turns True once
-  every call gets its answer, and a passing API error leaves it as it was. The
+  every call gets its answer, and a transient API error leaves it as it was. The
   NFS adapter's Service now publishes port 111 only once the operator has seen
   the portmapper on, so it no longer points at a port nothing listens on. The
   operator still cannot apply these settings without the admin role.
