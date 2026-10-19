@@ -1,4 +1,4 @@
-//go:build fdb
+//go:build linux && cgo
 
 package kvstore_test
 

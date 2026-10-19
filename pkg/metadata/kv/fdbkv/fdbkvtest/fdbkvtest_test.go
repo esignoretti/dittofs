@@ -1,4 +1,4 @@
-//go:build fdb
+//go:build linux && cgo
 
 package fdbkvtest
 
@@ -17,6 +17,9 @@ import (
 // Two stores Open makes see none of each other's keys, and a store's keys are
 // gone once its test ends, so tests sharing one cluster never meet.
 func TestOpenIsolatesAndClears(t *testing.T) {
+	if os.Getenv("DITTOFS_FDB_CLUSTER_FILE") == "" {
+		t.Skip("no FoundationDB: run through test/fdb/cluster.sh test, which sets DITTOFS_FDB_CLUSTER_FILE")
+	}
 	ctx := context.Background()
 	stored := func() int {
 		db, err := fdb.OpenDatabase(os.Getenv("DITTOFS_FDB_CLUSTER_FILE"))

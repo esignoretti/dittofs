@@ -1,4 +1,4 @@
-//go:build fdb
+//go:build linux && cgo
 
 // Package fdbkv is the replicated kv backend, on FoundationDB.
 package fdbkv

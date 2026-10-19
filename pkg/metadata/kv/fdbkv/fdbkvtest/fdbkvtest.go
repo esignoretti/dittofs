@@ -1,4 +1,4 @@
-//go:build fdb
+//go:build linux && cgo
 
 // Package fdbkvtest opens fdbkv stores for tests, each under a prefix of its
 // own on a local cluster.

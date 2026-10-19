@@ -1,4 +1,4 @@
-//go:build fdb
+//go:build linux && cgo
 
 package fdbkv_test
 
