@@ -199,9 +199,10 @@ Outcome: no write overwrites one its author never saw.
    in one transaction (§4.3).
 2. Every node reads the settings generation each second, re-reads the record,
    and applies it, live, within 5 s ([RFC 13 §5](rfc-13-configuration.md#5.%20Binding%20classes)).
-3. Each node reports the generation it has applied. `GET` on the setting shows
-   `applied: 3 of 3 nodes` — S1, P1 and P2; had P2 been frozen, it would show P2 behind and a
-   health condition naming it.
+3. Each node reports the position it has reconciled through. `GET` on the
+   setting shows `applied: 3 of 3 nodes` — S1, P1 and P2; had P2 been frozen,
+   it would show P2 behind and the `config_generation_behind` condition naming
+   it.
 
 Outcome: one write, and an answer to "is it applied everywhere?" that is read,
 not guessed.
@@ -984,8 +985,8 @@ changed. A client **MUST** reuse a key across its own retries of one action and
 
 > ponytail: an idempotency record per mutating call, kept a day. At an
 > operator's call rate that is nothing; a script making 10⁶ calls a day keeps
-> 10⁶ small records. Shorten the window, or key it per client instance, if the
-> records show up in the store's size.
+> 10⁶ small records. Shorten the window, or key it per client instance, when
+> `api_idempotency_records_written_total` (§11) shows 10⁶ written per day.
 
 ### 4.6 Long-running operations
 
@@ -1312,14 +1313,25 @@ These rules bind from the single node on, where most of them cost nothing
 - **Application spreads by generation.** A node learns of a change only through
   the settings generation, the share list version and the principals generation
   ([RFC 13 §5](rfc-13-configuration.md#5.%20Binding%20classes)), and reports what it applied (§2.4). A live change
-  reaches every node within 5 s; a node behind is a health condition, named in
-  the resource's status.
+  reaches every node within 5 s; a node behind is RFC 25's
+  `config_generation_behind` condition, named in the resource's status.
 - **(cluster)** **Operations are claimed, not pinned.** Work the operation runner drives is
   claimed by one storage node and taken over on lapse (§4.6); work a component
   owns follows that component's failover.
 - **(cluster)** **A rolling upgrade keeps the API served.** Nodes are upgraded one at a time
   ([RFC 30 §5.1](rfc-30-kubernetes.md#5.1%20Rolling%20upgrade)); a call that needs a newer record schema is
   refused until the schema's active version is raised (§9).
+
+### 8.1 Failure modes
+
+| Failure | What the API answers | What the runtime does |
+| --- | --- | --- |
+| metadata store unreachable | `503` `unavailable`, `Retry-After`; health detail names it | keeps the running set; a full reconcile at the next read that works (§2.3) |
+| a record fails to build its component | the write committed; status shows the node refused it | stops only what it configures; keeps the old component where one was serving (§2.3) |
+| an adapter fails to start | — | reports the record refused and keeps the others serving; readiness as §2.2 sets it |
+| a node frozen or partitioned | status names it behind; `config_generation_behind` | — |
+| **(cluster)** the runner's node dies | `GET` on any node keeps reporting the last step | another storage node takes the claim after it expires (§4.6) |
+| a stop step misses its bound | — | §2.2's rule: leaves its dependencies open and exits non-zero |
 
 ## 9. Versioning and compatibility
 
@@ -1375,21 +1387,30 @@ labels and histogram buckets follow
 
 | Answers | Metric | Type |
 | --- | --- | --- |
-| How many API calls, by route and outcome? | `api_requests_total{route, method, status}` | counter |
-| How long do they take? | `api_request_seconds{route, method}` | histogram (`request`) |
+| How many API calls, by call and outcome? | `api_requests_total{op, outcome}` — `op` the route and method from §4.1's resources and Actions table, `outcome` the problem `code` or `ok` | counter |
+| How long do they take? | `api_request_seconds{op}` | histogram (`request`) |
+| How many calls run now, against the bound of §4.3? | `api_calls_in_flight`, `api_calls_in_flight_limit` | gauge |
 | How often is authentication refused, and why? | `api_auth_failures_total{reason}` | counter |
 | How often are writes refused on a precondition? | `api_precondition_failures_total{kind}` — `generation`, `idempotency`, `missing` | counter |
 | How often are retries answered from an idempotency record? | `api_idempotent_replays_total` | counter |
+| How many idempotency records are written, and deleted at expiry? | `api_idempotency_records_written_total`, `api_idempotency_records_deleted_total` | counter |
 | How many operations, by kind and state? | `api_operations{kind, state}` | gauge |
 | How long has the oldest running operation of each kind been running? | `api_operation_oldest_seconds{kind}` | gauge |
 | How often is an error answered with no row? | `api_unmapped_errors_total` | counter |
-| What has each node applied? | `runtime_applied_generation{kind}` — `settings`, `shares`, `principals` | gauge |
+| What has each node reconciled through? | `runtime_reconciled_position{kind}` — `settings`, `shares`, `principals` | gauge |
 | How often does a reconcile step fail, by what it applies? | `runtime_reconcile_errors_total{kind}` | counter |
 | How many records await a restart on this node? | `runtime_restart_pending` | gauge |
 | Audit records written, by outcome | `audit_records_total{outcome}` | counter |
 
 `api_unmapped_errors_total` is zero on a healthy node. Records refused by
-validation are RFC 13's `config_refused_total`, not counted again here.
+validation are RFC 13's `config_refused_total`, not counted again here. A node
+behind is RFC 25's `config_generation_behind` condition
+([RFC 25 §3.9](rfc-25-observability.md#3.9%20The%20condition%20registry)), fed by `runtime_reconciled_position`.
+
+**Spans.** One span per API call, named by its `op`, its attributes the
+resource kind and ID and the outcome, never a body field
+([RFC 25 §6.1](rfc-25-observability.md#6.1%20Spans)). An operation's work opens a root span of its own that
+*links* to the request span that started it.
 
 ## 12. Conformance
 
