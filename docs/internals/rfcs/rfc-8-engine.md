@@ -312,7 +312,7 @@ The engine **MUST NOT**:
 
 ## 2. Composition
 
-![The engine on one node: the filesystem service above; the engine in the middle with its share contexts, five policy components and four modules; one work queue per device journal; the journal, carver, assembler, syncer and metadata store below](img/rfc8-engine-node.svg)
+![The engine on one node: the filesystem service above; the engine in the middle with its share contexts, five policy functions and three modules; one work queue per device journal; the journal, carver, assembler, syncer and metadata store below](img/rfc8-engine-node.svg)
 
 ### 2.1 Content composition
 
@@ -697,6 +697,8 @@ can land.
    live loop.
 
 ### 2.6 Dependencies and wiring
+
+![Who builds, owns, starts and closes what: the composition root builds and owns the metadata store, the carver, the cut gate, the syncer, the ref-counted remote block stores, the clock and the filesystem service; the runtime starts and stops the engine and sets and stops its shares, the snapshot cut calls PrepareCut and CommitCut, and the filesystem service alone calls the content methods; the root lends the store's views, the carver, the cut gate, the syncer and the clock to the engine through Deps, and the remote block stores are reached only through the syncer's flows; the engine opens and owns the journals, one work queue per journal, the offload passes and a share table whose contexts each own their journal handles and a syncer flow; the engine moves from New, which opens nothing, through Start with its shares, serving with SetShare, StopShare and ForgetShare, to Close, and closes only what it opened](img/rfc8-composition.svg)
 
 The composition root ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)) builds the engine with `New(Deps)`. `New`
 validates the settings and opens nothing; the engine closes only what it opens:
