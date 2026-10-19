@@ -1120,6 +1120,9 @@ type TxnLimits struct {
 
 type Reader interface {
 	Get(key []byte) ([]byte, error) // ErrNotFound
+	// GetMany is Get for a batch of keys in one round trip: values in key
+	// order, nil for an absent key, each read tracked as Get's is.
+	GetMany(keys [][]byte) ([][]byte, error)
 	Scan(prefix, after []byte) iter.Seq2[KeyValue, error] // untracked
 	// Before returns the last record under prefix whose key sorts below key,
 	// untracked like Scan; ok is false when there is none.
@@ -1146,6 +1149,15 @@ type Txn interface {
 ```
 
 ![One Update: fn runs against one snapshot, where Get, Guard and GuardRange are tracked, Scan and Before are not, and Set and Delete write. At commit, a conflict on any tracked or written key aborts the attempt, which is retried on a fresh snapshot within the caller's deadline; otherwise the commit shares a sync with other ready commits and returns only once durable. An error may still have committed. Panels: alice-pc and build01 both guard d1 and both commit; Report.docx and REPORT.DOCX fold to one key, so the second aborts and its retry finds the name taken; a guard committing before a writer lets both commit, a writer committing first aborts the guard](img/rfc16-txn.svg)
+
+**A batch of known keys is read in one round trip.** `GetMany` **MUST** behave as one `Get`
+per key: the values in key order, `nil` for an absent key and an empty slice for an empty
+value, the transaction's own writes seen, and inside `Update` every key tracked and counted
+toward `TxnBytes`. A backend **SHOULD** issue the reads concurrently: on a replicated store
+each read is a network round trip, so a page of records read one `Get` at a time costs a round
+trip per record, where one batch costs one. The entity layer
+reads with `GetMany` wherever it reads several keys it already knows: a listing page's
+records, an offload commit's chunk records.
 
 **A commit is reported only once durable.** `Update` **MUST** return success only
 after the transaction's writes are durable: on the embedded store, synced to its

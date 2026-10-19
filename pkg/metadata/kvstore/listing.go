@@ -63,11 +63,7 @@ func (n Namespace) list(ctx context.Context, id entity.Identity, dir entity.Hand
 // listPage reads one page: entriesPage entries, then the rest of the
 // collision chain the last one is in, so the page never ends inside a chain
 // and the last digest alone says where to resume. A chain longer than a page
-// comes back whole.
-//
-// ponytail: EntriesPlus reads each child with its own Get inside the page's
-// one transaction; the KV has no batched read of values. Add one to the
-// Reader when a remote backend makes the per-child round trip show.
+// comes back whole. EntriesPlus reads the page's children in one batch.
 func listPage(r kv.Reader, id entity.Identity, dir entity.Handle, after uint64, plus bool) ([]Listed, error) {
 	share, d, err := dirIn(r, dir)
 	if err != nil {
@@ -99,9 +95,20 @@ func listPage(r kv.Reader, id entity.Identity, dir entity.Handle, after uint64, 
 		}
 		page = append(page, Listed{Entry: e, Cookie: digest})
 	}
-	if plus {
+	if plus && len(page) > 0 {
+		ks := make([][]byte, len(page))
 		for i := range page {
-			if page[i].File, err = fileIn(r, share, page[i].Entry.Child); err != nil {
+			ks[i] = fileKey(share, page[i].Entry.Child)
+		}
+		vs, err := r.GetMany(ks)
+		if err != nil {
+			return nil, err
+		}
+		for i, v := range vs {
+			if v == nil {
+				return nil, entity.ErrStale
+			}
+			if page[i].File, err = decodeFile(share, page[i].Entry.Child, v); err != nil {
 				return nil, err
 			}
 		}

@@ -40,6 +40,7 @@ func Bench(b *testing.B, open Opener) {
 	b.Run("CreateManyDirectories/clients=64", func(b *testing.B) { benchParallelCreate(b, open, 64) })
 	for _, n := range sizes {
 		b.Run(fmt.Sprintf("ListPage/entries=%d", n), func(b *testing.B) { benchList(b, open, n) })
+		b.Run(fmt.Sprintf("ListPagePlus/entries=%d", n), func(b *testing.B) { benchListPlus(b, open, n) })
 	}
 	b.Run("Getattr", func(b *testing.B) { benchGetattr(b, open) })
 	for _, depth := range []int{1, 64} {
@@ -233,7 +234,12 @@ func benchParallelCreate(b *testing.B, open Opener, dirs int) {
 	b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "creates/s")
 }
 
-func benchList(b *testing.B, open Opener, n int) {
+func benchList(b *testing.B, open Opener, n int) { benchListing(b, open, n, false) }
+
+// benchListPlus lists with each child's File, as READDIRPLUS does.
+func benchListPlus(b *testing.B, open Opener, n int) { benchListing(b, open, n, true) }
+
+func benchListing(b *testing.B, open Opener, n int, plus bool) {
 	f := newBenchFS(b, open)
 	dir := f.mkdir(b, f.root, "d")
 	f.fill(b, dir, n)
@@ -243,7 +249,11 @@ func benchList(b *testing.B, open Opener, n int) {
 	for range b.N {
 		timed(&l, func() {
 			got := 0
-			for _, err := range f.s.Namespace().Entries(ctx, f.admin, dir, 0) {
+			list := f.s.Namespace().Entries
+			if plus {
+				list = f.s.Namespace().EntriesPlus
+			}
+			for _, err := range list(ctx, f.admin, dir, 0) {
 				if err != nil {
 					b.Fatal(err)
 				}
