@@ -8,6 +8,7 @@ depends_on:
   - "[[rfc-1-journal]]"
   - "[[rfc-3-syncer]]"
   - "[[rfc-8-engine]]"
+  - "[[rfc-9-gc]]"
   - "[[rfc-13-configuration]]"
   - "[[rfc-14-open-state]]"
   - "[[rfc-15-topology]]"
