@@ -41,7 +41,7 @@ tags:
 ---
 # RFC 25 — observability
 
-**Status:** draft. [§12](#12.%20Open%20questions) lists what is known to be undecided.
+**Status:** draft. [§13](#13.%20Open%20questions) lists what is known to be undecided.
 **Audience:** anyone adding a metric, a health condition, a log line or a span to
 any component; anyone wiring DittoFS into monitoring, alerting or an audit
 pipeline; anyone deciding whether a node is alive, ready or in trouble.
@@ -161,8 +161,8 @@ Outcome: one page, no restart, and a monitoring system that is still standing.
 
 **How the rest is organised.** §1 is purpose and boundaries. §2 is the metric
 conventions, §3 health derivation, §4 the event streams, §5 logs, §6 tracing and
-§7 alerting. §8 holds the invariants, §9 this RFC's own metrics, and §10 the audit
-of every other RFC's table against §2, as edits. §11 is conformance and §12 open
+§7 alerting. §8 is the components that carry them and their lifecycle, §9 the invariants, §10 this RFC's own metrics, and §11 the audit
+of every other RFC's table against §2, as edits. §12 is conformance and §13 open
 questions. Appendix A is prior art; Appendix B where the current code differs.
 
 ### Scenarios
@@ -263,7 +263,7 @@ component can own: how health combines, and how the event streams leave the node
 This RFC **MUST NOT** be read as specifying:
 
 - any component's own metrics, conditions or log lines: each is its owner's,
-  listed in its Observability section. This RFC audits those tables (§10) and does
+  listed in its Observability section. This RFC audits those tables (§11) and does
   not restate them;
 - the management API: which endpoints exist, their paths and their
   authentication are [RFC 23](rfc-23-control-plane.md)'s. This RFC fixes what the
@@ -345,7 +345,7 @@ joined by underscores.
 | `smb_` | [RFC 22](rfc-22-smb.md) |
 | `api_`, `runtime_`, `audit_` | [RFC 23](rfc-23-control-plane.md#11.%20Observability) |
 | `memory_`, `cpu_`, `fd_` | [RFC 24](rfc-24-resources.md) |
-| `health_`, `events_`, `build_` | this RFC (§9) |
+| `health_`, `events_`, `build_` | this RFC (§10) |
 | `backup_`, `export_`, `import_` | [RFC 26](rfc-26-catalog-backups.md) |
 | `claim_`, `move_`, `rehome_` | [RFC 27](rfc-27-namespace-migration.md) |
 
@@ -453,7 +453,7 @@ source. The same rule applies to `shard`. This is the "stated rule" that
 **Series budget.** At the reference profile — 10⁴ shares, every protocol in use,
 every role on one node — a node **MUST** export no more than **50,000** series in
 all and no single metric more than **10,000**, histogram buckets included. Both
-are fixed design limits, checked by counting after the reference workload (§11);
+are fixed design limits, checked by counting after the reference workload (§12);
 a table whose metric cannot fit is a defect in that table. `vfs_op_seconds` sets
 the scale: about 45 operations × 3 protocols × 3 outcomes × 20 series per
 histogram is 8,100.
@@ -496,7 +496,7 @@ and other RFCs link to that table rather than count it again. This extends what
 [RFC 15 §10](rfc-15-topology.md#10.%20Observability) and
 [RFC 17 §7](rfc-17-vfs.md#7.%20Observability) already say for their own
 metrics. Two metrics counting the same event drift apart, and an alert on one
-misses what the other saw. §10 lists the duplicates in the set today.
+misses what the other saw. §11 lists the duplicates in the set today.
 
 ### 2.8 Export
 
@@ -509,6 +509,12 @@ misses what the other saw. §10 lists the duplicates in the set today.
   not grow with work in flight. An export that needs a component's state it cannot
   read within 5 s omits that component's series and counts it in
   `health_export_partial_total`, rather than block.
+- **Two ways to emit, one naming rule.** A leaf component that depends on no metrics
+  library (the journal, the carver, the syncer) keeps counters in a `Stats` snapshot,
+  and the component that composes it exports that snapshot under the leaf's prefix
+  through one read-through collector. Any other component is handed the registry in its
+  `Deps` and records into series it resolved at construction (§2.9). Either way the
+  name belongs to the RFC that owns the prefix, not to the code that exports it.
 - An export carries no file name, no user content and no secret (§2.4, §5.4). So
   it is not audit data; whether it is authenticated is still RFC 23's choice,
   since share and store names are.
@@ -530,7 +536,10 @@ A **condition** is the one way a component says something is wrong. It carries:
 
 - A condition names its subject by name and ID, and a file by its FileID, never by
   path: a health report is not where file names go (§5.4).
-- A component raises and clears its own conditions; nothing else may.
+- A component reports its conditions when the evaluator asks, once per
+  evaluation; a condition its source no longer reports is cleared. Nothing else
+  reports a component's conditions, and no API raises or clears one, so a
+  condition cannot be latched (§3.4). The Go shape is §8.2's `Source`.
 - **Information is not a condition.** A grace period in progress, a snapshot being
   taken, a node draining at an operator's request: they appear in the health
   report's information section (§3.7) and change no status.
@@ -607,7 +616,7 @@ owner.
   short condition from paging.
 - Each raise logs once at `Warn` (`Error` for an unhealthy one) and each clear
   once at `Info`, with the condition's name, subject, cause and duration, and is
-  counted in `health_condition_transitions_total{condition}` (§9).
+  counted in `health_condition_transitions_total{condition}` (§10).
 - An operator may **silence** a condition's alerts for a stated time, through the
   management API. Silencing changes no status: the condition still shows, marked
   silenced, and the silence ends at its time.
@@ -620,6 +629,11 @@ request scheduler, the engine's work scheduler and the health evaluator — has
 not completed a turn, or reported itself idle, within 60 s. It **MUST NOT** read a
 condition, a store, the network or the disk.
 
+> decision: an idle loop is live. The watchdog catches a loop stuck mid-turn, not one
+> that never wakes: a lost wakeup with work queued passes liveness and shows as a queue
+> that only grows. Overturned by an incident where a lost wakeup needed a restart;
+> then the loop reports its queue's oldest entry, and an old entry fails liveness.
+
 > decision: no dependency fails liveness. A liveness failure asks the
 > orchestrator to restart the process, and no dependency failure in this set is
 > fixed by a restart: the journal recovers, every NFS client waits out a grace
@@ -630,7 +644,8 @@ condition, a store, the network or the disk.
 ### 3.6 Readiness
 
 **Readiness answers whether the node should be sent new clients.** It fails only
-while sending them elsewhere would help: the node can serve no share at all.
+while sending them elsewhere would help: the node can serve no share at all, or a
+listener clients are sent to is down.
 
 | Node state | Live | Ready | Status |
 | --- | --- | --- | --- |
@@ -641,6 +656,8 @@ while sending them elsewhere would help: the node can serve no share at all.
 | some shares refused: a journal device lost, a share's store denied | yes | yes | unhealthy for those shares |
 | started from a copied image | yes | yes — reads of offloaded content continue | unhealthy, `copied_image` |
 | metadata store lost: no share served until a recovery import | yes | no | unhealthy, `metadata_store_lost` |
+| a listener lost (`adapter_listener_lost`) | yes | no — clients sent to it cannot connect | unhealthy |
+| a start step failed | yes | no | unhealthy, naming the step |
 | draining: stop requested | yes | no | draining |
 | watchdog stalled | no | no | — |
 
@@ -666,8 +683,8 @@ serves three answers. Their content is this:
 - **liveness** (`GET /health/live`): the one word `live` while §3.5's watchdog holds; a failed answer
   once it has not, and nothing else.
 - **readiness** (`GET /health/ready`): one word, the node state from §3.6's table — `ready` while
-  ready, otherwise `starting`, `draining`, or `not_ready` with the metadata store
-  lost — and nothing else.
+  ready, otherwise `starting`, `draining`, or `not_ready` (the
+  metadata store lost, a listener lost, or a failed start step) — and nothing else.
 - Neither answer names a share, a store or a condition, so either can be served
   to a probe that holds no credential
   ([RFC 23 §2.5](rfc-23-control-plane.md#2.5%20Health%20and%20readiness%20endpoints)).
@@ -735,7 +752,7 @@ row.
 | `memory_limit_below_floors`, `fd_limit_low`, `memory_near_limit` | [RFC 24 §10](rfc-24-resources.md#10.%20Observability) | node | degraded | ticket |
 | `metrics_label_capped` | §2.4 | node | degraded | ticket |
 | `event_spool_high` | §4.6 | node | degraded, above 80% of the spool bound | ticket |
-| `event_gap` | §4.4 | node, naming the stream | degraded | page for the access stream while any share's audit policy is on; ticket otherwise |
+| `event_gap` | §4.4 | node, naming the stream (any stream) | degraded | page for the access stream while any share's audit policy is on; ticket otherwise |
 | `replication_under_floor` **(cluster)** | [RFC 10 §14](rfc-10-journal-replication.md#14.%20Observability) | share | degraded | page at 5 min |
 | `shard_relinquished` **(cluster)** | [RFC 10 §14](rfc-10-journal-replication.md#14.%20Observability) | share | unhealthy; waits for a replica or the operator | page at once |
 | `node_lost` **(cluster)** | [RFC 11 §9](rfc-11-ownership.md#9.%20Failure), §3.8 | installation | degraded while its shards fail over | page at 5 min |
@@ -756,7 +773,7 @@ record operator actions in ([RFC 13 §9](rfc-13-configuration.md#9.%20Test%20pla
 [RFC 12 §6](rfc-12-snapshots.md#6.%20Observability)). Unlike the others it
 starts from durable records: RFC 23 commits each audit record in the
 transaction of the change it records, keeps it for `audit.retention`, and owns
-its fields. This section owns only how those records leave the node (§4.3).
+its fields. This section owns only how those records are read (§4.3).
 
 Alarm entries select access events like audit entries do
 ([RFC 19 §2.2](rfc-19-authorization.md#2.2%20Entry%20kinds)): a record says which
@@ -789,7 +806,7 @@ A record is one JSON object (RFC 8259) on one line. The event's own fields are
   thing decided.
 
 [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) shows the `AccessEvent` type and
-lists what a quota event is for, but not its fields; §10 asks it to add
+lists what a quota event is for, but not its fields; §11 asks it to add
 `QuotaEvent` with the fields above.
 
 ### 4.3 From the emit point to the spool
@@ -816,20 +833,12 @@ lists what a quota event is for, but not its fields; §10 asks it to add
    order across restarts and after retention has deleted every file, and the
    oldest file is the lowest number. A boot ID is random and a sequence number
    restarts with it, so neither can order files.
-5. **The `admin` stream has no ring.** Each node's writer reads, in commit order,
-   the audit records of requests that node took (their `node` field), and appends
-   them to the stream's spool. Its position is a **cursor record in the metadata
-   store**, one per node that takes requests, advanced after each synced batch,
-   so it outlives the node. A restart resumes at the cursor, so nothing is lost
-   and a record may be written twice across a crash; a consumer deduplicates by
-   the record's request ID. **(cluster)** One writer at a time holds a node's
-   cursor: the node itself while its lease holds; once it is `node_lost`
-   (§3.8), the first live `storage` node to take the cursor by a conditional
-   write on its record, which then exports the lost node's records into its own
-   spool. A node that rejoins takes its cursor back the same way. Every advance
-   is conditional on holding the cursor, so a writer that has lost it stops at
-   its next batch, and a record both exported across the change is a duplicate
-   the request ID removes.
+5. **The `admin` stream has no ring and no spool.** It is RFC 23's audit, read in commit
+   order through the management API by position; the consumer keeps its position.
+   Nothing is lost while the consumer is away, short of `audit.retention`.
+
+> ponytail: the admin stream is pulled, not spooled. Spool it on the node, with a cursor
+> record per node, when a deployment's shipper can only tail files and cannot page an API.
 
 ### 4.4 Bounds, drops and gap records
 
@@ -845,14 +854,10 @@ lists what a quota event is for, but not its fields; §10 asks it to add
 - The same holds for every other loss: `spool_full` when the writer cannot
   append, `trimmed` when the byte bound deletes a file (§4.6), and at start,
   `restart`, a gap record with no count for the events of the last unsynced
-  second before the previous process ended. The `admin` stream loses records only
-  to `trimmed` and `expired`: a full spool makes its writer wait, since its source
-  is durable, and a record the audit's retention deletes before the cursor
-  reaches it is lost, written as an `expired` gap record naming the commit-time
-  range skipped. At the default `audit.retention` of 400 days that takes a writer
-  stopped for more than a year.
-- A gap in the access stream raises `event_gap` naming the stream (§3.9), cleared
-  an hour after the last gap.
+  second before the previous process ended. The
+  `admin` stream is not spooled and loses nothing here.
+- A gap in any stream raises `event_gap` naming the stream (§3.9), cleared an
+  hour after its last gap.
 - **Quota events are coalesced.** A transition — threshold crossed, soft limit
   exceeded, grace expired, back under — is emitted once per transition. Hard
   refusals are coalesced per (share, scope, subject, resource): the first after a
@@ -938,13 +943,13 @@ lists what a quota event is for, but not its fields; §10 asks it to add
 
 The spool files are the export: JSON lines, one record per line, rotated and named
 in order (§4.3). A shipper tails them; the format needs no DittoFS code to read.
-The management API also serves a stream's records, filtered by share, time and
-sequence range, read from the same files
+The management API also serves the spooled streams' records, filtered by share,
+time and sequence range, read from the same files
 ([RFC 23 §6](rfc-23-control-plane.md#6.%20The%20audit) owns the endpoint,
-`GET /api/v1/events/{stream}`).
+`GET /api/v1/events/{stream}`); the `admin` stream is the audit itself (§4.3).
 
 Events **MUST NOT** be exported as metrics or written to the log: the counters of
-§9 count them, but no metric label or log line carries a record's identity, file
+§10 count them, but no metric label or log line carries a record's identity, file
 or name.
 
 > ponytail: one export, files. A push exporter to a syslog collector or a trace
@@ -1041,7 +1046,7 @@ No log line, span attribute, health detail, metric or event record carries:
 Share, store and namespace names, principal IDs, client addresses and client IDs
 are operational identifiers and may be logged at any level.
 
-The check is a test, not a review (§11): a full conformance run with known
+The check is a test, not a review (§12): a full conformance run with known
 secrets and known names planted, and every line, span and record searched for
 them.
 
@@ -1089,9 +1094,9 @@ them.
 - An unsampled span **MUST** cost no allocation and no clock read beyond the trace
   ID itself, so tracing off costs the request path nothing measurable. The
   conformance run counts allocations per operation with tracing off and on at
-  ratio 0 (§11).
+  ratio 0 (§12).
 - Spans are exported in batches by a writer of their own, from a bounded queue
-  that drops and counts (`health_spans_dropped_total`, §9) rather than block.
+  that drops and counts (`health_spans_dropped_total`, §10) rather than block.
 
 > ponytail: head sampling only. A slow or failed request is kept only if it was
 > sampled. Tail sampling in the collector — keep every trace that ends in an
@@ -1134,7 +1139,160 @@ exporting (the scraper's own), `health_status{scope="installation"}` away from
 `healthy` for longer than the longest page delay, as a backstop for an alert
 route that failed, and the bug counters above.
 
-## 8. Invariants
+## 8. Components and lifecycle
+
+The composition root ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role),
+[RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows))
+builds each component below once per process and hands it to its consumers as a
+`Deps` field: no global, no registry lookup, no value carried in a context. A
+field is a concrete type where there is one implementation, as in
+[RFC 17 §2.3](rfc-17-vfs.md#2.3%20Dependencies%20and%20wiring). Start and stop
+steps are [RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)'s.
+
+### 8.1 What the root builds
+
+| Component | Package | Built by, owned by | Depends on | Injected as | Lifecycle |
+| --- | --- | --- | --- | --- | --- |
+| log handler | `internal/logger` | the root, first | settings | `Logger *slog.Logger`; each consumer adds `With("component", prefix)` (§5.3) | `New` only; a `Debug` level set through the API expires on a timer the handler owns (§5.2) |
+| metrics registry | `pkg/metrics` | the root | build version and commit | `Metrics *metrics.Registry` | `New` registers only the process and runtime collectors; the metrics listener (§2.8) starts before start step 2 and stops after stop step 6, so a stuck stop can still be scraped |
+| watchdog | `pkg/health` | the root | clock | `Watchdog *health.Watchdog`; each watched loop takes its own `*health.Loop` from `Watchdog.Loop(name)` and closes it when the loop ends — a listener on unbind, since [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)'s reconfiguration adds and removes listeners at run time | starts before start step 2, stops after stop step 6; the liveness answer reads it (§3.5) |
+| health evaluator | `pkg/health` | the root; the runtime reads its `Snapshot` and writes node status (§3.8) | clock, logger, registry, §3.9's table as Go, the `Source`s | injected into nothing: each component is a `Source`, added with `Add` and removed with `Remove` by the runtime, which owns the set of running components ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)) | `Start` before start step 2, evaluating every second; `Close` after stop step 6 |
+| event sink | `pkg/events` | the root | clock, logger, registry, `events.path` | `Events *events.Sink`, to the filesystem service and the authenticator only | `New` opens nothing; `Start` after start step 2 and before step 5 opens the spool, writes the `restart` gap record (§4.4) and starts the writers; `Close(ctx)` after stop step 2 drains the rings until `ctx` ends, drops and counts the rest, and syncs the spool |
+| tracer | none: the tracing API | the root builds the provider when `tracing.endpoint` is set (§6.3), a no-op provider otherwise | settings | `Tracer`, the tracing API's tracer type, in the service's and the adapters' `Deps` | the provider shuts down after stop step 2, flushing within the drain deadline; spans it cannot flush are counted (§10) |
+
+### 8.2 The packages
+
+Three packages, each with the narrowest surface its consumers need. There is no
+tracing package: the `Deps` carry the tracing API's tracer type and the root
+builds the provider.
+
+```go
+package metrics // pkg/metrics
+
+// The vector and collector types are aliases of the client library's own,
+// written clientlib here: no wrapper, so the surface is the library's.
+type (
+	CounterVec   = clientlib.CounterVec
+	GaugeVec     = clientlib.GaugeVec
+	HistogramVec = clientlib.HistogramVec
+	Collector    = clientlib.Collector
+)
+
+type Buckets uint8
+
+const (
+	None       Buckets = iota // not a histogram
+	Request                   // §2.6's sets
+	Background
+	Size
+	Count
+)
+
+type Spec struct {
+	Name    string   // without dittofs_; its prefix is in §2.1's table
+	Help    string
+	Labels  []string // refused if forbidden (§2.4); share and shard refused on counters and histograms
+	Buckets Buckets  // histograms only
+}
+
+type Registry struct{ /* the client library's registry */ }
+
+func New(version, commit string) *Registry
+
+// Counter, Gauge and Histogram panic on a Spec that breaks §2.1–§2.4, so a bad
+// name fails the first test that builds its component (§2.9).
+func (r *Registry) Counter(s Spec) *CounterVec
+func (r *Registry) Gauge(s Spec) *GaugeVec
+func (r *Registry) Histogram(s Spec) *HistogramVec
+func (r *Registry) Collect(c Collector) // read-through snapshots (§2.8), worst-n gauges (§2.5)
+func (r *Registry) Handler() http.Handler
+```
+
+```go
+package health // pkg/health
+
+type Name string    // a condition's name; the constants are §3.9's table as Go
+type Severity uint8 // Degraded, Unhealthy (§3.2)
+type Scope uint8    // Store, Namespace, Journal, Share, Node, Installation (§3.3)
+
+type Subject struct {
+	Scope    Scope
+	ID, Name string
+}
+
+// Condition carries no severity and no since: the registry's rule supplies the
+// first from Name and Cause, and the evaluator the second.
+type Condition struct {
+	Name    Name
+	Subject Subject
+	Cause   error  // the closed error or reason (§3.1)
+	Detail  string // a constant message and the figures that matter
+}
+
+// Source is what a component implements. The evaluator calls it once per
+// evaluation; a condition the source no longer returns is cleared (§3.4).
+type Source interface {
+	Conditions(dst []Condition) []Condition
+}
+
+type Evaluator struct{ /* … */ }
+
+func NewEvaluator(clk clock.Clock, log *slog.Logger, m *metrics.Registry) *Evaluator
+func (e *Evaluator) Add(s Source)
+func (e *Evaluator) Remove(s Source)
+func (e *Evaluator) Start(ctx context.Context) error
+func (e *Evaluator) Snapshot() Snapshot // what §3.7's health answer reports
+func (e *Evaluator) Close() error
+
+type Watchdog struct{ /* … */ }
+
+func NewWatchdog(clk clock.Clock) *Watchdog
+func (w *Watchdog) Loop(name string) *Loop
+func (w *Watchdog) Live() bool // every open loop turned or idle within 60 s (§3.5)
+
+type Loop struct{ /* … */ }
+
+func (l *Loop) Turn()  // a turn completed
+func (l *Loop) Idle()  // waiting, with nothing to do
+func (l *Loop) Close() // the loop is gone and no longer counts
+```
+
+```go
+package events // pkg/events
+
+type AccessEvent struct{ /* RFC 17 §3.3's fields */ }
+type QuotaEvent struct{ /* §4.2's quota fields */ }
+type LogonEvent struct{ /* §4.2's logon fields */ }
+
+// Sink is nil-safe: a nil *Sink is the null sink.
+type Sink struct{ /* rings, writers, spool */ }
+
+func New(clk clock.Clock, log *slog.Logger, m *metrics.Registry, path string) *Sink
+func (s *Sink) Start(ctx context.Context) error
+func (s *Sink) Access(ctx context.Context, e *AccessEvent) // §4.3: copies, never waits
+func (s *Sink) Quota(ctx context.Context, e *QuotaEvent)
+func (s *Sink) Logon(ctx context.Context, e *LogonEvent)
+func (s *Sink) Close(ctx context.Context) error
+```
+
+- **The event types live in `events`, not beside their emitters.** The sink's
+  methods are typed, so a sink that took `vfs` and `identity` types would import
+  both packages, while `vfs.Deps` imports the sink: an import cycle. So the sink
+  and its three structs live in the leaf package, and
+  [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) still fixes the access
+  event's fields.
+- **No library type name appears in this RFC's text.** The client library's
+  types reach a component only through the aliases above.
+
+### 8.3 On removal
+
+A share's per-share gauges are computed at export from the live share list, so a
+removed share leaves at the next scrape with nothing to delete. Its conditions
+leave when the runtime removes its context's `Source`. No counter carries the
+share, so none changes. A removed store, namespace or journal has its series
+deleted by the component that created them (§2.4).
+
+## 9. Invariants
 
 | # | Invariant |
 | --- | --- |
@@ -1155,7 +1313,7 @@ route that failed, and the bug counters above.
 | O15 | No line at `Info` or above is written per client request. |
 | O16 | The trace context never enters a request ID, dedup key or durable record. |
 
-## 9. Observability
+## 10. Observability
 
 What this RFC itself exports. Metric names are shown without the prefix.
 
@@ -1169,7 +1327,7 @@ What this RFC itself exports. Metric names are shown without the prefix.
 | series exported, and entity labels capped (§2.4) | `health_series`, `health_label_capped_total{metric}` | gauge, counter |
 | spans dropped by the export queue (§6.3) | `health_spans_dropped_total` | counter |
 | records accepted, by stream | `events_records_total{stream}` | counter |
-| records dropped, by stream and reason (`ring_full`, `spool_full`, `trimmed`, `restart`; `expired` for `admin`) | `events_dropped_total{stream, reason}` | counter |
+| records dropped, by stream and reason (`ring_full`, `spool_full`, `trimmed`, `restart`) | `events_dropped_total{stream, reason}` | counter |
 | ring occupancy against its size | `events_ring_entries{stream}`, `events_ring_entries_limit{stream}` | gauge, gauge |
 | spool bytes against its bound, and the oldest file's age | `events_spool_bytes`, `events_spool_bytes_limit`, `events_spool_oldest_seconds` | gauge, gauge, gauge |
 | time from accept to synced in the spool | `events_write_seconds{stream}` | histogram (`request`) |
@@ -1178,9 +1336,9 @@ What this RFC itself exports. Metric names are shown without the prefix.
 `condition` takes the registry's names, a closed set; `health_conditions` is
 exported at zero for every registered condition (§2.3). `events_dropped_total`
 is the one count of lost events: it replaces the drop counters of RFC 7 and
-RFC 17 (§10).
+RFC 17 (§11).
 
-## 10. Audit of the set's tables
+## 11. Audit of the set's tables
 
 Every Observability section was read against §2. Each row is an edit for the
 owning RFC; none is applied here.
@@ -1217,7 +1375,7 @@ Tables found to follow §2 as written: [RFC 2](rfc-2-carver.md#2.3%20What%20a%20
 [RFC 24](rfc-24-resources.md#10.%20Observability), with their histograms to take
 the `request` or `background` set of §2.6.
 
-## 11. Conformance
+## 12. Conformance
 
 The checks run at the tiers [RFC 29 §4.3](rfc-29-test-harness.md#4.3%20Tiers)
 names, on the composed single-node harness of the [index](rfc-index.md#Test%20harness).
@@ -1239,14 +1397,13 @@ names, on the composed single-node harness of the [index](rfc-index.md#Test%20ha
 | §4.5 restart | Kill the process with events in the ring. Restart: assert a `restart` gap record and a new boot ID, no sequence number reused within a stream and boot, and spool file names still sorting in write order across the restart. | a reused sequence after a crash |
 | §4.6 retention | Fill the spool past `events.max_bytes`: assert the oldest file deleted, a `trimmed` gap record, `event_spool_high` raised first. Advance the clock past `events.retention` with the spool under its bound: assert the old files retired, no gap record and no `event_gap`. Put `events.path` on a journal's filesystem: assert the start refused. | a spool that eats journal capacity; a page for every hour of normal retention |
 | §4.8 access | As `viewer` and as `operator`, read the access and admin streams: refused. Change a share's audit policy: assert an `admin` record in the spool. Assert spool modes 0600/0700 and a start refused on a world-readable path. | audit data readable by any account |
-| §4.3 admin stream | Kill the node between an audited change and its export; restart. Assert the record is in the spool once the writer resumes, and nothing after the cursor is missing. **(cluster)** Kill it and never restart it: assert, once it is `node_lost`, another storage node exports the record; restart it then, and assert one writer advances its cursor. | an admin record lost to a crash or to a node lost for good |
 | §5.4 never logged | Configure every secret-bearing record, plant known file names and known xattr contents, run the full suite at `Info`, and again at `Debug` for the second check. Search every line, span, health answer, metric and record: assert no secret anywhere, no content anywhere, no planted name at `Info` or above or outside the access stream. | a path in a warning; a token in a span |
 | §5.2 per-request lines | Run 10⁵ operations of every kind with clients provoking every expected error. Assert the count of lines at `Info` and above does not grow with the operation count. | a log line per request |
 | §5.2 debug expiry | Turn debug on for one component; advance the clock 15 minutes: assert it is off. | debug left on |
 | §6.2 propagation **(cluster)** | Forward a write from P1 to S2 with sampling at 1: assert one trace with P1's span parenting S2's service span. Retry the write: assert the same request ID, a new span, and one application. | trace context in the dedup key |
 | §6.3 cost | Count allocations per `Write`, `Read` and `GetAttr` with tracing off and with an endpoint at ratio 0: assert equal. | a span that allocates unsampled |
 
-## 12. Open questions
+## 13. Open questions
 
 1. **A per-share counter profile.** §2.4 forbids share labels on counters. An
    installation with tens of shares might want them; whether to offer a setting,
