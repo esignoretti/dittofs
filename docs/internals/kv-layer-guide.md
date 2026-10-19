@@ -92,7 +92,7 @@ FoundationDB is optimistic like Badger, so most of the contract maps straight on
 | `Now` | The node's clock under a ceiling key, the same code as `badgerkv` (`internal/backend/clock.go`) |
 | Durable before `Update` returns | Native: FoundationDB acknowledges a commit once its logs hold it, and batches concurrent commits itself, so there is no syncer |
 
-Two decisions are marked in the code. An unknown commit result is returned as an error, not retried, because the commit may have landed and running the transaction again would answer as if it had not. And `Close` leaves the client's database handle open, because the client shares one handle among every store on a cluster file.
+Two behaviours go beyond what FoundationDB does by itself. An unknown commit result is retried safely: every `Update` that writes also writes a commit mark (`\x00commit/`, time-ordered and swept after ten minutes), and the retry first reads that mark, tracked; if the commit landed, `Update` reports success without running the transaction again, so a create never finds its own file and answers that it exists. And `Close` leaves the client's database handle open, because the client shares one handle among every store on a cluster file.
 
 `Limits()` on FoundationDB: keys up to 10 kB less the store's prefix, values up to 100 kB less the stamp, five seconds per transaction, and `TxnBytes` of 3 MB, under a third of FoundationDB's 10 MB because FoundationDB counts a written key three times (the mutation and both ends of its conflict range). A transaction of unusually short keys can still reach FoundationDB's limit first; it then gets `ErrTooLarge` from the backend's own estimate.
 

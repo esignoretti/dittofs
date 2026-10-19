@@ -6,6 +6,7 @@ package fdbkv
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -50,8 +51,9 @@ type Store struct {
 	time   *backend.Clock
 	limits kv.TxnLimits
 
-	stop chan struct{}
-	done chan struct{}
+	stop  chan struct{}
+	done  chan struct{} // the clock loop ended
+	swept chan struct{} // the mark sweep ended
 
 	// gate is held shared by every Update and View attempt and exclusively
 	// by Close, which so waits for the calls in flight. closed is set under
@@ -78,6 +80,7 @@ func Open(opts Options) (*Store, error) {
 		clk:    append(keys.ID([]byte{keys.KindN}, opts.NodeID[:]), keys.NClk),
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
+		swept:  make(chan struct{}),
 	}
 	if len(s.prefix) > 0 {
 		if s.end, err = fdb.Strinc(s.prefix); err != nil {
@@ -106,6 +109,19 @@ func Open(opts Options) (*Store, error) {
 	go func() {
 		defer close(s.done)
 		s.time.Run(s.stop, s.writeCeiling)
+	}()
+	go func() {
+		defer close(s.swept)
+		tick := time.NewTicker(markSweep)
+		defer tick.Stop()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-tick.C:
+				_ = s.sweepMarks() // a failed sweep is tried again at the next tick
+			}
+		}
 	}()
 	return s, nil
 }
@@ -152,6 +168,7 @@ func (s *Store) Close() error {
 	s.gate.Unlock()
 	close(s.stop)
 	<-s.done
+	<-s.swept
 	return nil
 }
 
@@ -172,8 +189,49 @@ func (s *Store) key(k []byte) fdb.Key {
 }
 
 func (s *Store) Update(ctx context.Context, fn func(kv.Txn) error) error {
-	return kv.Retry(ctx, func() error { return s.attempt(ctx, fn) })
+	var c commit
+	return kv.Retry(ctx, func() error { return s.attempt(ctx, fn, &c) })
 }
+
+// commit is what an Update's attempts share: the mark its commit writes, and
+// whether an attempt's commit left its outcome unknown.
+type commit struct {
+	mark    []byte // keys.Commit‖time‖random, made by the first attempt that writes
+	inDoubt bool
+}
+
+// Commit marks are swept once they are older than markRetention, far longer
+// than any Update retries, every markSweep.
+//
+// ponytail: every Update that writes also writes its mark, kept for ten
+// minutes: one small key per commit. Switch to FoundationDB's own automatic
+// idempotency once it is marked ready, which keeps the same record itself.
+const (
+	markRetention = 10 * time.Minute
+	markSweep     = time.Minute
+)
+
+// newMark is a commit mark: its time first, so marks sort by age, then
+// random bytes, so two commits in one nanosecond still differ.
+func newMark() []byte {
+	m := binary.BigEndian.AppendUint64(append([]byte{}, keys.Commit...), uint64(time.Now().UnixNano()))
+	return append(m, rand.Text()[:16]...)
+}
+
+// sweepMarks clears the marks older than markRetention, as one range: a range
+// clear conflicts with no commit, whose own mark is newer than the cut.
+func (s *Store) sweepMarks() error {
+	cut := binary.BigEndian.AppendUint64(append([]byte{}, keys.Commit...), uint64(time.Now().Add(-markRetention).UnixNano()))
+	_, err := s.db.Transact(func(tr fdb.Transaction) (any, error) {
+		tr.ClearRange(fdb.KeyRange{Begin: s.key(keys.Commit), End: s.key(cut)})
+		return nil, nil
+	})
+	return err
+}
+
+// afterCommit sees a commit's result before the attempt does; tests replace
+// it to report a landed commit's outcome as unknown.
+var afterCommit = func(err error) error { return err }
 
 func (s *Store) View(ctx context.Context, fn func(kv.Reader) error) error {
 	if err := s.enter(); err != nil {
@@ -212,7 +270,7 @@ func (s *Store) begin(ctx context.Context) (fdb.Transaction, func(), error) {
 	return tr, func() { close(done); tr.Cancel() }, nil
 }
 
-func (s *Store) attempt(ctx context.Context, fn func(kv.Txn) error) error {
+func (s *Store) attempt(ctx context.Context, fn func(kv.Txn) error, c *commit) error {
 	if err := s.enter(); err != nil {
 		return err
 	}
@@ -228,6 +286,18 @@ func (s *Store) attempt(ctx context.Context, fn func(kv.Txn) error) error {
 	// take it at its commit, after any write it should conflict with.
 	if _, err := tr.GetReadVersion().Get(); err != nil {
 		return mapErr(err)
+	}
+	if c.inDoubt {
+		// An earlier attempt's commit may have landed: its mark says so. The
+		// read is tracked, so a commit still in flight that lands after this
+		// snapshot aborts this attempt, and the next one reads its mark.
+		v, err := tr.Get(s.key(c.mark)).Get()
+		if err != nil {
+			return mapErr(err)
+		}
+		if v != nil {
+			return nil
+		}
 	}
 	t := &txn{reader: reader{s: s, snap: tr.Snapshot(), own: backend.Overlay{}}, tr: tr, now: s.time.Now()}
 	// Issued now and waited on only if fn asks the time.
@@ -260,20 +330,24 @@ func (s *Store) attempt(ctx context.Context, fn func(kv.Txn) error) error {
 			tr.SetVersionstampedValue(key, stamped(w.Value))
 		}
 	}
+	if c.mark == nil {
+		c.mark = newMark()
+	}
+	tr.Set(s.key(c.mark), nil)
 	if t.timed {
 		// Raise the highest time handed out to this transaction's. An
 		// atomic maximum conflicts with nothing, and a later transaction
 		// on any node then reads at least this time.
 		tr.Max(s.key(keys.Time), binary.LittleEndian.AppendUint64(nil, uint64(t.now.UnixNano())))
 	}
-	if err := tr.Commit().Get(); err != nil {
-		// decision: an unknown commit result is returned, not retried. The
-		// commit may have landed, and running fn again over its own
-		// result would answer as if it had not: a create would find its
-		// file and report it exists. The error leaves the outcome
-		// unknown, as kv.KV says an Update error does.
+	if err := afterCommit(tr.Commit().Get()); err != nil {
+		// An unknown commit result is retried, and the retry first reads
+		// this commit's mark: if the commit landed, the Update is done, so
+		// fn never runs again over its own result, as a create that found
+		// its file and reported it exists would.
 		if code(err) == codeCommitUnknown {
-			return fmt.Errorf("fdbkv: commit outcome unknown: %w", err)
+			c.inDoubt = true
+			return fmt.Errorf("%w: fdbkv: commit outcome unknown: %w", kv.ErrConflict, err)
 		}
 		return mapErr(err)
 	}
