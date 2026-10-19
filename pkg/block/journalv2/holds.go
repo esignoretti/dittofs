@@ -30,7 +30,8 @@ func (h *Handle) Held(share ShareID) int64 {
 }
 
 // Stamp records the cut an existence commit read, for every version of file
-// id it covered up to through. It is a record made durable by the file's next
+// id it covered up to through. An offer carries it with each extent, as
+// OfferedExtent.Cut, for the offload commit to copy into the ref as born. It is a record made durable by the file's next
 // Sync. It carries a version already issued, so the version limit never
 // refuses it; it is refused with a NoSpaceError naming LimitHeadroom once less
 // than half the reserved headroom remains, and a refused or failed Stamp

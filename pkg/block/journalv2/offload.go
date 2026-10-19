@@ -9,11 +9,11 @@ import "io"
 // the callback is called.
 type Offer struct {
 	ID         FileID
-	Dirty      []Extent // the extents offered
-	Neighbours []Extent // offloaded held extents contiguous with Dirty, offered on request (widen)
-	Superseded []Held   // superseded versions the journal still retains for offload
-	Oldest     Version  // the oldest content version among the offered records, neighbours included
-	Newest     Version  // the newest
+	Dirty      []OfferedExtent // the extents offered, each with its version and stamp
+	Neighbours []Held          // offloaded held extents contiguous with Dirty, offered on request (widen)
+	Superseded []OfferedExtent // superseded versions the journal still retains for offload
+	Oldest     Version         // the oldest content version among the offered records, neighbours included
+	Newest     Version         // the newest
 
 	// Offered reads the offered bytes at file offsets, for as long as the
 	// callback runs. A read outside the offered extents fails with
@@ -24,16 +24,50 @@ type Offer struct {
 	Offered io.ReaderAt
 }
 
-// Offload offers the dirty content of file id and marks exactly the extents
-// reported offloaded. It is OffloadMany over one file.
-func (h *Handle) Offload(id FileID, limit, widen int64, fn func(o Offer, report func(offloaded []Extent) error) error) error {
+// OfferedExtent is one extent of an offer, with the content version of its
+// bytes and the stamp of that version: the cut its existence commit read,
+// which the offload commit copies into the ref as born. One offer can hold
+// several versions of one file side by side, and born is decided per extent,
+// so the offer's Oldest and Newest alone cannot say which bytes are which.
+//
+// Stamped is false only for a version whose stamp was lost, refused or
+// failed to append; it is offered all the same, and the offload commit
+// rebuilds its born from the file's record in metadata. A neighbour carries no
+// stamp: its born is the one on the ref it comes from.
+type OfferedExtent struct {
+	Extent  Extent
+	Version Version
+	Cut     SnapshotCut // the cut its existence commit read; valid only when Stamped
+	Stamped bool        // false: the stamp was lost; the offload commit rebuilds born
+}
+
+// Capture names one file to offload and Through, the version the caller's own
+// existence commit for it covered. Nothing above Through is offered.
+type Capture struct {
+	ID      FileID
+	Through Version
+}
+
+// Offload offers the dirty content of file id at or below through, and marks
+// exactly the extents reported offloaded. It is OffloadMany over one Capture.
+func (h *Handle) Offload(id FileID, through Version, limit, widen int64, fn func(o Offer, report func(offloaded []Extent) error) error) error {
 	return ErrNotImplemented
 }
 
-// OffloadMany offers the dirty content of the files ids in one callback, so
-// the caller can pack several files into one block, and marks exactly the
+// OffloadMany offers the dirty content of the captured files in one callback,
+// so the caller can pack several files into one block, and marks exactly the
 // extents reported offloaded. Offloading is how dirty content becomes
 // evictable; the journal itself uploads nothing.
+//
+// Each file is offered only up to its Capture's Through, the version the
+// caller's existence commit covered: an extent above it stays dirty for a
+// later call, since a version whose existence has not committed has no stamp
+// and so no correct born. Where a version above Through overwrote one at or
+// below it, the older one is still offered, retained, as the file's live
+// content. A version at or below Through whose stamp was lost is offered with
+// Stamped false, never skipped: skipping it would keep it from ever being
+// released, and the headroom whose exhaustion refused the stamp would never
+// come back.
 //
 // What is offered: extents whose offloaded bit is unset, in offset order,
 // until the next would pass limit, the bound on the dirty bytes offered across
@@ -60,7 +94,7 @@ func (h *Handle) Offload(id FileID, limit, widen int64, fn func(o Offer, report 
 // Partial success is honoured: every extent reported before fn returns stays
 // marked, whatever fn returns, and the error fn returns covers only what was
 // not reported. No lock is held while fn runs.
-func (h *Handle) OffloadMany(ids []FileID, limit, widen int64, fn func(offers []Offer, report func(id FileID, offloaded []Extent) error) error) error {
+func (h *Handle) OffloadMany(files []Capture, limit, widen int64, fn func(offers []Offer, report func(id FileID, offloaded []Extent) error) error) error {
 	return ErrNotImplemented
 }
 

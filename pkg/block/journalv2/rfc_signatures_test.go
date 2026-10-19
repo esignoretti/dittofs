@@ -48,12 +48,12 @@ var (
 	_ = []ChangeKind{ChangeWrite, ChangeTruncate, ChangeDeallocate, ChangeDelete, ChangeCloneTarget, ChangeLoss}
 
 	_ = func(h *Handle) error {
-		return h.Offload(FileID{}, int64(0), int64(0), func(o Offer, report func(offloaded []Extent) error) error {
+		return h.Offload(FileID{}, Version{}, int64(0), int64(0), func(o Offer, report func(offloaded []Extent) error) error {
 			return report([]Extent(nil))
 		})
 	}
 	_ = func(h *Handle) error {
-		return h.OffloadMany([]FileID(nil), int64(0), int64(0), func(offers []Offer, report func(id FileID, offloaded []Extent) error) error {
+		return h.OffloadMany([]Capture(nil), int64(0), int64(0), func(offers []Offer, report func(id FileID, offloaded []Extent) error) error {
 			return report(FileID{}, []Extent(nil))
 		})
 	}
@@ -66,7 +66,9 @@ var (
 	_ = func(h *Handle) error { return h.Stamp(FileID{}, Version{}, SnapshotCut(0)) }
 	_ = func(j *Journal) (int64, error) { return j.Repack(int64(0), RepackScope{}) }
 
-	_ = Offer{ID: FileID{}, Dirty: []Extent(nil), Neighbours: []Extent(nil), Superseded: []Held(nil),
+	_ = Offer{ID: FileID{}, Dirty: []OfferedExtent(nil), Neighbours: []Held(nil), Superseded: []OfferedExtent(nil),
 		Oldest: Version{}, Newest: Version{}, Offered: io.ReaderAt(nil)}
+	_ = OfferedExtent{Extent: Extent{}, Version: Version{}, Cut: SnapshotCut(0), Stamped: false}
+	_ = Capture{ID: FileID{}, Through: Version{}}
 	_ = RepackScope{Share: ShareTag(0), Segments: []SegmentID(nil)}
 )
