@@ -1299,6 +1299,17 @@ not evidence for the ACL path, and the reverse.
    everyone's rewrite would add write data the entry lacked. Settling it needs
    the merge to apply only the bits that changed, which is RFC 7's merge to
    change, not this RFC's.
+7. **How an adapter obtains its `Spelling`.** §5.1's translation takes RFC 18's
+   mapping bound to the call's caller, and the adapter calls it. But
+   [RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)'s `Deps` carries only the
+   service and the authenticator, and
+   [RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity) forbids an adapter to map a
+   principal itself. Either the service hands out the call's `Spelling`, or
+   `Deps` gains RFC 18's mapping. To be settled with RFC 17 and RFC 20.
+8. **`dacl` and `sacl`.** Whether any client of the reference profile reads or
+   sets them is unmeasured. If none does, serving `acl` alone loses no round
+   trip, because `acl` leaves the stored flags as they were (§7.1). What it does
+   lose is setting the protected flag over NFS.
 
 ## Appendix A — prior art
 
@@ -1331,19 +1342,21 @@ not evidence for the ACL path, and the reverse.
 | §2.3 | principals by ID, kind part of the entry | an entry's principal is a string: `OWNER@`-style specials, `sid:<SID>`, `name@domain`, or `<number>@localdomain`; the last matches the caller's UID **or** any of its GIDs, so a user entry for uid 1000 matches every member of gid 1000 |
 | §2.3, §3.3 | owner rights leaves `OWNER@` matching | an effective owner-rights entry stops `OWNER@` entries matching the owner, as Samba does |
 | §2.6 | null DACL stored as one allow-everyone entry | stored as a flag the evaluator checks first |
+| §2.8 | a SID no principal holds refuses the set | a foreign-domain SID in a DACL entry is stored as `sid:<SID>` and round-trips |
 | §2.8, §6.4 | an unsupported entry refuses the set | the descriptor parser skips entry types it cannot map, object and callback denies included, and stores the rest |
-| §3.1 step 5 | the owner's implicit rights are not removable by a deny | an explicit deny removes them per bit; an administrator SID owner also receives change-the-owner implicitly, as a take-ownership privilege |
+| §3.1 step 5 | the owner's implicit rights are not removable by a deny | an explicit deny removes them per bit; an administrator SID owner also receives change-the-owner implicitly, as a take-ownership privilege (`HasTakeOwnershipPrivilege`, `IsAdminSID`) |
 | §3.1, RFC 7 §7.1 | the share ceiling is applied at the chokepoint | the SMB write and create handlers test the session's share permission themselves; the metadata layer separately strips write and delete for a read-only grant, and a handle-based write bypass skips the file check unless the ACL holds a deny |
-| §3.2 | the ceiling is never written into an ACL | share grants are synthesised into the share root's ACL, and direct SID grants are added to the descriptor shown for files with no stored ACL, display only |
+| §3.2 | the ceiling is never written into an ACL | share grants are synthesised into the share root's ACL, and direct SID grants are added to the descriptor shown for files with no stored ACL, display only (`BuildShareRootACL`, `LocalDomainPrincipal`) |
 | §3.4 | maximum allowed as Windows' access check | `GENERIC_READ` and `GENERIC_EXECUTE` beside `MAXIMUM_ALLOWED` are granted best-effort, as Samba does |
 | §3.7 | audit entries select events | audit entries are stored and shown and select nothing |
-| §4.1 | the mode-implied ACL is shown and evaluated | a file with no stored ACL is shown owner and SYSTEM full control over SMB and an empty `acl` over NFSv4, and evaluated by a separate mode check in which the write bit grants delete on the file and ownership grants change-the-owner |
+| §4.1 | the mode-implied ACL is shown and evaluated | a file with no stored ACL is shown owner and SYSTEM full control over SMB and an empty `acl` over NFSv4, and evaluated by a separate mode check in which the write bit grants delete on the file and ownership grants change-the-owner (`SynthesizeWindowsDefault`) |
 | §4.2, RFC 7 §2.6 | setting an ACL stores the mode it implies | setting an ACL leaves `Mode` unchanged; the mode-from-ACL function has no production caller |
 | §4.3, RFC 7 §2.6 | `chmod` limits named allows | `chmod` rewrites only the owner, group and everyone entries and leaves named entries unchanged |
-| §4.4 | no server-side propagation | a propagation function exists with no production caller, and the SMB fidelity guide lists recursive propagation as working |
+| §4.4 | inherited flags stored as sent | the auto-inherited flag is kept only when a set carries both it and the auto-inherit request, unless a per-share setting (`acl flag inherited canonicalization = no`) keeps it as sent |
+| §4.4 | no server-side propagation | a propagation function exists with no production caller, and the SMB fidelity guide lists recursive propagation as working (`PropagateACL`) |
 | §5.1, RFC 20 §2.3 | one translation both adapters share | NFS writes stored who strings verbatim; SMB has its own principal-to-SID mapping inside its handler package |
 | §6.1 | an unresolvable owner SID refuses the set | it is ignored and the rest of the set applied |
 | §7.1 | `acl`, `dacl`, `sacl` | only `acl` is served; it carries no audit entries on read, and audit entries sent in it are stored in the access list; `aclsupport` reports all four kinds |
 | §7.2 | the group flag from the principal's kind | the group flag is neither set on read nor read on write |
 | §7.3 | `ACCESS` bits by right | a directory's `MODIFY` and `EXTEND` both map to one write permission needing write data and append together |
-| docs | — | the ACL design document still states that ACLs are validated for canonical order, which the code no longer does |
+| docs | — | `docs/internals/acl-design.md` still states that ACLs are validated for canonical order, which the code no longer does |
