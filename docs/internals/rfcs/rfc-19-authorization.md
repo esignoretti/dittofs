@@ -4,7 +4,6 @@ title: "RFC 19 — authorization"
 component: authorization
 status: draft
 depends_on:
-  - "[[rfc-0-data-lifecycle]]"
   - "[[rfc-7-namespace-metadata]]"
   - "[[rfc-13-configuration]]"
   - "[[rfc-14-open-state]]"
@@ -116,12 +115,6 @@ With this RFC:
 - The mode and the ACL agree after every change, by two functions this RFC
   defines (§4).
 
-**How the rest is organised.** §1 gives the purpose and the split with RFC 7.
-§2 is the model, §3 evaluation, §4 the mode and inheritance. §5 is the shared
-translation, §6 and §7 its two spellings. §8 is the worked example end to end.
-§9–§11 are invariants, metrics and conformance; §12 lists open questions.
-Appendix A is prior art, Appendix B where the current code differs.
-
 ### Scenarios
 
 **build01 runs `chmod 750` on a directory alice permissioned from Windows.**
@@ -169,29 +162,6 @@ Outcome: a file can narrow a share grant and never widen it.
    is refused whole with `ErrInvalid`; nothing is stored.
 
 Outcome: an unsupported entry costs the client an error, never an open door.
-
-## In short
-
-- One ACL per file, stored by [RFC 7](rfc-7-namespace-metadata.md); this RFC
-  owns what it means. Entries name principals by ID, never by a protocol
-  spelling.
-- Rights are the union both protocols need, at the bit values both protocols
-  already share. Generic rights are mapped before anything is stored or asked.
-- A decision runs one sequence: map the request, take the share ceiling, apply
-  privilege or the owner's implicit rights and the walk, add what the parent
-  grants for delete, remove what the flags refuse, intersect with the ceiling,
-  decide, and select audit events.
-- The walk is RFC 7's ordered allow and deny walk, in stored order, adopted as
-  the evaluation; the server never reorders what a client set.
-- A file with no stored ACL is evaluated against the ACL its mode implies, and
-  that same ACL is what both protocols are shown.
-- The mode an ACL implies is computed by one function; a `chmod` merges by
-  RFC 7's rule; the two agree after every transaction.
-- One translation, shared by both adapters, spells the ACL as a security
-  descriptor and as an NFSv4 `acl`, `dacl` or `sacl`. Every principal has a
-  spelling in both; what cannot be held is refused, never dropped.
-- Audit entries never grant or deny. They select access events, when the
-  share's audit policy says to honour them.
 
 ---
 
@@ -833,8 +803,8 @@ directory's transaction for as long as the tree is large.
 
 > ponytail: no server-side propagation. Clients that propagate already walk the
 > tree themselves, one set per file. Add an asynchronous, resumable propagation
-> job — the shape of RFC 26's batched work — when an operator needs to change
-> the permissions of a tree too large for a client to walk.
+> job when an operator needs to change the permissions of a tree too large for a
+> client to walk.
 
 ## 5. The shared translation
 
