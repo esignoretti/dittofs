@@ -29,8 +29,7 @@ tags:
 ---
 # RFC 23 — the control plane
 
-**Status:** draft. [§13](#13.%20Open%20questions) lists what is known to be undecided, and
-records the one question since settled.
+**Status:** draft. [§13](#13.%20Open%20questions) lists what is known to be undecided.
 **Audience:** anyone adding a management-API resource or action, changing how a
 node is composed or how it applies a record, or writing a client of the API —
 the CLI, the Kubernetes operator, a script.
@@ -424,8 +423,8 @@ the API, forms no cycle with it.
    ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)). From here the node's health endpoints answer
    (§2.5): live, not ready. The node's API address opens here. Until step 4,
    every `/api/v1` route but `/api/v1/health` answers `503` `starting`. On a
-   node without `storage` every `/api/v1` route but `/api/v1/health` answers
-   `404`.
+   node without `storage` every `/api/v1` route answers `404`,
+   `/api/v1/health` included (§2.5).
 3. **Load the runtime.** Register the node's version ranges and roles in its
    node record ([RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap)) — refusing to go on if an active version lies
    outside them — then read the settings, the share list and the principals
@@ -556,7 +555,8 @@ node-status record is one of them.
 
 ### 2.5 Health and readiness endpoints
 
-Every node, of either role, serves on its API address:
+Every node, of either role, serves on its API address the two anonymous
+endpoints; a `storage` node also serves the third:
 
 | Endpoint | Answers | Authentication |
 | --- | --- | --- |
@@ -571,6 +571,28 @@ to send traffic, and an anonymous caller is owed nothing more. What "live",
 adapter is not ready is [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)'s. The endpoints answer from step 2
 of start (§2.2), so a node stuck recovering its journal says so instead of
 refusing connections.
+
+> decision: a protocol-only node serves only the two anonymous endpoints. An
+> API token is verified with the signing key, which is sealed under the
+> `storage` wrapping key (§5.3) and so cannot be opened on a node without
+> `storage`; verifying `/api/v1/health` there would need a second key scheme.
+> Its conditions are read through a storage node's `/api/v1/health`, which
+> reports the installation's. Overturned if an operator must read a protocol
+> node's detail where no storage node is reachable, and then by signing tokens
+> with an asymmetric key whose public half every node holds.
+
+**The metrics listener** ([RFC 25 §2.8](rfc-25-observability.md#2.8%20Export)) has an address of its own, separate
+from the API's, a bootstrap fact of the host
+([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)). It is served without authentication, over the API's TLS on
+every address but loopback, and opens at start step 2.
+
+> decision: the metrics listener asks for no token, because a protocol-only
+> node cannot verify one (above) and a scraper must reach every node. What it
+> exposes to anyone who reaches the address is RFC 25 §2.4's labels: share and
+> remote store names and counts, never a file name, user content or a secret
+> ([RFC 25 §2.8](rfc-25-observability.md#2.8%20Export)). Overturned if those names are themselves sensitive in
+> a deployment, and then by binding the address to a management network or by
+> the asymmetric token key above.
 
 ## 3. Resources and their lifecycles
 
@@ -602,7 +624,7 @@ that component's surface:
 | audit record | audit record | §6 | the API, in the change's transaction |
 
 Operation, token, session and audit records, and the node-status record of
-§2.4, are records this RFC adds; [§13](#13.%20Open%20questions) asks RFC 16 for their keys.
+§2.4, are records this RFC adds; [RFC 16](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed) defines their keys.
 
 ### 3.2 A share
 
@@ -1111,7 +1133,7 @@ second store.
 - **A secret is written as its owner is.** A write of a `Secret` is authorized
   as a write of the resource that names it — a remote store's credential as the
   store, a backup location's as the location — and no route writes a secret by
-  reference alone. An account's password and NT hash are written only through
+  reference alone. An account's password and every hash derived from it ([RFC 18](rfc-18-identity.md#8.%20Management-API%20users)) are written only through
   `:set-password` and `POST /auth/password`, under the account rules here. The
   signing key of §5.3 and the wrapping keys are written by no route; the
   signing key changes only by `POST /installation:rotate-signing-key`.
@@ -1159,7 +1181,9 @@ second store.
 - **Throttling.** After 5 consecutive failed sign-ins for an account, or from
   one source address, each further attempt waits twice as long as the last,
   from 1 s up to 5 min, answered `429` with `Retry-After`. A success resets the
-  account's count. Every failure is audited (§6).
+  account's count. Every failure is audited (§6). The counts are kept in the
+  store, written in the failure's audit transaction, so the bound is 5 per
+  account and per source installation-wide, not per node.
 - **Transport.** The API **MUST** be served over TLS on every address but
   loopback. Its certificate and key are bootstrap facts of the host.
 
@@ -1277,8 +1301,8 @@ These rules bind from the single node on, where most of them cost nothing
 ![One API write in a cluster: the CLI sends a PUT to the API on S1; S1 validates with the component's validator, checks If-Match, and commits the record, the settings generation and the audit record in one transaction in the metadata store; every node, S1, P1 and P2, reads the settings generation each second, re-reads the record, applies it by its binding class and writes the position it has reconciled through to its node-status record; a GET on any API node joins those reports into the resource's status](img/rfc23-write-path.svg)
 
 - **Any API node answers any call.** The management API is composed on every
-  `storage` node ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)); a protocol-only node serves the health
-  endpoints only (§2.5). A client may send any call to any API node and gets
+  `storage` node ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)); a protocol-only node serves the two
+  anonymous health endpoints only (§2.5). A client may send any call to any API node and gets
   the same answer, because every read and every precondition is evaluated
   against the store, except the node-local reads of §4.2, which name their
   node.
@@ -1398,42 +1422,34 @@ marked **(cluster)**.
 
 ## 13. Open questions
 
-1. **Sealing a protocol secret on a storage-only node** — resolved by
-   [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets). Each role's wrapping key
-   is a key pair, and every node holds the public half of every role's key, so
-   any node seals. A password hash and the signing key are sealed under the
-   `storage` key, whose private half every `storage` node, and so every API
-   node, holds: sign-in (§5.3) and the current-password check (§5.4) verify on
-   a storage-only node. The NT hash, keytabs and bind credentials stay under
-   the `protocol` key; a storage-only node seals them and never opens them.
-2. **Which counter a position is of.** [RFC 16](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)
+1. **Which counter a position is of.** [RFC 16](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)
    defines the records this RFC adds and their keys, a `User`'s role and
    not-before time, every record's `Position`, and `expect` on every write,
    `SetGrant` and `SetQuota` included. One question is left: which counter
    (`CFGGEN`, `SL` or `PGEN`) a grant's, an export policy's, a netgroup's and a
    quota's `Position` is of. [RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)
    keeps grants and export policies off the principals generation.
-3. **Audit volume at scale.** An audit record per change is nothing for
+2. **Audit volume at scale.** An audit record per change is nothing for
    operators; a provisioning reload that rewrites 10⁴ shares writes 10⁴ records
    in its transactions. Whether a reload's records are summarised per record
    kind is unmeasured.
-4. **The API on protocol-only nodes.** A split deployment exposes the API only
+3. **The API on protocol-only nodes.** A split deployment exposes the API only
    on storage nodes. Whether a protocol node should serve reads, forwarding
    writes over the shard service's `ControlPlane` calls, depends on whether
    operators reach the storage tier's network. Until it is settled, the
    node-local reads of §4.2 cannot reach a protocol node's spool or adapters,
    since a protocol node serves no API (§8).
-5. **Server-sent changes.** Clients poll operations and resources. A watch
+4. **Server-sent changes.** Clients poll operations and resources. A watch
    (a stream of changes from a generation) would serve the Kubernetes operator
    better; whether it is worth a second read path is open.
-6. **Lifecycles the owning RFCs have yet to state.** §2.1's table marks
+5. **Lifecycles the owning RFCs have yet to state.** §2.1's table marks
    "pending" what this RFC cannot state for another: the construction and
    lifecycle of open state and namespace metadata (RFC 14), the identity
    resolver and authenticator, and whether they hold directory connections or
    keytabs to close (RFC 18), the event sink and the admin-stream writer
    (RFC 25), the pools (RFC 24), the router and the client-address agent
    (RFC 15), shard placement (RFC 11) and the metadata store's close (RFC 16).
-7. **The cost of a full reconcile.** A full reconcile after every failed read
+6. **The cost of a full reconcile.** A full reconcile after every failed read
    re-lists every record of every kind; during a flapping store, at 10⁴ shares,
    that is once a second. Whether it needs a rate bound, and whether reconciling
    only the records above the reconciled position needs an index by (kind,
