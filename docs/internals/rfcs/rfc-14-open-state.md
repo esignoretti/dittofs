@@ -451,7 +451,7 @@ layer would then import an adapter.
 type Open struct {
 	ID            OpenID // unique across the installation, never reused
 	Client        ClientID
-	Principal     Principal // who opened it; a reconnect by anyone else is refused (§8.1)
+	Principal     Principal // who opened it: the caller's mapped principal, before squashing (RFC 18 §6.1), as Client.Principal is; a reconnect or a call through the open by any other is refused (§8.1, L26)
 	File          FileID
 	Access        Access     // granted at open: the full mask of RFC 7 §7.7, WRITE_DAC, WRITE_OWNER and a DELETE granted through the parent included
 	Privileged    bool       // opened with backup or restore intent by a caller privileged for it (RFC 7 §7.4); every request through the open keeps it
@@ -2066,8 +2066,11 @@ type OpenState interface {
 	TestLock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange, exclusive bool) (*Lock, error)
 	Unlock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange) error // ErrRangeNotLocked for an SMB owner not holding r (§2.3)
 
-	// Restart notification from an NLM host (§4.5): expires its old ClientID.
-	HostRestarted(ctx context.Context, host []byte, state uint32) error
+	// Restart notification from an NLM host (§4.5): expires the ClientID whose Owner
+	// is owner — caller_name with the address the notification came from, encoded as
+	// Client.Owner is (§2.1); a notification from another address names another
+	// owner and releases nothing (RFC 21 §6.1).
+	HostRestarted(ctx context.Context, owner []byte, state uint32) error
 	DropShare(ctx context.Context, share ShareID, why DropReason) error // why is removed or moved. Ends every open, lock, lock waiter (NLM ones included), grant, watch, layout and copy under the share, and every copy reading from it, without a recall or a wait for the holder: for a share being removed (RFC 16 §2.3.2), and at a namespace move's release for each moved share (RFC 27 §2.2), whose FileIDs a move back would meet again; each is reported to its adapter through Revoked with the share-removed or the moved reason (RevokedMoved, RFC 17 §3.2), and its records go with it, so a later stateid of the share resolves to nothing and is answered bad stateid with no revoked-state flag left for the client to clear (RFC 21 answers it so); so a blocked lock or a pending change notification is answered rather than left waiting; it starts no §5.3 no-grant period for the client, and runs whether or not the shard is in grace
 
 	// Asynchronous copies (§2.7). The filesystem service runs the copy and

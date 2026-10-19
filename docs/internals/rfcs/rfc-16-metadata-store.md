@@ -367,7 +367,7 @@ takes that form, since a minted ID is a random UUID with its version bits set.
 | 0x09 | system | nothing a client can present |
 | 0x0A | network | every remote caller, which is every caller |
 | 0x0B | built-in users | a caller marked `authenticated` |
-| 0x0C | anonymous | a caller acting as the anonymous principal: an `AUTH_NONE` caller, an anonymous SMB session, a caller squashed under a policy whose `Anonymous` is this one (RFC 18 §2.1, §6.2) |
+| 0x0C | anonymous | a caller acting as the anonymous principal: an `AUTH_NONE` caller, an anonymous SMB session, a caller squashed under a policy whose `Anonymous` is this one (RFC 18 §2.1, §6.2); its uid and gid, 65534, are fixed by RFC 18 §2.1 and never `PX` rows; a `PutUser` or `PutGroup` naming 65534 is refused `ErrInvalid` |
 
 How each is spelled on the wire — a SID, an NFSv4 `who` — is the adapters'
 ([RFC 7 §2.6](rfc-7-namespace-metadata.md#2.6%20ACL%2C%20and%20how%20it%20agrees%20with%20the%20mode)). A deny entry naming a
@@ -464,28 +464,12 @@ type Share struct {
 	Write      uint32 // as wide as a ref's nsgen, which RFC 6 §2.1 owns
 }
 
-// ShareGrant is one principal's access to one share. The filesystem service
-// reads a caller's grants on every call, in RFC 18 §6.4's order, and the
-// access they give arrives with the identity, which Files.Authorize applies as
-// the share ceiling before any file ACL (RFC 19 §3.2); the share's grant-list
-// version is part of the authorisation cache key (RFC 7 §7.5), so a revoked
-// grant stops a
-// client that still holds handles; mount and tree connect only fail early on
-// it. A deleted grant leaves no record whose version could change, so the key
-// carries the share's grant-list version (S‖id‖gv), which every SetGrant and
-// DeleteGrant sets in its own transaction. A share's default access, for callers no other grant names, is a grant
-// to the well-known everyone or authenticated users principal; there is no
-// other default.
-// An admin grant makes its principal privileged only as RFC 7 §7.4 states:
-// on an authenticated flavour (Kerberos, an authenticated SMB session), and
-// over SMB only on a handle whose CREATE carried backup or restore intent,
-// which every later request on that handle keeps, MaximalAccess computed
-// without it; never over AUTH_SYS, where a client asserts the UID itself and
-// only an unsquashed uid 0 is privileged, which Squash root squashes.
-// Setting oneself as a file's owner needs the change-owner right
-// (WRITE_OWNER, take-ownership), which is not a privilege; setting another
-// principal is privileged, and over SMB only through a handle opened with
-// backup or restore intent (RFC 7 §7.4).
+// ShareGrant is one principal's access to one share; RFC 18 §6.4 reads a
+// caller's grants on every call and RFC 19 §3.2 applies them as the share
+// ceiling. A cache keys on the share's grant-list version, S‖id‖gv (§4.2),
+// never on a grant's own Version. A share's default access is a grant to the
+// well-known everyone or authenticated-users principal. An admin grant makes
+// its principal privileged only as RFC 18 §6.5 decides.
 type ShareGrant struct {
 	Share     ShareID
 	Principal Principal
@@ -1074,7 +1058,8 @@ type Principals interface {
 	ByName(ctx context.Context, kind PrincipalKind, name string) (Principal, error)
 	ByProtocolID(ctx context.Context, id ProtocolID) (Principal, error)
 	Groups(ctx context.Context, p Principal) iter.Seq2[Principal, error]
-	Grant(ctx context.Context, share ShareID, p Principal) (ShareAccess, error)
+	// A caller of Grant reads S‖id‖gv before the grants it keys a cache entry on.
+	Grant(ctx context.Context, share ShareID, p Principal) (ShareAccess, bool, error) // false: no grant names p; a stored none is (none, true)
 }
 
 // ControlPlane is the management API's view (RFC 23). Every write names what
@@ -1148,7 +1133,7 @@ else answers size or times, and `Existence` offers no read of them.
 index. `PutUser`, `PutGroup`, `PutShare`, `PutExportPolicy`, `PutNetgroup` and
 `PutSetting` are the only places in the model where a whole-record put is
 allowed, each checked against `expect` inside its transaction, and only over
-records whose one writer is the management API, with no background path. `PutShare` therefore writes `S‖id‖info` alone — name, path,
+records whose one writer is the management API, with no background path; the one exception is the identity component's create-only `PutUser`/`PutGroup` (`expect` 0) and its conditional name refresh (RFC 18 §2.4, §5.1), which a protocol node issues and which never overwrite what they did not read. `PutShare` therefore writes `S‖id‖info` alone — name, path,
 root, configuration — and the name and path indexes. The two parts of a `Share`
 that a background path changes are records of their own: `S‖id‖st`, the state,
 which cuts, deletions and the management API all change through
@@ -1531,7 +1516,7 @@ the bytes §4.2.1 assigns. The layout encodes the boundary
 | | `TG` | share-tag counter: the next journal tag ([RFC 1 §3](rfc-1-journal.md#3.%20Interface)), raised in the transaction that records a share's tag and never lowered, so no tag is given twice; a recovery import opens every adopted journal (after `Restamp`) before publishing any share, raises it above every tag their `Stats` name ([RFC 1 §3.7](rfc-1-journal.md#3.7%20State%20introspection)), and only then mints tags ([RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)) |
 | | `IN` | Installation: the installation's identity, written once by the explicit initialisation step, which writes the same ID into every journal's `format` file ([RFC 1 §3](rfc-1-journal.md#3.%20Interface)); its instance part and recorded machine-generation identifier; and the active version of every shared format but the store format, which `\x00format` holds, each raised only by the control plane's gate (§2.3, §4.6) |
 | | `NSM` | the NSM state number, one per installation; raised durably before the grace of any failover that lost NLM locks, and at a moved address's arrival above the larger of the move delta's number and its own ([RFC 14 §4.5](rfc-14-open-state.md#4.5%20NLM%20locks%20and%20restart%20notification), [RFC 27 §2.2](rfc-27-namespace-migration.md#2.2%20The%20move%2C%20step%20by%20step)) |
-| | `PGEN` | principals generation: one installation-wide counter, raised in the transaction of every `User`, `Group` or `Membership` write and every `PX‖` row written or deleted; every `protocol` node reads it at least once a second and stops serving identity it cached under an older one (RFC 18 §7.2) |
+| | `PGEN` | principals generation: one installation-wide counter, raised in the transaction of every `User`, `Group` or `Membership` write and every `PX‖` row written or deleted; every node reads it at least once a second and stops serving identity it cached under an older one (RFC 18 §7.2) |
 | | `PX‖scheme‖id` | protocol-ID index → `PrincipalID`, unique per scheme; `scheme` is one of `uid`, `gid`, `sid` (binary form) and `krb`, a Kerberos principal as `name@REALM`, compared byte for byte as the KDC spells it; with the User or Group record, the only place a protocol spelling is stored (§2.2) |
 | | `N‖node`, `N‖node‖exp`, `N‖node‖clk` | Node: its roles, binary version, the version range it reads and writes for every shared format, failure domain, node epoch and whether a takeover marked it lapsed, guarded by every fenced commit; NodeLease (cluster): the lease's expiry, which a renewal writes with its journals' generations and nothing else, and a resume rewrites with the node record ([RFC 11 §3.1](rfc-11-ownership.md#3.1%20The%20primary%20is%20fenced%20by%20an%20epoch)). On a single node the node record's epoch rises at every start and no lease is written ([RFC 0 §1.4](rfc-0-data-lifecycle.md#1.4%20The%20single-node%20profile)). Clock ceiling, only on a backend without a timestamp oracle: the bound `Now` stays under, raised once a second (§4.1); its own key, so raising it conflicts with no fenced commit |
 | | `SH‖shard` | Shard, with its primary as (node, node epoch, journal identity, join incarnation), its epoch, its shard incarnation, its grace instance and its replicas ([RFC 11 §3.1](rfc-11-ownership.md#3.1%20The%20primary%20is%20fenced%20by%20an%20epoch)) |

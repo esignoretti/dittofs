@@ -390,8 +390,11 @@ reads the store — `Lookup`, `Entries`, `ACL`, `Authorize` and the other calls
 §4 serves at any node — and writes only node records — its own lease, and the
 lapsed mark on a lost protocol node before taking its addresses ([§5.3](#5.3%20Client%20addressing)) —
 the health condition of a primary it cannot reach
-([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Front-ends%20forward%20to%20the%20primary)), and the client records it is lease owner of
-([RFC 14 §4.1](rfc-14-open-state.md#4.1%20A%20client%20lease)). It **MUST NOT** write a file's,
+([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Front-ends%20forward%20to%20the%20primary)), the client records it is lease owner of
+([RFC 14 §4.1](rfc-14-open-state.md#4.1%20A%20client%20lease)), its own node-status record (RFC 23 §2.4), and the
+principals a first sign-in mints — a create-only `PutUser` or `PutGroup` with
+its `PX` rows, allocated IDs and `PGEN` (RFC 18 §2.4, §5.1) — and a directory
+principal's name refresh, conditional on the generation it read. It **MUST NOT** write a file's,
 a directory's, a shard's or a share's record, nor any control-plane record: each
 of those is written by a storage node.
 
@@ -822,7 +825,7 @@ store gives no high availability, whatever the roles.
 | T9 | Every message between nodes travels on a mutually authenticated, encrypted channel whose authenticated peer is the node the message names. |
 | T10 | An NFS request ID is the protocol's retry identity — (client address, XID, procedure, argument checksum) for NFSv3 and NFSv4.0, (front-end node ID, the node epoch the session was created under, session, slot, sequence ID) for NFSv4.1 — so an NFSv3 or NFSv4.0 retry on a new connection or through another front-end, and an NFSv4.1 retry on its session across a new node epoch of its front-end, carries the same ID and is answered from a durable record of its first result, across a takeover of the primary too. A handover ships the open-state calls' entries with the open-state table. An SMB replay on another channel is matched at the primary by its create GUID, lock sequence or the channel sequence and outstanding counts in its `Open`, the channel sequence durable for a persistent open. |
 | T11 | A single node advertises no pNFS and answers every layout operation with `NFS4ERR_NOTSUPP`. |
-| T12 | The shard service is the only interface between a protocol node and a storage node. A protocol node holds no file state and writes to the metadata store only node records (its own lease, a lost protocol node's lapsed mark), the health condition of a primary it cannot reach, and the client records it is lease owner of; every other record is written by a storage node. |
+| T12 | The shard service is the only interface between a protocol node and a storage node. A protocol node holds no file state and writes to the metadata store only node records (its own lease, a lost protocol node's lapsed mark), the health condition of a primary it cannot reach, the client records it is lease owner of, its node-status record, and the principals a first sign-in mints create-only, with a directory principal's conditional name refresh; every other record is written by a storage node. |
 
 ## 9. Conformance and benchmarks
 
