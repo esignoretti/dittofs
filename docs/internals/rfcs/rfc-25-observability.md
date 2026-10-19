@@ -615,8 +615,7 @@ owner.
 ### 3.5 Liveness
 
 **Liveness answers one question: is the process making progress?** It **MUST**
-fail only when a fixed set of internal loops — each adapter's accept loop, each
-connection's reader ([RFC 20 §3.7](rfc-20-adapters.md#3.7%20Health%20and%20probes)), the
+fail only when a fixed set of internal loops — each adapter's accept loop, the
 request scheduler, the engine's work scheduler and the health evaluator — has
 not completed a turn, or reported itself idle, within 60 s. It **MUST NOT** read a
 condition, a store, the network or the disk.
