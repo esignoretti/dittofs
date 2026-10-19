@@ -656,9 +656,13 @@ modes on files with different owners — `allow alice READ_DATA` is 0400 on a fi
 alice owns and 0040 on one bob owns.
 
 ```go
-func (a ACL) Mode(owner Principal) uint32                // the nine bits a implies on a file owner owns
-func (a ACL) WithMode(mode uint32, owner Principal) ACL  // RFC 7's chmod merge, as §4.3 states it
+func ACLFromMode(mode uint32, dir bool) ACL                         // §4.1: on a directory the write bit also grants delete a child
+func (a ACL) Mode(owner Principal) uint32                           // the nine bits a implies on a file owner owns
+func (a ACL) WithMode(mode uint32, owner Principal, dir bool) ACL   // RFC 7's chmod merge, as §4.3 states it
 ```
+
+The text writes `ACLFromMode(m)` and `WithMode(m, o)` for the file at hand,
+whose type they take.
 
 ### 4.1 The ACL a mode implies
 
@@ -668,8 +672,8 @@ shown as. Let `u`, `g`, `o` be the owner, group and other bits of `m`, and
 ([RFC 7 §2.6](rfc-7-namespace-metadata.md#2.6%20ACL%2C%20and%20how%20it%20agrees%20with%20the%20mode),
 "what a mode bit grants": any bit grants the minor rights; read adds read data,
 write adds write data, append, write attributes and write extended attributes —
-and on a directory add a file, add a subdirectory and delete a child — execute
-adds execute). It is, in this order, with every entry whose mask is empty left
+on a directory the first two are add a file and add a subdirectory, and write
+also adds delete a child — execute adds execute). It is, in this order, with every entry whose mask is empty left
 out:
 
 1. deny `OWNER@` `R(g|o)` minus `R(u)`;
@@ -683,7 +687,7 @@ POSIX's class rule: an owner gets the owner bits and nothing a group or other
 class adds; a group member who is not the owner gets the group bits; anyone else
 the other bits. For every mode whose classes only narrow — owner ⊇ group ⊇
 other, as 0755, 0750, 0644, 0640 and 0600 — no deny entry is produced, and a
-Windows Security tab shows three allow entries and no deny.
+Windows Security tab shows only allow entries, one per class with any bit set.
 
 > decision: the mode-implied ACL has a deny entry only where a mode cannot be
 > expressed without one, such as 0604. An allow-only form would give the group
@@ -725,15 +729,10 @@ read must grant afterwards exactly what was granted before. With the group class
 read from `GROUP@` alone, `chmod $(stat -c %a f) f` on alice's directory of §8
 would strip `builders` of read, write and execute.
 
-Because the group bits are then a mask over the named entries, a `chmod` must
-not turn them into a grant to the owning group, and §4.3's merge does not: on a
-file owned by alice, group `staff`, whose ACL is only `allow bob READ_DATA`,
-`Mode(alice)` is 0040, and a merge that added `allow GROUP@ R(r--)` for those
-bits would give every member of `staff` a read bob alone held.
-
 Two identities **MUST** hold, and are checked (§11):
 
-- `ACLFromMode(m).Mode(o) == m` for every nine-bit `m` and every owner `o`;
+- `ACLFromMode(m, d).Mode(o) == m` for every nine-bit `m`, both file types `d`
+  and every owner `o`;
 - for every ACL `a` and owner `o`, `a.WithMode(a.Mode(o), o)` grants every
   caller of a file owned by `o` exactly what `a` grants — for every `a` whose
   allows hold write data wherever they hold another right the write bit adds
@@ -765,9 +764,8 @@ Two identities **MUST** hold, and are checked (§11):
   the named entries grant less than the requested group bits; the stored `Mode`
   then shows what is granted, never more.
 - A `chmod` of a file with no stored ACL changes `Mode` and stores no ACL.
-- A request that sets both — an NFSv4 `SETATTR` naming `mode` and `acl`, or
-  `mode` and `dacl` — stores the ACL, and takes from `mode` only setuid, setgid
-  and sticky (§7.4).
+- A request that sets the ACL and the mode together stores the ACL, and takes
+  from the mode only setuid, setgid and sticky (§7.4).
 - A `chown` or `chgrp` changes no entry. `OWNER@` and `GROUP@` follow it (§2.3).
 
 ### 4.4 Inheritance
@@ -791,17 +789,25 @@ Every copy carries the inherited flag. An effective copy of an entry naming
 CREATOR OWNER or CREATOR GROUP names `OWNER@` or `GROUP@`: the entry for the new
 file's own owner or group RFC 7 requires, spelled as §6.3 stores an owner's
 entry, so an inherited `OWNER@` and an inherited CREATOR OWNER give a child the
-same entry. An effective copy has its generic bits
+same entry. A new directory's copy of an entry naming CREATOR OWNER with both
+inherit flags is one `OWNER@` entry, effective and inheritable, never an
+effective entry beside an inherit-only CREATOR OWNER copy. §6.3 spells it as
+those two on the SMB wire, and RFC 7's inheritance rule stores it so too. An
+effective copy has its generic bits
 mapped for the new file's type; an inherit-only copy keeps them as written. The
 new list carries the auto-inherited flag when the parent's does. A parent's
 protected flag does not pass to children; a list with the protected flag set
 inherits nothing.
 
-**At set.** A set of a list whose flags ask for inheritance to be computed (SMB's
-`SE_DACL_AUTO_INHERIT_REQ`, `SE_SACL_AUTO_INHERIT_REQ`) recomputes that one
-file's inherited entries from its parent's current lists, keeps the explicit
-entries the client sent, and stores explicit before inherited. A set without
-that request stores the entries as sent, inherited flags included.
+**At set.** Some sets carry flags asking for inheritance to be computed (SMB's
+`SE_DACL_AUTO_INHERIT_REQ`, `SE_SACL_AUTO_INHERIT_REQ`). Such a set recomputes
+that file's inherited entries from the current lists of the directory the open
+was resolved through (its `via`,
+[RFC 7 §7.7](rfc-7-namespace-metadata.md#7.7%20What%20a%20caller%20may%20be%20asked%20for%2C%20and%20what%20removing%20a%20name%20needs)),
+read in the set's transaction. It keeps the explicit entries the client sent,
+and stores explicit before inherited. A set with no `via` — on a share's root,
+or through an open by file ID — stores the entries as sent. A set without that
+request stores the entries as sent, inherited flags included.
 
 **Never to descendants.** A change to a directory's ACL changes no other file.
 Propagating it down a tree is the client's: Windows tools walk the tree and set
