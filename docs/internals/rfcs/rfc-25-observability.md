@@ -519,6 +519,14 @@ misses what the other saw. §11 lists the duplicates in the set today.
   it is not audit data; whether it is authenticated is still RFC 23's choice,
   since share and store names are.
 
+### 2.9 Recording
+
+- A series a request touches is resolved once, at construction or when its entity is
+  added; recording is an atomic add or an observe, with no label lookup and no
+  allocation.
+- The registry refuses a metric whose name, unit word, prefix or labels break §2.1–§2.4
+  when it is registered, so every unit test that builds a component checks its names.
+
 ## 3. Health
 
 ### 3.1 Conditions
@@ -813,14 +821,17 @@ lists what a quota event is for, but not its fields; §11 asks it to add
 
 ![The service calls the sink at the chokepoint and at quota enforcement and never waits; the sink stamps node, boot and sequence and puts the event in a fixed ring per stream, dropping and counting when full; one writer per stream appends batches to spool files every second, writing a gap record for anything dropped; the spool is bounded by age and bytes and is read by a shipper tailing the files or by an auditor through the management API](img/rfc25-events.svg)
 
-1. **The service calls the sink and returns.** `Events.Emit` takes an access
-   or quota event, and a logon event from RFC 18's authenticator, and puts
-   it into its stream's ring; they **MUST NOT**
-   allocate on the caller's path beyond the copy of the name, take a lock a
-   request path also takes, or wait
-   ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)).
+1. **Emitters call the sink and return.** The sink is a concrete type with one method
+   per stream — `Access`, `Quota`, `Logon` — each taking a pointer to the event; a nil
+   sink is the null sink, and with no policy no event is built. A call copies the event,
+   and the name's bytes, into a ring slot and **MUST NOT** allocate, take a lock a
+   request path also takes, or wait ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)).
+   Because the methods are concrete, the event stays on the caller's stack;
+   `testing.AllocsPerRun` of each is 0 (§12).
 2. **One ring per stream, of fixed size**: 16,384 entries for `access` and 4,096
-   each for `quota` and `logon`, each entry at most 1 KiB. The rings are allocated at start, so
+   each for `quota` and `logon`, each entry at most 1 KiB. A slot holds the principal ID
+   and flavour, not the group list (§4.2). A name longer than the slot's room is written
+   truncated, with `name_truncated: true`, never dropped. The rings are allocated at start, so
    they are fixed memory outside RFC 24's pools: at most 24 MiB per node,
    whatever the load.
 3. **One writer per stream** takes entries in order and appends them to the
@@ -1000,6 +1011,14 @@ and the project's rules have it: a client can produce them at any rate.
 - A line that names something noisy — a share at its cap, an address at its
   connection quarter, a client sending unmappable IDs — is rate-limited to once a
   minute per subject, with the count suppressed.
+- On a request path a `Debug` line is guarded by `Enabled`, because a logging
+  call's arguments are boxed before the level is checked:
+
+  ```go
+  if s.log.Enabled(ctx, slog.LevelDebug) {
+  	s.log.LogAttrs(ctx, slog.LevelDebug, "lookup refused", slog.Uint64("file", uint64(f)))
+  }
+  ```
 - `Debug` may be turned on for one component at a time through the management
   API, and turns itself off after 15 minutes unless renewed. A debug level set in
   the configuration file holds for the first hour after start only.
@@ -1025,7 +1044,9 @@ at the node:
 | `error`, `cause` | on failures | the closed error and its cause |
 
 - A **trace ID exists on every request**, sampled or not (§6.3), so a log line can
-  always be joined to its request even when no span was exported.
+  always be joined to its request even when no span was exported. With tracing off
+  the adapter still draws the trace ID and carries it in the request's own state,
+  not as a context value.
 - An error wrapped across components keeps its cause, and the line that reports it
   names the component that decided it, not the one that logged it.
 
@@ -1063,11 +1084,14 @@ them.
   store opens one child per KV call
   ([RFC 16 §7.3](rfc-16-metadata-store.md#7.3%20Profiling)); the engine one per
   stage it waits on — journal sync, existence commit, fetch.
+- Work done by another component is a child span; a wait inside one component is a
+  span event on that component's span.
 - Background work — an offload pass, a GC pass, a handover, a snapshot, a backup —
   opens a root span of its own. A pass that serves a request it was waiting on, a
   fetch joined by a read, *links* to that request's span rather than becoming its
   child, so a request's trace shows the wait without absorbing the pass.
-- Span names are constant: the operation or the stage. Attributes are the
+- Span names are constant: `<prefix>.<Name>`, the prefix from §2.1's table —
+  `vfs.Write`, `metadata.kv.Get`, `adapter.nfs4.COMPOUND`. Attributes are the
   operation's closed-set fields, sizes, the share and file by ID, the outcome and
   the error. §5.4 applies to every attribute.
 
