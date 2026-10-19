@@ -9,6 +9,9 @@ depends_on:
   - "[[rfc-11-ownership]]"
   - "[[rfc-15-topology]]"
   - "[[rfc-16-metadata-store]]"
+  - "[[rfc-17-vfs]]"
+  - "[[rfc-24-resources]]"
+  - "[[rfc-27-namespace-migration]]"
 aliases:
   - RFC 14
 tags:
@@ -44,7 +47,7 @@ in memory, not on paper. If its node fails, the new one runs a grace period: for
 a while it only gives back what clients say they held. Three things here share
 the word "lease", and nothing else:
 
-- a **node lease**: is this server still in charge of its shards?
+- a **node lease**: is this server still the primary of its files?
 - a **client lease**: is this client still alive? 90 s for NFSv4;
 - an **SMB lease**: a promise that the client may cache the file.
 
@@ -191,8 +194,10 @@ This component **MUST NOT**:
 
 ## 2. The entities
 
-The entities below live in the metadata package ([RFC 16](rfc-16-metadata-store.md)). Signatures are
-indicative; the rules around them are normative.
+The entities below are `pkg/openstate`'s ([§11.1](#11.1%20Package%2C%20dependencies%20and%20wiring)).
+Only the pieces [§8](#8.%20What%20is%20durable) makes durable reach the
+metadata store, as records [RFC 16](rfc-16-metadata-store.md) keys. Signatures
+are indicative; the rules around them are normative.
 
 ![The entities: a durable Client record, indexed by protocol and owner, whose Expires is volatile at its lease owner; an Unconfirmed record at the protocol node that answered SETCLIENTID or EXCHANGE_ID, whose confirm writes the Client; NFSv4.0 OwnerSeq at the owner's home shard primary; and, in the file's table at the primary of its shard, the Open, which names its CachingGrant for SMB only, and Lock, LockState, LockWaiter and Layout, which each name their Open (zero for an NLM lock or waiter), plus Copy in the destination file's table and Watch at its directory's shard primary; each names its Client, whose lease expiry or revoke releases all of it in one step](img/rfc14-entities.svg)
 
@@ -212,12 +217,14 @@ type Client struct {
 	CSSeq      uint32    // NFSv4.1: the sequence ID of the last CREATE_SESSION applied (RFC 8881 §18.36.4)
 	CSReply    []byte    // NFSv4.1: that CREATE_SESSION's reply, opaque here; answers its replay
 	Expires    time.Time // volatile, held by the lease owner (§8); zero for an NLM host, which has no lease (§4.5)
-	LeaseOwner NodeID    // (cluster) the one node that renews and expires this client (§4.1)
-	Callback   NodeID    // (cluster) the protocol node holding its back channel; zero: none
 	PathDown   bool      // its back channel is down; signalled to the client until it rebinds (§4.1)
-	Sessions   []NodeID  // (cluster) protocol nodes holding a session of this client
-	Shards     []ShardID // shards it has held state in; bounded (§8)
+	Shards     []ShardID // shards it has held state in; at most a fixed count, then every shard of the share (§8)
 	Notify     []byte    // NLM only: where its restart notification goes (§4.5); opaque here
+
+	// (cluster) set at the client's first contact, never imported (§8)
+	LeaseOwner NodeID   // the one node that renews and expires this client (§4.1)
+	Callback   NodeID   // the protocol node holding its back channel; zero: none
+	Sessions   []NodeID // protocol nodes holding a session of this client
 }
 ```
 
@@ -343,7 +350,7 @@ type Open struct {
 	Access        Access     // granted at open: the full mask of RFC 7 §7.7, WRITE_DAC, WRITE_OWNER and a DELETE granted through the parent included
 	Privileged    bool       // opened with backup or restore intent by a caller privileged for it (RFC 7 §7.4); every request through the open keeps it
 	Deny          Access     // deny mode: SMB share access; NFSv4 deny, which has no delete bit
-	Durability    Durability // none, durable, persistent (§8)
+	Durability    Durability // none, SMB durable, persistent (§8)
 	DeleteOnClose bool       // its close makes the file delete pending (§9.4)
 	DeleteBy      Principal  // who asked for delete on close or set the disposition; the deferred unlink runs as it (§9.4)
 	Grant         GrantID    // the SMB lease or oplock covering it; zero for NFS (§2.4)
@@ -355,22 +362,32 @@ type Open struct {
 	Session       SessionRef // SMB: (protocol node, the node epoch the session was created under, session ID) of the session that opened or last reconnected it; session IDs are unique only per node and per process, and a restarted node takes a new node epoch. A disconnect acts on the opens of a session whose last channel ended (§8.1)
 
 	// A clone's source open (§9.2): held by no client, written by the clone's
-	// first phase. Kind is client for every other open, and the two fields
+	// first phase. Role is client for every other open, and the two fields
 	// below are then zero.
-	Kind         OpenKind // client, clone source
+	Role         OpenRole // client, clone source
 	CloneDst     FileID   // the clone's destination file, whose Removal record holds the clone spec
 	CloneVersion Version  // the 16-byte journal version asOf the source was read at (RFC 6 §6.6)
 
-	// SMB durable, resilient and persistent opens (§8.1); zero for NFS.
+	// Every SMB 3.x open (§8.1); zero for NFS.
+	ChannelSeq  uint16    // the open's channel sequence: replays carrying an older one are refused (§8.1)
+	Outstanding [2]uint32 // requests in flight under ChannelSeq and under the sequences before it (MS-SMB2 3.3.5.2.10); volatile, zero at a new primary
+
+	// SMB durable v2 and persistent opens (§8.1); nil for NFS and for a volatile open.
+	Reconnect *ReconnectKeys
+}
+
+// ReconnectKeys is what a reconnect or replay of an SMB open matches on.
+type ReconnectKeys struct {
 	CreateGUID  [16]byte      // identifies the CREATE: replay and reconnect matching
 	AppInstance [16]byte      // zero: none
 	AppVersion  [2]uint64     // the app instance version, high and low; zero: none
 	Timeout     time.Duration // how long it is kept once its client disconnects
 	LockSeq     [64]uint8     // lock sequence per index: a valid bit and a 4-bit sequence
-	ChannelSeq  uint16        // the open's channel sequence: replays carrying an older one are refused (§8.1)
-	Outstanding [2]uint32     // requests in flight under ChannelSeq and under the sequences before it (MS-SMB2 3.3.5.2.10); volatile, zero at a new primary
 }
 ```
+
+> ponytail: one pointer per open, to stay within RFC 24 M6's 1 KiB per open.
+> Inline the fields again if M6 measures the indirection.
 
 The name is both protocols' own: NFS's `OPEN` and its open stateid, the
 "Open" of the SMB2 specification with its FileId. "Handle" is not used: in this
@@ -768,7 +785,7 @@ by handle is the subtler error: one client may hold several handles to one file,
 and a lock one handle can see and another cannot is a lock the same client can
 take twice.
 
-All of it is held **in one table per file, at the primary of the file's shard**
+All of it is held **in one table per file, at the file's primary**
 ([RFC 15 §3](rfc-15-topology.md#3.%20One%20primary%20per%20shard)). A file is never split across shards. That
 primary also runs the file's I/O, so a conflict check and the I/O it admits run
 in one process under one epoch, and no grant lands between them. An implementation **MUST NOT** hold any of it in an adapter,
@@ -776,13 +793,19 @@ where the other adapter cannot see it: a lock one protocol grants and the other
 does not observe is not a lock. Every adapter reaches the table through the
 filesystem service ([RFC 17](rfc-17-vfs.md)), which routes to the primary.
 
-**Who owns the table.** It is built at the primary and owned by the
-filesystem service's per-file part there, handed to it in the service's `Deps`
-([RFC 17 §2.3](rfc-17-vfs.md#2.3%20Dependencies%20and%20wiring)), and it is the
-only lock manager in the system. The service's
-front on the protocol node and the adapters hold none of it; only this RFC's
-durable pieces, client records and persistent opens, reach the metadata store
+**The table is per file and serialised per file.** A file's entry is created
+with its first piece of state and freed with its last, so a file with no state
+costs nothing. Each entry has its own mutex: the open-state step. No lock spans
+files except each primary's stateid index and per-client index, which are taken
+after a file's step and only to add or remove an entry. `CheckIO` on a file
+with no entry is one map read and allocates nothing.
+
+**Who owns the table.** The table is the concrete `*openstate.Table` in the
+service's `Deps`, built and wired as
+[§11.1](#11.1%20Package%2C%20dependencies%20and%20wiring) says, and the only
+lock manager
 ([RFC 17 §2.2](rfc-17-vfs.md#2.2%20Who%20owns%20open%20state%20and%20locks)).
+The front and the adapters hold none of it.
 
 ## 4. Client leases, grace and reclaim
 
@@ -845,7 +868,7 @@ client holds any state, releasing nothing (RFC 8881 §18.50), and otherwise
 deletes the record. An SMB client record names a machine whose sessions belong to many
 users (§2.1), so an SMB logoff closes only its own session's opens (MS-SMB2
 §3.3.5.6) and releases nothing else; the SMB record is released once it holds no
-open and no durable open's `Timeout` is still running.
+open and no SMB durable or persistent open's `Timeout` is still running.
 
 ### 4.2 Grace makes volatile state safe
 
@@ -1031,6 +1054,29 @@ side spells and sends the notice
 > protocol's own contract, and every NLM server has the same ceiling; a
 > server-side timeout would release locks a slow but live host still relies
 > on. Add a timeout only if a deployment's NLM hosts are known to be disposable.
+
+### 4.6 What each failure does
+
+Each condition of [RFC 0 §10](rfc-0-data-lifecycle.md#10.%20Failure%20model) is
+decided where this table points; it adds no rule.
+
+| Condition | Decided in |
+| --- | --- |
+| a client falls silent | [§4.1](#4.1%20A%20client%20lease), [§4.3](#4.3%20An%20expired%20lease%20releases%20everything%20it%20held%2C%20everywhere) |
+| a grant's holder falls silent | [§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time) |
+| a client's back channel is lost | [§4.1](#4.1%20A%20client%20lease) |
+| a `protocol` node is lost | [§8.1](#8.1%20SMB%20durable%20and%20persistent%20opens) |
+| a primary restarts or fails over | [§4.2](#4.2%20Grace%20makes%20volatile%20state%20safe), [§4.4](#4.4%20Grace%20is%20per%20shard) |
+| a handover's table never arrives | [§4.4](#4.4%20Grace%20is%20per%20shard) |
+| an NLM host never returns | [§4.5](#4.5%20NLM%20locks%20and%20restart%20notification) |
+| a revoked set is lost | [§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time) |
+| the metadata store is unavailable | the `decision:` below |
+
+> decision: the store unavailable while writing a client record, a persistent
+> open, a durable open of an unlinked file or delete pending: the call is
+> refused with the store's error and changes no volatile state; a renewal,
+> which writes nothing, is unaffected. Proposed, not tested against a store
+> outage; revisit if a measured outage shows clients needing a softer answer.
 
 ## 5. Caching grants
 
@@ -1390,7 +1436,7 @@ primary.
 also loses acknowledged unstable writes while its process keeps running: a record
 dropped as corrupt, a failed sync window, a re-attached device
 ([RFC 1 §3.8](rfc-1-journal.md#3.8%20Loss%20events)). An NFS client learns from
-the write verifier; nothing on the SMB wire changes, and a durable open carries
+the write verifier; nothing on the SMB wire changes, and an SMB durable open carries
 on over the gap. So every SMB open keeps `LossSeen`, the file's **loss
 sequence** — which the engine raises each time a loss event drops an
 acknowledged, unoffloaded write of the file, and for every file attached to a
@@ -1416,11 +1462,11 @@ above the new sequence and let a flush succeed over the new process's loss.
 > application that closes without flushing and treats the close as durable; then
 > the opens whose writes the loss record names are invalidated instead.
 
-> decision: durable v1 and v2 opens are not reclaimable across a primary restart
+> decision: SMB durable v1 and v2 opens are not reclaimable across a primary restart
 > or failover, only across a disconnect, because their writes are unstable and SMB
 > gives the client no signal that unstable writes were lost; reclaiming the handle
 > would hide the loss. MS-SMB2 permits the server to lose them. Overturned if
-> durable opens' writes are made stable too, at the price of a sync per write on
+> SMB durable opens' writes are made stable too, at the price of a sync per write on
 > every share, in which case they could be reclaimed in grace like persistent
 > ones.
 
@@ -1703,16 +1749,82 @@ handover that ships the table keeps the instance.
 Signatures are indicative; the obligations above are normative. The filesystem
 service ([RFC 17](rfc-17-vfs.md)) is this interface's only caller.
 
-**One lock order.** A call that takes a file's open-state step — the
-serialisation each call below runs under at the file's primary, a
-`CheckChange` held to its commit included — takes it in the one order
-[RFC 17 §5.0](rfc-17-vfs.md#5.0%20One%20lock%20order) states for every call: the open-state
-steps of every file it touches, in FileID order, then fold admission, then the
-accept locks, in FileID order. Open state never takes an accept lock or waits on
-fold admission while it holds a step out of that order, so a write holding its
-file's step and an unlink holding that file's accept lock never wait on each
-other. A call the service holds behind a clone or a chunk holds none of these
-while it waits ([RFC 17 §5.0](rfc-17-vfs.md#5.0%20One%20lock%20order), "A held call holds nothing", which owns the rule).
+Every call takes its open-state steps in
+[RFC 17 §5.0](rfc-17-vfs.md#5.0%20One%20lock%20order)'s one lock order, and
+holds none while the service holds it behind a clone or chunk.
+
+### 11.1 Package, dependencies and wiring
+
+```go
+package openstate // pkg/openstate
+
+type Deps struct {
+	Store   *metadata.Store   // RFC 16: the OpenRecords view only — client records, durable opens and their locks, delete pending, the NSM number
+	Sink    Sink              // implemented by the filesystem service (below)
+	Pool    *resources.Pool   // RFC 24 §4.6: the open-state pool
+	Clock   clock.Clock       // the only time source
+	Metrics *metrics.Registry
+	Logger  *slog.Logger
+}
+
+// New builds an empty table and starts nothing. *Table is the only
+// implementation; the service holds it as a concrete type (RFC 17 §2.3).
+func New(d Deps) (*Table, error)
+
+// Sink is how open state reaches clients. The service implements it and
+// routes each event to the client's Callbacks (RFC 17 §3.2). Every method
+// queues and returns; a failed or late delivery counts as the client not answering.
+type Sink interface {
+	RecallGrant(c ClientID, g CachingGrant, to GrantKind)
+	Notify(c ClientID, w WatchID, ch []Change)
+	Revoked(r Revocation)
+	LockWaitOver(c ClientID, w LockWaiter, granted bool) // the service forwards it and reports the host's answer through WaitAnswered
+}
+```
+
+No method reads the wall clock: every lease, deadline, poll, fence, grace and
+`Timeout` here is read from `Deps.Clock`. `Revocation`, `RevokeReason`,
+`ClientStatus`, `LockReq`, `LockRange` and `StateRef` are declared here and
+aliased by `pkg/vfs`
+([RFC 17 §3.0](rfc-17-vfs.md#3.0%20Value%20types)), since open state cannot
+import vfs. The import rule — only the filesystem service imports this package
+— is held by the architecture test
+([RFC 20](rfc-20-adapters.md)), not by the package's location.
+
+The package is laid out as method sets over the per-file entry:
+
+```text
+pkg/openstate/
+  doc.go deps.go types.go errors.go sink.go
+  table.go step.go            per-file entries and the step
+  clients.go lease.go         Propose, Connect, Renew, Expire, Revoke; the lease clock
+  open.go deny.go reconnect.go delete.go
+  lock.go waiters.go grant.go recall.go
+  grace.go reclaim.go stateref.go ownerseq.go
+  watch.go check.go
+  ranges/                     pure leaf
+  leasefsm/                   pure leaf, SMB lease states, ported
+```
+
+There is no durable-store interface of open state's own and no separate test
+package: the store is RFC 16's, faults are injected below it, and the suite
+runs in the package ([§12](#12.%20Invariants)).
+
+### 11.2 Lifecycle
+
+The composition root calls `Start(ctx)` after the store and before the
+service's `Start`
+([RFC 17 §2.5](rfc-17-vfs.md#2.5%20Lifecycle)), and `Close` after the
+service's `Close`, before the store's. `Start` reads each served shard's
+`GraceInstance` and incarnation, already raised by the node's start
+transaction ([§4.4](#4.4%20Grace%20is%20per%20shard)), enters grace for each,
+and arms the lease, recall, waiter-deadline, grant-fence and `Timeout` timers
+on `Deps.Clock`. A timer firing is a call into the same per-file step. There is
+no drain: draining revokes nothing, and open state is left to the next start's
+grace ([RFC 17 §2.5](rfc-17-vfs.md#2.5%20Lifecycle)). `Close` stops the
+timers.
+
+### 11.3 Methods
 
 ```go
 // ClientStatus is what a renewal reports beside the lease; RFC 17's
@@ -2034,3 +2146,23 @@ with the client and file.
 | The SMB2 specification (opens, durable and persistent handles, leases) | durability as a property of an open; lease keys per file |
 | Multiprotocol NAS (a lock manager per volume on its serving node; a distributed lock manager with protocol-shared lock domains) | one table per file; SMB deny modes and locks mandatory against NFS I/O |
 | Distributed file systems with client capabilities | caching grants recalled on conflict, rebuilt from clients on reconnect |
+
+## Appendix B — where the current code differs
+
+*Informative.* Each line names a requirement above and what the code does
+today. [RFC 17 §9](rfc-17-vfs.md#9.%20Migration) slice 3 closes them, as
+`pkg/metadata/lock` becomes `pkg/openstate`.
+
+| Requirement | Today |
+| --- | --- |
+| no open state in an adapter ([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)) | NFSv4 state is held in `internal/adapter/nfs/v4/state`, and SMB leases in the SMB lease manager |
+| keyed by file, never a handle ([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)) | `handleKey := string(fileHandle)` (`internal/adapter/smb/lease/manager.go:564`, `pkg/metadata/service.go`) |
+| locks volatile unless their open is persistent ([§8](#8.%20What%20is%20durable)) | locks are persisted, and restored by `RestoreLocks` (`pkg/metadata/share_registry.go:433`) |
+| one grace instance per loss ([§4.4](#4.4%20Grace%20is%20per%20shard)) | two grace machines, and `IncrementServerEpoch` |
+| a waiter has no time limit of its own ([§2.10](#2.10%20Lock%20waiters)) | `BlockingTimeout` (60 s) and `MandatoryLocking` are declared in `config.go` and read nowhere else |
+| a recall ends by its deadline ([§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time)) | `byteRangeLockBreakWaitTimeout = 5s` (`break.go:300`); `lease_break_timeout` is an adapter setting |
+| the grant fence is per client ([§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time)) | `RecentlyRecalledTTL = 30s`, per file (`delegation.go:20`) |
+| per-client bounds ([§5.5](#5.5%20A%20client%27s%20grants%20are%20bounded)) | per-file, per-client and total lock limits, as settings |
+| no deadlock detection is specified | `deadlock.go` |
+| directory delegations are not offered ([§2.5](#2.5%20Watch)) | `dir_delegation.go` |
+| the table is serialised per file ([§3](#3.%20One%20table%20per%20file%2C%20at%20one%20primary)) | one `sync.RWMutex` over `map[string][]*UnifiedLock` (`manager.go:744`) |
