@@ -127,7 +127,7 @@ slows down with retry-later answers instead of taking the node with it.
 - No queue is unbounded, and the [table in §5.1](#5.1%20No%20queue%20is%20unbounded)
   names every one with its bound.
 - Each bound another RFC already states — the journal's index, the syncer's
-  pools, the hold pool — is composed here, not redefined: this RFC sets its
+  pools — is composed here, not redefined: this RFC sets its
   share and checks at start that the configuration fits.
 
 **How the rest is organised.** §1 gives the purpose and non-goals. §2 is the
@@ -190,7 +190,8 @@ on one address opens connections to P1 in a loop.
 Outcome: one address cannot lock other clients out of the node.
 
 **A share is frozen while SMB clients keep writing.** `profiles` is frozen for
-a move for 20 s ([RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)'s holds).
+a move for 20 s, and the SMB adapter holds each write pending
+([RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests)).
 
 1. Each SMB write the service holds keeps its receive reservation while its
    connection is within its floor of 256 requests and 32 MiB
@@ -198,8 +199,8 @@ a move for 20 s ([RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)'s holds)
 2. Past the floor, the held write's bytes move from the receive pool to the hold
    pool, a sixteenth of *L* (§4.3); the receive pool gets them back for other
    clients.
-3. With the hold pool full too, a further past-floor write is refused
-   `STATUS_INSUFFICIENT_RESOURCES` at once, as RFC 17 and RFC 22 state.
+3. With the hold pool full too, the adapter answers a further past-floor write
+   `STATUS_INSUFFICIENT_RESOURCES` at once, as RFC 20 §4.6 and RFC 22 state.
 
 Outcome: a freeze holds what the floors and the hold pool allow, and the rest of
 the node keeps reading.
@@ -236,8 +237,8 @@ Every component RFC bounds its own memory. The syncer bounds its workers
 ([RFC 3 §2.2](rfc-3-syncer.md#2.2%20The%20pool%20size%20is%20a%20memory%20bound)),
 the journal its index
 ([RFC 1 §4.2](rfc-1-journal.md#4.2%20The%20index%20is%20bounded%20by%20extent%20count%2C%20not%20by%20bytes)),
-the service its held requests
-([RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)), the adapters their
+the adapters their held requests
+([RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests)) and their
 flow control ([RFC 20 §6.3](rfc-20-adapters.md#6.3%20Flow%20control%20is%20the%20protocol%27s%20own)).
 A bound that is correct for its component says nothing about the process:
 eight correct bounds, each sized from the machine's whole memory, add up to
@@ -250,7 +251,7 @@ so that overload has a specified outcome instead of an out-of-memory kill.
 This RFC **MUST NOT** be read as specifying:
 
 - the internals of a bound another RFC owns — the index's entry rules, the
-  syncer's scheduling, the hold policy's counting — only their share of the
+  syncer's scheduling, the adapters' counting of held requests — only their share of the
   budget and how their defaults derive from it;
 - local disk space — the journal's capacity and its pacing are
   [RFC 1 §6](rfc-1-journal.md#6.%20Capacity)'s and
@@ -330,7 +331,7 @@ sixteenth. It is not reserved by anyone and nothing waits for it.
 | --- | --- | --- | --- | --- |
 | **receive** | request buffers from frame until the call returns, writes' payloads included (§3.2) | 1/16 | 16 MiB | the connection's reader waits; the socket is not read, and TCP pushes back on the client |
 | **reply** | reply buffers from before the call until the writer has sent them (§3.3) | 1/16 | 16 MiB | the call waits, within its deadline; at the deadline `ErrDelay` with `DelayResources` |
-| **hold** | held calls' bytes past their key's floor ([RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)) | 1/16 | none | `ErrDelay` with `DelayHoldBudget`, at once ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values)) |
+| **hold** | held requests' bytes past their connection's floor ([RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests)) | 1/16 | none | the adapter answers the request at once, holding nothing: `STATUS_INSUFFICIENT_RESOURCES` over SMB (§4.3) |
 | **connection state** | each connection's fixed cost; sessions and their reply caches; security contexts (§4.4, §4.5) | 1/16 | 4 MiB | new connections closed at accept; a new session refused retry-later or granted fewer slots |
 | **open state** | opens, byte-range locks, lock waiters, caching grants, quota reservations; **(cluster)** the routed-request dedup table (§4.6) | 1/16 | 4 MiB | new state refused with `ErrDelay` and `DelayResources`; no caching grant offered; never a close or unlock; a reclaim only past its allowance |
 | **metadata store** | the store's in-process memory: caches, write buffers, compaction (§7.3) | 3/16 | 64 MiB | the store evicts; it never refuses |
@@ -357,12 +358,22 @@ The shares do not move between roles.
 > deployment's protocol node is shown memory-bound; make a share a setting only
 > when two named workloads want different values on the same hardware.
 
-> decision: the hold pool stays a sixteenth of *L*, as
-> [RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone) and
-> [RFC 22 §3.3](rfc-22-smb.md#3.3%20Sizes%20and%20credits) already state it,
-> rather than being re-derived here. Its size was argued from a freeze's
-> worth of held profile-disk writes; this RFC adds only where its bytes come
-> from (§4.3).
+> decision: the hold pool is a sixteenth of *L*, derived, not a setting; a
+> test sizes it by setting the process limit, 128 MiB giving 8 MiB. Its size is
+> argued from a freeze's worth of held profile-disk writes
+> ([RFC 22 §3.3](rfc-22-smb.md#3.3%20Sizes%20and%20credits)): on a 64 GiB node
+> it is 4 GiB, and a multi-session host with 40 users at queue depth 8 of 1 MiB
+> writes holds 320 MiB through a freeze. Each request drawn on it is charged
+> its write's bytes, and at least 64 KiB, one SMB credit's size, so it bounds
+> held requests as well as bytes. Revisit the fraction when §8's measurements
+> show freezes or stalls refusing writes with the pool full while other pools
+> sit below half their ceilings.
+
+> ponytail: the hold pool is first come, first served past the floors, so one
+> connection's burst can take all of it and leave another refused past its
+> floor while that one holds gigabytes. Cap each connection's share of the pool
+> when `adapter_hold_refusals_total` counts refusals on connections other than
+> the one holding most of it.
 
 ### 2.4 Floors
 
@@ -672,9 +683,13 @@ needs only a small reply (§3.3), so no reply wait can refuse it either.
 > turns. Withdraw it if a release operation is shown to carry a payload, which
 > none of the three protocols defines.
 
-`DelayResources` is answered at once and never held: `NFS4ERR_DELAY` over
-NFSv4, `NFS3ERR_JUKEBOX` over NFSv3, `NLM4_DENIED_NOLOCKS` over NLM, and
-`STATUS_INSUFFICIENT_RESOURCES` over SMB, as for `DelayHoldBudget`
+`DelayResources` is the one class for every node-pool refusal — the share cap
+and the open-state pool, which the service refuses, and a reply reservation's
+deadline, which the adapter's pipeline refuses before the call and answers with
+the same value. It is never held (`HoldNone`,
+[RFC 17 §3.2](rfc-17-vfs.md#3.2%20Callbacks)): `NFS4ERR_DELAY` over NFSv4,
+`NFS3ERR_JUKEBOX` over NFSv3, `NLM4_DENIED_NOLOCKS` over NLM, and
+`STATUS_INSUFFICIENT_RESOURCES` over SMB
 ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values)). Holding it
 would spend the hold pool on the very share that is short of memory.
 
@@ -691,23 +706,25 @@ The share cap is the one that was missing: the request-path memory above them.
 
 ### 4.3 Held requests: where their bytes go
 
-[RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone) counts held calls per key
-against a budget, and past a pooled key's floor against the node's hold pool.
-This RFC fixes which pool holds the bytes:
+The SMB adapter counts the requests it holds per connection against a floor,
+and past it against the node's hold pool
+([RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests)), whether a request
+waits between re-drives or inside the service behind a clone. The service
+counts nothing about holds. This RFC fixes which pool holds the bytes:
 
-- **Within its key's floor**, a held call keeps its receive reservation. The
+- **Within its connection's floor**, a held call keeps its receive reservation. The
   floor is a guarantee that the call is held, and its memory stays in the
   receive pool, under the receive pool's turns and caps.
-- **Past the floor**, when the service draws the call on the hold pool, the
+- **Past the floor**, when the adapter draws the call on the hold pool, the
   call's receive reservation **MUST** move to the hold pool whole (`Move`,
   §2.5) — its buffer's class size and its per-request overhead, as charged at
   frame — and the receive pool gets those bytes back. A move never shrinks a
   charge: the buffer it backs is not shrunk by being held, so a 100 KiB write in
   a transfer-class buffer charges the hold pool about 1 MiB.
-- RFC 17's per-key hold budgets in calls and bytes count the write's bytes, at
-  least 64 KiB; that is a logical count of what a key may have held, and it is
-  kept apart from the hold pool, which counts memory. The call is refused
-  `DelayHoldBudget` if either would pass.
+- The adapter's per-connection floors in requests and bytes count the write's
+  bytes, at least 64 KiB; that is a logical count of what a connection may have
+  held, and it is kept apart from the hold pool, which counts memory. Past
+  both, the adapter refuses the request at once and holds nothing.
 - A held call holds no reply reservation between attempts; each re-run takes one
   as a new call would (§3.3).
 
@@ -835,7 +852,7 @@ from here. The inventory, from the socket down:
 | requests waiting for reply bytes | the requests admitted | §3.3 | the call's deadline, then `DelayResources` |
 | the writer's queue | the connection's flow-control bound | [RFC 20 §6.2](rfc-20-adapters.md#6.2%20The%20writer) | the reader stops; the write deadline closes |
 | datagram listeners (the port mapper, NLM and NSM over UDP) | a fixed queue | [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states) | dropped; the client retries |
-| held SMB requests | the hold budget and floor per key, the hold pool | [RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone), §4.3 | `DelayHoldBudget` |
+| held SMB requests | the floor per connection, the hold pool | [RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests), §4.3 | `STATUS_INSUFFICIENT_RESOURCES`, from the adapter |
 | blocked lock waiters | the open-state pool | [RFC 14](rfc-14-open-state.md), §4.6 | `DelayResources` |
 | callbacks to clients | the writer's queue, the callback deadline | [RFC 20 §3.3](rfc-20-adapters.md#3.3%20Callbacks%20are%20the%20adapter%27s%20to%20deliver) | the client is not answering |
 | access-audit and quota events | rings of 16,384 and 4,096 entries of at most 1 KiB, allocated at start (§2.2) | [RFC 25 §4.4](rfc-25-observability.md#4.4%20Bounds%2C%20drops%20and%20gap%20records) | dropped, counted, a gap record written |
@@ -915,7 +932,7 @@ pays only time, a refusal where waiting would keep memory another client needs.
 | reply pool | waits, to the deadline | the request is admitted, and its reply is the next thing it needs |
 | share cap | refuses | the call already holds the share's memory |
 | open state | refuses | creating state is the thing that would exceed the pool |
-| hold pool | refuses | [RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone) |
+| hold pool | refuses | [RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests), §4.3 |
 | journal capacity | paces, then refuses | [RFC 8 §10.2.1](rfc-8-engine.md#10.2.1%20Writes%20are%20paced%20before%20the%20limit%2C%20not%20stopped%20at%20it) |
 | transfers | waits, then refuses a full queue | [RFC 3 §2.9](rfc-3-syncer.md#2.9%20Workers%20are%20shared%20fairly%20across%20flows) |
 
@@ -1109,7 +1126,7 @@ not become a setting (§2.3's ponytail).
 | R6 | At the receive ceiling the socket is not read; no request is read that cannot be reserved, and a record in several fragments is reserved at its protocol's largest class before its first fragment is read. |
 | R7 | No client key holds more than three quarters of the receive or reply pool while another key waits for it, and waiting keys are granted in turns. |
 | R8 | While the receive or reply pool is more than half full, no call is admitted that would take its share past three quarters of it, counting the call's own reservations and checked atomically with their charge; it is refused with `DelayResources` at once. A call that only releases or reclaims state is exempt (§4.2). |
-| R9 | A held call past its key's floor holds its bytes in the hold pool, not the receive pool, charged its whole receive reservation — buffer class and overhead — never less. |
+| R9 | A held call past its connection's floor holds its bytes in the hold pool, not the receive pool, charged its whole receive reservation — buffer class and overhead — never less. |
 | R10 | No address holds more than a quarter of the connection limit. |
 | R11 | A close, unlock, grant return, or reclaim of durable state is never refused for memory; a reclaim of volatile state is refused, retry-later, only once the open-state pool holds twice its ceiling. |
 | R12 | No held request, blocked lock, queued transfer, work item or waiting reader has a goroutine of its own. |
@@ -1136,8 +1153,8 @@ labels and histogram buckets follow
 Connections closed at accept for a pool, the limit or the per-address quarter
 are `adapter_connection_closes_total{reason}`
 ([RFC 20 §10](rfc-20-adapters.md#10.%20Observability)), with the reasons
-`pool`, `limit` and `per_address`. Held-call metrics are RFC 17's
-([RFC 17 §7](rfc-17-vfs.md#7.%20Observability)).
+`pool`, `limit` and `per_address`. Held-request metrics are the adapters'
+([RFC 20 §10.1](rfc-20-adapters.md#10.1%20Metrics)).
 
 No metric carries a share or client label. A share refused by its cap, and an
 address at its connection quarter, are named in a log line at warning, at most
@@ -1174,13 +1191,10 @@ a pool.
 
 ## 12. Open questions
 
-1. **The hold pool in a split deployment.** **(cluster)** RFC 17 counts holds at
-   the primary, but a held request's bytes live at the `protocol` node that
-   decoded it. On a collocated node the two are one budget; split, the
-   primary's hold pool counts bytes it does not hold, and the front-end's
-   receive pool holds bytes the primary's count lets through. Whether the
-   front-end should count instead is RFC 17 §5.9's second ponytail, and this
-   RFC's question with it.
+1. **The hold pool in a split deployment.** Resolved: the adapter counts held
+   requests at the `protocol` node that decoded them, where their bytes live
+   ([RFC 20 §4.6](rfc-20-adapters.md#4.6%20Held%20requests)), so the count
+   and the memory are one budget on every deployment.
 2. **Shares that move.** Fixed fractions waste a role's idle pools (§2.3). A
    budget that lends an idle pool's ceiling to a busy one must take it back
    under load, which is eviction by another name; whether a measured workload
