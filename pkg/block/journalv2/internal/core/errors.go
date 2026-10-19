@@ -31,8 +31,8 @@ var (
 	// format file or a segment. Nothing is written.
 	ErrJournalExists = errors.New("journal: directory already holds a journal")
 
-	// ErrNoJournal is returned by Open and Restamp, given a non-zero expected
-	// identity, when the directory holds no journal, empty or missing. Neither
+	// ErrNoJournal is returned by Open and Restamp when the directory holds no
+	// journal, empty or missing, whatever identity the caller expected. Neither
 	// ever creates one; only Init does.
 	ErrNoJournal = errors.New("journal: directory holds no journal")
 
