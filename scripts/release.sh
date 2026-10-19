@@ -49,13 +49,14 @@ sha="$(git rev-parse --short HEAD)"
 
 echo
 echo "Committed $sha and tagged $tag locally. Pushing will:"
-echo "  push develop, fast-forward main to $sha, push $tag (triggers release.yml)"
+echo "  push develop and fast-forward main to $sha, then push $tag (triggers release.yml)"
 read -r -p "Push? [y/N] " ok
 if [[ "$ok" != [yY] ]]; then
   echo "Not pushed. To undo: git tag -d $tag && git reset --hard origin/develop"
   exit 0
 fi
 
-git push origin develop
-git push origin "HEAD:main"
+# develop and main move together, without the tag even under push.followTags,
+# so release.yml never starts on a tag main does not contain.
+git push --atomic --no-follow-tags origin HEAD:develop HEAD:main
 git push origin "$tag"
