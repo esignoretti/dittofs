@@ -15,6 +15,8 @@ depends_on:
   - "[[rfc-21-nfs]]"
   - "[[rfc-22-smb]]"
   - "[[rfc-23-control-plane]]"
+  - "[[rfc-24-resources]]"
+  - "[[rfc-25-observability]]"
   - "[[rfc-26-catalog-backups]]"
 aliases:
   - RFC 18
@@ -24,7 +26,7 @@ tags:
 ---
 # RFC 18 — identity and authentication
 
-**Status:** draft. [§12](#12.%20Open%20questions) lists what is known to be undecided.
+**Status:** draft. [§13](#13.%20Open%20questions) lists what is known to be undecided.
 **Audience:** anyone changing how a client signs in, how a user, group or
 Windows SID becomes a principal, how squashing works, or any cache keyed on who
 the caller is.
@@ -125,6 +127,7 @@ With this RFC:
 - One mapping, used by both protocols: alice is the same principal over NFS
   and SMB, and a file she creates over one shows her as owner over the other.
 - Adapters authenticate and encode; they never map, squash or grant.
+- Management-API roles grant nothing on files; that API's own sign-in is [RFC 23 §5](rfc-23-control-plane.md#5.%20Authentication%20and%20authorization)'s.
 
 **How the rest is organised.** §1 gives the purpose and non-goals. §2 defines
 principals and the rule that keeps their IDs stable. §3 is authentication:
@@ -133,7 +136,7 @@ directions. §5 is the directory, its cache and what a stale entry may grant.
 §6 is resolution per share: squashing, groups, grants and the caller's flags.
 §7 is caches. §8 separates management-API users from file principals. §9
 collects failure modes. §10 and §11 are invariants, metrics and conformance;
-§12 lists open questions. Appendix A is prior art, Appendix B where the
+§12 is migration and §13 lists open questions. Appendix A is prior art, Appendix B where the
 current code differs.
 
 ### Scenarios
@@ -212,28 +215,6 @@ Outcome: a local change takes effect within a second, on every protocol.
    `NFS4ERR_BADOWNER`.
 
 Outcome: names round-trip through one mapping; unknown ones fail visibly.
-
-## In short
-
-- A principal is a minted ID. Its uid, gid, SID and names are spellings, each
-  unique in its scheme, each stored once with the principal
-  ([RFC 16](rfc-16-metadata-store.md)). No ID is defaulted, and none is reused.
-- Adapters run handshakes and call one authentication interface: verify an
-  NTLMv2 response, accept a Kerberos ticket against the keytab, pass NTLM
-  through to a domain controller. The result is a proof, held in memory.
-- `AUTH_SYS` and `AUTH_NONE` prove nothing: their callers are never
-  `authenticated`, never `admin`, and an unmapped uid acts as the anonymous
-  principal.
-- The service maps a proof to a principal on every call, through a cache keyed
-  by the whole proof, then squashes, resolves the share grant and sets the
-  caller's flags.
-- The directory fills in principals the store does not hold. Its answers are
-  cached with a TTL; when it is down, known principals are served for a
-  bounded grace and unknown ones are refused.
-- Errors fail closed. A store or directory error is never read as "unknown
-  user", and unknown is never read as "guest".
-- Management-API roles grant nothing on files; that API's own sign-in is
-  [RFC 23 §5](rfc-23-control-plane.md#5.%20Authentication%20and%20authorization)'s.
 
 ---
 
@@ -432,6 +413,83 @@ nested groups included, and the groups a directory or a verified PAC reports
 > group a deny entry names. 1 024 sits just above what a Windows token carries
 > by default, so a real account rarely meets it. Raise the default, or make
 > the cap per share, when a deployment shows accounts above it.
+
+### 2.6 Components, wiring and lifecycle
+
+One component, the **identity server**, holds the authenticator (§3), `Identities` (§4), the directory client
+and its cache (§5), and resolution with its caches (§6, §7). The composition root
+([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)) builds it
+once on each node that runs `protocol`, from one `Deps`. It builds no other component and closes nothing it was
+handed. The root hands each consumer the one interface it calls:
+
+| Interface | Consumer | Handed as |
+| --- | --- | --- |
+| `Authenticator` (§3.1) | the adapters | `core.Deps.Auth` ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)) |
+| `Identities` (§4.1) | the adapters | `core.Deps.Names` |
+| `Resolver` (§6.1) | the filesystem service | `vfs.Deps.Identity` ([RFC 17 §2.3](rfc-17-vfs.md#2.3%20Dependencies%20and%20wiring)) |
+
+```go
+package identity // internal/identity
+
+type Deps struct {
+	Principals metadata.Principals // RFC 16 §3: every read
+	Mint       Minter              // create-only PutUser and PutGroup: the only writes (§2.4, §5.1); RFC 16's ControlPlane satisfies it
+	Secrets    SecretProvider      // RFC 13 §7: keytab, NT hashes, the bind credential, the machine-account password
+	Logons     LogonSink           // RFC 25 §4.1's logon stream
+	Clock      clock.Clock
+	Metrics    *metrics.Registry
+	Logger     *slog.Logger
+}
+
+// New validates the settings and starts nothing. *Server implements
+// Authenticator, Identities and Resolver; only the composition root holds it.
+func New(d Deps, s config.Identity) (*Server, error)
+func (s *Server) Start(ctx context.Context) error        // loads the keytab's versions; the directory client dials lazily, so a down directory does not fail start
+func (s *Server) Apply(gen uint64, cfg config.Identity) // from the runtime: a new principals generation, identity settings, the directory record (§7.2)
+func (s *Server) Close() error                         // drops every in-memory table
+```
+
+**Start and stop.** The runtime starts it after it has loaded the records
+([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop) step 3) and before the filesystem service.
+It stops it after the filesystem service, because a drain still delivers calls that resolve. A failed start
+closes what it opened, as RFC 23 §2.2 says.
+
+**Reconfiguration** arrives only through `Apply`, from the runtime's reconcile
+([RFC 23 §2.3](rfc-23-control-plane.md#2.3%20The%20runtime%20reconciles%3B%20it%20does%20not%20take%20orders)):
+
+| Change | Effect |
+| --- | --- |
+| a principal, membership or protocol-ID row | a new generation; entries built under an older one are not served (§7.2) |
+| a keytab `Secret` version | the new key is added; older versions stay while a ticket can name them (§3.3); no restart |
+| the directory record | a new client and an empty cache; lookups in flight finish on the old client |
+| `identity.ntlm` turned off | NTLM sign-ins are refused, and calls on established NTLM contexts are refused at resolution; the NT hashes are deleted as §3.5 says |
+| `identity.id_range` | applies to the next allocation; no existing ID moves |
+
+> decision: turning NTLM off refuses established NTLM contexts as well, rather than letting them run to their
+> end, because an operator turning it off is removing a weaker credential. Overturned if operators are shown to
+> need a drain window.
+
+**Restart.** Every table is in memory and is lost: proofs (clients sign in again), the replay cache (§3.3), the
+logon throttle (§3.1) and the caches, which start cold.
+
+### 2.7 Package layout
+
+```text
+pkg/identity/           the contract, a leaf importing metadata types only: Identity, Proof, Keys, Caller,
+                        Spelling, Scheme, SID, NTLMAuthenticate, the errors; Authenticator, Identities, Resolver
+  identitytest/         Static (an Authenticator and a Resolver returning fixed values), a fake directory
+internal/identity/      the server: one package, one file per concern
+  server.go             New, Start, Apply, Close (§2.6)
+  authn.go kerberos.go pac.go ntlm.go   the authenticator (§3.1–§3.5)
+  throttle.go events.go                 the logon throttle and logon events (§3.1)
+  resolve.go cache.go                   resolution and its caches (§6, §7)
+  names.go                              Identities: Spell and Find (§4)
+  directory/            the LDAP client and its cache (§5): a package, so only it imports LDAP
+```
+
+`pkg/vfs` aliases `Identity`, `Proof`, `Caller` and `Identities`, so `pkg/identity` imports no package of the
+service and the two form no cycle. The NTLM and SPNEGO wire code is
+[RFC 20 §4.4](rfc-20-adapters.md#4.4%20Identity)'s `internal/adapter/auth`.
 
 ## 3. Authentication
 
@@ -1155,6 +1213,18 @@ it was built under.
 > pushed rather than polled, when a profile shows resolution misses after
 > generation changes at the reference box's call rate.
 
+### 7.3 Bounds
+
+Every table here is keyed on input a client controls, so each is charged to
+[RFC 24](rfc-24-resources.md#5.1%20No%20queue%20is%20unbounded)'s connection-state pool, and past its share:
+
+| Table | Past its share |
+| --- | --- |
+| caller cache | the least recently used entry is evicted, counted |
+| directory cache | the least recently used entry is evicted; an evicted entry is a miss, never "not found" |
+| replay cache | holds entries younger than `identity.clock_skew`; a sign-in that would need one more fails `ErrUnavailable` |
+| logon throttle | the oldest pair is evicted; a pair at its limit is never evicted early |
+
 ## 8. Management-API users
 
 The management API has users of its own: operators who create shares, users
@@ -1282,21 +1352,21 @@ with the directory and KDC as local test services.
 | §7.1 directory deadline | Resolve bob over NTLM; remove bob from a directory group. Keep the session open past the TTL: assert his next call drops the group, with no generation change. | a derived cache outliving the directory answer |
 | §4.4 SID-less directory | An RFC 2307 directory entry with no SID: assert the minted principal holds a local SID from the RID counter, unchanged when the directory later adds one. | a directory principal with no SID |
 
-## 12. Open questions
+## 12. Migration
 
-1. **Tombstones for deleted principals.** Whether a deleted principal keeps its
-   SID and name as index rows that answer principal-to-wire but not
-   wire-to-principal, so the security tab shows who owned a file (§4.4).
-2. **Trusted domains.** Whether NTLM pass-through and SID resolution follow the
-   directory's forest trusts, and how many directories an installation may
-   name (§3.5, §5.1).
-3. **Unmapped `AUTH_SYS` users.** Whether a share option should mint numeric
-   principals on sight, with a cap, for NFS clients whose users the store
-   cannot hold (§4.3).
-4. **The principals generation in a cluster.** Whether polling one counter per
-   second from every `protocol` node is cheap enough at the target scale, or
-   needs a pushed change stream (§7.2).
-5. **Name case.** Whether case-insensitive uniqueness of names (§4.6) holds for
+| Slice | What moves | What is deleted |
+| --- | --- | --- |
+| 0, now | fixed in today's code: no default uid (allocate), the bootstrap admin without uid 0, no guest on a failed or unparsable session setup, plain LDAP refused | the 1000 default; `root_to_admin`, `all_to_admin` |
+| 1 | the `pkg/identity` contract (§2.7) and allocation on RFC 16's uid, gid and RID counters; today's uid-derived SIDs written once as stored values, so no SID changes (ID4) | RID derivation from a uid |
+| 2 | the authenticator: Kerberos and NTLM behind `Authenticator`, logon events, the throttle | the five-domain NTLM retry; the RPCSEC_GSS "unmapped → nobody" path |
+| 3 | resolution in the front ([RFC 17 §9](rfc-17-vfs.md#9.%20Migration) slice 2), squash `none`/`root`/`all`, stored `none` grants | the NFS share-permission resolver, the NFSv3 auth-context cache, SID share permissions, `default_permission` |
+| 4 | the directory cache with stale grace; `Identities` with owner strings by name | the resolver cache's error TTL |
+
+## 13. Open questions
+
+The deferrals of §3.5, §4.3, §4.4, §5.1 and §7.2 are recorded at their markers, with what would overturn each.
+
+1. **Name case.** Whether case-insensitive uniqueness of names (§4.6) holds for
    every directory a deployment uses, or a directory with case-distinct names
    needs an exception.
 
