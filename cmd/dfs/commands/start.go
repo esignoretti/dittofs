@@ -18,6 +18,7 @@ import (
 	"github.com/marmos91/dittofs/internal/controlplane/api/handlers"
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/internal/sysinfo"
+	"github.com/marmos91/dittofs/pkg/adapter/nbd"
 	"github.com/marmos91/dittofs/pkg/adapter/nfs"
 	"github.com/marmos91/dittofs/pkg/adapter/smb"
 	"github.com/marmos91/dittofs/pkg/auth/kerberos"
@@ -904,6 +905,8 @@ func createAdapterFactory(kerberosConfig *config.KerberosConfig, nlAuth *netlogo
 			return createNFSAdapter(cfg, kerberosConfig)
 		case "smb":
 			return createSMBAdapter(cfg, kerberosConfig, nlAuth)
+		case "nbd":
+			return createNBDAdapter(cfg)
 		default:
 			return nil, fmt.Errorf("unknown adapter type: %s", cfg.Type)
 		}
@@ -1037,6 +1040,44 @@ func createSMBAdapter(cfg *models.AdapterConfig, kerberosConfig *config.Kerberos
 	}
 
 	return smbAdapter, nil
+}
+
+// createNBDAdapter builds the NBD adapter from its persisted row. The row's
+// port wins over the type default; the adapter-specific settings live in the
+// config blob.
+//
+// allow_remote_bind is the one setting with no safe default: NBD has no
+// authentication, so an adapter that binds a reachable interface without it is
+// refused at Serve. Nothing here can grant it implicitly.
+func createNBDAdapter(cfg *models.AdapterConfig) (runtime.ProtocolAdapter, error) {
+	port := cfg.Port
+	if port == 0 {
+		port = models.DefaultNBDPort
+	}
+
+	nbdCfg := nbd.Config{Enabled: true, Port: port}
+
+	parsedConfig, err := cfg.GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse adapter config: %w", err)
+	}
+
+	if bindAddr, ok := parsedConfig["bind_address"].(string); ok {
+		nbdCfg.BindAddress = bindAddr
+	}
+	if allowRemote, ok := parsedConfig["allow_remote_bind"].(bool); ok {
+		nbdCfg.AllowRemoteBind = allowRemote
+	}
+	if defaultExport, ok := parsedConfig["default_export"].(string); ok {
+		nbdCfg.DefaultExport = defaultExport
+	}
+	if maxConns, ok := parsedConfig["max_connections"].(float64); ok {
+		nbdCfg.MaxConnections = int(maxConns)
+	} else if maxConns, ok := parsedConfig["max_connections"].(int); ok {
+		nbdCfg.MaxConnections = maxConns
+	}
+
+	return nbd.New(nbdCfg), nil
 }
 
 // handleFormatMismatch prints the operator directive and reports exit 78 when

@@ -37,7 +37,7 @@ func WithFilePayloadScope[T any](authCtx *metadata.AuthContext, metaSvc *metadat
 		return err
 	})
 	if err != nil && !entered {
-		return result, normalizeBlockStoreError(err)
+		return result, NormalizeBlockStoreError(err)
 	}
 	return result, err
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/marmos91/dittofs/internal/logger"
+	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/block/engine"
 	"github.com/marmos91/dittofs/pkg/metadata"
 )
@@ -65,9 +66,21 @@ func WriteToBlockStore(
 	defer cancel()
 	_, err := blockStore.WriteAt(ctx, string(payloadID), nil, data, offset)
 	if err != nil {
-		return normalizeBlockStoreError(err)
+		return NormalizeBlockStoreError(err)
 	}
 	return nil
+}
+
+// Committer is the block-store surface CommitBlockStore reads. It is an
+// interface rather than *engine.Store so the durability rule can be exercised
+// against a fake, and so a caller that holds only the store's I/O surface can
+// still reach the one shared implementation of that rule instead of writing
+// its own copy. *engine.Store satisfies it.
+type Committer interface {
+	Flush(ctx context.Context, payloadID string) (*block.FlushResult, error)
+	LocalDurable() bool
+	RemoteDurable() bool
+	RequireDurableCommit() bool
 }
 
 // CommitBlockStore is the COMMIT/flush seam used by NFSv3 COMMIT, NFSv4
@@ -109,7 +122,7 @@ func WriteToBlockStore(
 //     ErrNotDurableYet (the operator opted into honest failure).
 func CommitBlockStore(
 	ctx context.Context,
-	blockStore *engine.Store,
+	blockStore Committer,
 	payloadID metadata.PayloadID,
 ) error {
 	ctx, cancel := WithRequestDeadline(ctx)
@@ -119,7 +132,7 @@ func CommitBlockStore(
 		// Hard error: unchanged behavior, normalized so the wire mappers see
 		// the code (a closed store wraps as the stale-handle row, the rest as
 		// the I/O row; the original error stays reachable via Cause).
-		return normalizeBlockStoreError(err)
+		return NormalizeBlockStoreError(err)
 	}
 
 	// Observability: record the per-store durability decision at the
@@ -168,7 +181,7 @@ func CommitBlockStore(
 	// Normalized so the wire mappers see the I/O-class code while the
 	// ErrNotDurableYet sentinel stays reachable via Cause for tests and the
 	// durability policy's own retry classification.
-	return normalizeBlockStoreError(ErrNotDurableYet)
+	return NormalizeBlockStoreError(ErrNotDurableYet)
 }
 
 // FlushStableWrite forces a file's cached data — and, when fileSync is set, its
@@ -188,7 +201,7 @@ func CommitBlockStore(
 func FlushStableWrite(
 	authCtx *metadata.AuthContext,
 	metaSvc *metadata.Service,
-	blockStore *engine.Store,
+	blockStore Committer,
 	handle metadata.FileHandle,
 	payloadID metadata.PayloadID,
 	fileSync bool,

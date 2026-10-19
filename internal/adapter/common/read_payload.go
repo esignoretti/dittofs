@@ -57,7 +57,7 @@ func ReadFromBlockStore(
 
 	if readErr != nil {
 		pool.Put(data)
-		return BlockReadResult{}, normalizeBlockStoreError(readErr)
+		return BlockReadResult{}, NormalizeBlockStoreError(readErr)
 	}
 
 	return BlockReadResult{Data: data[:n], EOF: false}, nil

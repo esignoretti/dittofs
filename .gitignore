@@ -132,3 +132,7 @@ docker-compose.override.yml
 
 # Obsidian vault settings
 .obsidian/
+
+# NBD rig artifacts (test/nbd/fetch-artifacts.sh downloads ~30MB of kernel and
+# modules here). Build outputs, never committed — the recipe reproduces them.
+test/nbd/artifacts/

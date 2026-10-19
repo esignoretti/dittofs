@@ -9,7 +9,7 @@ import (
 // AdapterConfig defines a protocol adapter configuration.
 type AdapterConfig struct {
 	ID        string    `gorm:"primaryKey;size:36" json:"id"`
-	Type      string    `gorm:"uniqueIndex;not null;size:50" json:"type"` // nfs, smb
+	Type      string    `gorm:"uniqueIndex;not null;size:50" json:"type"` // nfs, smb, nbd
 	Enabled   bool      `gorm:"default:true" json:"enabled"`
 	Port      int       `gorm:"default:0" json:"port"`
 	Config    string    `gorm:"type:text" json:"-"` // JSON blob for adapter-specific config
@@ -27,6 +27,7 @@ type AdapterConfig struct {
 const (
 	DefaultNFSPort = 12049
 	DefaultSMBPort = 12445
+	DefaultNBDPort = 10809
 )
 
 // DefaultPort returns the port an adapter of the given type binds to when its
@@ -37,6 +38,8 @@ func DefaultPort(adapterType string) int {
 		return DefaultNFSPort
 	case "smb":
 		return DefaultSMBPort
+	case "nbd":
+		return DefaultNBDPort
 	default:
 		return 0
 	}
@@ -53,7 +56,7 @@ func (a *AdapterConfig) Validate() error {
 	// Only the types with a known default port have a constructor in the
 	// adapter factory, so a type without one has no adapter to build.
 	if DefaultPort(a.Type) == 0 {
-		return fmt.Errorf("unsupported adapter type %q: must be one of nfs, smb", a.Type)
+		return fmt.Errorf("unsupported adapter type %q: must be one of nfs, smb, nbd", a.Type)
 	}
 	if a.Port < 0 || a.Port > 65535 {
 		return fmt.Errorf("invalid port %d: must be 0-65535", a.Port)

@@ -6,10 +6,12 @@ import (
 	merrs "github.com/marmos91/dittofs/pkg/metadata/errors"
 )
 
-// normalizeBlockStoreError converts a raw block-store error into a
+// NormalizeBlockStoreError converts a raw block-store error into a
 // *merrs.StoreError so the wire mappers (the per-adapter StatusFor family)
 // can see its code. Every non-nil error from ReadFromBlockStore,
-// WriteToBlockStore, and CommitBlockStore passes through here exactly once:
+// WriteToBlockStore, and CommitBlockStore passes through here exactly once,
+// and a protocol adapter that maps a raw store error itself calls it first so
+// the classification below matches instead of collapsing to the generic row:
 //
 //   - engine.ErrStoreClosed (the share was removed or hot-reloaded
 //     mid-transfer) wraps as the stale-handle row.
@@ -22,7 +24,7 @@ import (
 // The original error is preserved as Cause (multi-%w), so errors.Is and
 // errors.As still traverse to the block sentinel for logging and tests.
 // Callers that need the code directly use ClassifyBlockStoreError.
-func normalizeBlockStoreError(err error) error {
+func NormalizeBlockStoreError(err error) error {
 	var storeErr *merrs.StoreError
 	if goerrors.As(err, &storeErr) {
 		// Already a StoreError (e.g. an engine op that surfaced a metadata
