@@ -339,6 +339,11 @@ sixteenth. It is not reserved by anyone and nothing waits for it.
 | **transfers** | both syncer halves and the staging budget ([RFC 3 §2.2](rfc-3-syncer.md#2.2%20The%20pool%20size%20is%20a%20memory%20bound)) (§7.2) | 1/8 | eight workers per half, and the staging they imply | the syncer's own wait or refusal ([RFC 3 §2.3](rfc-3-syncer.md#2.3%20Backpressure%20propagates%3B%20it%20does%20not%20buffer)) |
 | *unpooled* | §2.2 | 1/4 | — | — |
 
+Five pools are counted at run time — receive, reply, hold, connection state,
+open state — and are `Budget`s (§2.5). The other three are **sizes**: the
+composition root hands each its figure at construction, and its owner enforces
+its own bound (§7). Nothing reserves from them.
+
 The shares are **fixed**, not settings. On a 64 GiB node they are 4 GiB each
 for the five small pools, 12 GiB for the metadata store, 8 GiB each for the
 index and transfers, and 16 GiB unpooled; on an 8 GiB container, 512 MiB, 1.5 GiB,
@@ -400,26 +405,32 @@ that sets *L* to size one pool, as RFC 17's hold-pool test sets 128 MiB to get a
 
 ### 2.5 Memory is reserved before it is used
 
-A pool is a counter, not an allocator. Each consumer **MUST** reserve the bytes
-it is about to hold from its pool **before** it holds them, and release them
-when it frees them:
+A pool is a counter, not an allocator. Each consumer of a counted pool **MUST**
+reserve the bytes it is about to hold from its pool **before** it holds them,
+and release them when it frees them:
 
 ```go
-// Pool is indicative; the obligations around it are normative.
-type Pool interface {
-	// Reserve charges n bytes to the pool for key, waiting or refusing as the
-	// pool's ceiling rule says (§2.3). It never waits past ctx.
-	Reserve(ctx context.Context, key Key, n int64) (Reservation, error)
-	// TryReserve charges n bytes or refuses at once; it never waits.
-	TryReserve(key Key, n int64) (Reservation, bool)
-}
+package resources // internal/resources
 
-type Reservation interface {
-	Release()             // idempotent; returns the bytes to the pool
-	Move(to Pool) error   // hands the bytes to another pool without releasing first (§4.3)
-}
+// Budget is one counted pool (§2.3): waits or refuses at its ceiling, as the pool's row says.
+type Budget struct{ /* name, ceiling, waits bool, reserved, per-key DRR queues */ }
+func NewBudget(name string, ceiling int64, waits bool) *Budget
+// Reserve charges n bytes for key. A waiting budget waits within ctx; a refusing one refuses at once.
+func (b *Budget) Reserve(ctx context.Context, key netip.Addr, n int64) (Reservation, error)
+func (b *Budget) Reserved() int64 // for gauges and the leak check (§2.7)
+
+// Reservation is a value; Release is idempotent.
+type Reservation struct{ b *Budget; n int64 }
+func (r *Reservation) Release()
+
+// Pools is what an adapter is handed (RFC 20 §4.7): the four budgets on the request path.
+type Pools struct{ Receive, Reply, Conn, Hold *Budget }
 ```
 
+- Whether a budget waits or refuses is fixed by its pool's row (§2.3), so one
+  `Reserve` serves both. A refusing budget ignores `key`; its callers pass the
+  zero `netip.Addr`.
+- `Reservation` is a value, so taking one allocates nothing.
 - A reservation is in bytes of memory held, rounded up to the buffer class
   (§3.1) where a pooled buffer backs it.
 - **Charged, not measured.** No pool reads the heap to decide. A charge is
@@ -451,6 +462,90 @@ later in this order. Each pool is freed by work that needs nothing earlier in
 the order — a reply by the writer sending it, a transfer by its store — so no
 set of waits forms a cycle and none waits forever. Steps 5 and 6 never wait:
 they refuse.
+
+### 2.7 Wiring and lifecycle
+
+The composition root
+([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)) builds the
+budget in two phases, inside the start order
+[RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop) owns:
+
+- **(a) before that order opens the metadata store**, because the store's size
+  is one of the figures: learn *L* (§2.1), set the runtime's soft limit, and
+  compute the fixed fractions, which need only *L* and the bootstrap roles;
+- **(b) once the settings are read**: check `upload_workers`, `fetch_workers`,
+  `ExtentLimit` and `connection_limit` against their figures (§4.4, §7), and
+  build the budgets.
+
+```go
+lim, err := resources.Detect()                     // (a) §2.1; refuses an unreadable control group
+debug.SetMemoryLimit(lim.Bytes * 15 / 16)          // (a) before any pool fills
+sp := resources.SplitFor(lim, roles)               // (a) §2.3, §2.4: the fractions and floors
+st, _ := metadata.Open(ctx, kv, metadata.Options{CacheBytes: sp.Meta /* … */}) // a size, §7.3
+err = sp.Check(settings)                           // (b) §4.4, §7: refuses what does not fit
+pools := &resources.Pools{
+	Receive: resources.NewBudget("receive", sp.Receive, true),
+	Reply:   resources.NewBudget("reply", sp.Reply, true),
+	Conn:    resources.NewBudget("connection", sp.Conn, false),
+	Hold:    resources.NewBudget("hold", sp.Hold, false),
+}
+ost := openstate.New(openstate.Deps{Budget: resources.NewBudget("open", sp.Open, false) /* … */})
+svc, _ := vfs.New(vfs.Deps{Shares: resources.NewShareCap(pools.Receive, pools.Reply) /* … */})
+// every adapter is handed pools as core.Deps.Pools (RFC 20 §3.4); the journals take
+// sp.Index and the syncer sp.Transfers as sizes (§7.1, §7.2); CPU tokens are a
+// semaphore.Weighted over sp.Tokens (§6.2)
+```
+
+| Component | Built by | Owned by | Lifecycle |
+| --- | --- | --- | --- |
+| `Limit` | the root, first | the root | read once; never changes |
+| `Split` | the root, from `Limit` and roles | the root, a value | recomputed only at the next start |
+| `Pools`: receive, reply, connection state, hold | the root | shared by every adapter's `core` | none; checked at zero after the adapters stop |
+| open-state `Budget` | the root | the open-state table; **(cluster)** also the dedup table | as above |
+| `ShareCap` | the root, over receive and reply | the service's front | entries dropped at zero |
+| CPU tokens | the root, from `Split` | shared by background workers | none |
+| sizes: metadata store, index, transfers | the root, from `Split` | the store, each journal, the syncer | handed at construction; the owner sizes itself |
+
+- **A consumer takes only the budgets it charges**, as fields of its own
+  `Deps`, never the whole set: `core.Deps` takes `Pools`, `openstate.Deps` the
+  open-state budget, `vfs.Deps` the share cap; the store, the journals and the
+  syncer take a size, not a budget.
+- **Nothing here has a lifecycle.** `Detect`, `SplitFor` and `NewBudget` start
+  no goroutine and open nothing; a release grants the next waiter on the
+  releasing goroutine. There is no `Start` or `Close`. After the adapters and
+  the service have stopped, the root logs any budget whose `Reserved()` is not
+  zero, and the test harness fails on it.
+- **Shared budgets are the root's.** The receive, reply, connection-state and
+  hold budgets are shared by every adapter; no adapter may replace or close
+  one, and an adapter restarted by the runtime gets the same ones back.
+- **Reconfiguration.** *L* and the split change only at a restart (§2.1). A
+  live setting a figure bounds — `connection_limit` — is checked against the
+  split when the runtime applies it, and refused there as at start.
+- **Failure halfway.** Phase (a) fails before anything is opened, and phase (b)
+  before anything serves, so a start refused here closes only what RFC 23's
+  order already opened.
+
+| Failure | Behaviour |
+| --- | --- |
+| a control-group file exists but cannot be parsed | start refused, naming the file |
+| a budget not at zero at close | logged at error with the pool and bytes; tests fail on it |
+| a release past zero | panics in tests; clamps to zero and is counted in production |
+
+### 2.8 Package layout
+
+```text
+internal/resources/
+  limit.go        Limit, Detect: the runtime limit, the control group, the host (§2.1)
+  split.go        Split, SplitFor, Check: fractions, floors, the ceilings' sum, settings (§2.3, §2.4, §7)
+  budget.go       Budget, Reservation, Pools: counted pools and their turns (§2.5, §4.1)
+  sharecap.go     ShareCap, WithCharge, ChargeOf (§4.2)
+  fd.go           the open-file split and fd_limit_low (§6.3)
+  metrics.go      memory_*, cpu_* (§10)
+  budget_test.go  the turns property test and B1
+```
+
+- **One package, no subpackages, a leaf.** It imports only the standard
+  library and the metrics registry; its consumers import it, never the reverse.
 
 ## 3. Request and reply buffers
 
@@ -665,6 +760,39 @@ of the calls it has admitted to that share, and at admission
 The cap is a refusal, not a wait, because the call already holds its receive
 reservation: waiting would keep it, and the memory is what the cap protects.
 
+> decision: the share is known only at admission, after the reply wait, so a
+> call may wait for reply bytes to its deadline and then be refused by its
+> share's cap. It holds only a small-class receive charge meanwhile. Check the
+> cap before the reply wait if the adapter is ever told a call's share before
+> calling the service.
+
+**How the service learns a call's bytes.** `core` attaches the call's receive
+and reply charge to the call's context once, before the service is called, as
+it already passes a call's hold bound (`vfs.WithHold`,
+[RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)). The front's admission reads it
+and adds it to the share's count in the same step that checks the cap:
+
+```go
+func WithCharge(ctx context.Context, bytes int64) context.Context
+func ChargeOf(ctx context.Context) int64 // 0 for an internal caller no adapter reserved for
+
+// ShareCap is the front's per-share count (§4.2): one per service, built over the
+// receive and reply budgets, whose fill it reads. A map entry exists only while a share
+// has a call in flight, so a removed share leaves nothing behind.
+type ShareCap struct{ /* mu; per share: bytes */ }
+func NewShareCap(receive, reply *Budget) *ShareCap
+func (c *ShareCap) Admit(ctx context.Context, share uint64, exempt bool) (release func(), err error)
+```
+
+The share key is a plain integer, because `resources` imports nothing of the
+service's.
+
+> decision: the charge rides in the context because otherwise every `Service`
+> method grows a parameter that only admission reads. It is a number the service
+> reads, not a policy it applies, so it is not the hold-policy hook RFC 17
+> rejected. Make it a field of the call if a second value has to travel the
+> same way.
+
 **A call that releases or reclaims state is not refused by the cap.** A call
 whose operations only end state — a close, an unlock, a lock cancel, a grant or
 layout return, a freed state ID — or reclaim it during grace, with the
@@ -715,12 +843,13 @@ counts nothing about holds. This RFC fixes which pool holds the bytes:
 - **Within its connection's floor**, a held call keeps its receive reservation. The
   floor is a guarantee that the call is held, and its memory stays in the
   receive pool, under the receive pool's turns and caps.
-- **Past the floor**, when the adapter draws the call on the hold pool, the
-  call's receive reservation **MUST** move to the hold pool whole (`Move`,
-  §2.5) — its buffer's class size and its per-request overhead, as charged at
-  frame — and the receive pool gets those bytes back. A move never shrinks a
-  charge: the buffer it backs is not shrunk by being held, so a 100 KiB write in
-  a transfer-class buffer charges the hold pool about 1 MiB.
+- **Past the floor**, the adapter reserves the call's whole receive charge —
+  buffer class and per-request overhead, as charged at frame — from the hold
+  pool and, only once that succeeds, releases the receive reservation, so the
+  charge is never absent. Failing, it refuses the call, and the receive
+  reservation is released with it. The charge never shrinks: the buffer it
+  backs is not shrunk by being held, so a 100 KiB write in a transfer-class
+  buffer charges the hold pool about 1 MiB.
 - The adapter's per-connection floors in requests and bytes count the write's
   bytes, at least 64 KiB; that is a logical count of what a connection may have
   held, and it is kept apart from the hold pool, which counts memory. Past
@@ -795,9 +924,13 @@ Opens, byte-range locks, lock waiters, caching grants and quota reservations at
 a primary are each charged a fixed per-kind cost to the open-state pool when
 created, and released when they end. The costs are proposed at 1 KiB per open
 and 256 bytes per lock range, waiter, grant or reservation, settled by §8's M6.
-**(cluster)** The routed-request dedup table
-([RFC 15 §4.3](rfc-15-topology.md#4.3%20The%20route%20envelope)) is charged per
-entry to the same pool.
+
+The open-state table ([RFC 14](rfc-14-open-state.md)) is the pool's one owner:
+it takes the open-state `*Budget` in its `Deps`, charges at each create and
+releases at each end. **(cluster)** The route envelope's dedup table takes the
+same budget in its own `Deps`
+([RFC 15 §4.3](rfc-15-topology.md#4.3%20The%20route%20envelope)) and is charged
+per entry.
 
 At the ceiling:
 
@@ -1122,7 +1255,7 @@ not become a setting (§2.3's ponytail).
 | --- | --- |
 | R1 | The process memory limit is learned once at start, from the runtime's soft limit, else the container's, else the host's memory, and the runtime is told it. |
 | R2 | The pools' ceilings — each pool's larger of its share of *L* and its floor — sum to at most three quarters of *L*; where they sum to more, the node raises a health condition naming that sum. |
-| R3 | Memory held on behalf of a request, a connection, a session, open state, a held call, a transfer or the index is reserved from its pool before it is held, and released on every path. |
+| R3 | Memory held on behalf of a request, a connection, a session, open state or a held call is reserved from its pool before it is held, and released on every path; a size-bounded owner stays within the figure it was handed (§7). |
 | R4 | Reservations along a request's path are taken in §2.6's order, and no wait is entered while holding a later one. |
 | R5 | No queue, wait list or table that grows with load is unbounded; each has a row in §5.1 or in the RFC it cites. |
 | R6 | At the receive ceiling the socket is not read; no request is read that cannot be reserved, and a record in several fragments is reserved at its protocol's largest class before its first fragment is read. |
