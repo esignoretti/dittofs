@@ -1268,24 +1268,24 @@ deleted by the component that created them (§2.4).
 
 ## 9. Invariants
 
-| # | Invariant |
-| --- | --- |
-| O1 | Every metric's prefix has one owning RFC, its unit is in its name, and counters end `_total`. |
-| O2 | No counter or histogram carries a share, shard, client, principal, file, path or connection label; no metric carries a value a client chose. |
-| O3 | Every entity label is capped at 64 values per metric per node; per-share and per-shard gauges are exported for the worst `metrics.top_shares` and summed. |
-| O4 | A node exports at most 50,000 series at the reference profile, no metric more than 10,000. |
-| O5 | Every event is counted by one metric, in one RFC. |
-| O6 | A status is the worst severity among current conditions in scope; a share's conditions never set its node's status. |
-| O7 | Every condition is derived from current evidence and clears on its own, except the four states RFC 0 §10.2 names. |
-| O8 | Liveness reads no condition, store, network or disk. |
-| O9 | Readiness is false only while starting, draining, or with the metadata store lost. |
-| O10 | An event hook never blocks or fails an operation; every event dropped leaves a gap record in its stream and a count. |
-| O11 | Every record names its node, stream, boot and sequence; within one stream and boot sequence numbers have no gap that is not a gap record, and a gap record sits in sequence position. |
-| O12 | The spool is never on a journal's filesystem and is readable only by the service's account. |
-| O13 | The access and admin streams are readable only with the right to read the audit, and never appear in a log, a metric or a health answer. |
-| O14 | No log line, span, metric, health detail or record carries a secret or file content; no line at `Info` or above carries a user-chosen name. |
-| O15 | No line at `Info` or above is written per client request. |
-| O16 | The trace context never enters a request ID, dedup key or durable record. |
+| # | Invariant | Test (§12) |
+| --- | --- | --- |
+| O1 | Every metric's prefix has one owning RFC, its unit is in its name, and counters end `_total`. | §2.1, §2.2 names |
+| O2 | No counter or histogram carries a share, shard, client, principal, file, path or connection label; no metric carries a value a client chose. | §2.4 forbidden labels |
+| O3 | Every entity label is capped at 64 values per metric per node; per-share and per-shard gauges are exported for the worst `metrics.top_shares` and summed. | §2.5 budget |
+| O4 | A node exports at most 50,000 series at the reference profile, no metric more than 10,000. | §2.5 budget |
+| O5 | Every event is counted by one metric, in one RFC. | none: §11's audit, by review |
+| O6 | A status is the worst severity among current conditions in scope; a share's conditions never set its node's status. | §3.3 share does not set node |
+| O7 | Every condition is derived from current evidence and clears on its own, except the four states RFC 0 §10.2 names. | §3.4 never latched |
+| O8 | Liveness reads no condition, store, network or disk. | §3.5 liveness |
+| O9 | Readiness is false only while starting, draining, with the metadata store lost, with a listener down, or after a failed start step. | §3.6 readiness |
+| O10 | In the `access`, `quota` and `logon` streams, an event hook never blocks or fails an operation; every event dropped leaves a gap record in its stream and a count. | §4.3 never blocks |
+| O11 | In the `access`, `quota` and `logon` streams, every record names its node, stream, boot and sequence; within one stream and boot sequence numbers have no gap that is not a gap record, and a gap record sits in sequence position. | §4.3 never blocks; §4.5 restart |
+| O12 | The spool is never on a journal's filesystem and is readable only by the service's account. | §4.6 retention; §4.8 access |
+| O13 | The `access`, `logon` and `admin` streams are readable only with the right to read the audit, and never appear in a log, a metric or a health answer. | §4.8 access; §5.4 never logged |
+| O14 | No log line, span, metric, health detail or record carries a secret or file content; no line at `Info` or above carries a user-chosen name. | §5.4 never logged |
+| O15 | No line at `Info` or above is written per client request. | §5.2 per-request lines |
+| O16 | The trace context never enters a request ID, dedup key or durable record. | §6.2 propagation |
 
 ## 10. Observability
 
@@ -1349,26 +1349,26 @@ names, on the composed single-node harness of the [index](rfc-index.md#Test%20ha
 
 | Rule | Check | Catches |
 | --- | --- | --- |
-| §2.1, §2.2 names | Scrape a node that has run the reference workload. Assert every name's prefix is in §2.1's registry, every counter ends `_total`, every unit word is one of §2.2's. | a metric with a borrowed prefix, milliseconds |
+| §2.1, §2.2 names | Scrape a node that has run the reference workload. Assert every name's prefix is in §2.1's registry, every counter ends `_total`, every unit word is one of §2.2's. `metrics.golden` lists every name, type and label set; the scrape is diffed against it, and `-update` rewrites it. | a metric with a borrowed prefix, milliseconds; a quiet rename |
 | §2.4 forbidden labels | On the same scrape assert no series carries a forbidden label, and no counter or histogram carries `share` or `shard`. Plant a share named like a file and a user named like a path: assert neither value appears in any label. | a share label slipped onto a histogram |
-| §2.5 budget | Configure 10⁴ shares, run every protocol and role on one node, scrape. Assert at most 50,000 series and no metric above 10,000. Raise `metrics.top_shares` to 10⁴: assert the count rises by the per-share gauges only. | a label that scales with shares or clients |
+| §2.5 budget | Configure 10⁴ shares and every entity label at 64 values, run every protocol and role on one node, scrape. Assert at most 50,000 series and no metric above 10,000. Raise `metrics.top_shares` to 10⁴: assert the count rises by the per-share gauges only. | a label that scales with shares or clients |
 | §2.3 zero start | Start a node, scrape before any traffic. Assert every closed-set series of every bug counter is present at 0. | an alert on "any increase" that misses the first event |
 | §2.8 export does not block | Hold the engine's state lock; scrape. Assert the scrape returns within 6 s without the engine's series and `health_export_partial_total` rose; release; assert a write completed during the scrape. | an export that takes a request-path lock |
 | §3.3 share does not set node | Deny puts on one store under one share of a hundred: assert the share unhealthy naming the store, the node's status unchanged by it, `health_shares{state="unhealthy"}` = 1, readiness and liveness true. | a readiness probe that restarts for a bucket policy |
 | §3.4 never latched | Make a store get-unhealthy, then fix it without touching DittoFS. Assert the condition clears within its owner's bound and the share returns healthy, with no operator action. | a latched condition |
 | §3.5 liveness | Stop the metadata store and the remote, fill the journal's device: assert liveness stays true throughout. Block the request scheduler: assert liveness fails within 60 s. | liveness on a dependency |
-| §3.6 readiness | Assert not ready during recovery, ready in grace, ready while self-fenced, not ready with the metadata store lost and while draining. **(cluster)** Relinquish a shard on a storage node: assert the node stays ready and `shard_relinquished` is raised. | a node unreachable for reclaim; a probe stricter than §3.6 |
-| §3.9 registry | For every condition the suite can raise, assert its name is in the registry and its severity matches the registry's rule for the cause injected. | a condition no alert knows |
-| §4.3 never blocks | With the access policy at every decision, stop the writer; run 10⁵ operations. Assert operation latency unchanged within noise, `events_dropped_total{reason="ring_full"}` equal to the events beyond the ring, and, once the writer resumes, one gap record covering exactly those sequence numbers, after every record below them and before every record above. Stop again, drop, and emit nothing more: assert the gap record is written within a second of the writer resuming. | a blocking sink; a silent drop; a gap out of order |
+| §3.6 readiness | Assert not ready during recovery, ready in grace, ready while self-fenced, not ready with the metadata store lost and while draining. Drop one listener: assert not ready and `adapter_listener_lost`. Fail a start step: assert `not_ready` and the step named. **(cluster)** Relinquish a shard on a storage node: assert the node stays ready and `shard_relinquished` is raised. | a node unreachable for reclaim; a probe stricter than §3.6 |
+| §3.9 registry | §3.9's Go table and the RFC table agree, and every `Name` is returned by some `Source` in a test that injects its cause, with the severity the registry's rule gives that cause. | a condition no alert knows |
+| §4.3 never blocks | With the access policy at every decision, stop the writer; run 10⁵ operations. Assert all 10⁵ operations complete, `events_dropped_total{reason="ring_full"}` equal to the events beyond the ring, and, once the writer resumes, one gap record covering exactly those sequence numbers, after every record below them and before every record above. Stop again, drop, and emit nothing more: assert the gap record is written within a second of the writer resuming. | a blocking sink; a silent drop; a gap out of order |
 | §4.4 coalescing | Hammer a full quota with 10⁴ writes in a minute. Assert exactly two hard-refusal records: the first, at once, and one summary carrying the count of the rest. | a quota stream that floods |
 | §4.5 restart | Kill the process with events in the ring. Restart: assert a `restart` gap record and a new boot ID, no sequence number reused within a stream and boot, and spool file names still sorting in write order across the restart. | a reused sequence after a crash |
 | §4.6 retention | Fill the spool past `events.max_bytes`: assert the oldest file deleted, a `trimmed` gap record, `event_spool_high` raised first. Advance the clock past `events.retention` with the spool under its bound: assert the old files retired, no gap record and no `event_gap`. Put `events.path` on a journal's filesystem: assert the start refused. | a spool that eats journal capacity; a page for every hour of normal retention |
-| §4.8 access | As `viewer` and as `operator`, read the access and admin streams: refused. Change a share's audit policy: assert an `admin` record in the spool. Assert spool modes 0600/0700 and a start refused on a world-readable path. | audit data readable by any account |
+| §4.8 access | As `viewer` and as `operator`, read the access, logon and admin streams: refused. Change a share's audit policy: assert an `admin` record in the audit. Assert spool modes 0600/0700 and a start refused on a world-readable path. | audit data readable by any account |
 | §5.4 never logged | Configure every secret-bearing record, plant known file names and known xattr contents, run the full suite at `Info`, and again at `Debug` for the second check. Search every line, span, health answer, metric and record: assert no secret anywhere, no content anywhere, no planted name at `Info` or above or outside the access stream. | a path in a warning; a token in a span |
 | §5.2 per-request lines | Run 10⁵ operations of every kind with clients provoking every expected error. Assert the count of lines at `Info` and above does not grow with the operation count. | a log line per request |
-| §5.2 debug expiry | Turn debug on for one component; advance the clock 15 minutes: assert it is off. | debug left on |
+| §5.2 debug expiry | Turn debug on for one component; advance the clock 15 minutes: assert it is off. Set `Debug` in configuration: assert it stays and `debug_logging_on` is raised. | debug left on; a developer's debug silently dropped |
 | §6.2 propagation **(cluster)** | Forward a write from P1 to S2 with sampling at 1: assert one trace with P1's span parenting S2's service span. Retry the write: assert the same request ID, a new span, and one application. | trace context in the dedup key |
-| §6.3 cost | Count allocations per `Write`, `Read` and `GetAttr` with tracing off and with an endpoint at ratio 0: assert equal. | a span that allocates unsampled |
+| §6.3 cost | `testing.AllocsPerRun` of starting and ending an unsampled span is 0, and of each `Sink` method is 0. | a span that allocates unsampled; a sink that boxes its event |
 
 ## 13. Open questions
 
