@@ -107,6 +107,15 @@ func (c Content) Commit(ctx context.Context, bc BlockCommit) (CommitResult, erro
 type counts map[entity.ChunkHash]int64
 
 func commitBlock(tx kv.Txn, bc BlockCommit) (CommitResult, error) {
+	// A block carries each chunk once: the engine never packs one twice, and
+	// a repeat would count the chunk twice against the block's live count.
+	seen := make(map[entity.ChunkHash]bool, len(bc.Chunks))
+	for _, ch := range bc.Chunks {
+		if seen[ch.Hash] {
+			return nil, fmt.Errorf("%w: block %s carries chunk %s twice", ErrInconsistent, bc.Name, ch.Hash)
+		}
+		seen[ch.Hash] = true
+	}
 	ns, now := bc.Namespace, tx.Now()
 	ikey := intentKey(ns, bc.Name)
 	if _, ok, err := get(tx, ikey); err != nil {
@@ -130,23 +139,9 @@ func commitBlock(tx kv.Txn, bc BlockCommit) (CommitResult, error) {
 		return nil, err
 	}
 	owned := map[entity.ChunkHash]bool{}
-	visited := map[entity.ChunkHash]bool{}
 	var preLive int64
 	for i, ch := range bc.Chunks {
 		rec, ok := recs[i].rec, recs[i].ok
-		if visited[ch.Hash] {
-			// Carried twice: read what the first visit wrote.
-			b, found, err := get(tx, chunkKey(ns, ch.Hash))
-			if err != nil {
-				return nil, err
-			}
-			if ok = found; ok {
-				if rec, err = decodeChunk(ch.Hash, b); err != nil {
-					return nil, err
-				}
-			}
-		}
-		visited[ch.Hash] = true
 		repoint := !ok
 		if ok {
 			st, err := state(rec.Block)
