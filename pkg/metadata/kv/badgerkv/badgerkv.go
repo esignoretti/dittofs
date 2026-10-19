@@ -324,6 +324,26 @@ func (r *reader) Get(key []byte) ([]byte, error) {
 	return get(r.snap, key)
 }
 
+func (r *reader) GetMany(keys [][]byte) ([][]byte, error) { return getMany(keys, r.Get) }
+
+// getMany reads each key with get, in turn: Badger reads from memory, so a
+// batch gains nothing from reading concurrently. An absent key is nil; Badger
+// already gives an empty value as a non-nil empty slice.
+func getMany(keys [][]byte, get func([]byte) ([]byte, error)) ([][]byte, error) {
+	out := make([][]byte, len(keys))
+	for i, k := range keys {
+		v, err := get(k)
+		if errors.Is(err, kv.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+
 func get(t *badger.Txn, key []byte) ([]byte, error) {
 	item, err := t.Get(key)
 	if errors.Is(err, badger.ErrKeyNotFound) {
@@ -417,6 +437,9 @@ func (t *txn) Get(key []byte) ([]byte, error) {
 	}
 	return get(t.w, key)
 }
+
+// GetMany reads each key as Get does: tracked, and counted toward TxnBytes.
+func (t *txn) GetMany(keys [][]byte) ([][]byte, error) { return getMany(keys, t.Get) }
 
 // track counts n bytes of conflict range toward TxnBytes.
 func (t *txn) track(n int) error {

@@ -373,6 +373,41 @@ func (r *reader) get(rt fdb.ReadTransaction, key []byte) ([]byte, error) {
 	return val, err
 }
 
+func (r *reader) GetMany(keys [][]byte) ([][]byte, error) { return r.getMany(r.snap, keys) }
+
+// getMany issues every read before it waits on any, so the batch costs one
+// round trip. A key the transaction wrote is answered from its own writes. An
+// absent key is nil and an empty value a non-nil empty slice.
+func (r *reader) getMany(rt fdb.ReadTransaction, keys [][]byte) ([][]byte, error) {
+	out := make([][]byte, len(keys))
+	futures := make([]fdb.FutureByteSlice, len(keys))
+	for i, k := range keys {
+		if w, ok := r.own[string(k)]; ok {
+			if !w.Deleted {
+				out[i] = append([]byte{}, w.Value...)
+			}
+			continue
+		}
+		futures[i] = rt.Get(r.s.key(k))
+	}
+	for i, f := range futures {
+		if f == nil {
+			continue
+		}
+		v, err := f.Get()
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		if v == nil {
+			continue
+		}
+		if _, out[i], err = unstamp(v); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (r *reader) Scan(prefix, after []byte) iter.Seq2[kv.KeyValue, error] {
 	return func(yield func(kv.KeyValue, error) bool) {
 		begin := r.s.key(prefix)
@@ -522,6 +557,17 @@ func (t *txn) Get(key []byte) ([]byte, error) {
 		return bytes.Clone(w.Value), nil
 	}
 	return t.get(t.tr, key)
+}
+
+// GetMany is Get for every key in one round trip: each read is tracked and
+// counted toward TxnBytes.
+func (t *txn) GetMany(keys [][]byte) ([][]byte, error) {
+	for _, k := range keys {
+		if err := t.track(len(k)); err != nil {
+			return nil, err
+		}
+	}
+	return t.getMany(t.tr, keys)
 }
 
 // Guard adds key's read conflict without reading it.

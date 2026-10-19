@@ -29,6 +29,7 @@ func Run(t *testing.T, open func(t *testing.T) kv.KV) {
 		{"CloseTwice", testCloseTwice},
 		{"UpdateRacingClose", testUpdateRacingClose},
 		{"OwnWrites", testOwnWrites},
+		{"GetMany", testGetMany},
 		{"ConcurrentIncrements", testConcurrentIncrements},
 		{"LostUpdate", testLostUpdate},
 		{"WriteSkew", testWriteSkew},
@@ -349,6 +350,58 @@ func byteKeys(keys []string) [][]byte {
 }
 
 // Writer first: a write committed after the guard's snapshot aborts the guard.
+// GetMany answers in key order, nil for an absent key and an empty slice for
+// an empty value, sees the transaction's own writes, and tracks every key it
+// read: a write of one of them committed after the snapshot aborts the
+// transaction.
+func testGetMany(t *testing.T, s kv.KV) {
+	set(t, s, "a", "1", "e", "")
+	keys := byteKeys([]string{"a", "absent", "e"})
+	if err := s.View(ctx(t), func(r kv.Reader) error {
+		vs, err := r.GetMany(keys)
+		if err != nil {
+			return err
+		}
+		if len(vs) != 3 || string(vs[0]) != "1" || vs[1] != nil || vs[2] == nil || len(vs[2]) != 0 {
+			return fmt.Errorf("got %q, want [1 <nil> empty]", vs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(ctx(t), func(tx kv.Txn) error {
+		if err := tx.Set([]byte("b"), []byte("2")); err != nil {
+			return err
+		}
+		if err := tx.Delete([]byte("a")); err != nil {
+			return err
+		}
+		if err := tx.Set([]byte("z"), nil); err != nil {
+			return err
+		}
+		vs, err := tx.GetMany(byteKeys([]string{"a", "b", "z"}))
+		if err != nil {
+			return err
+		}
+		if vs[0] != nil || string(vs[1]) != "2" || vs[2] == nil || len(vs[2]) != 0 {
+			return fmt.Errorf("own writes: got %q, want [<nil> 2 empty]", vs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	set(t, s, "a", "1")
+	readThenSet := func(tx kv.Txn) error {
+		if _, err := tx.GetMany(byteKeys([]string{"a", "e"})); err != nil {
+			return err
+		}
+		return tx.Set([]byte("out"), []byte("1"))
+	}
+	if _, got := ordered(t, s, setter("e", "changed"), readThenSet); got != 2 {
+		t.Errorf("GetMany took %d attempts, want 2: a write of a key it read, committed after its snapshot, must abort it", got)
+	}
+}
+
 func testGuardVsWrite(t *testing.T, s kv.KV) {
 	set(t, s, "parent", "dir")
 	if _, got := ordered(t, s, setter("parent", "changed"), guardThenSet("parent", "child")); got != 2 {
@@ -781,6 +834,10 @@ func testLimits(t *testing.T, s kv.KV) {
 			"GuardRange": func(tx kv.Txn) error { return tx.GuardRange(append(guard, 'x')) },
 			"Get": func(tx kv.Txn) error {
 				_, err := tx.Get(append(guard, 'x'))
+				return err
+			},
+			"GetMany": func(tx kv.Txn) error {
+				_, err := tx.GetMany([][]byte{append(guard, 'x')})
 				return err
 			},
 		} {
