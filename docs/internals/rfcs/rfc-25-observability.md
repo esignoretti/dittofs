@@ -397,7 +397,8 @@ are three kinds of allowed label, and a list of forbidden ones.
    reports ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values),
    [RFC 4 §4.8](rfc-4-remote-tier.md#4.8%20Errors%20are%20a%20closed%20set)). The
    `protocol` label takes `nfs3`, `nfs4` or `smb` — minor versions are not
-   separate values — and the side programs count under `nfs3`.
+   separate values — and NFS's auxiliary services (MOUNT, NLM, NSM) and
+   the port mapper count under `nfs3`.
 2. **Entity labels**, whose values are configured objects: `store`, `namespace`,
    `journal`, `pool`, `location`, `transform`, `node`. Any metric may carry them.
    Each metric exports at most **64** values of each entity label per node; past
