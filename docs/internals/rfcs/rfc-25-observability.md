@@ -68,7 +68,8 @@ tables read as one system:
 - how the health conditions every component raises combine into the health of a
   share, a node and the installation, and what liveness and readiness mean;
 - how the access-audit and quota events the filesystem service emits
-  ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) are queued, stored, kept and
+  ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)), and the logon events the
+  authenticator emits, are queued, stored, kept and
   handed to whoever consumes them;
 - what a log line looks like, what it must never contain, and how a trace follows
   one request across nodes;
@@ -234,8 +235,8 @@ whatever the tracing says.
   namespace conditions flow to their shares; shares do not make a node unhealthy.
 - Liveness fails only on a stalled process. Readiness fails only while the node
   can serve no share at all: starting, draining, or with its metadata store lost.
-- Three event streams — access, quota, administrative — are written to
-  node-local spool files and exported as JSON lines. Access and quota events pass
+- Four event streams — access, quota, logon, administrative — are written to
+  node-local spool files and exported as JSON lines. Access, quota and logon events pass
   through a fixed ring: a drop never blocks an operation and always leaves a gap
   record. Administrative records are read from the control plane's durable audit.
 - Logs: constant messages, fixed keys, a trace ID on every request-scoped line;
@@ -291,6 +292,7 @@ This RFC **MUST NOT** be read as specifying:
 | the endpoints that serve them, and who may call them | [RFC 23](rfc-23-control-plane.md) |
 | the Kubernetes probes and the cluster resource's conditions | [RFC 30 §4.4](rfc-30-kubernetes.md#4.4%20Health), reading §3.5–§3.6 |
 | where access and quota events are emitted, and their fields | [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) |
+| where logon events are emitted, and logon throttling | [RFC 18 §3.1](rfc-18-identity.md#3.1%20The%20authentication%20interface) |
 | which decisions an audit entry selects | [RFC 19 §3.7](rfc-19-authorization.md#3.7%20Audit%20entries%20select%20events) |
 | delivery, bounds, drops, retention, format and access of the streams | this RFC, §4 |
 | the management audit records, their content, durability and retention | [RFC 23 §6](rfc-23-control-plane.md#6.%20The%20audit) |
@@ -392,7 +394,8 @@ A label's values **MUST** be a set whose size is known before deployment. There
 are three kinds of allowed label, and a list of forbidden ones.
 
 1. **Closed sets**, named in the owning RFC's table: `op`, `protocol`, `outcome`,
-   `reason`, `result`, `kind`, `direction`, `state`, `role`, `cause`. Values are
+   `reason`, `result`, `kind`, `direction`, `state`, `role`, `cause`, `stage`
+   (the pipeline stages of [RFC 20 §4.1](rfc-20-adapters.md#4.1%20One%20pipeline)). Values are
    lower-case words; an error label takes the names of the closed error set it
    reports ([RFC 17 §4.3](rfc-17-vfs.md#4.3%20Errors%20are%20neutral%20values),
    [RFC 4 §4.8](rfc-4-remote-tier.md#4.8%20Errors%20are%20a%20closed%20set)). The
@@ -612,7 +615,8 @@ owner.
 ### 3.5 Liveness
 
 **Liveness answers one question: is the process making progress?** It **MUST**
-fail only when a fixed set of internal loops — each adapter's accept loop, the
+fail only when a fixed set of internal loops — each adapter's accept loop, each
+connection's reader ([RFC 20 §3.7](rfc-20-adapters.md#3.7%20Health%20and%20probes)), the
 request scheduler, the engine's work scheduler and the health evaluator — has
 not completed a turn, or reported itself idle, within 60 s. It **MUST NOT** read a
 condition, a store, the network or the disk.
@@ -727,6 +731,8 @@ row.
 | `snapshot_policy_skipping` | [RFC 12 §6](rfc-12-snapshots.md#6.%20Observability) | share, at 3 skipped ticks | degraded | ticket |
 | `backup_failing`, `backup_location_mismatch` | [RFC 26 §7](rfc-26-catalog-backups.md#7.%20Observability) | share; location | degraded | ticket |
 | `directory_unreachable` | [RFC 18 §10.2](rfc-18-identity.md#10.2%20Metrics) | installation | degraded within the stale grace; unhealthy past it, since sign-ins are refused | ticket; page at 5 min when unhealthy |
+| `adapter_listener_lost` | [RFC 20 §3.7](rfc-20-adapters.md#3.7%20Health%20and%20probes) | node, naming the adapter and address | unhealthy: a listener's socket failed while serving | page at 5 min |
+| `sidecar_failed` | [RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars) | node, naming the sidecar | degraded: the adapters keep serving | ticket |
 | `memory_limit_below_floors`, `fd_limit_low`, `memory_near_limit` | [RFC 24 §10](rfc-24-resources.md#10.%20Observability) | node | degraded | ticket |
 | `metrics_label_capped` | §2.4 | node | degraded | ticket |
 | `event_spool_high` | §4.6 | node | degraded, above 80% of the spool bound | ticket |
@@ -737,17 +743,18 @@ row.
 
 ## 4. Event streams
 
-### 4.1 Three streams
+### 4.1 Four streams
 
 | Stream | Emitted by | Carries | Selected by |
 | --- | --- | --- | --- |
 | `access` | the filesystem service, where it consults the chokepoint ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) | one authorisation decision | the share's audit policy and the file's audit entries ([RFC 19 §3.7](rfc-19-authorization.md#3.7%20Audit%20entries%20select%20events)) |
 | `quota` | the filesystem service, where it enforces quota ([RFC 17 §5.6](rfc-17-vfs.md#5.6%20Quota)) | a threshold crossed, a soft limit exceeded, a grace expired, a hard refusal, a return under the limit | always |
+| `logon` | the authenticator, at each logon attempt ([RFC 18 §3.1](rfc-18-identity.md#3.1%20The%20authentication%20interface)) | one sign-in, over either protocol: success or failure, flavour, principal, client address; never the credential | always |
 | `admin` | the control plane's audit records ([RFC 23 §6](rfc-23-control-plane.md#6.%20The%20audit)) | one management action or refusal: actor, target, change, outcome — a governance-lock override, a statement that a location is lost, a share's audit policy changed | always |
 
 The administrative stream is the export of the management audit that other RFCs
 record operator actions in ([RFC 13 §9](rfc-13-configuration.md#9.%20Test%20plan),
-[RFC 12 §6](rfc-12-snapshots.md#6.%20Observability)). Unlike the other two it
+[RFC 12 §6](rfc-12-snapshots.md#6.%20Observability)). Unlike the others it
 starts from durable records: RFC 23 commits each audit record in the
 transaction of the change it records, keeps it for `audit.retention`, and owns
 its fields. This section owns only how those records leave the node (§4.3).
@@ -764,7 +771,7 @@ A record is one JSON object (RFC 8259) on one line. The event's own fields are
 | Field | Set by | Means |
 | --- | --- | --- |
 | `v` | sink | the record format's version, 1; a consumer refuses a version it does not know |
-| `stream` | sink | `access`, `quota`, `admin` |
+| `stream` | sink | `access`, `quota`, `logon`, `admin` |
 | `node`, `boot`, `seq` | sink | the node's ID, a random ID drawn at each process start, and a sequence number counted from 0 per stream and boot; `(node, stream, boot, seq)` names a record uniquely and shows any gap |
 | `time` | event | the event's time, RFC 3339 in UTC with nanoseconds |
 | `trace_id` | sink, from the call's context | the trace the decision ran in (§6), when sampled |
@@ -773,6 +780,7 @@ A record is one JSON object (RFC 8259) on one line. The event's own fields are
 | `identity` | event | the principal ID, the flavour and whether authenticated, as [RFC 18](rfc-18-identity.md) resolved them — not a uid alone, which two principals may share |
 | `op`, `file`, `name` | event | the operation, the FileID, and the name acted on for a namespace operation |
 | `want`, `allowed`, `selected_by` | event | the rights asked, the decision, and `policy` or `entry` |
+| logon fields | event | the outcome (success, or the authenticator's error, `throttled` when the attempt was refused unchecked), the flavour, the principal name as presented and, on success, the principal ID; with `client` and `protocol` above. Never a response, ticket, hash or key |
 | quota fields | event | scope (`user`, `group`, `project`, `share`), subject, resource (`bytes`, `files`), kind, used, soft, hard, grace end, and for a hard refusal the writer's identity and the count coalesced (§4.4) |
 
 - A name is written as UTF-8 when it is valid UTF-8, and otherwise as base64 under
@@ -790,13 +798,14 @@ lists what a quota event is for, but not its fields; §10 asks it to add
 ![The service calls the sink at the chokepoint and at quota enforcement and never waits; the sink stamps node, boot and sequence and puts the event in a fixed ring per stream, dropping and counting when full; one writer per stream appends batches to spool files every second, writing a gap record for anything dropped; the spool is bounded by age and bytes and is read by a shipper tailing the files or by an auditor through the management API](img/rfc25-events.svg)
 
 1. **The service calls the sink and returns.** `Events.Access` and
-   `Events.Quota` take a value and put it into the stream's ring; they **MUST NOT**
+   `Events.Quota` take a value, as does `Events.Logon`, which RFC 18's
+   authenticator calls, and put it into the stream's ring; they **MUST NOT**
    allocate on the caller's path beyond the copy of the name, take a lock a
    request path also takes, or wait
    ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)).
 2. **One ring per stream, of fixed size**: 16,384 entries for `access` and 4,096
-   for `quota`, each entry at most 1 KiB. The rings are allocated at start, so
-   they are fixed memory outside RFC 24's pools: at most 20 MiB per node,
+   each for `quota` and `logon`, each entry at most 1 KiB. The rings are allocated at start, so
+   they are fixed memory outside RFC 24's pools: at most 24 MiB per node,
    whatever the load.
 3. **One writer per stream** takes entries in order and appends them to the
    stream's current spool file, in batches, syncing the file and making it visible
@@ -952,7 +961,7 @@ server holds.
 - Spool files and their directory are readable and writable only by the service's
   own account (modes 0600 and 0700), and the node refuses to start if
   `events.path` is readable by others.
-- **Reading the `access` and `admin` streams through the management API requires
+- **Reading the `access`, `logon` and `admin` streams through the management API requires
   the right to read the audit**, which [RFC 23 §5.2](rfc-23-control-plane.md#5.2%20Roles)
   gives to `admin` only. Reading `quota` requires `operator`, the role that
   manages quotas. A `viewer`, who may read health detail, reads neither.
@@ -1193,7 +1202,7 @@ owning RFC; none is applied here.
 | [RFC 16 §8](rfc-16-metadata-store.md#8.%20Observability) | `metadata_txn_size{kind=entries\|bytes}` and `…_txn_limit` select a unit by label; "On fold, they follow RFC 25's conventions; until then they start `metadata_`" is stale | split into `metadata_txn_entries`, `metadata_txn_bytes` histograms and `metadata_txn_entries_limit`, `metadata_txn_bytes_limit` gauges; "Metric names follow RFC 25's conventions, under the prefix `metadata_`." |
 | [RFC 17 §7](rfc-17-vfs.md#7.%20Observability), §3.3 | `outcome` on `vfs_op_seconds` has no stated values, and the full error set would cost about 70,000 series; `vfs_events_dropped_total` is the sink's; §3.3 defines no `QuotaEvent`, and says "planned observability RFC" | "`outcome` = `ok`, `error` or `delay`; the error itself is counted in `vfs_errors_total{op, error}`"; remove the drop row, "events dropped are RFC 25's `events_dropped_total`"; add a `QuotaEvent` type with RFC 25 §4.2's quota fields; "belong to RFC 25" |
 | [RFC 19 §1.1](rfc-19-authorization.md#1.1%20Non-goals), §10 | "the planned RFC 25's"; "events dropped are RFC 7's" | link [RFC 25 §4](rfc-25-observability.md#4.%20Event%20streams); "events dropped are RFC 25's" |
-| [RFC 24 §5.1](rfc-24-resources.md#5.1%20No%20queue%20is%20unbounded), §2.2 | the events row's bound is "the stream's fixed buffer"; §2.2 does not list the rings as outside the pools | "access-audit and quota events \| rings of 16,384 and 4,096 entries of at most 1 KiB, allocated at start \| RFC 25 §4.4 \| dropped, counted, a gap record written"; add the event rings to §2.2's list |
+| [RFC 24 §5.1](rfc-24-resources.md#5.1%20No%20queue%20is%20unbounded), §2.2 | the events row's bound is "the stream's fixed buffer"; §2.2 does not list the rings as outside the pools | "access-audit, quota and logon events \| rings of 16,384, 4,096 and 4,096 entries of at most 1 KiB, allocated at start \| RFC 25 §4.4 \| dropped, counted, a gap record written"; add the event rings to §2.2's list |
 | [RFC 26 §7](rfc-26-catalog-backups.md#7.%20Observability) | `backup_newest_age_seconds` "per share" states no rule | "per share, under RFC 25's worst-n rule, with the oldest unlabelled" |
 | [RFC 27 §6](rfc-27-namespace-migration.md#6.%20Observability) | `namespace_owned` and `namespace_claim_copy_total` use RFC 7's prefix, `gc_claim_refusals_total` RFC 9's; `rehome_old_refs` per share states no rule | rename to `claim_owned`, `claim_copy_total` and `claim_gc_refusals_total`; worst-n for `rehome_old_refs` |
 | [RFC 15 §4.3](rfc-15-topology.md#4.3%20The%20route%20envelope) | the envelope has no trace context | add a row: "trace context \| the sender's trace ID, parent span ID and sampled flag ([RFC 25 §6.2](rfc-25-observability.md#6.2%20Propagation%20across%20nodes)); never part of the request ID" |
