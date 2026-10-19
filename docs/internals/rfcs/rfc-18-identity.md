@@ -1345,45 +1345,66 @@ and grants. Their sign-in — passwords, tokens, roles, sessions — is
 
 ### 10.1 Invariants
 
-| # | Invariant |
-| --- | --- |
-| ID1 | Every comparison of identity compares `PrincipalID`s, never a spelling. |
-| ID2 | No ID given to a principal is given to another: `PrincipalID`, allocated uid, gid and RID alike. |
-| ID3 | No uid or gid is ever a default; every user has a uid, every group a gid, every user and group a SID — an API-only account aside, which has none (§8). 65534 is anonymous's alone. |
-| ID4 | A SID never changes once given. |
-| ID5 | Every cache of identity is keyed by everything its value was derived from, the proof's name and flavour included. |
-| ID6 | A store or directory error is never read as "no such principal", and never yields a guest, anonymous or default grant. |
-| ID7 | A failed sign-in never yields a session. |
-| ID8 | `AUTH_SYS` and `AUTH_NONE` callers are never `authenticated` and never `admin`. |
-| ID9 | `admin` is set only from a share grant, on an authenticated flavour. |
-| ID10 | A squashed caller carries nothing of the principal it replaced. |
-| ID11 | A group closure is used whole or not at all. |
-| ID12 | A directory answer is used no longer than the TTL plus the grace after it was given, read directly or through any cache derived from it. |
-| ID13 | A disabled or deleted local principal is refused on every call within one second of the change. |
-| ID14 | Adapters map, squash and grant nothing; every spelling they show or read goes through `Identities`. |
-| ID15 | A security context acts as the principal its sign-in bound it to, for its whole life; its name is never mapped again. |
-| ID16 | An unlinked machine principal acts on files as `Anonymous`: never `authenticated`, and no share grant names it. |
-| ID17 | A deny-only SID matches deny entries only; it never grants, through an ACL or a share grant. |
-| ID18 | A grant of `none` is stored, and is distinct from no grant. |
+| # | Invariant | Checked by |
+| --- | --- | --- |
+| ID1 | Every comparison of identity compares `PrincipalID`s, never a spelling. | §2.3, §7.1 one uid, two proofs |
+| ID2 | No ID given to a principal is given to another: `PrincipalID`, allocated uid, gid and RID alike. | §2.3 no reuse |
+| ID3 | No uid or gid is ever a default; every user has a uid, every group a gid, every user and group a SID — an API-only account aside, which has none (§8). 65534 is anonymous's alone. | §2.3, §7.1 one uid, two proofs; §4.4 SID-less directory |
+| ID4 | A SID never changes once given. | §4.4 SID-less directory |
+| §3.1 logon throttle | Send 10 wrong passwords for alice from one address, then an 11th attempt with the right one: assert refused, outcome `throttled`. | a throttle that still checks the credential, or none |
+| §3.1 expiry | Over `sec=krb5`, keep a context open past its ticket's `Expires`: assert the next request is refused with the expired-credential answer. | a context served past its ticket |
+| §3.3 replay | Send the same AP-REQ twice: assert the second refused, outcome `replay`. | no replay cache |
+| §3.2 `ManageGIDs` | On a share with `ManageGIDs`, a user in 20 store groups calls over `AUTH_SYS`: assert a file whose ACL grants only the 20th group is granted. | groups capped at the credential's 16 |
+| §3.5 NTLM off | Hold an NTLM session, then turn `identity.ntlm` off: assert its next call refused, and once the deletion operation ends, no NT hash in the store. | an NTLM context outliving the setting; hashes left behind |
+| §5.1 TLS | A directory record asking for plain LDAP: assert refused at validation. | a bind credential sent in clear |
+| §5.2 one query per key | 100 concurrent lookups of one key against a counting fake directory: assert 1 query. | a sign-in storm multiplied per connection |
+| §4.4 anonymous lookup | Over an anonymous session on `IPC$`, `LookupSids` of an unminted directory SID: assert no record written. | an unauthenticated caller minting principals |
+| §4.6 name case | Create two users whose names differ only in case: assert the second refused as a duplicate. | names unique byte for byte |
+
+**Fuzz.** `FuzzPAC`, `FuzzAPReq`, `FuzzSID` and `FuzzOwnerString` never panic, never
+allocate past the input's size times a constant, and decode∘encode is the identity on what decodes; the NTLM
+message decoder is RFC 20's. **Unit.** Resolution's five steps run as one table-driven test over (flavour ×
+squash × grant × machine) against a fake `Principals`.
+| ID5 | Every cache of identity is keyed by everything its value was derived from, the proof's name and flavour included. | §2.3, §7.1 one uid, two proofs |
+| ID6 | A store or directory error is never read as "no such principal", and never yields a guest, anonymous or default grant. | §5.4 error is not "unknown" |
+| ID7 | A failed sign-in never yields a session. | §3.6 no map to guest |
+| ID8 | `AUTH_SYS` and `AUTH_NONE` callers are never `authenticated` and never `admin`. | §6.5 admin needs proof |
+| ID9 | `admin` is set only from a share grant, on an authenticated flavour. | §6.5 admin needs proof; §8 roles grant nothing |
+| ID10 | A squashed caller carries nothing of the principal it replaced. | §6.2 squash drops SIDs |
+| ID11 | A group closure is used whole or not at all. | §2.5 group cap |
+| ID12 | A directory answer is used no longer than the TTL plus the grace after it was given, read directly or through any cache derived from it. | §5.3 stale grace; §7.1 directory deadline |
+| ID13 | A disabled or deleted local principal is refused on every call admitted after the first principals-generation read that follows the change; the runtime reads it at most 1 s apart (§7.2). | §7.2 disable takes effect |
+| ID14 | Adapters map, squash and grant nothing; every spelling they show or read goes through `Identities`. | the import test of [RFC 20 §7.1](rfc-20-adapters.md#7.1%20Imports%20and%20call%20sites): no adapter imports `internal/identity` or a store view |
+| ID15 | A security context acts as the principal its sign-in bound it to, for its whole life; its name is never mapped again. | §3.1 binding |
+| ID16 | An unlinked machine principal acts on files as `Anonymous`: never `authenticated`, and no share grant names it. | §2.4 machines |
+| ID17 | A deny-only SID matches deny entries only; it never grants, through an ACL or a share grant. | §3.4 deny-only SIDs |
+| ID18 | A grant of `none` is stored, and is distinct from no grant. | §6.4 `none` is stored |
 
 ### 10.2 Metrics
 
 | Answers | Metric | Type |
 | --- | --- | --- |
-| How many sign-ins, by flavour and outcome? | `identity_authentications_total{protocol, flavor, outcome}` | counter |
-| How long does a sign-in take? | `identity_authentication_seconds{flavor}` | histogram (`request`) |
-| How often is a spelling unmapped? | `identity_unmapped_total{scheme}` | counter |
-| How often is a call refused for an undecidable identity? | `identity_unavailable_total{cause}` | counter |
-| How often are stale directory entries used? | `identity_directory_stale_total` | counter |
-| How often is a sign-in refused for the directory? | `identity_directory_refusals_total` | counter |
-| Directory queries and their latency | `identity_directory_queries_total{question, outcome}`, `identity_directory_seconds` | counter, histogram (`request`) |
-| Resolution cache effectiveness | `identity_cache_hits_total{cache}`, `identity_cache_misses_total{cache}` | counters |
-| How many principals were refused over the group cap? | `identity_group_cap_refusals_total` | counter |
-| How old is the principals generation each node serves? | `config_generation_lag_seconds{kind="principals"}`, RFC 13's gauge | gauge |
+| Sign-ins by flavour and outcome | `identity_authentications_total{protocol, flavor, outcome}`: `flavor` = `krb5`, `ntlm`; `outcome` = `ok`, `logon_failure`, `disabled`, `invalid`, `unavailable`, `throttled`, `replay` | counter |
+| Sign-in latency | `identity_authentication_seconds{flavor}` | histogram (`request`) |
+| Unmapped spellings | `identity_unmapped_total{scheme}`: `scheme` = `uid`, `gid`, `sid`, `owner` | counter |
+| Calls refused at resolution | `identity_resolution_refusals_total{reason}`: `reason` = `disabled`, `group_cap`, `store_unavailable`, `directory_unavailable`, `anonymous_missing` | counter |
+| Directory lookups by result | `identity_directory_lookups_total{question, result}`: `question` = `name`, `sid`, `groups`, `group`; `result` = `fresh`, `queried`, `not_found`, `stale`, `refused` | counter |
+| Directory query latency | `identity_directory_seconds` | histogram (`request`) |
+| Cache effectiveness | `identity_cache_lookups_total{cache, result}`: `cache` = `caller`, `directory`; `result` = `hit`, `miss` | counter |
+| Age of the principals generation served | `config_generation_lag_seconds{kind="principals"}`, RFC 13's gauge | gauge |
 
-`identity_unavailable_total` and `identity_directory_refusals_total` rising
-together is a directory outage; `identity_unmapped_total{scheme="uid"}` rising
-alone is a client sending uids the store does not know.
+| Condition | Scope | Raised |
+| --- | --- | --- |
+| `directory_unreachable` | installation | degraded while lookups are served stale within the grace; unhealthy once one is refused past it; cleared by the first query the directory answers |
+
+**Spans.** `identity.authenticate` is a child of the adapter's request span. `identity.resolve` is a child of
+the service-call span, opened only on a cache miss. Each directory query is a child of whichever opened it.
+Attributes are the flavour, the outcome, the cache result and the principal's ID: never a name, SID, ticket or
+hash ([RFC 25 §5.4](rfc-25-observability.md#5.4%20What%20is%20never%20logged)).
+
+`identity_directory_lookups_total{result="refused"}` rising with
+`identity_resolution_refusals_total{reason="directory_unavailable"}` is a directory outage;
+`identity_unmapped_total{scheme="uid"}` rising alone is a client sending uids the store does not know.
 
 ## 11. Conformance
 
@@ -1400,8 +1421,8 @@ with the directory and KDC as local test services.
 | §3.6 no map to guest | Over SMB send a wrong password, an unknown user and, with the store failing, a known user. Assert `STATUS_LOGON_FAILURE` each time and no session. Then an anonymous session: assert it reaches `IPC$` and `TREE_CONNECT` to `profiles` is refused. | a failed login answered as guest |
 | §6.2 squash drops SIDs | On a share with `Squash = all`, a Kerberos caller whose PAC carries `Finance` reads a file whose ACL grants `Finance` only: assert refused. On `Squash = none`: assert granted. | a squash that kept the SIDs |
 | §6.5 admin needs proof | A share grant names uid 1500 `admin`. Over `AUTH_SYS` as uid 1500, read a mode-0600 file of another user: assert refused. Give the same user's principal a Kerberos name; over `sec=krb5`: assert granted. Put `S-1-5-32-544` in a test PAC for a non-admin: assert not `admin`. | `admin` derived from a uid or a SID |
-| §8 roles grant nothing | The management API's administrator, with no grant, mounts each share over every flavour: assert every call refused. | an API role leaking into file access |
-| §7.2 disable takes effect | bob holds an open over SMB and a GSS context over NFS; disable bob. Assert every call from both refused within 1 s of the commit. | a cached resolution outliving a disable |
+| §8 roles grant nothing | [RFC 23 §12](rfc-23-control-plane.md#12.%20Conformance)'s §5.1 check, which also asserts that the account holds no spelling | — |
+| §7.2 disable takes effect | bob holds an SMB open and an NFS GSS context; make one call on each and assert a cache hit. Disable bob, and before the generation is applied, assert the next call is still served from the cache. Apply it (fake clock and the runtime's read); assert every call from both is refused. | a cached resolution outliving a disable |
 | §2.5 group cap | A principal in `identity.max_groups` + 1 groups: assert refused, never resolved with fewer. A nested group whose read fails mid-closure: assert the call fails. | truncated group lists |
 | §4.5 owner strings | Over `sec=krb5`, `chown` to `alice@corp.example` and to `alice@other.example`: assert success then `NFS4ERR_BADOWNER`. Over `AUTH_SYS`, `GETATTR`: assert numeric owners. A file owned by a deleted user: assert `nobody@…` and, over SMB, `S-1-0-0`. | names mapped by guesswork |
 | §3.4 PAC | A ticket whose PAC server signature is corrupted: assert the sign-in fails. A ticket with no PAC for a user in a store group: assert the group applies. | an unverified PAC trusted |
