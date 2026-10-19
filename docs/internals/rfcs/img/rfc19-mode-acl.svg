@@ -56,6 +56,6 @@
 
   <rect x="24" y="408" width="852" height="60" rx="6" class="sv"/>
   <text x="40" y="430" class="h">two identities, checked (§11)</text>
-  <text x="40" y="450" class="m">ACLFromMode(m).Mode(o) == m   for every nine-bit m</text>
-  <text x="470" y="450" class="m">a.WithMode(a.Mode(o), o) grants what a grants</text>
+  <text x="40" y="450" class="m">ACLFromMode(m, d).Mode(o) == m   for every m and d</text>
+  <text x="440" y="450" class="m">a.WithMode(a.Mode(o), o, d) grants what a grants (§4.2's ACLs)</text>
 </svg>
