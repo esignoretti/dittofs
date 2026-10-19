@@ -1089,6 +1089,8 @@ side spells and sends the notice
 > protocol's own contract, and every NLM server has the same ceiling; a
 > server-side timeout would release locks a slow but live host still relies
 > on. Add a timeout only if a deployment's NLM hosts are known to be disposable.
+> The `lock_grant_unacknowledged` health condition
+> ([§14](#14.%20Observability)) names such a host to the administrator.
 
 ### 4.6 What each failure does
 
@@ -2161,25 +2163,57 @@ Tiers are RFC 29's.
 
 ## 14. Observability
 
-Metric names are shown without the deployment's prefix.
+Metric names are shown without the deployment's prefix. `protocol` takes
+RFC 25's values: `nfs3` (NLM included), `nfs4`, `smb`.
 
 | Answers | Metric | Type |
 | --- | --- | --- |
-| state held, by kind | `openstate_held{kind=client\|open\|lock\|grant\|watch\|layout\|copy\|delete_pending}` | gauge |
-| grants offered and declined | `openstate_grants_total{result}` | counter |
-| recall time | `openstate_recall_seconds` | histogram |
-| recalls revoked at the deadline | `openstate_recalls_revoked_total` | counter |
-| conflicts refused, by rule | `openstate_conflicts_total{rule}` | counter |
+| state held | `openstate_held{kind, protocol}`, `kind` = `client`, `unconfirmed`, `open`, `lock`, `lock_state`, `waiter`, `grant`, `watch`, `delete_pending`, `revoked` | gauge |
+| grants offered and declined | `openstate_grants_total{protocol, result}`, `result` = `offered`, `conflict`, `no_callback`, `budget`, `fenced`, `setuid`, `pool`, `shared` | counter |
+| recalls, by outcome and cause | `openstate_recalls_total{protocol, outcome, reason}`, `outcome` = `returned`, `revoked`, `downgraded`; `reason` = `conflict`, `budget`, `setuid`, `fence` | counter |
+| recall time | `openstate_recall_seconds{protocol, outcome}` | histogram (`request`) |
+| conflicts refused | `openstate_conflicts_total{reason}`, `reason` = `deny_mode`, `lock`, `mandatory_io`, `delete_pending`, `open_children`, `grace` | counter |
+| lock waits | `openstate_lock_wait_seconds{protocol, outcome}`, `outcome` = `granted`, `cancelled`, `poll_missed`, `ended` | histogram (`background`) |
+| grants not yet acknowledged by their lock-waiter's host, and the oldest | `openstate_lock_grants_unacknowledged`, `openstate_lock_grant_unacknowledged_oldest_seconds` | gauge |
+| clients fenced from grants ([§5.3](#5.3%20A%20recall%20MUST%20end%20within%20a%20bounded%20time)) | `openstate_grant_fenced_clients` | gauge |
 | shards in grace | `openstate_grace_shards` | gauge |
-| grace periods ended, by `reason` = `complete` or `timeout` | `openstate_grace_ended_total{reason}` | counter |
-| requests answered `ErrDelay` while a recall is outstanding | `openstate_delays_total` | counter |
-| layouts recalled on a primary change | `openstate_layout_recalls_total` | counter |
-| reclaims accepted and refused | `openstate_reclaims_total{result}` | counter |
-| leases expired | `openstate_expired_total` | counter |
+| grace duration | `openstate_grace_seconds{reason}`, `reason` = `complete`, `timeout`, `move` | histogram (`background`) |
+| reclaims | `openstate_reclaims_total{protocol, kind, result}`, `kind` = `open`, `lock`, `grant`, `persistent`; `result` = `accepted`, `no_record`, `more_than_held`, `revoked`, `pool` | counter |
+| SMB reconnects | `openstate_reconnects_total{result}`, `result` = `matched`, `refused_key`, `refused_principal`, `timed_out` | counter |
+| clients ended | `openstate_clients_ended_total{protocol, reason}`, `reason` = `lease`, `reboot`, `admin`, `destroy`, `share` | counter |
+| wait for a file's open-state step | `openstate_step_wait_seconds` | histogram (`request`) |
 
+The recall histogram uses the `request` set. A delegation revoked at its 90 s
+deadline lands above the last bucket, 60 s, and is counted by
+`outcome="revoked"`. Every series is exported from start at zero. Requests
+answered retry-later are counted once, in RFC 17's `vfs_delayed_total{cause}`.
 Recall, grant, grace and open-state metrics are defined here only; other RFCs
-link to this table. No share or client label. A revoked recall and an expired lease log at `Warn`
-with the client and file.
+link to this table. No share or client label.
+
+**Spans.** A table call opens no span; it runs inside RFC 17's `vfs.<Op>` span
+and adds events to it: `openstate.conflict` (`reason`),
+`openstate.recall_started` (holder `protocol`, number of grants),
+`openstate.waiter_recorded`, `openstate.grace_refused`, and
+`openstate.step_wait` with the time waited. Work that outlives a request opens
+a root span that links to the request that started it: `openstate.recall`
+(grant kind, `protocol`, `outcome`, deadline), `openstate.grace` per shard
+(shard ID, grace instance, recorded clients, `reason`), and
+`openstate.client_end` (client ID, `reason`, counts released). A renewal opens
+no span; at 10⁵ clients one per lease period would be most of the export
+queue. Client, share and file IDs are span attributes, never metric labels.
+
+**Logs.** An expired or revoked client logs one `Warn` line naming the client
+and `reason`, with counts of what was released by kind. A recall revoked at its
+deadline logs one `Warn` per client per lease period, with the count and the
+first FileID. Per-file detail is at `Debug`.
+
+**Health.** One condition, `lock_grant_unacknowledged`: node scope, naming
+the client; degraded while a lock granted to a waiting NLM host has gone
+unacknowledged for 15 min (proposed), raising a ticket; read from
+`openstate_lock_grant_unacknowledged_oldest_seconds`. It is how an
+administrator learns of the hold
+[§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)'s `decision:`
+accepts.
 
 ## 15. Open questions
 
@@ -2194,6 +2228,9 @@ with the client and file.
    ones or zero meaning to end of file; conflicts are computed on that form.
    Open: whether a lock past 2⁶³ from an NFS client and an SMB one must ever
    meet.
+4. **A file's table through the management API.** Whether it reads a file's
+   holders, locks and waiters for an operator asking who holds a file; it adds
+   API surface.
 
 ## Appendix A — prior art
 
