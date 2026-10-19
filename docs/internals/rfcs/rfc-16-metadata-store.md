@@ -811,7 +811,7 @@ A share is removed by `DeleteShare`, and removal is one-way: once a share is
 // DeleteShare starts a share's removal and returns once the share is
 // being removed: its name and path are free, and every call into it is
 // ErrStale. The rest runs in the background and survives a crash.
-DeleteShare(ctx context.Context, share ShareID, snapshots SnapshotDisposition) error
+DeleteShare(ctx context.Context, share ShareID, snapshots SnapshotDisposition, expect uint64) error
 
 type SnapshotDisposition uint8 // refuse (the default), delete, detach
 ```
@@ -1082,40 +1082,42 @@ type Principals interface {
 // nothing under any F‖ prefix.
 type ControlPlane interface {
 	Users(ctx context.Context, after string) iter.Seq2[User, error]
-	// Every Put* and Set* takes expect, the generation the caller read
-	// (Version, for a grant, an export policy or a netgroup; Position, for a
-	// quota, which has no generation of its own). It reads the record with
+	// Every Put*, Set* and Delete* takes expect, the generation the caller
+	// read (Version, for a grant, an export policy, a netgroup or a quota). It reads the record with
 	// conflict tracking and refuses ErrGenerationMismatch when the stored one
 	// differs, so the management API's If-Match check sits inside the write's
 	// transaction (RFC 23 §4.4); the write raises the generation. Zero expects
 	// the record absent: the write is create-only and refused
 	// ErrGenerationMismatch when one exists, which is If-None-Match: *.
 	//
-	// Every record this interface writes also carries Position uint64: the
-	// value of its kind's counter (CFGGEN, SL or PGEN) that its last change
-	// raised, written in that change's transaction. A generation counts one
+	// Every record of a reconciled kind — settings (CFGGEN), shares (SL),
+	// principals (PGEN) — also carries Position uint64: the value of its kind's
+	// counter that its last change raised, written in that change's
+	// transaction. Grants, export policies, quotas and netgroups carry none,
+	// since they take effect through the versions in the cache keys that read
+	// them (RFC 23 §2.3), not through reconciliation. A generation counts one
 	// record's changes and is not comparable with the counters; a node reports
-	// the counter value it has reconciled through (NodeStatus), and a record is
-	// applied there once that reaches its Position (RFC 23 §2.4).
+	// the counter value it has reconciled through (NodeStatus), and RFC 23 §2.4
+	// says when that makes a record applied.
 	PutUser(ctx context.Context, u User, expect uint64) error
-	DeleteUser(ctx context.Context, p Principal) error // as DeleteGroup: the first transaction deletes the indexes (NX, PX) and marks the record deleted, bounded batches a restart resumes from that mark drop its grants (through GR), memberships (MR, M) and quota records, and the last transaction deletes the record with every version of the secret it names (SEC‖id‖*, through RFC 13 §7), so no password or NT hash outlives its user; a marked user is admitted nowhere
+	DeleteUser(ctx context.Context, p Principal, expect uint64) error // as DeleteGroup: the first transaction deletes the indexes (NX, PX) and marks the record deleted, bounded batches a restart resumes from that mark drop its grants (through GR), memberships (MR, M) and quota records, and the last transaction deletes the record with every version of the secret it names (SEC‖id‖*, through RFC 13 §7), so no password or NT hash outlives its user; a marked user is admitted nowhere
 	Groups(ctx context.Context, after string) iter.Seq2[Group, error]
 	PutGroup(ctx context.Context, g Group, expect uint64) error
 	AddMember(ctx context.Context, m Membership) error
 	RemoveMember(ctx context.Context, m Membership) error
-	DeleteGroup(ctx context.Context, p Principal) error // all its rows: the group, its name and protocol-ID indexes (NX, PX), grants (through GR), memberships both ways (M, MR) and quota records; the first transaction deletes the indexes and marks the group record deleted, bounded batches a restart resumes from that mark drop the rest, and the record goes last; a membership of a marked group grants nothing, and a User.Primary naming one counts as zero
+	DeleteGroup(ctx context.Context, p Principal, expect uint64) error // all its rows: the group, its name and protocol-ID indexes (NX, PX), grants (through GR), memberships both ways (M, MR) and quota records; the first transaction deletes the indexes and marks the group record deleted, bounded batches a restart resumes from that mark drop the rest, and the record goes last; a membership of a marked group grants nothing, and a User.Primary naming one counts as zero
 	Shares(ctx context.Context) iter.Seq2[Share, error]
 	PutShare(ctx context.Context, s Share, expect uint64) error // Name, Path, Root, Config only
 	SetShareState(ctx context.Context, share ShareID, from, to ShareState) error
-	DeleteShare(ctx context.Context, share ShareID, snapshots SnapshotDisposition) error // §2.3.2
+	DeleteShare(ctx context.Context, share ShareID, snapshots SnapshotDisposition, expect uint64) error // §2.3.2
 	SetGrant(ctx context.Context, g ShareGrant, expect uint64) error // Access none stores a grant that refuses the principal, distinct from no grant (RFC 18 §6.4); a grant naming a machine principal is refused; Version, and the share's grant-list version S‖id‖gv written in the same transaction, are the writing commit's, so neither ever repeats a value a cache keyed on
-	DeleteGrant(ctx context.Context, share ShareID, p Principal) error // deletes the grant and its GR key, so the principal falls through to its groups' grants, and sets S‖id‖gv to the writing commit's version, so a cache keyed before the deletion misses
+	DeleteGrant(ctx context.Context, share ShareID, p Principal, expect uint64) error // deletes the grant and its GR key, so the principal falls through to its groups' grants, and sets S‖id‖gv to the writing commit's version, so a cache keyed before the deletion misses
 	PutExportPolicy(ctx context.Context, p ExportPolicy, expect uint64) error // raises Version, as SetGrant does
 	Quotas(ctx context.Context, share ShareID) iter.Seq2[Quota, error] // the share's quotas: share-wide, the user and group defaults, per principal and per project
 	SetQuota(ctx context.Context, share ShareID, q Quota, expect uint64) error // a quota that limits nothing deletes it, and a share-wide or project one its qx; a changed soft limit restarts its grace: qx is rewritten at the change's time if usage is above the new soft limit and deleted otherwise, while a change to any other limit leaves a running grace; a principal's grace under a changed default, or one that gains or loses its own quota, restarts at its next check, which finds the soft limit qx recorded no longer in force (RFC 7 §2.8)
 	Netgroups(ctx context.Context, after string) iter.Seq2[Netgroup, error]
 	PutNetgroup(ctx context.Context, n Netgroup, expect uint64) error // sets Version to the writing commit's, as SetGrant does
-	DeleteNetgroup(ctx context.Context, name string) error // rules naming it are not rewritten and fail closed (Netgroup)
+	DeleteNetgroup(ctx context.Context, name string, expect uint64) error // rules naming it are not rewritten and fail closed (Netgroup)
 	Snapshots(ctx context.Context, share ShareID) iter.Seq2[Snapshot, error]
 	Settings(ctx context.Context, scope SettingScope) iter.Seq2[Setting, error]
 	PutSetting(ctx context.Context, s Setting, expect uint64) error
@@ -1493,7 +1495,7 @@ the bytes §4.2.1 assigns. The layout encodes the boundary
 | | `S‖id‖od‖shard‖unique` | `old_refs` delta, not yet folded, per shard: its own range, apart from the usage deltas, so a re-home's finish can guard each shard's range as empty without conflicting with every writer of the share ([RFC 27 §2.7](rfc-27-namespace-migration.md#2.7%20Moving%20one%20share%20out%20of%20a%20shared%20namespace), §4.4) |
 | | `S‖id‖ut‖shard`, `S‖id‖pu‖principal‖shard`, `S‖id‖pj‖project‖shard` | folded usage, **per shard**: share, with its `history_bytes`, principal, project; each written only by its shard's fold, and a reader sums a prefix scan over the shards (§4.4) |
 | | `S‖id‖ud‖shard‖unique` | usage delta, not yet folded, per shard (§4.4) |
-| | `S‖id‖qt‖target` | Quota: `Hard`, `Soft`, `Grace`, `Advisory` ([RFC 7](rfc-7-namespace-metadata.md)); `target` is a principal, a project, the share as a whole, which `FilesystemInfo.Quota` reports, or a default for every user or every group without a quota of its own. Written by `SetQuota` (§3) |
+| | `S‖id‖qt‖target` | Quota: `Hard`, `Soft`, `Grace`, `Advisory`, `Version` ([RFC 7](rfc-7-namespace-metadata.md)); `target` is a principal, a project, the share as a whole, which `FilesystemInfo.Quota` reports, or a default for every user or every group without a quota of its own. Written by `SetQuota` (§3) |
 | | `S‖id‖qx‖target` | when usage first exceeded the soft limit, and that soft limit; deleted when it falls back under. `target` is the share, a project or a principal — the principal even when its limit is the default, so each principal's grace is its own and none is keyed by a default. A `SetQuota` that changes a share-wide, project or principal soft limit rewrites it at the change's time if usage is above the new limit and deletes it otherwise; a check that finds the soft limit in force differs from the one recorded — a default changed, or the principal gained or lost its own quota — does the same at the check's time ([RFC 17 §5.6](rfc-17-vfs.md#5.6%20Quota)) |
 | | `S‖id‖pjn` | project allocator: the next `ProjectID`, read and raised in the transaction of the `SetProject` it numbers, so no project number is issued twice in the share ([RFC 7 §2.8](rfc-7-namespace-metadata.md#2.8%20A%20share%20is%20one%20filesystem)) |
 | | `S‖id‖vf‖bucket‖version‖FileID`, `S‖id‖vf‖bucket‖version‖FileID‖unique` | version-floor index: **one entry per File, at its stored `Version`**, written by every transaction that raises that `Version`, at the version the filesystem service drew from the engine under the file's accept lock ([RFC 17 §5.1](rfc-17-vfs.md#5.1%20Write)) for a namespace call — an existence commit, an attribute, flag, ACL or xattr change, a link change — which deletes the entry it supersedes; and one entry per unfolded directory-time delta at the delta's version, under its own unique suffix, written blind with the delta and replaced by the directory's own entry when the fold absorbs it. No ref has an entry: a File's `Version` is at least every version its refs and `Applied` carry. `bucket` is the file's identity hashed into one of *B* fixed buckets, so a share's commits spread over *B* key ranges ([RFC 6 §8.3](rfc-6-block-metadata.md#8.3%20A%20file%27s%20refs%20and%20the%20version%20floor), [RFC 7 §9.4](rfc-7-namespace-metadata.md#9.4%20The%20change%20attribute%20and%20ctime%20never%20move%20backward)) |

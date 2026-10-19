@@ -294,7 +294,8 @@ only, and **MUST NOT** be on by default.
 ### 2.3 A record is versioned
 
 Each record carries a **generation**, raised by every change, and a **schema
-version**. A node reports, per kind (`settings`, `shares`, `principals`), the position it has reconciled through, the records it refused and those awaiting a restart; a record is applied once that position reaches the record's own (RFC 23 §2.4)
+version**. Which nodes have applied it is [RFC 23 §2.4](rfc-23-control-plane.md#2.4%20What%20a%20node%20reports)'s, read from each
+node's reconciled position and its refused and restart-pending sets
 ([§8](#8.%20Observability)). A reader that meets a schema version it does not know refuses
 the record rather than reading the fields it recognises: a field it skipped may
 be the one that mattered.
@@ -838,7 +839,7 @@ Metric names are shown without the deployment's prefix, which the exporter adds.
 
 | Answers | Metric | Type |
 | --- | --- | --- |
-| the position a node has reconciled through per kind — `settings`, `shares`, `principals` — read against the store's current counter per kind; a record is applied once it reaches the record's own | RFC 23's `runtime_applied_generation{kind}` | gauge |
+| the position a node has reconciled through per kind — `settings`, `shares`, `principals` — read against the store's current counter per kind | RFC 23's `runtime_applied_generation{kind}` | gauge |
 | how long a node's reconciled position has been behind the store's counter, per kind — `settings` (`CFGGEN`), `shares` (`SL`), `principals` (`PGEN`) | `config_generation_lag_seconds{kind}` | gauge |
 | secrets a node holds at an older version than the current one | `config_secrets_behind` | gauge, a count |
 | each format's active version, and the range each node registers | `format_active_version`, `format_supported_range` | gauges, labelled by format |
