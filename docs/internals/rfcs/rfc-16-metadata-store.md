@@ -659,6 +659,7 @@ type Operation struct { // RFC 23 §4.6
 	Started, Updated time.Time
 	Error    []byte      // the problem body, when failed
 	Result   []byte      // when succeeded
+	// Progress is not stored: RFC 23 §4.6 reads it from the owner's cursor; Error is the encoded Problem
 }
 
 type IdempotencyRecord struct { // RFC 23 §4.5
@@ -1106,6 +1107,15 @@ type ControlPlane interface {
 	Snapshots(ctx context.Context, share ShareID) iter.Seq2[Snapshot, error]
 	Settings(ctx context.Context, scope SettingScope) iter.Seq2[Setting, error]
 	PutSetting(ctx context.Context, s Setting, expect uint64) error
+
+	// The management API's own records (§2.3) — Operation, IdempotencyRecord,
+	// Session, APIToken, AuditRecord, AuditCursor — are reached here too,
+	// indicatively one read and one conditional write each, written in the
+	// transaction of the request it records. An AuditRecord is append-only;
+	// a cursor's write names the holder it read. NodeStatus is not here: every
+	// node writes its own through the Node view.
+	PutOperation(ctx context.Context, op Operation, expect uint64) error
+	AdvanceCursor(ctx context.Context, c AuditCursor, holder NodeID, holderEpoch uint64) error
 }
 ```
 
@@ -1118,8 +1128,8 @@ What each consumer holds:
 | Engine | `Existence`, `Content` |
 | GC | `Blocks` |
 | Authentication (session setup, Kerberos contexts) | `Principals`; tree connect and mount go through the filesystem service's `Shares` calls ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)) |
-| Management API | `ControlPlane` |
-| Shard placement (RFC 11) | `Node` and `Shard` records through its own view, fenced by epoch |
+| Management API | `ControlPlane`, its own records included |
+| Shard placement (RFC 11), and every node's own `NodeStatus` | `Node` and `Shard` records through its own view, fenced by epoch |
 | Debug tooling | `Dump` (§4.5) |
 
 **The metadata store is a leaf.** It never calls the engine, and no view here
