@@ -21,6 +21,10 @@ func (h *Handle) Unhold(share ShareID, cut SnapshotCut) error {
 }
 
 // Held returns the bytes share's holds keep, from a maintained counter.
+//
+// decision: the stub returns 0 because the signature has no error to carry
+// ErrNotImplemented. Zero reads as "nothing held", so no caller may depend on
+// it until holds land.
 func (h *Handle) Held(share ShareID) int64 {
 	return 0
 }
