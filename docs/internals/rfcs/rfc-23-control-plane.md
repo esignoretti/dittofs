@@ -279,6 +279,11 @@ components after start:
   the engine;
 - it moves each adapter between configured, serving, draining and stopped, and
   reconfigures its listeners ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states));
+- it runs the sidecars, calling each one's `Sync` with the adapters it serves
+  that are serving; it declares the `Adapter` and `Sidecar` interfaces it drives
+  beside its own code, so it imports no adapter
+  ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface),
+  [§3.5](rfc-20-adapters.md#3.5%20Sidecars));
 - it hands a live setting to the component that reads it;
 - it runs the operations no other component owns (§4.6).
 
@@ -315,14 +320,17 @@ make the share's existence depend on which node took the request.
    resumes the operations this node holds; then the **management API**, which
    starts accepting calls.
 5. With `protocol`: the router and the filesystem service, then the
-   **adapters**, each from configured to serving as its records say. Readiness
-   turns true once every adapter the records enable is serving.
+   **adapters**, each from configured to serving as its records say, then the
+   **sidecars**, synced with the adapters now serving. Readiness turns true once
+   every adapter the records enable is serving.
 
 **Stop.** The reverse, and each step completes before the next:
 
 1. Readiness turns false, so whatever steers clients stops sending them
    ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)).
-2. Adapters drain and stop, then the router and the filesystem service.
+2. Sidecars are synced with the empty set, so nothing is advertised that is
+   about to stop; then adapters drain and stop, then the router and the
+   filesystem service.
 3. The management API stops accepting calls; calls in flight run to their answer
    within the drain deadline.
 4. The operation runner stops: each operation it drives is left at its last
@@ -351,6 +359,7 @@ The runtime holds two pictures: the **desired** one, read from records, and the
 | an adapter enabled or disabled | starts it, or drains and stops it |
 | an adapter's live setting | applies it to connections set up afterwards ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)) |
 | an adapter's restart-class setting | drains and starts that adapter, alone; the others keep serving |
+| a sidecar enabled or disabled | `Sync` with the serving adapters, or with none ([RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars)) |
 | a node-scoped or installation-scoped restart-class setting | nothing until the process next starts; the node reports the record as restart-pending (§2.4) |
 | a principal, grant or export policy | nothing of its own: their generations and versions are in the identity and admission cache keys ([RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)) |
 
@@ -647,6 +656,12 @@ raise-format, set-password, drain — are `POST` on `{resource}:{verb}`.
   not offered.
 - **Secrets are never read.** A secret-bearing field reads as its reference and
   version, never its value ([RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)).
+- **A node's open connections are the one live read.**
+  `GET /nodes/{id}/connections` answers what each adapter's `Connections()`
+  lists now — protocol, remote address, session, since
+  ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)) — from that node, not
+  from the store, for `viewer`. It is read-only and writes no client or
+  principal record.
 
 ### 4.3 Writes
 
@@ -888,7 +903,7 @@ second store.
 | Right | `viewer` | `operator` | `admin` |
 | --- | --- | --- | --- |
 | read every resource but accounts, tokens and the audit | ✓ | ✓ | ✓ |
-| health detail, operations, node status | ✓ | ✓ | ✓ |
+| health detail, operations, node status, a node's open connections | ✓ | ✓ | ✓ |
 | shares, grants, export policies, quotas, snapshots, policies, backups, restores | | ✓ | ✓ |
 | remote stores, namespaces, adapters, settings, netgroups, and the secrets they name | | ✓ | ✓ |
 | users and groups that hold no role | | ✓ | ✓ |
