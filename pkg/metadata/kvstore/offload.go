@@ -107,6 +107,15 @@ func (c Content) Commit(ctx context.Context, bc BlockCommit) (CommitResult, erro
 type counts map[entity.ChunkHash]int64
 
 func commitBlock(tx kv.Txn, bc BlockCommit) (CommitResult, error) {
+	// A block carries each chunk once: the engine never packs one twice, and
+	// a repeat would count the chunk twice against the block's live count.
+	seen := make(map[entity.ChunkHash]bool, len(bc.Chunks))
+	for _, ch := range bc.Chunks {
+		if seen[ch.Hash] {
+			return nil, fmt.Errorf("%w: block %s carries chunk %s twice", ErrInconsistent, bc.Name, ch.Hash)
+		}
+		seen[ch.Hash] = true
+	}
 	ns, now := bc.Namespace, tx.Now()
 	ikey := intentKey(ns, bc.Name)
 	if _, ok, err := get(tx, ikey); err != nil {
@@ -125,20 +134,17 @@ func commitBlock(tx kv.Txn, bc BlockCommit) (CommitResult, error) {
 
 	// Chunk records: create the missing, repoint those naming a block that
 	// is gone or going.
+	recs, state, err := chunksOf(tx, ns, bc.Chunks)
+	if err != nil {
+		return nil, err
+	}
 	owned := map[entity.ChunkHash]bool{}
 	var preLive int64
-	for _, ch := range bc.Chunks {
-		b, ok, err := get(tx, chunkKey(ns, ch.Hash))
-		if err != nil {
-			return nil, err
-		}
+	for i, ch := range bc.Chunks {
+		rec, ok := recs[i].rec, recs[i].ok
 		repoint := !ok
-		var rec chunkRecord
 		if ok {
-			if rec, err = decodeChunk(ch.Hash, b); err != nil {
-				return nil, err
-			}
-			st, err := blockState(tx, ns, rec.Block)
+			st, err := state(rec.Block)
 			if err != nil {
 				return nil, err
 			}
@@ -191,6 +197,59 @@ func commitBlock(tx kv.Txn, bc BlockCommit) (CommitResult, error) {
 		}
 	}
 	return out, writeBlocks(tx, ns, blocks)
+}
+
+// storedChunk is a chunk record as the snapshot holds it, ok false when
+// there is none.
+type storedChunk struct {
+	rec chunkRecord
+	ok  bool
+}
+
+// chunksOf reads the records of chunks in one batch, and the blocks those
+// name in a second: on a remote store each read is a round trip. state
+// answers a block's state from that batch, reading one it doesn't hold.
+func chunksOf(tx kv.Txn, ns entity.NamespaceID, chunks []ChunkAt) ([]storedChunk, func(entity.BlockName) (entity.BlockState, error), error) {
+	ks := make([][]byte, len(chunks))
+	for i, ch := range chunks {
+		ks[i] = chunkKey(ns, ch.Hash)
+	}
+	stored, err := tx.GetMany(ks)
+	if err != nil {
+		return nil, nil, err
+	}
+	recs := make([]storedChunk, len(chunks))
+	at := map[entity.BlockName]int{}
+	var bks [][]byte
+	for i, b := range stored {
+		if b == nil {
+			continue
+		}
+		if recs[i].rec, err = decodeChunk(chunks[i].Hash, b); err != nil {
+			return nil, nil, err
+		}
+		recs[i].ok = true
+		if _, seen := at[recs[i].rec.Block]; !seen {
+			at[recs[i].rec.Block] = len(bks)
+			bks = append(bks, blockKey(ns, recs[i].rec.Block))
+		}
+	}
+	blocks, err := tx.GetMany(bks)
+	if err != nil {
+		return nil, nil, err
+	}
+	state := func(name entity.BlockName) (entity.BlockState, error) {
+		i, held := at[name]
+		if !held {
+			return blockState(tx, ns, name)
+		}
+		if blocks[i] == nil {
+			return entity.BlockDeleted, nil // pruned: gone
+		}
+		blk, err := decodeBlock(name, blocks[i])
+		return blk.State, err
+	}
+	return recs, state, nil
 }
 
 func blockState(r kv.Reader, ns entity.NamespaceID, name entity.BlockName) (entity.BlockState, error) {
@@ -372,11 +431,18 @@ func dropRef(tx kv.Txn, ns entity.NamespaceID, share entity.ShareID, c entity.Ch
 // count crosses zero. blocks holds the block records already loaded, the
 // committing one included; it gains any other it touches.
 func applyCounts(tx kv.Txn, ns entity.NamespaceID, delta counts, blocks map[entity.BlockName]*entity.Block) error {
-	for h, d := range delta {
-		b, ok, err := get(tx, chunkKey(ns, h))
-		if err != nil {
-			return err
-		}
+	hashes := make([]entity.ChunkHash, 0, len(delta))
+	ks := make([][]byte, 0, len(delta))
+	for h := range delta {
+		hashes = append(hashes, h)
+		ks = append(ks, chunkKey(ns, h))
+	}
+	stored, err := tx.GetMany(ks)
+	if err != nil {
+		return err
+	}
+	for i, h := range hashes {
+		d, b, ok := delta[h], stored[i], stored[i] != nil
 		if !ok {
 			if d > 0 {
 				return fmt.Errorf("%w: a ref names chunk %s, which has no record", ErrInconsistent, h)
@@ -436,11 +502,18 @@ func loadBlock(r kv.Reader, ns entity.NamespaceID, name entity.BlockName, blocks
 // zero while retired is resurrected.
 func writeBlocks(tx kv.Txn, ns entity.NamespaceID, blocks map[entity.BlockName]*entity.Block) error {
 	now := tx.Now()
-	for name, b := range blocks {
-		v, existed, err := get(tx, blockKey(ns, name))
-		if err != nil {
-			return err
-		}
+	names := make([]entity.BlockName, 0, len(blocks))
+	ks := make([][]byte, 0, len(blocks))
+	for name := range blocks {
+		names = append(names, name)
+		ks = append(ks, blockKey(ns, name))
+	}
+	stored, err := tx.GetMany(ks)
+	if err != nil {
+		return err
+	}
+	for i, name := range names {
+		b, v, existed := blocks[name], stored[i], stored[i] != nil
 		var was entity.Block
 		if existed {
 			if was, err = decodeBlock(name, v); err != nil {

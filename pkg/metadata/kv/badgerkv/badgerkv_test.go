@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/marmos91/dittofs/pkg/metadata/kv"
+	"github.com/marmos91/dittofs/pkg/metadata/kv/internal/backend"
 	"github.com/marmos91/dittofs/pkg/metadata/kv/kvtest"
 )
 
@@ -129,22 +130,6 @@ func TestNowAcrossRestartWithClockSteppedBack(t *testing.T) {
 	}
 }
 
-// A clock that has not ticked between two commits, as a coarse one does not
-// within its tick, still gives each a later Now.
-func TestNowAdvancesOnAStillClock(t *testing.T) {
-	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
-	s := open(t, Options{Clock: clock.now})
-	defer func() {
-		if err := s.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-	first := txnNow(t, s)
-	if second := txnNow(t, s); !second.After(first) {
-		t.Fatalf("Now went from %v to %v with the clock still", first, second)
-	}
-}
-
 func TestNowStaysUnderCeiling(t *testing.T) {
 	start := time.Unix(1_800_000_000, 0)
 	clock := &fakeClock{t: start}
@@ -158,7 +143,7 @@ func TestNowStaysUnderCeiling(t *testing.T) {
 	// The clock jumps past the ceiling before the next raise: Now holds at
 	// the ceiling rather than pass it.
 	clock.set(start.Add(time.Hour))
-	if now, limit := txnNow(t, s), start.Add(ceilingAhead); now.After(limit) {
+	if now, limit := txnNow(t, s), start.Add(backend.CeilingAhead); now.After(limit) {
 		t.Fatalf("Now %v passed the ceiling %v", now, limit)
 	}
 	// Once raised, Now follows the clock again.

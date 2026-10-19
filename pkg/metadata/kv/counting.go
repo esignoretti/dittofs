@@ -84,6 +84,13 @@ func (r *countingReader) Get(key []byte) ([]byte, error) {
 	return r.Reader.Get(key)
 }
 
+// GetMany counts a read per key, as that many Gets would: a key count stays
+// the same whichever way the store reads.
+func (r *countingReader) GetMany(keys [][]byte) ([][]byte, error) {
+	r.c.Gets += len(keys)
+	return r.Reader.GetMany(keys)
+}
+
 func (r *countingReader) Versions(keys [][]byte) ([]uint64, error) {
 	r.c.Versions += len(keys)
 	return r.Reader.Versions(keys)
@@ -106,6 +113,11 @@ type countingTxn struct {
 func (t *countingTxn) Get(key []byte) ([]byte, error) {
 	t.c.Gets++
 	return t.Txn.Get(key)
+}
+
+func (t *countingTxn) GetMany(keys [][]byte) ([][]byte, error) {
+	t.c.Gets += len(keys)
+	return t.Txn.GetMany(keys)
 }
 
 func (t *countingTxn) Scan(prefix, after []byte) iter.Seq2[KeyValue, error] {

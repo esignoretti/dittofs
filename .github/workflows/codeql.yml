@@ -66,6 +66,11 @@ jobs:
         with:
           go-version-file: k8s/dittofs-operator/go.mod
           cache: true
+      # Autobuild compiles fdbkv, which links libfdb_c on Linux.
+      - name: Install the FoundationDB client
+        if: matrix.language == 'go'
+        uses: ./.github/actions/fdb-client
+
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4

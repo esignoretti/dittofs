@@ -67,6 +67,34 @@ If you prefer not to use Nix, install dependencies manually:
   - Linux: `nfs-common` package
   - macOS: Built-in NFS client
 - Git
+- FoundationDB client library, on Linux only
+
+#### FoundationDB client
+
+A Linux build with cgo compiles the FoundationDB metadata backend, which links
+`libfdb_c`, so `go build ./...` and `go test ./...` fail with
+`foundationdb/fdb_c.h: No such file or directory` until the client is
+installed. macOS builds leave the backend out and need nothing.
+
+On Debian or Ubuntu, install the same release CI uses, checked against the
+digest CI pins (on ARM, use `aarch64` and the arm64 digest from
+`.github/actions/fdb-client/action.yml`):
+
+```bash
+v=7.3.77
+curl -fLO https://github.com/apple/foundationdb/releases/download/$v/foundationdb-clients_${v}-1_amd64.deb
+echo "b6c263723009bddbc30b6ae8cf9854340bd35cef14152abb0da8fb5af2b91254  foundationdb-clients_${v}-1_amd64.deb" | sha256sum -c -
+sudo dpkg -i foundationdb-clients_${v}-1_amd64.deb
+```
+
+On other x86_64 distributions, `test/fdb/cluster.sh client` downloads the library and
+headers under `~/.cache/dittofs-fdb/` without installing anything, and
+`test/fdb/cluster.sh test ./...` runs `go test` with them on the cgo paths.
+That script also starts a local cluster for the backend's tests
+(`test/fdb/cluster.sh up`, then `down`); without one they skip.
+
+To build without the client at all, set `CGO_ENABLED=0`. That leaves the
+backend out, at the cost of `-race`, which needs cgo.
 
 ### Clone and Setup
 

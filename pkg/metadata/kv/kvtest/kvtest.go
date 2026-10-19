@@ -29,6 +29,7 @@ func Run(t *testing.T, open func(t *testing.T) kv.KV) {
 		{"CloseTwice", testCloseTwice},
 		{"UpdateRacingClose", testUpdateRacingClose},
 		{"OwnWrites", testOwnWrites},
+		{"GetMany", testGetMany},
 		{"ConcurrentIncrements", testConcurrentIncrements},
 		{"LostUpdate", testLostUpdate},
 		{"WriteSkew", testWriteSkew},
@@ -349,6 +350,58 @@ func byteKeys(keys []string) [][]byte {
 }
 
 // Writer first: a write committed after the guard's snapshot aborts the guard.
+// GetMany answers in key order, nil for an absent key and an empty slice for
+// an empty value, sees the transaction's own writes, and tracks every key it
+// read: a write of one of them committed after the snapshot aborts the
+// transaction.
+func testGetMany(t *testing.T, s kv.KV) {
+	set(t, s, "a", "1", "e", "")
+	keys := byteKeys([]string{"a", "absent", "e"})
+	if err := s.View(ctx(t), func(r kv.Reader) error {
+		vs, err := r.GetMany(keys)
+		if err != nil {
+			return err
+		}
+		if len(vs) != 3 || string(vs[0]) != "1" || vs[1] != nil || vs[2] == nil || len(vs[2]) != 0 {
+			return fmt.Errorf("got %q, want [1 <nil> empty]", vs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(ctx(t), func(tx kv.Txn) error {
+		if err := tx.Set([]byte("b"), []byte("2")); err != nil {
+			return err
+		}
+		if err := tx.Delete([]byte("a")); err != nil {
+			return err
+		}
+		if err := tx.Set([]byte("z"), nil); err != nil {
+			return err
+		}
+		vs, err := tx.GetMany(byteKeys([]string{"a", "b", "z"}))
+		if err != nil {
+			return err
+		}
+		if vs[0] != nil || string(vs[1]) != "2" || vs[2] == nil || len(vs[2]) != 0 {
+			return fmt.Errorf("own writes: got %q, want [<nil> 2 empty]", vs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	set(t, s, "a", "1")
+	readThenSet := func(tx kv.Txn) error {
+		if _, err := tx.GetMany(byteKeys([]string{"a", "e"})); err != nil {
+			return err
+		}
+		return tx.Set([]byte("out"), []byte("1"))
+	}
+	if _, got := ordered(t, s, setter("e", "changed"), readThenSet); got != 2 {
+		t.Errorf("GetMany took %d attempts, want 2: a write of a key it read, committed after its snapshot, must abort it", got)
+	}
+}
+
 func testGuardVsWrite(t *testing.T, s kv.KV) {
 	set(t, s, "parent", "dir")
 	if _, got := ordered(t, s, setter("parent", "changed"), guardThenSet("parent", "child")); got != 2 {
@@ -669,6 +722,31 @@ func testVersions(t *testing.T, s kv.KV) {
 	}
 }
 
+// NowAcrossStores checks a replicated backend's store time across nodes:
+// open makes a store over the same data each call, its clock offset by skew.
+// A transaction that starts after another committed gets a later Now, even
+// when the node that committed first runs its clock ahead.
+func NowAcrossStores(t *testing.T, open func(t *testing.T, skew time.Duration) kv.KV) {
+	ahead, behind := open(t, 5*time.Millisecond), open(t, 0)
+	now := func(s kv.KV, key string) time.Time {
+		t.Helper()
+		var n time.Time
+		if err := s.Update(ctx(t), func(tx kv.Txn) error {
+			n = tx.Now()
+			return tx.Set([]byte(key), []byte("1"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for i := range 20 {
+		first := now(ahead, fmt.Sprintf("a%d", i))
+		if second := now(behind, fmt.Sprintf("b%d", i)); !second.After(first) {
+			t.Fatalf("round %d: a store whose clock is 5ms behind gave %v after the other committed %v", i, second, first)
+		}
+	}
+}
+
 func testNow(t *testing.T, s kv.KV) {
 	var prev time.Time
 	for range 50 {
@@ -781,6 +859,10 @@ func testLimits(t *testing.T, s kv.KV) {
 			"GuardRange": func(tx kv.Txn) error { return tx.GuardRange(append(guard, 'x')) },
 			"Get": func(tx kv.Txn) error {
 				_, err := tx.Get(append(guard, 'x'))
+				return err
+			},
+			"GetMany": func(tx kv.Txn) error {
+				_, err := tx.GetMany([][]byte{append(guard, 'x')})
 				return err
 			},
 		} {

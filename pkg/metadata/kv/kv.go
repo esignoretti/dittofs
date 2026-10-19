@@ -38,6 +38,13 @@ type Reader interface {
 	// tracked: the commit aborts if another transaction committed a write of
 	// key after the snapshot.
 	Get(key []byte) ([]byte, error)
+	// GetMany reads keys in one batch and returns their values in the same
+	// order, nil for a key that is absent and a non-nil empty slice for one
+	// whose value is empty. Each read behaves as Get's would: inside Update it
+	// is tracked and counts toward TxnBytes, and it sees the transaction's own
+	// writes. A backend may issue the reads concurrently, so a batch costs one
+	// round trip to a remote store rather than one per key.
+	GetMany(keys [][]byte) ([][]byte, error)
 	// Scan yields the keys under prefix that sort after after (all of them
 	// when after is nil), in key order. A scan is never tracked, so it
 	// detects no phantom: an invariant over a range uses GuardRange or gates
@@ -86,8 +93,10 @@ type Txn interface {
 	// guards are shared like point guards.
 	GuardRange(prefix []byte) error
 	// Now is store time for this transaction: strictly increasing across
-	// transactions that commit in order, within a stated bound of real time,
-	// and fixed for the transaction's life. Reading it writes no key.
+	// transactions that commit in order, on every node of a replicated store,
+	// within a stated bound of real time, and fixed for the transaction's
+	// life. A replicated backend keeps it increasing across nodes by raising
+	// a shared highest time at commit, a write that conflicts with nothing.
 	Now() time.Time
 }
 
