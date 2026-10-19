@@ -207,13 +207,27 @@ RFC 7 states a rule in full, this RFC cites it and does not restate it.
 | the ACL entity, its storage, and that `Mode` and ACL change in one transaction | RFC 7 | [§2.6](rfc-7-namespace-metadata.md#2.6%20ACL%2C%20and%20how%20it%20agrees%20with%20the%20mode) |
 | the chokepoint, open-time grants, the decision against the file, the resolved identity, the privileged flag and who may set owner and group | RFC 7 | [§7.1–§7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved) |
 | cache keys of decisions | RFC 7 | [§7.5](rfc-7-namespace-metadata.md#7.5%20A%20cached%20decision%20is%20keyed%20by%20everything%20it%20read) |
-| returning which of the audit policy and the file's audit entries selected a decision, and the immutable and append-only flags; the event itself is emitted by the filesystem service ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) | RFC 7 | [§7.6](rfc-7-namespace-metadata.md#7.6%20Decisions%20are%20observable), [§7.8](rfc-7-namespace-metadata.md#7.8%20Immutable%20and%20append-only%20flags%20are%20enforced%20at%20the%20chokepoint) |
+| returning, with each decision, whether an audit or alarm entry of the file selected it, and the immutable and append-only flags; the share's audit policy and the event itself are the filesystem service's ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) | RFC 7 | [§7.6](rfc-7-namespace-metadata.md#7.6%20Decisions%20are%20observable), [§7.8](rfc-7-namespace-metadata.md#7.8%20Immutable%20and%20append-only%20flags%20are%20enforced%20at%20the%20chokepoint) |
 | what removing a name needs, and delete decided with the parent | RFC 7 | [§7.7](rfc-7-namespace-metadata.md#7.7%20What%20a%20caller%20may%20be%20asked%20for%2C%20and%20what%20removing%20a%20name%20needs) |
 | the ordered walk, the owner's implicit rights, generic rights, what a mode bit grants, the well-known principals, inheritance at create, maximal access, the `chmod` merge | RFC 7, adopted here | [§2.6](rfc-7-namespace-metadata.md#2.6%20ACL%2C%20and%20how%20it%20agrees%20with%20the%20mode) |
 | the model: entry kinds, principals, rights and their bits, flags, order, what a stored ACL may hold | this RFC | §2 |
 | the sequence one decision runs, the share ceiling, `MAXIMUM_ALLOWED`, the system-security right, which decisions an audit entry selects | this RFC | §3 |
 | the ACL a mode implies, the mode an ACL implies, how inheritance is computed and set | this RFC | §4 |
 | the shared translation and both spellings | this RFC | §5–§7 |
+
+This RFC adds no component with state or a lifecycle: nothing here starts,
+drains or closes, and nothing holds state between calls. The sequence of §3 runs
+inside RFC 7's chokepoint, in the entity layer written once over every backend
+([RFC 16 §4.1](rfc-16-metadata-store.md#4.1%20One%20small%20interface%20per%20backend)).
+The functions of §4 are on RFC 7's `ACL` type. The translation of §5 is pure
+functions in the adapters' shared translation package
+([RFC 20 §2.5](rfc-20-adapters.md#2.5%20Architecture%20and%20package%20layout)),
+handed RFC 18's mapping per call (§12, item 7). Every stateful input — the
+principal mapping, the share grant, the audit policy — is another RFC's, built
+by the composition root
+([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)),
+and reaches a decision through the caller or the file's record. The audit policy
+is the exception: the service applies it to the decision the chokepoint returns.
 
 > decision: RFC 7's walk is adopted unchanged. It is what NFSv4 clients assume
 > and what Windows' access check does for allow and deny entries, and RFC 7's
@@ -275,11 +289,12 @@ of one of three kinds:
   and the matching rule of
   [RFC 7 §2.6](rfc-7-namespace-metadata.md#2.6%20ACL%2C%20and%20how%20it%20agrees%20with%20the%20mode)'s
   table, which this RFC adopts. A well-known principal with no row there matches
-  no caller; a deny naming one is refused when stored, and an allow naming one
-  is stored and grants nothing (RFC 7).
+  no caller; §2.8 says what a set naming one does.
 
 Matching reads the identity [RFC 18](rfc-18-identity.md) resolved — the
-principal, its groups, its deny-only principals (§3.3), the `authenticated`
+principal, its groups, its deny-only principals, which match deny entries only
+([RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)),
+the `authenticated`
 and `admin` flags — and nothing else. It never reads a UID, GID, SID or name: those are spellings, held on the
 User and Group records and in the protocol-ID index, and resolved to principals
 by RFC 18 before an entry is stored or a caller arrives. A caller resolved as
@@ -333,7 +348,9 @@ A mask a client sets is reduced to entry rights before it is stored: generic
 bits are mapped, and every other bit outside the fourteen — system security,
 maximum allowed, NFSv4's retention bits (`0x00000200`, `0x00000400`), reserved
 bits — is cleared and counted (§10). Clearing a bit no request can be granted
-by narrows neither an allow nor a deny in any way a request can observe.
+by narrows neither an allow nor a deny in any way a request can observe. It is
+harmless while no entry grants the system-security right (§3.5); revisit it with
+that rule.
 
 What each operation asks for is [RFC 7 §7.7](rfc-7-namespace-metadata.md#7.7%20What%20a%20caller%20may%20be%20asked%20for%2C%20and%20what%20removing%20a%20name%20needs)'s
 and [RFC 17](rfc-17-vfs.md)'s.
@@ -403,15 +420,20 @@ The audit list has no order that matters: an audit entry never decides.
 
 A set **MUST** be refused whole, with `ErrInvalid`, and nothing stored, when:
 
-- either list holds more than 128 entries, or its encoding is larger than
-  64 KiB (both fixed values). An entry is counted as many times as either
-  protocol spells it: an effective, inheritable `OWNER@` or `GROUP@` entry
-  counts two, being two entries in a security descriptor (§6.3). So a list
-  stored within the limit is always within it on the wire, and writing back
-  what was read never exceeds it;
+- either list, counted as a security descriptor spells it (§6.3) — an
+  effective, inheritable `OWNER@` or `GROUP@` entry counting two — holds more
+  than 128 entries, or that spelling is larger than 64 KiB (both fixed values).
+  So a list stored within the limit is within it whenever it is spelled as a
+  descriptor, and writing back what was read never exceeds it;
 - an entry is of a kind §2.2 does not hold;
-- an entry's principal cannot be resolved to a principal ([RFC 18](rfc-18-identity.md));
+- an entry's principal resolves to no principal (RFC 18's `ErrUnknownPrincipal`);
 - a deny names a well-known principal with no row in RFC 7's table.
+
+Only a lookup answering that no principal holds the spelling is "resolves to no
+principal". Any other lookup error fails the set with that error, never
+`ErrInvalid` ([RFC 18 §5.4](rfc-18-identity.md#5.4%20Errors%20never%20become%20answers)).
+A client then retries a set the store could not check, rather than being told it
+is malformed.
 
 A set **MUST NOT** be accepted with one entry left out, but for an entry naming
 a deleted principal (§5.2). Leaving out an allow
@@ -449,7 +471,8 @@ after the service has admitted the call and the identity is resolved:
    is refused whatever else it asked.
 5. **The owner's implicit rights**, before any entry is read
    ([RFC 7 §2.6](rfc-7-namespace-metadata.md#2.6%20ACL%2C%20and%20how%20it%20agrees%20with%20the%20mode)):
-   read and write the ACL, unless an effective owner-rights entry exists.
+   read and write the ACL — and, on a file with no stored ACL, read and write
+   attributes — unless an effective owner-rights entry exists.
 6. **The walk** over the stored access list, or over the ACL the mode implies
    when none is stored (§4.1) (§3.3).
 7. **The parent.** On a call that names the directory it resolved through,
@@ -479,10 +502,9 @@ on a read share cannot rewrite its ACL.
 
 A share grant names one principal's access to one share
 ([RFC 16 §2.3](rfc-16-metadata-store.md#2.3%20Server-wide%20and%20control-plane%20entities)).
-A caller's **grant level** is read from the share's grants by
-[RFC 18](rfc-18-identity.md)'s order — its own grant first, then the widest of
-its groups', then authenticated users', then everyone's — and arrives with the
-identity. The **share ceiling** is the rights that level allows, narrowed by
+A caller's **grant level** is
+[RFC 18 §6.4](rfc-18-identity.md#6.4%20Share%20access%20from%20the%20grants)'s
+`Access`, and arrives with the identity. The **share ceiling** is the rights that level allows, narrowed by
 admission:
 
 | Level | Ceiling |
@@ -490,16 +512,16 @@ admission:
 | none (no grant) | nothing: the call is refused at step 2 |
 | read | read data and list, execute and traverse, read attributes, read extended attributes, read the ACL, synchronize |
 | read-write | every entry right |
-| admin | every entry right; on an authenticated flavour the identity's `admin` flag is set ([RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)), which Administrators entries match and the system-security right needs (§3.5) |
+| admin | every entry right; the identity's `admin` flag is set as [RFC 18 §6.5](rfc-18-identity.md#6.5%20What%20the%20flavour%20proved%3A%20authenticated%2C%20admin%2C%20privileged) says, which Administrators entries match and the system-security right needs (§3.5) |
 
 Admission may narrow a grant to read-only — a client rule, or a share marked
 read-only ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)).
-The chokepoint does not evaluate client rules
-([RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)),
-so the narrowing **MUST** arrive as a field of the identity the service hands
-it, and the ceiling is then the read row's whatever the grant. Because the field
-is part of the identity, every cache key over the identity includes it
-([RFC 7 §7.5](rfc-7-namespace-metadata.md#7.5%20A%20cached%20decision%20is%20keyed%20by%20everything%20it%20read)).
+The chokepoint evaluates no client rule, so admission's narrowing arrives in
+the caller's `Access` ([RFC 18 §6.1](rfc-18-identity.md#6.1%20From%20Identity%20to%20caller)).
+The service sets `Access` to the narrower of the grant's level and admission's,
+so the ceiling is always the row of `Access`, and no second field exists for a
+cache key to miss. `Access` is covered by the caller's `Key`
+([RFC 18 §7.1](rfc-18-identity.md#7.1%20Every%20key%20carries%20the%20whole%20proof)).
 
 A file's ACL can narrow what the ceiling allows and never widen it: the
 ceiling is an intersection, not an entry. The ceiling is never written into a
@@ -539,14 +561,6 @@ Three cases the walk meets, stated here because RFC 7 does not:
 - **The ACL a mode implies** is walked like any stored one. A file with no
   stored ACL has no second check path.
 
-A caller's deny-only principals — group SIDs the proof marked
-`SE_GROUP_USE_FOR_DENY_ONLY`, carried in its `DenyOnly`
-([RFC 18 §6.1](rfc-18-identity.md#6.1%20From%20Identity%20to%20caller)) —
-match deny entries only, as
-[RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)
-states: a deny naming one refuses the caller, and an allow entry naming one
-does not match.
-
 ### 3.4 Maximum allowed
 
 An SMB open whose `DesiredAccess` holds `MAXIMUM_ALLOWED` is granted `G` (§3.1
@@ -556,19 +570,13 @@ access check decides. The open's grant, stored with the open
 ([RFC 14 §2.2](rfc-14-open-state.md#2.2%20Open)), is `G`.
 
 NFS `ACCESS`, SMB's `MaximalAccess` and the `MxAc` create context answer `G` too
-([RFC 17 §3.1](rfc-17-vfs.md#3.1%20Operations)). NFS `ACCESS` answers it with the
-privileged flag, as every later operation is authorised
-([RFC 21 §8.1](rfc-21-nfs.md#8.1%20Supported)): unsquashed root asking `READ` of
-another user's mode-000 file is told yes, because the read that follows is
-granted. SMB's `MaximalAccess` and `MxAc` are computed without the flag, even on
-a backup-intent open
-([RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)).
+([RFC 17 §3.1](rfc-17-vfs.md#3.1%20Operations)), with privilege as
+[RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved) and
+[RFC 21 §8.1](rfc-21-nfs.md#8.1%20Supported) apply it: NFS `ACCESS` with the
+privileged flag, because the operation that follows is authorised with it;
+`MaximalAccess` and `MxAc` without it, even on a backup-intent open.
 
 ### 3.5 Privilege and the system-security right
-
-Privilege is RFC 7 §7.4's one flag, set by the service on the callers RFC 7
-names; this RFC only places it in the sequence (§3.1 step 3). Take-ownership is
-not a privilege: it is the change-the-owner right, which an entry grants.
 
 The **system-security right** — reading or writing the audit list — is granted
 only to a caller whose identity has `admin` set, and never by an entry, by
@@ -597,22 +605,16 @@ made before the admission narrowed cannot write the audit list after it.
 > may write is the call's ceiling. Overturned if a level below admin is ever
 > allowed to read the audit list.
 
-### 3.6 Deleting and renaming
-
-Removing a name is decided by RFC 7 §7.7 inside the operation's transaction:
-delete on the file, or delete a child on its directory. This RFC adds nothing to
-that rule but the rights' names (§2.4) and the sequence (§3.1), in which the
-parent's grant is step 7.
-
 ### 3.7 Audit entries select events
 
 The filesystem service emits an access event
-([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) for a decision an audit entry
-**selects**, when the share's audit policy honours file entries. The chokepoint
+([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) for a decision the share's
+audit policy selects, and, when that policy honours file entries, for a decision
+an audit entry **selects**. The chokepoint
 ([RFC 7 §7.6](rfc-7-namespace-metadata.md#7.6%20Decisions%20are%20observable))
-emits nothing: it returns the decision and which of the policy and the file's
-audit entries selected it, and the service builds the event. An effective
-audit or alarm entry selects a decision when:
+emits nothing and does not read the policy. It returns, with the decision,
+whether an audit entry selected it. An effective audit or alarm entry selects a
+decision when:
 
 - it names the caller, matched as the walk matches (§2.3);
 - its mask holds at least one right the request asked for, after generic
@@ -633,6 +635,12 @@ decides whether file entries are honoured, beside its own selection of every
 decision, denials only, or writes and namespace changes. With the policy off,
 no entry selects anything and no event is built, as on Windows, where an audit
 entry has effect only while object-access auditing is on.
+
+A cached decision is keyed as
+[RFC 7 §7.5](rfc-7-namespace-metadata.md#7.5%20A%20cached%20decision%20is%20keyed%20by%20everything%20it%20read)
+says. This RFC adds no input to a decision beyond the caller (its whole `Key`),
+the file's record, `via`'s record and the share's grant list. The audit policy
+is applied after the decision, by the service, and is in no key of it.
 
 ## 4. Mode and ACL
 
