@@ -54,7 +54,8 @@ type Stats struct {
 	// Files is the number of files with at least one held extent. Kind: gauge.
 	Files int
 
-	// ExtentCount is the number of held extents. Kind: gauge.
+	// ExtentCount is the number of placement index entries: held extents,
+	// retained extents and removal markers. Kind: gauge.
 	ExtentCount int
 
 	// DropRanges is the number of ranges the removal-drop test keeps per file

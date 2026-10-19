@@ -98,8 +98,9 @@ type SegmentInfo struct {
 
 // VerifyReport is what Verify found.
 type VerifyReport struct {
-	// Unsupported are the index entries no record on the segments supports.
-	Unsupported []IndexEntry
+	// Unsupported holds, per file, the index entries no record on the
+	// segments supports.
+	Unsupported map[FileID][]IndexEntry
 
 	// Unreferenced are the records the segments hold that no index entry
 	// references.
