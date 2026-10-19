@@ -21,23 +21,23 @@ func TestOpenIsolatesAndClears(t *testing.T) {
 		t.Skip("no FoundationDB: run through test/fdb/cluster.sh test, which sets DITTOFS_FDB_CLUSTER_FILE")
 	}
 	ctx := context.Background()
-	stored := func() int {
+	pa, pb := Prefix(), Prefix()
+	stored := func(prefix []byte) int {
 		db, err := fdb.OpenDatabase(os.Getenv("DITTOFS_FDB_CLUSTER_FILE"))
 		if err != nil {
 			t.Fatal(err)
 		}
+		end, _ := fdb.Strinc(prefix)
 		kvs, err := db.ReadTransact(func(tr fdb.ReadTransaction) (any, error) {
-			return tr.GetRange(fdb.KeyRange{Begin: fdb.Key("test/"), End: fdb.Key("test0")}, fdb.RangeOptions{}).GetSliceWithError()
+			return tr.GetRange(fdb.KeyRange{Begin: fdb.Key(prefix), End: fdb.Key(end)}, fdb.RangeOptions{}).GetSliceWithError()
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return len(kvs.([]fdb.KeyValue))
 	}
-	var before int
 	t.Run("stores", func(t *testing.T) {
-		a, b := Open(t, fdbkv.Options{}), Open(t, fdbkv.Options{})
-		before = stored()
+		a, b := Open(t, fdbkv.Options{Prefix: pa}), Open(t, fdbkv.Options{Prefix: pb})
 		if err := a.Update(ctx, func(tx kv.Txn) error { return tx.Set([]byte("k"), []byte("a")) }); err != nil {
 			t.Fatal(err)
 		}
@@ -47,8 +47,11 @@ func TestOpenIsolatesAndClears(t *testing.T) {
 		}); !errors.Is(err, kv.ErrNotFound) {
 			t.Errorf("one store read another's key: %v", err)
 		}
+		if stored(pa) == 0 {
+			t.Fatal("the store wrote nothing under its prefix")
+		}
 	})
-	if after := stored(); after >= before {
-		t.Errorf("%d keys under test/ after the stores' test, %d while it ran: not cleared", after, before)
+	if n := stored(pa) + stored(pb); n != 0 {
+		t.Errorf("%d keys left under the stores' prefixes after their test", n)
 	}
 }

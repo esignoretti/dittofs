@@ -18,7 +18,11 @@ import (
 
 var run atomic.Int64
 
-// Open is a store under a prefix of its own on the cluster
+// Prefix is a fresh prefix for a test's store; stores opened with the same one
+// share their data.
+func Prefix() []byte { return fmt.Appendf(nil, "test/%d-%d/", time.Now().UnixNano(), run.Add(1)) }
+
+// Open is a store under a prefix of its own, or opts.Prefix, on the cluster
 // DITTOFS_FDB_CLUSTER_FILE names, cleared when tb ends: test/fdb/cluster.sh
 // starts one and sets it. Without it the test is skipped.
 func Open(tb testing.TB, opts fdbkv.Options) *fdbkv.Store {
@@ -28,7 +32,9 @@ func Open(tb testing.TB, opts fdbkv.Options) *fdbkv.Store {
 		tb.Skip("no FoundationDB: run through test/fdb/cluster.sh test, which sets DITTOFS_FDB_CLUSTER_FILE")
 	}
 	opts.ClusterFile = cf
-	opts.Prefix = fmt.Appendf(nil, "test/%d-%d/", time.Now().UnixNano(), run.Add(1))
+	if opts.Prefix == nil {
+		opts.Prefix = Prefix()
+	}
 	s, err := fdbkv.Open(opts)
 	if err != nil {
 		tb.Fatal(err)
