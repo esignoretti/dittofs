@@ -2767,9 +2767,11 @@ The engine exports what only it can see; each component exports its own. No
 per-operation metric carries a share label: one engine serves every share of its
 node, and at 10⁴ shares a share label multiplies every histogram by 10⁴
 ([RFC 16 §8.1](rfc-16-metadata-store.md#8.1%20Metrics)). Per-share figures — offload backlog, oldest unoffloaded age,
-health — are gauges exported for the shares a stated rule selects (the worst
-*n* by each figure), and every share's are readable through the management API. Metric names are shown without the
-deployment's prefix.
+health — are gauges exported under [RFC 25 §2.5](rfc-25-observability.md#2.5%20Cardinality)'s worst-n rule, with an
+unlabelled sum, and every share's are readable through the management API.
+Metric names are shown without the deployment's prefix. Histograms use
+[RFC 25 §2.6](rfc-25-observability.md#2.6%20Histogram%20buckets)'s sets: `request` for read and pacing latency, `background` for
+pipeline states, `count` for operations per commit.
 
 | Answers | Metric | Type |
 | --- | --- | --- |
@@ -2782,9 +2784,8 @@ deployment's prefix.
 | files backed off as failing ([§6.3](#6.3%20The%20offload%20pipeline), O6) | `engine_failing_files` | gauge |
 | passes aborted as wholly removed; commits that found their intent gone | `engine_passes_aborted_total`, `engine_intent_missing_total` | counter |
 | busy time of each stage — carve, assemble, put, commit ([§15.4](#15.4%20Benchmarks)) | `engine_stage_busy_ratio` | gauge |
-| dedup lookups, labelled `result` = `adopted`, `carried` or `error`; adoptions refused at commit ([§6.5](#6.5%20The%20dedup%20oracle)); exported once deduplication is added | `engine_dedup_lookups_total`, `engine_adoptions_refused_total` | counter |
 | stability points, the operations each committed, and group-commit splits ([§5.2](#5.2%20Group%20commit%20is%20bounded%2C%20and%20retries%20only%20the%20files%20that%20conflict)) | `engine_stability_points_total`, `engine_pending_existence_ops`, `engine_group_commit_splits_total` | counter, histogram, counter |
-| reads, labelled `class` = `journal`, `hole`, `remote`, `lost`, `corrupt` or `unavailable`; time to first byte ([§7.2](#7.2%20The%20reply%20holds%20only%20verified%20chunks%2C%20in%20file%20order)) | `engine_reads_total`, `engine_read_first_byte_seconds` | counter, histogram |
+| reads, labelled `class` = `journal`, `hole`, `remote`, `lost`, `corrupt` or `unavailable`; read latency ([§7.2](#7.2%20The%20reply%20holds%20only%20verified%20chunks%2C%20in%20file%20order)) | `engine_reads_total`, `engine_read_seconds` | counter, histogram |
 | fetches, labelled `shape` = `chunks` or `block` ([§7.8](#7.8%20A%20cold%20read%20asks%20for%20chunks%2C%20or%20for%20the%20block)), and bytes fetched against bytes read | `engine_fetches_total`, `engine_fetch_bytes_total` | counter |
 | fills, labelled `result` = `done`, `declined` or `refused` ([§7.3](#7.3%20Filling%20is%20a%20decision)) | `engine_fills_total` | counter |
 | speculative bytes fetched, and those read before eviction ([§7.4](#7.4%20The%20speculator)) | `engine_speculation_bytes_total`, `engine_speculation_used_bytes_total` | counter |
@@ -2792,6 +2793,17 @@ deployment's prefix.
 | evictions and bytes freed; pacing delays; refusals ([§10](#10.%20Local%20space)) | `engine_evicted_bytes_total`, `engine_pacing_seconds`, `engine_write_refusals_total` | counter, histogram, counter |
 | offloaded bits cleared by the consistency check ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)) | `engine_ledger_mismatches_total` | counter |
 | time waiting on engine-internal locks, labelled `area` (file state, share context table, work queue); not labelled by share ([§1.1](#1.1%20Neither%20a%20single%20point%20of%20failure%20nor%20a%20bottleneck)) | `engine_lock_wait_seconds` | histogram |
+| self-fences, labelled `reason` = `store`, and **(cluster)** `lease`, `unreachable` or `clock` ([§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here)) | `engine_self_fences_total` | counter |
+| work items dropped at the scheduler's fixed total, labelled `source` ([§6.1.1](#6.1.1%20The%20shared%20work%20scheduler), [RFC 24 §5.1](rfc-24-resources.md#5.1%20No%20queue%20is%20unbounded)) | `engine_work_items_dropped_total` | counter |
+
+**Spans.** A content call opens a child of the caller's span for each stage it
+waits on — journal sync, existence commit, fetch, pacing ([RFC 25 §6.1](rfc-25-observability.md#6.1%20Spans)) —
+carrying the share and file by ID, the bytes and the outcome. The span names,
+`engine.sync`, `engine.existence_commit`, `engine.fetch` and `engine.pace`, are
+proposals. An offload pass, a removal batch, a reseed and a pre-warm page open
+root spans of their own; a read that joins a fetch already in flight *links* to
+that fetch's span. Waits on a file's guard, a registration or the cut gate are
+span events. An unsampled span costs no allocation ([RFC 25 §6.3](rfc-25-observability.md#6.3%20Sampling%20and%20cost)).
 
 A **Lost** or corrupt read logs the file and extent at `Error`, once per extent.
 A share entering or leaving an offload health condition logs at `Warn`, and so
