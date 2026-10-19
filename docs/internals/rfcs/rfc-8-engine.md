@@ -290,6 +290,11 @@ from being either:
   Background work runs per journal ([§6.1](#6.1%20The%20work%20queue)), and the events that feed it
   never block the request that posts them. The table of share contexts is read
   without a lock on the hot path.
+
+  > decision: the share table is copy-on-write: a share's attach or removal
+  > copies the whole table, up to 10⁴ entries, once per change, so the hot path
+  > reads it without a lock. Overturned if share churn is measured in changes
+  > per second.
 - **Failover is not its job.** When a node dies, what its engine served moves
   with its shards: another node becomes their primary and replays from a replica
   ([RFC 10](rfc-10-journal-replication.md), [RFC 11](rfc-11-ownership.md)). The engine's state is memory by design ([§3.3](#3.3%20Policy%20state%20is%20memory%2C%20and%20disposable)), so
@@ -453,31 +458,42 @@ engines.** A share cannot starve another because its capacity, transfers and
 pacing draw on its own budgets and the queue serves shares fairly
 ([§1.1](#1.1%20Neither%20a%20single%20point%20of%20failure%20nor%20a%20bottleneck)); a share's failure is its context's health, not the engine's. Adding,
 removing or quiescing a share changes one context and never restarts the
-engine. A live change of a share's `sync.policy` reaches its context, which
-applies it with `SetSyncPolicy` on every journal handle it holds for the share,
-within RFC 13's live bound ([RFC 13 §5](rfc-13-configuration.md#5.%20Binding%20classes), [RFC 1 §5.2](rfc-1-journal.md#5.2%20Sync%20policy)); records
-written after it follow the new policy.
+engine.
 
-**`removing` ends the share's work, then its journal tag.** A context moves to
-`removing` at step 3 of the share's removal ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)), on each shard's
-primary, after admission has begun refusing the share with `ErrStale`. The
-move **MUST**, in this order: admit no new call, clone, copy, offload pass or
-removal batch for the share, other than the offload a removal that keeps
-snapshots runs for their hold marks and the phase-2 batches of a clone the join
-below waits on; join every call admitted before the
-refusal, every clone with the share on either side, and every pass and batch in
-flight; and cancel every asynchronous copy reading from the share, whatever
-share it writes ([RFC 14 §2.7](rfc-14-open-state.md#2.7%20Copy)). A namespace call — a create, link or
+**`SetShare` adds a context or changes one.** For a share the engine does not
+serve it attaches it ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)). For one it serves it applies the change: a
+state change, quiesced and back; a `sync.policy` change, applied with
+`SetSyncPolicy` on every journal handle the context holds for the share, within
+RFC 13's live bound ([RFC 13 §5](rfc-13-configuration.md#5.%20Binding%20classes), [RFC 1 §5.2](rfc-1-journal.md#5.2%20Sync%20policy)), so records written
+after it follow the new policy; or a backend change, which replaces the context
+([§2.1](#2.1%20Content%20composition)). Two changes belong to a re-home ([RFC 27 §2.7](rfc-27-namespace-migration.md#2.7%20Moving%20one%20share%20out%20of%20a%20shared%20namespace)): a `SetShare`
+naming a new write namespace returns once every pass captured under the old one
+is joined ([§6.6](#6.6%20A%20block%27s%20name%20is%20minted%2C%20and%20its%20intent%20recorded%2C%20before%20the%20put)); one with `State: Closing` counts clones and copies admitted
+from then on as refused, and returns once those admitted before it are done
+([§9.1](#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)).
+
+**`StopShare` ends the share's work; `ForgetShare` ends its journal tag.** The
+share's removal calls `StopShare(id, keepHolds)` at its step 3
+([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)), on each shard's primary, after admission has begun refusing
+the share with `ErrStale`. `StopShare` moves the context to `removing` and
+**MUST**, in this order: admit no new call, clone, copy, offload pass or removal
+batch for the share, other than the phase-2 batches of a clone the join below
+waits on; join every call admitted before the refusal, every clone with the
+share on either side, and every pass and batch in flight; cancel every
+asynchronous copy reading from the share, whatever share it writes
+([RFC 14 §2.7](rfc-14-open-state.md#2.7%20Copy)); and, with `keepHolds` — a removal that keeps snapshots —
+offload the extents its hold marks cover before it returns. A namespace call — a create, link or
 rename — enters the engine only to `Draw` its versions, which counts nothing,
 so the engine cannot join it: the filesystem
 service counts the calls it has admitted per share and the removal's step 3
 waits for that count to reach zero as well ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)). Only then does the removal end the share's open
 state and drop the tag, in RFC 16's order ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)): once every shard of
 the share has recorded its step 3 offload done (a removal that keeps no
-snapshots records it with nothing to offload), the node closes its journal
-handle on the tag (`Close`, [RFC 1 §3](rfc-1-journal.md#3.%20Interface)) and runs the whole-tag `Forget`,
-which is refused while a handle is open, **before** it advances the shard's
-`rm` row to forgotten. `Forget` is durable and idempotent, so a crash between
+snapshots records it with nothing to offload), it calls `ForgetShare`, which
+closes the share's journal handle on the tag (`Close`, [RFC 1 §3](rfc-1-journal.md#3.%20Interface)), runs the
+whole-tag `Forget`, which is refused while a handle is open, and closes the
+share's flow, **before** the shard's `rm` row is advanced to forgotten. Node
+stop never calls `ForgetShare`: `Close` closes handles and keeps tags. `Forget` is durable and idempotent, so a crash between
 the two only repeats it, and at every start the engine runs `Forget` again for
 each tag `Stats` still names whose share's `rm` rows read forgotten, before that share could attach ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), step 1). On one
 node a journal holds one shard per tag, and the `rm` row is the only record of
@@ -495,6 +511,14 @@ primary, which offloads the whole file. A file is never split across shards
 ([RFC 0 §1.3](rfc-0-data-lifecycle.md#1.3%20The%20layers)); range shards are deferred
 ([RFC 11 Appendix C](rfc-11-ownership.md#Appendix%20C%20%E2%80%94%20later%3A%20per-file%20and%20range%20shards)).
 
+> ponytail: per-file state — guards, frontiers, clone registrations, loss
+> entries — lives while the file has pending existence, an offer, a
+> registration, an open frontier or a loss entry above the floor, and is
+> dropped after; its count is bounded by the files active in the last existence
+> age plus those open. This bound is a proposal, not a measurement. Bound it
+> explicitly, with eviction of idle entries, if a count of per-file states
+> grows with the namespace rather than the working set.
+
 ### 2.4 Settings are validated once, and refused rather than replaced
 
 The engine validates every setting it composes at construction, and **MUST**
@@ -505,12 +529,19 @@ and **MUST** report a change to them as a migration rather than apply it
 
 ### 2.5 Start in order, stop in reverse, and join before closing
 
-**Start.** Each step completes before the next begins.
+**Start.** `New` validates settings and opens nothing. `Start(ctx, shares)` runs
+the steps below over the given shares, each step completing before the next
+begins. A step that fails closes in reverse what earlier steps opened and
+returns its error, so the engine is either serving or as built. A share refused
+at step 1 — its journal missing or foreign — does not fail `Start`: it is not
+attached, and `Stats` names it and its device.
 
 1. **Open the journal.** Read the version floor for every share the device
    journal may serve ([RFC 6 §8.3](rfc-6-block-metadata.md#8.3%20A%20file%27s%20refs%20and%20the%20version%20floor)), and the journal identity the metadata store
    records for the device ([RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)), and open the journal with both
-   ([RFC 28 §3.1](rfc-28-journal-format.md#3.1%20Rebuilding), [§3.4](rfc-28-journal-format.md#3.4%20Unattachable%20files)). A share whose removal has reached its
+   ([RFC 28 §3.1](rfc-28-journal-format.md#3.1%20Rebuilding), [§3.4](rfc-28-journal-format.md#3.4%20Unattachable%20files)). The engine opens each journal itself, through
+   `Deps.Open`, reading the floor and the identity from the store; the root
+   opens none. A share whose removal has reached its
    offload step — its `rm` rows at offloaded or later
    ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)) — is never attached at start ([RFC 1 §3](rfc-1-journal.md#3.%20Interface)): once the
    journal is open and before any share attaches, the engine runs `Forget` for
@@ -541,49 +572,8 @@ and **MUST** report a change to them as a migration rather than apply it
    ([RFC 10](rfc-10-journal-replication.md)), and only one that has lost every replica is gated.
 
    The floor the journal opens with is, per share, the larger of the version
-   floor and the share's **version limit** `S‖id‖vl` ([RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)), so the
-   counter restarts above every version a crash may have lost
-   ([RFC 7 §9.4](rfc-7-namespace-metadata.md#9.4%20The%20change%20attribute%20and%20ctime%20never%20move%20backward)). Then, before any version is issued, the engine writes
-   every served share's limit at the journal's next version, as `Stats`
-   reports it ([RFC 1 §3.7](rfc-1-journal.md#3.7%20State%20introspection)), plus one block (proposal: 2²⁴ versions; the counter
-   is 64-bit), and passes it with `SetVersionLimit`
-   ([RFC 1 §4.3](rfc-1-journal.md#4.3%20Versions)) once every write has committed. While the journal serves, the engine raises every served
-   share's limit by a block whenever `Stats` shows fewer
-   versions left than the larger of half a block and the journal's peak version
-   rate times the margin, and passes the new limit only after every share's
-   raise has committed. Both run in as many transactions as the key budget `K`
-   takes — 10⁴ shares are 2 × 10⁴ keys — never one over every share (E40). It
-   evaluates that trigger on every version it issues. The **peak version rate** is the highest
-   count of versions drawn in any one second of the last 60 s; the **margin** is
-   30 s plus the existence age ([§5.1](#5.1%20Commit%20is%20answered%20by%20the%20journal)) plus one second, the trigger's own
-   sampling: the self-fence counts from the last commit, which can precede the
-   stall by up to one existence age. So a metadata stall that begins just as a
-   raise falls due leaves at least the self-fence's 30 s of versions at the peak
-   rate ([§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here)), and writes go on being acknowledged until the fence trips; half
-   a block of 2²⁴ covers about 260 000 versions a second for that 32 s margin
-   before the rate term raises earlier. **Every write of `S‖id‖vl` — this one at
-   start, the one at attach below and every raise — is a tracked max-write**: it
-   writes the larger of the value it reads, tracked, and its own, never blindly.
-   **(cluster)** A share whose shards are served by several journals has one
-   limit, and a write from a journal with a lower counter would otherwise lower
-   it below versions another journal has reported. A write that reaches the
-   limit first is refused as retry-later ([§10.2](#10.2%20A%20capacity%20refusal%20comes%20back%20here)).
-
-   > decision: the headroom is sized by time, not by count alone, so that the
-   > version limit does not refuse writes before the 30 s self-fence would at
-   > any rate the last minute has seen. The block size is a proposal; overturned
-   > by the sustained-rate stall check of [§15.2](#15.2%20Group%20B%20%E2%80%94%20wedging) failing at a measured peak
-   > rate, which then sets the block.
-
-   > ponytail: the trigger looks back one minute, so a burst at a stall's start
-   > faster than the larger of about 280 000 versions a second (half a block
-   > over 30 s) and 1.07 × the last minute's peak (32 s of it over 30 s) spends
-   > the headroom before the fence: 500 000 a second after a minute at 100 000
-   > is refused retry-later about 13 s before the fence would. The cost is
-   > `ErrDelay` with `DelayCommit`, a retry, never a failure. Raise by a larger
-   > block, or size the margin from the device's peak IOPS rather than the
-   > last minute, when [§15.2](#15.2%20Group%20B%20%E2%80%94%20wedging)'s burst check is refused at a rate a
-   > deployment reaches.
+   floor and the share's version limit, and before any version is issued the
+   engine writes every served share's version limit ([§2.7](#2.7%20The%20version%20limit)).
 2. **Raise incarnations.** One transaction — the start transaction — raises the
    incarnation of every shard the node will serve as primary, before any
    verifier is returned or any grace instance named ([§4.1](#4.1%20A%20write%20is%20staged%20and%20acknowledged%2C%20and%20nothing%20more), [RFC 14 §4.2](rfc-14-open-state.md#4.2%20Grace%20makes%20volatile%20state%20safe)). A
@@ -658,15 +648,18 @@ and **MUST** report a change to them as a migration rather than apply it
    the extent is offered again; `MarkOffloaded` only ever sets bits.
 8. **Serve.** No file is served before step 3 has run for it.
 
-**A share attached at run time starts above its floor.** Before a journal serves
-a share it did not serve when it opened — a share added to the node, moved to it,
-recovered onto it, or made by a clone or a restore — the engine reads that share's
-version floor ([RFC 6 §8.3](rfc-6-block-metadata.md#8.3%20A%20file%27s%20refs%20and%20the%20version%20floor)) and its version limit, passes the larger to the journal's
-`Share` ([RFC 1 §3](rfc-1-journal.md#3.%20Interface)), which raises the version counter above it before it returns,
-and writes the share's limit at the journal's, as a tracked max-write — raising every served share's
-first, as step 1 does, when the raised counter leaves fewer versions than step
-1's raise trigger; for an imported share, it then strands the journal's
-unclaimed tags as step 5 does; only then is the share served. Imported refs keep the versions they
+**`SetShare` attaches a share above its floor.** Before a journal serves a share
+it did not serve when it opened — a share added to the node, moved to it,
+recovered onto it, or made by a clone or a restore — `SetShare` reads that
+share's version floor ([RFC 6 §8.3](rfc-6-block-metadata.md#8.3%20A%20file%27s%20refs%20and%20the%20version%20floor)) and its version limit, passes the larger to
+the journal's `Share` ([RFC 1 §3](rfc-1-journal.md#3.%20Interface)), which raises the version counter above it
+before it returns, and writes the share's limit at the journal's, as a tracked
+max-write — raising every served share's first, as [§2.7](#2.7%20The%20version%20limit) does, when the
+raised counter leaves fewer versions than its raise trigger; for an imported
+share, it then strands the journal's unclaimed tags as step 5 does. It opens the
+share's flow and raises the shard's incarnation before it publishes the
+context; a failure undoes these in reverse and publishes nothing. Only then is
+the share served. Imported refs keep the versions they
 were written at, and a new write staged at a lower version than an imported ref
 would lose to it: reported offloaded, released, and read back as the older,
 imported content.
@@ -693,19 +686,146 @@ offloaded bit is offered again:
 handover ([RFC 11](rfc-11-ownership.md)) — the new primary settles each file to the sealed or drained
 point ([RFC 10](rfc-10-journal-replication.md)) and runs steps 3, 4 and 6 for it before serving it.
 
-**Stop.**
+**Stop.** `Close(ctx)` runs these steps in one call, after the filesystem service
+has closed and while the metadata store is still open, so the last group commit
+can land.
 
 1. Refuse every call with `ErrUnavailable`.
 2. Stop the work queue dispatching new passes and batches, and commit every
    file's pending existence in a last group commit per journal, within the stop
    bound, so a clean stop leaves no append or hole fill for recovery to replay.
 3. Cancel in-flight passes and background loops, then join them.
-4. Close the components in the reverse of the order they were built — only after
-   every join has completed. A component **MUST NOT** be closed while any work
+4. Close what the engine opened — every share's flow, then its journal handles,
+   then the journals — in the reverse of the order they were opened, and nothing
+   it was handed, only after every join has completed. A component **MUST NOT** be closed while any work
    that uses it is still running ([RFC 1 §8.7](rfc-1-journal.md#8.7%20Shutdown)).
 5. A join that does not complete within its bound **MUST** leave the components
    it depends on open and report the failure, rather than close them under a
    live loop.
+
+### 2.6 Dependencies and wiring
+
+The composition root ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)) builds the engine with `New(Deps)`. `New`
+validates the settings and opens nothing; the engine closes only what it opens:
+the journals, their share handles, the flows.
+
+```go
+// Deps is what the composition root hands New. Every interface here is
+// declared beside the engine's code and holds only the methods §2.1's table
+// names; the root passes each component's concrete type.
+type Deps struct {
+	Devices  []string // one journal directory per device; Start opens each (§2.5 step 1)
+	Open     func(dir string, floor Version, expect JournalID) (Journal, error) // RFC 1 §3 Open
+	Carver   Carver   // RFC 2: Cut and the block assembler's fold
+	Syncer   Syncer   // RFC 3 §1.3: OpenFlow, one flow per share
+	Blocks   Blocks   // RFC 6 §10: the Existence and Content views
+	Refs     Refs     // RFC 16 §3.1: Inspect.Refs, for the reseed only
+	Gate     Gate     // RFC 12 §2.3: the per-shard cut gate every existence commit passes
+	Clock    Clock    // Now, Elapsed, After: the subset of the node's clock the engine reads
+	Settings Settings // node-level; New refuses an invalid one (§2.4)
+	Metrics  *metrics.Registry
+	Logger   *slog.Logger
+}
+```
+
+**Build, start and stop.** The root builds, in order: the metadata store; the
+syncer, registering every remote block store, ref-counted per configuration; the
+carver; the engine with `New(Deps)`, which opens nothing; GC; open state; the
+filesystem service. The runtime ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)) starts them in that order —
+the engine's `Start` opening the journals and attaching the shares the records
+say this node serves — and stops them in reverse. The engine closes only the
+journals, handles and flows it opened.
+
+| Component | Composed of | Depends on | Injected | Built by → owned by | Lifecycle |
+| --- | --- | --- | --- | --- | --- |
+| engine, `*Engine` | the share table, the journals, a work queue per journal, the passes, the speculator, verifier and fence state, the policy functions | everything in `Deps` | `Deps` | root, `New` → root | `New` opens nothing → `Start(shares)` → serving → `Close`, after the filesystem service and before the syncer and the store |
+| share table | the share contexts, copy-on-write ([§1.1](#1.1%20Neither%20a%20single%20point%20of%20failure%20nor%20a%20bottleneck)) | — | internal | engine → engine | swapped by `SetShare` and `ForgetShare` |
+| share context | its journal handles and flow, settings, budgets, policy state, health, state, the clones and copies admitted into it ([§9.1](#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)) | journal, syncer, metadata store | internal | engine at `Start` or `SetShare` → engine | adding → serving → removing → forgotten ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) |
+| journal, one per device | [RFC 1](rfc-1-journal.md) | its directory, `Clock`, its fault seam | `Deps.Devices`, `Deps.Open` | engine at `Start` step 1, once it has read the floor and identity → engine | closed by `Close` after every handle; never after a failed join ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), stop step 5) |
+| journal handle, one per share per journal | [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | its journal | the journal's `Share` | engine → share context | `Close` then the tag's `Forget` in `ForgetShare`; `Close` alone at node stop |
+| work queue, one per journal | one instance of the shared work scheduler with the engine's source ([§6.1](#6.1%20The%20work%20queue)) | journal statistics, the policy functions | internal | engine at `Start` step 6 → engine | its consumer starts at step 7; it stops dispatching at `Close` |
+| offload pipeline | one state machine per pass ([§6.3](#6.3%20The%20offload%20pipeline)) | the offer, carver, assembler, flow, `Blocks` | internal | work queue → the pass | joined by `Close`; a pass outlives no component (E13) |
+| speculator | per-open-file frontiers, pre-warm plans ([§7.4](#7.4%20The%20speculator)) | journal statistics, the flow's `Prefetch` | internal | engine → engine | memory only; cancelled by `Close` |
+| carver and block assembler | [RFC 2](rfc-2-carver.md) | — | `Deps.Carver` | root → root | stateless |
+| syncer | [RFC 3](rfc-3-syncer.md), shared pools | the remote block stores | `Deps.Syncer` | root → root | the engine opens one flow per share at attach and closes it in `ForgetShare` or `Close`; the root closes the syncer after the engine |
+| remote block store | [RFC 4](rfc-4-remote-tier.md)'s codec, [RFC 5](rfc-5-transforms.md)'s transforms | — | reached only through the share's flow | root, registered with the syncer, ref-counted per configuration → root | open while any flow names it |
+| metadata store | [RFC 16](rfc-16-metadata-store.md), with [RFC 6](rfc-6-block-metadata.md)'s views | — | `Deps.Blocks`, `Deps.Refs` | root → root | never closed by the engine |
+| cut gate, one per shard | [RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate) | — | `Deps.Gate` | root → root | — |
+| clock, metrics, logger | one per node | — | `Deps` | root → root | — |
+
+### 2.7 The version limit
+
+The floor the journal opens with is, per share, the larger of the version
+floor and the share's **version limit** `S‖id‖vl` ([RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)), so the
+counter restarts above every version a crash may have lost
+([RFC 7 §9.4](rfc-7-namespace-metadata.md#9.4%20The%20change%20attribute%20and%20ctime%20never%20move%20backward)). At start ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), step 1), before any version is issued, the engine writes
+every served share's limit at the journal's next version, as `Stats`
+reports it ([RFC 1 §3.7](rfc-1-journal.md#3.7%20State%20introspection)), plus one block (proposal: 2²⁴ versions; the counter
+is 64-bit), and passes it with `SetVersionLimit`
+([RFC 1 §4.3](rfc-1-journal.md#4.3%20Versions)) once every write has committed. While the journal serves, the engine raises every served
+share's limit by a block whenever `Stats` shows fewer
+versions left than the larger of half a block and the journal's peak version
+rate times the margin, and passes the new limit only after every share's
+raise has committed. Both run in as many transactions as the key budget `K`
+takes — 10⁴ shares are 2 × 10⁴ keys — never one over every share (E40). It
+evaluates that trigger on every version it issues. The **peak version rate** is the highest
+count of versions drawn in any one second of the last 60 s; the **margin** is
+30 s plus the existence age ([§5.1](#5.1%20Commit%20is%20answered%20by%20the%20journal)) plus one second, the trigger's own
+sampling: the self-fence counts from the last commit, which can precede the
+stall by up to one existence age. So a metadata stall that begins just as a
+raise falls due leaves at least the self-fence's 30 s of versions at the peak
+rate ([§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here)), and writes go on being acknowledged until the fence trips; half
+a block of 2²⁴ covers about 260 000 versions a second for that 32 s margin
+before the rate term raises earlier. **Every write of `S‖id‖vl` — this one at
+start, the one at attach ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)) and every raise — is a tracked max-write**: it
+writes the larger of the value it reads, tracked, and its own, never blindly.
+**(cluster)** A share whose shards are served by several journals has one
+limit, and a write from a journal with a lower counter would otherwise lower
+it below versions another journal has reported. A write that reaches the
+limit first is refused as retry-later ([§10.2](#10.2%20A%20capacity%20refusal%20comes%20back%20here)).
+
+> decision: the headroom is sized by time, not by count alone, so that the
+> version limit does not refuse writes before the 30 s self-fence would at
+> any rate the last minute has seen. The block size is a proposal; overturned
+> by the sustained-rate stall check of [§15.2](#15.2%20Group%20B%20%E2%80%94%20wedging) failing at a measured peak
+> rate, which then sets the block.
+
+> ponytail: the trigger looks back one minute, so a burst at a stall's start
+> faster than the larger of about 280 000 versions a second (half a block
+> over 30 s) and 1.07 × the last minute's peak (32 s of it over 30 s) spends
+> the headroom before the fence: 500 000 a second after a minute at 100 000
+> is refused retry-later about 13 s before the fence would. The cost is
+> `ErrDelay` with `DelayCommit`, a retry, never a failure. Raise by a larger
+> block, or size the margin from the device's peak IOPS rather than the
+> last minute, when [§15.2](#15.2%20Group%20B%20%E2%80%94%20wedging)'s burst check is refused at a rate a
+> deployment reaches.
+
+### 2.8 Package layout
+
+```text
+pkg/block/engine/            the engine (this RFC)
+  engine.go                  New, Start, Close (§2.5, §2.6)
+  deps.go                    Deps and the interfaces it holds, each with the methods §2.1's table names
+  share.go                   SetShare, StopShare, ForgetShare, the share table (§2.3)
+  recover.go                 Start steps 1–8, the reseed (§2.5); the version limit (§2.7)
+  write.go commit.go         Write, Draw (§4); Commit, the verifier, the loss sequence (§5.1)
+  groupcommit.go             the group commit and its split (§5.2)
+  cut.go                     PrepareCut, CommitCut (§5.1)
+  read.go overlay.go         Read, resolution, re-resolution (§7); Overlay, Allocation
+  remove.go copy.go          Truncate, Deallocate, Delete (§8); Clone, Copy (§9)
+  capacity.go evict.go       admission, pacing, the refusal table (§10.2); eviction, repack (§10.1, §10.3)
+  health.go fence.go         health, conditions, Stats, WaitOffloaded (§11.1, §11.4); the self-fence (§11.2)
+  policy.go                  the five policy functions (§3.1)
+  speculate.go               the speculator, PreWarm (§7.4)
+  queue.go                   the engine's source for the shared work scheduler, per journal (§6.1)
+  offload/                   the pipeline state machine (§6.3–§6.8): capture, carve, assemble, intent, put, commit, report
+  arch_test.go               §15.3's architecture test
+pkg/sched/                   the shared work scheduler (§6.1.1), used by the engine and GC
+```
+
+`offload/` is the one subpackage. It is the largest state machine, and its tests
+import only fakes of the offer, the carver, a flow and `Blocks`, so the import
+rule enforces its boundary.
 
 ## 3. Policy
 
@@ -925,9 +1045,18 @@ after a loss, each client resends its recent unstable writes once.
   recoverable (**proposal**: 1 s, the `existence_age` setting), and always before
   an offer captures the file, before a removal's first transaction, before a size
   or time set ([RFC 7 §9.5](rfc-7-namespace-metadata.md#9.5%20An%20explicit%20time%20outlives%20the%20writes%20staged%20before%20it)), and behind a snapshot cut's closed gate.
+- **The existence commit records usage, then releases the reservation.** The
+  existence commit that commits a write also records the usage it adds
+  ([RFC 16 §4.4](rfc-16-metadata-store.md#4.4%20Counters%20that%20many%20writers%20change)) and then calls the write's `Done`, so the filesystem
+  service releases its quota reservation only once the usage is visible
+  ([RFC 17 §5.6](rfc-17-vfs.md#5.6%20Quota)). A recovery commit records the usage the same way;
+  nothing waits on a `Done` after a restart.
 - **A cut closes the gate first, then sets a point per journal.** The pre-cut
   commit is [RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate)'s, which owns its steps — what is synced and committed
-  with the gate still open, when, and what is left behind it. Behind the closed
+  with the gate still open, when, and what is left behind it. It reaches the
+  engine as two calls per shard: `PrepareCut`, with the gate open, and
+  `CommitCut`, behind the closed gate. The gate is `Deps.Gate`
+  ([§2.6](#2.6%20Dependencies%20and%20wiring)), and every existence commit passes it. Behind the closed
   gate the primary takes a **cut point** in every journal holding the shard's
   files — the position below which lies every write it has acknowledged — and
   commits the shard's remaining pending existence up to those points, in
@@ -1002,6 +1131,12 @@ after a loss, each client resends its recent unstable writes once.
   compare against the wrong one: open state resets a persistent open's
   `LossSeen` to 0 when it reinstates the open after a restart
   ([RFC 14 §8.1](rfc-14-open-state.md#8.1%20SMB%20durable%20and%20persistent%20opens)).
+
+  > ponytail: the loss sequence is a journal-wide floor plus a per-file entry
+  > only for files whose own loss raised them above it, so a missed ring or a
+  > device loss raises the floor, not 10⁸ entries; a file's sequence is the
+  > larger. Upgrade to per-file entries throughout only if a protocol needs to
+  > tell two files' losses apart below the floor.
 - **A commit is reported only once durable.** Every metadata transaction the
   engine commits — existence, offload, removal, intent — **MUST** be durable in
   the metadata store when the store reports it committed ([RFC 16](rfc-16-metadata-store.md)). The
@@ -1516,7 +1651,8 @@ against the production oracle and block metadata, and asserts the read.
   captured namespace is no longer the share's write namespace; its content is
   re-offered and carved again. When a re-home switches the write namespace
   ([RFC 27 §2.7](rfc-27-namespace-migration.md#2.7%20Moving%20one%20share%20out%20of%20a%20shared%20namespace)), the primary joins every pass captured under the old one
-  before it acknowledges the switch. A pass carved under one namespace whose
+  before it acknowledges the switch: the `SetShare` naming the new write
+  namespace returns only then ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)). A pass carved under one namespace whose
   blocks were put in the next would hold chunk IDs keyed under the first, which
   every later read, hashing under the second's key, fails as corrupt.
 - Before the put, it durably records a **put intent** for the name, carrying the
@@ -2355,7 +2491,7 @@ is told from an unreachable one:
 | --- | --- | --- |
 | the journal's capacity or the share's journal limit | unreclaimed bytes remain, or dirty bytes with the store put-healthy, slow, or put-unhealthy with cause `ErrTransient` (an outage the client waits out) | `ErrDelay` (retry-later), for as long as the cause lasts; it **never** becomes `ErrNoSpace` because a deadline ran out |
 | the journal's capacity or the share's journal limit | nothing without an operator: the held bytes are all dirty and the store is put-unhealthy with cause `ErrDenied` of cause quota (the service is full), access (the credential is refused) or size (a body limit refusing blocks), or `ErrDrift` — a setting read back different, never a `Recheck` call that failed, which is `ErrTransient` ([RFC 3 §1.3](rfc-3-syncer.md#1.3%20Interface)) — or an operator's retention pin holds them, or the device itself is out of space — a roll that can make no spare for that reason included ([RFC 28 §2.2](rfc-28-journal-format.md#2.2%20Segments)); and any write on a node started from a copied image, before an operator has answered ([§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here)) | `ErrNoSpace` at once |
-| the journal's version limit ([RFC 1 §4.3](rfc-1-journal.md#4.3%20Versions)) — a `WriteAt`, `Draw` or header-only record | the raise of every served share's limit ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)), already under way | `ErrDelay` (retry-later) until the raise commits; the headroom of [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) lasts past the 30 s self-fence at the peak version rate, so a stalled store reaches this row only after the fence of [§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here) already answers writes `ErrDelay` |
+| the journal's version limit ([RFC 1 §4.3](rfc-1-journal.md#4.3%20Versions)) — a `WriteAt`, `Draw` or header-only record | the raise of every served share's limit ([§2.7](#2.7%20The%20version%20limit)), already under way | `ErrDelay` (retry-later) until the raise commits; the headroom of [§2.7](#2.7%20The%20version%20limit) lasts past the 30 s self-fence at the peak version rate, so a stalled store reaches this row only after the fence of [§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here) already answers writes `ErrDelay` |
 | the journal's index bound ([RFC 1 §4.2](rfc-1-journal.md#4.2%20The%20index%20is%20bounded%20by%20extent%20count%2C%20not%20by%20bytes)) — a content write, or a release or deallocate that would split a held extent past its cap | offload, eviction and repack, which lower the count | `ErrDelay` (retry-later, cause capacity) for as long as they can lower it; when none can — the held extents all dirty and the store put-unhealthy for a cause the second row names — `ErrNoSpace` at once, as that row answers |
 | a segment roll that finds no spare ready ([RFC 28 §2.2](rfc-28-journal-format.md#2.2%20Segments)) — refused at once with `ErrNoSpace` naming the limit `spare`, never the journal's maximum, never waited for inside the journal, and counted by the journal's `spare_refusals` ([RFC 1 §6](rfc-1-journal.md#6.%20Capacity)) | a retired segment recycled, or a spare made, in the background | `ErrDelay` (retry-later, cause capacity); a spare that cannot be made because the device is out of space is the second row's device case, `ErrNoSpace` at once |
 | a logical quota on the share, principal or project ([RFC 17 §5.6](rfc-17-vfs.md#5.6%20Quota)) | — | `ErrQuota` at once, from the filesystem service before the write reaches the engine |
@@ -2805,7 +2941,7 @@ the work queue [§6.1](#6.1%20The%20work%20queue), the offload pipeline [§6.3](
 | [§8.3](#8.3%20A%20pass%20in%20flight%20survives%20a%20removal%20under%20it) transfer survives a removal | Stall a pass's upload; truncate the file below the offered extent; release the upload. Assert the upload completes, the commit drops the refs past the new size, drops a straddler whole and re-offers its outside part, applies the rest, and the truncated extent reads as past end of file. Run both commit orders. Repeat with deallocate, release and a clone onto the file. |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) restart re-offer | Crash after a put and before its commit; restart. Assert the extents are offered again under a new name, the first object stays unrecorded with its intent, collection removes both once the epoch is superseded, and reads are correct. Crash after a commit, before `report`; assert the re-offer carries every chunk, its commit finds every ref already committed and writes none, its block is born dead, and the extents become evictable. |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) journal gone | Write to two shares on one device journal without offloading; stop; delete the journal directory; start. Assert both shares are refused, each named, and no journal is created. Acknowledge the loss; assert the shares serve, and a read of the unoffloaded extent fails as **Lost**, never zeros. Repeat with the shard's journal replicated (cluster): assert it rejoins from a replica with no operator action. |
-| [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) version limit | Start with a block of 16 versions; assert `S‖id‖vl` is committed before the first write is accepted. Write unstably until fewer than 8 remain; assert the limit is raised in a committed transaction before the journal is given it. Block the raise's commit; assert the write that reaches the limit answers `ErrDelay`, not `ErrNoSpace`, and succeeds once the raise commits. Crash with a reported, unsynced version; restart; assert no version is issued again. |
+| [§2.7](#2.7%20The%20version%20limit) version limit | Start with a block of 16 versions; assert `S‖id‖vl` is committed before the first write is accepted. Write unstably until fewer than 8 remain; assert the limit is raised in a committed transaction before the journal is given it. Block the raise's commit; assert the write that reaches the limit answers `ErrDelay`, not `ErrNoSpace`, and succeeds once the raise commits. Crash with a reported, unsynced version; restart; assert no version is issued again. |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) attach above the floor | Move a share whose refs reach version 9·10⁸ onto a node whose journal's counter is near 2·10⁶; write over an extent the imported refs cover, offload, evict, read. Assert the new write's version exceeds 9·10⁸ and the read returns the new bytes. Repeat for a clone and a restore into the node. Remove the raise: the read returns the imported content. |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) attach after a device loss | Write unstably to a share, the metadata store stalled so none commits, until its journal has reported versions far above its version floor; destroy the device, acknowledge the loss, and attach the share to a new journal whose counter starts at 0. Assert the counter is raised above the share's version limit `S‖id‖vl` as well as its floor, so no version the lost journal reported is issued again, and a write after the attach reads back. Assert too that the attach wrote the limit as a tracked max-write, the incarnation and the verifier changed, and a share whose `rm` row reads offloaded was not attached. An attach that raises only above the floor reissues those versions ([RFC 0 §1.4](rfc-0-data-lifecycle.md#1.4%20The%20single-node%20profile)). |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) reseed gates offer and eviction | Crash after an offload commit with its durable record unsynced, with the journal full; restart. Assert the block is not put again, and no extent of a file is evicted before the reseed has visited that file. Restart with a bit whose ref was deleted behind the journal: assert a ledger mismatch is reported, the bit is cleared with `Unmark`, the extent is offered again and never evicted before that offer commits. |
@@ -2865,8 +3001,8 @@ the work queue [§6.1](#6.1%20The%20work%20queue), the offload pipeline [§6.3](
 | [§1.1](#1.1%20Neither%20a%20single%20point%20of%20failure%20nor%20a%20bottleneck) no cross-share slowdown | Run N shares with M writers each on one node; saturate one share with writes and cold reads. Assert every other share's p99 write and read latency stays within its unloaded baseline's bound, and `engine_lock_wait_seconds` shows no area whose wait grows with the loaded share's rate. |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) join | Close with an offload parked in a stalled put. Assert no component is closed while the pass runs. |
 | [§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here) self-fence threshold | Stall the store for 10 s: assert writes are still acknowledged. Stall it for 31 s: assert writes and stability points answer `ErrDelay`, reads are served, a condition names the store, and once a write commits, writes resume with the verifier unchanged. |
-| [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) version limit under sustained load | Write at the measured peak version rate (4 KiB writes at the device's peak IOPS) and stall the store just as a raise falls due, its last commit one existence age before the stall. Assert writes are acknowledged for the first 10 s and until the self-fence trips at 30 s, never refused by the version limit first. Hold the rate below the trigger, then raise it in one step: assert the raise is due on the next draw, not on a timer. A limit raised only below half a block of 2²⁰ refuses within seconds. |
-| [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) burst at a stall's start | With a block of 2²⁴, write at 100 000 versions a second for a minute, then stall the store and raise the rate in one step. At 250 000 a second assert no write is refused by the version limit before the self-fence trips. At 500 000 a second assert the refusals are `ErrDelay` with `DelayCommit`, never `ErrNoSpace`, and begin no sooner than the ponytail's bound, about 13 s before the fence; once the store returns and the raise commits, writes are acknowledged again. |
+| [§2.7](#2.7%20The%20version%20limit) version limit under sustained load | Write at the measured peak version rate (4 KiB writes at the device's peak IOPS) and stall the store just as a raise falls due, its last commit one existence age before the stall. Assert writes are acknowledged for the first 10 s and until the self-fence trips at 30 s, never refused by the version limit first. Hold the rate below the trigger, then raise it in one step: assert the raise is due on the next draw, not on a timer. A limit raised only below half a block of 2²⁰ refuses within seconds. |
+| [§2.7](#2.7%20The%20version%20limit) burst at a stall's start | With a block of 2²⁴, write at 100 000 versions a second for a minute, then stall the store and raise the rate in one step. At 250 000 a second assert no write is refused by the version limit before the self-fence trips. At 500 000 a second assert the refusals are `ErrDelay` with `DelayCommit`, never `ErrNoSpace`, and begin no sooner than the ponytail's bound, about 13 s before the fence; once the store returns and the raise commits, writes are acknowledged again. |
 | [§2.1](#2.1%20Content%20composition) one clock | Run the node with two `TestClock`s — one for the embedded metadata store's `Now`, whose clamped wall clock is otherwise the node's own ([§2.1](#2.1%20Content%20composition)), and one, 5 % fast, for every other component — and run [RFC 0 §1.4](rfc-0-data-lifecycle.md#1.4%20The%20single-node%20profile)'s clock-bound check through it: assert every wait on another clock's timeout ends no sooner than its bound by the slow clock. A component that reads a private clock does not skew, and the check names it. |
 | [§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here) self-fence on an erroring store | Make every write transaction fail at once while reads succeed: assert the engine fences after 30 s and resumes once a write commits. Leave the node idle with no write for 60 s: assert it does not fence. A trigger on "no transaction completed" never fires on the first. |
 | [§11.2](#11.2%20Every%20condition%20in%20RFC%200%20%C2%A710%20has%20its%20engine%20behaviour%20here) metadata store lost | Delete the single node's metadata store and start. Assert no share is served until the recovery import runs, files then read as of the last catalog backup, and GC waits for the operator. |
@@ -2929,6 +3065,13 @@ enough to exhaust the local device's write cache.
 5. **Group-commit bound** ([§5.2](#5.2%20Group%20commit%20is%20bounded%2C%20and%20retries%20only%20the%20files%20that%20conflict)): `G` is unmeasured.
 6. **Unspecified policy**: upload delay for data young enough to be overwritten,
    and manual sync.
+7. **Who holds the cut gate** (`Deps.Gate`, [§2.6](#2.6%20Dependencies%20and%20wiring)): neither
+   [RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate) nor [RFC 17](rfc-17-vfs.md) names the component that holds the per-shard
+   cut gate every existence commit passes.
+8. **`WriteOpts.Done` or a byte count** ([§5.1](#5.1%20Commit%20is%20answered%20by%20the%20journal), [§12.1](#12.1%20One%20content%20interface%2C%20called%20by%20the%20filesystem%20service)): whether the
+   engine computes the usage a write adds from the existence change and calls
+   `Done`, or is told the charge as a `Charge int64`, depends on how
+   [RFC 16 §4.4](rfc-16-metadata-store.md#4.4%20Counters%20that%20many%20writers%20change)'s counters are keyed by owner.
 
 ## Appendix A — where the current code differs
 
@@ -2942,7 +3085,7 @@ One line per requirement.
 | [§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context) one journal per device | one journal per share |
 | [§2.4](#2.4%20Settings%20are%20validated%20once%2C%20and%20refused%20rather%20than%20replaced) settings refused | invalid chunking settings replaced by defaults; no profile record |
 | [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) start order | no floor, no existence replay, no ledger; a bounded join, then close under running loops |
-| [§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) version limit | none: no version counter is shared with metadata, so nothing bounds versions a crash may reissue |
+| [§2.7](#2.7%20The%20version%20limit) version limit | none: no version counter is shared with metadata, so nothing bounds versions a crash may reissue |
 | [§4.1](#4.1%20A%20write%20is%20staged%20and%20acknowledged%2C%20and%20nothing%20more) `Draw` | a metadata change takes its change attribute from the store's clock (`ctime`), never from the journal |
 | [§9.1](#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally) clone-kind source open | no record holds the source during a clone, and nothing holds back removals of its destination |
 | [§3.1](#3.1%20Policy%20is%20decided%20here%20and%20executed%20below), [§6.2](#6.2%20When%20a%20file%20is%20offered) offload policy here | thresholds are journal configuration |
@@ -2966,3 +3109,15 @@ One line per requirement.
 | [§5.1](#5.1%20Commit%20is%20answered%20by%20the%20journal) commit answered by the journal | a per-share setting makes commit wait for an inline offload |
 | [§12.3](#12.3%20The%20engine%20writes%20no%20residency) no residency writes | the engine marks extents remote and pins journal versions |
 | E1 no dead state | a read cache is started and never consulted |
+
+## Appendix B — Migration
+
+Ordered so the code stops lying first:
+
+1. One composition root, no setters ([Appendix A](#Appendix%20A%20%E2%80%94%20where%20the%20current%20code%20differs), its first three rows).
+2. `Deps`, `New`, `Start` and `Close` on today's engine ([§2.6](#2.6%20Dependencies%20and%20wiring)).
+3. One journal per device ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)).
+4. The interface of [§12.1](#12.1%20One%20content%20interface%2C%20called%20by%20the%20filesystem%20service) beside the old one, and the filesystem service
+   moved to it.
+5. Policy out of the journal ([§3.1](#3.1%20Policy%20is%20decided%20here%20and%20executed%20below)).
+6. The old surface deleted.
