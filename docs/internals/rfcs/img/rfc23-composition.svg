@@ -23,13 +23,14 @@
 
   <rect x="200" y="64" width="500" height="44" rx="6" class="pr"/>
   <text x="214" y="83" class="l">adapters: configured → serving</text>
-  <text x="214" y="99" class="s">protocol role · readiness turns true when all are serving</text>
+  <text x="214" y="99" class="s">protocol role · then sidecars synced · readiness turns true when all are serving</text>
   <text x="44" y="90" class="s">5 · adapters last</text>
-  <text x="726" y="83" class="s">1 readiness false</text>
-  <text x="726" y="99" class="s">2 drain and stop</text>
+  <text x="726" y="78" class="s">1 readiness false</text>
+  <text x="726" y="92" class="s">2 sidecars withdrawn,</text>
+  <text x="726" y="105" class="s">drain, stop</text>
 
   <rect x="200" y="120" width="500" height="44" rx="6" class="pr"/>
-  <text x="214" y="146" class="l">router · filesystem service</text>
+  <text x="214" y="146" class="l">router · client-address agent · filesystem service</text>
   <text x="44" y="146" class="s">5 · protocol role</text>
   <text x="726" y="146" class="s">2 after the adapters</text>
 
@@ -41,7 +42,7 @@
   <text x="726" y="211" class="s">4 runner releases claims</text>
 
   <rect x="200" y="232" width="500" height="44" rx="6" class="sv"/>
-  <text x="214" y="251" class="l">shard placement · content subsystem · a context per share</text>
+  <text x="214" y="251" class="l">content subsystem · contexts · namespace · open state</text>
   <text x="214" y="267" class="s">in RFC 8's order</text>
   <text x="44" y="258" class="s">4 · storage role</text>
   <text x="726" y="251" class="s">5 hand shards over,</text>

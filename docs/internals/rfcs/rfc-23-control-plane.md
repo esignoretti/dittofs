@@ -99,7 +99,7 @@ Under this RFC:
 4. Both operators' writes, refusals included, are in the **audit log** with
    who, when, from where and the generation before and after (§6).
 
-![A node's composition: the start order on the left — refuse, metadata store, health endpoints, runtime load, storage components in RFC 8's order, the operation runner and the management API, then the protocol components with adapters last — and the stop order on the right, the exact reverse, with the API kept until adapters have drained](img/rfc23-composition.svg)
+![A node's composition: the start order on the left — refuse, metadata store, health endpoints, runtime load, the content subsystem with its share contexts, namespace metadata and open state, the operation runner and the management API, then the router, the client-address agent and the filesystem service, then adapters and the sidecars synced with them — and the stop order on the right, the exact reverse: sidecars withdrawn before the adapters drain, and the API kept until adapters have drained](img/rfc23-composition.svg)
 
 **The words you need.**
 
@@ -299,6 +299,114 @@ make the share's existence depend on which node took the request.
 > faster than the one-second generation read, and then shorten the read, not the
 > path.
 
+**What the root builds, and who owns it.** Every constructor opens nothing and
+starts no goroutine. Each component has one owner, the one that closes it. The
+lifecycle column names only the calls the owning RFC states.
+
+| Component | Built by | From | Owner (closes it) | Lifecycle | Start / stop step (§2.2) |
+| --- | --- | --- | --- | --- | --- |
+| clock, fault seam ([RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition)) | root | — | root | none: values | before 1 / at exit |
+| metrics registry, logger | root | the host's bootstrap | root | none: values | before 1 / at exit |
+| pools ([RFC 24 §2.3](rfc-24-resources.md#2.3%20The%20pools)) | root | the node's limit ([RFC 24 §2.1](rfc-24-resources.md#2.1%20One%20limit%2C%20learned%20once)) | root | stated by RFC 24 (pending) | before 2 / at exit |
+| metadata store ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)) | root, `metadata.Open` | the KV, the host's bootstrap | runtime | `Open`; its close stated by RFC 16 (pending) | 2 / 6 |
+| remote store clients ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)) | root, one per store configuration | the store configuration, its `Secret` | the stores opened on it; the last store's `Close` releases it | a store's `Close` | 4 / 5 |
+| content subsystem: engine, journals, carver, syncer, GC ([RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition)) | root, in RFC 8 §2.1's order | RFC 8 §2.1's tables | runtime, as one unit | RFC 8 §2.5's start and stop | 4 / 5 |
+| share contexts ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) | runtime, through `Content` | the share's records | the content subsystem | `Content` (below) | 4, and while serving / 5 |
+| namespace metadata, open state ([RFC 14](rfc-14-open-state.md)) | root; open state by `openstate.New` ([RFC 17 §2.3](rfc-17-vfs.md#2.3%20Dependencies%20and%20wiring)) | the metadata store | runtime | stated by RFC 14 (pending) | 4 / 5 |
+| identity resolver, authenticator ([RFC 18 §3.1](rfc-18-identity.md#3.1%20The%20authentication%20interface)) | root | stated by RFC 18 (pending) | runtime | stated by RFC 18 (pending) | before the API and the service / after both |
+| event sink, spool, admin-stream writer ([RFC 25 §4.3](rfc-25-observability.md#4.3%20From%20the%20emit%20point%20to%20the%20spool)) | root | stated by RFC 25 (pending) | runtime | stated by RFC 25 (pending) | before the service / after its `Close` |
+| operation runner (§4.6) | root | the store view, the component calls of §4.6 | runtime | `Runner` (below) | 4 / 4 |
+| the API address: health endpoints and management API (§2.5, §4) | root | the store's `ControlPlane` view, the validator table (§4.3), identity, RFC 25's health registry | runtime | `API` (below) | 2 and 4 / 3, and at exit |
+| metrics listener ([RFC 25 §2.8](rfc-25-observability.md#2.8%20Export)) | root | the registry; its address from the host's bootstrap (§2.5) | runtime | opened by `API.Listen` | 2 / at exit |
+| router, client-address agent ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)) | root | stated by RFC 15 (pending) | runtime | stated by RFC 15 (pending) | 5 / 2 |
+| filesystem service ([RFC 17 §2.5](rfc-17-vfs.md#2.5%20Lifecycle)) | root, `vfs.New` | RFC 17 §2.3's `Deps` | runtime | `Start`, `Drain`, `Close` | 5 / 2 |
+| adapters ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)) | runtime, through the root's `AdapterFactory` | `core.Deps`, the adapter's settings | runtime | `Start`, `Reconfigure`, `Stop` | 5 / 2 |
+| sidecars ([RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars)) | root | — | runtime | `Sync` | 5 / 2 |
+| **(cluster)** shard placement ([RFC 11](rfc-11-ownership.md)), pNFS data server ([RFC 15 §5.1](rfc-15-topology.md#5.1%20pNFS)) | root | stated by RFC 11 and RFC 15 (pending) | runtime | stated by RFC 11 and RFC 15 (pending) | 4 / 5 |
+
+The root builds every component and hands them to the runtime, which from then
+on makes every lifecycle call; no adapter drives the service's lifecycle. Two
+exceptions are built after start, because records decide them:
+
+- share contexts, which the runtime attaches through the engine;
+- adapters, which the runtime builds through the factory of
+  [RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface).
+
+The content subsystem is one unit: its internal start and stop, which closes its
+journals, syncer and GC, are [RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)'s.
+
+**The runtime's surface.** The runtime declares, beside its own code, what it
+drives, so it imports no component's implementation:
+
+```go
+package runtime // pkg/controlplane/runtime
+
+// Deps is everything the runtime drives. The root builds each value and starts
+// none; a field is nil where the node lacks the role.
+type Deps struct {
+	Records  Records                   // the runtime's store view; not RFC 16's ControlPlane, the API's write view
+	Content  Content                   // storage: the content subsystem as one unit
+	Runner   Runner                    // storage: the operation runner (§4.6)
+	API      API                       // the node's API address (§2.5)
+	Service  Service                   // protocol: the filesystem service (RFC 17 §2.5)
+	Adapters map[string]AdapterFactory // by protocol name; AdapterFactory is RFC 20 §3.4's
+	Sidecars []Sidecar                 // RFC 20 §3.5
+	Clock    clock.Clock
+	Metrics  *metrics.Registry
+	Logger   *slog.Logger
+}
+
+// Records is the desired state and the node's own report.
+type Records interface {
+	List(ctx context.Context, kind Kind, after string) iter.Seq2[Record, error] // paged (RFC 16 §3.1)
+	Counters(ctx context.Context) (Counters, error)                            // settings, share list, principals
+	PutNodeStatus(ctx context.Context, s NodeStatus) error                     // §2.4
+}
+
+// Content holds one call per row of §2.3's table that reaches the content subsystem.
+type Content interface {
+	Start(ctx context.Context, shares []metadata.Share) error                      // RFC 8 §2.5, over every share this node serves at once
+	Attach(ctx context.Context, s metadata.Share) error                             // a share created while serving
+	SetState(ctx context.Context, id metadata.ShareID, st metadata.ShareState) error // quiescing and back
+	Apply(ctx context.Context, r Record) error                                      // a live or next-write setting: a share's or a remote store's
+	Replace(ctx context.Context, s metadata.Share) error                            // its backends changed
+	Detach(ctx context.Context, id metadata.ShareID) error                          // at the step its removal names (RFC 16 §2.3.2)
+	Stop(ctx context.Context) error                                                 // RFC 8 §2.5's stop
+}
+
+// Runner, API and Service hold only the calls §2.2 makes.
+type Runner interface {
+	Start(ctx context.Context) error // resumes the operations this node holds
+	Stop(ctx context.Context) error  // leaves each at its last durable step and releases its claim
+}
+
+type API interface {
+	Listen(ctx context.Context) error   // start step 2: the API address and the metrics listener open
+	Serve(ctx context.Context) error    // start step 4: /api/v1 accepts calls
+	Shutdown(ctx context.Context) error // stop step 3: calls in flight run to their answer
+}
+
+type Service interface {
+	Start(ctx context.Context) error
+	Drain(ctx context.Context) error
+	Close() error
+}
+
+func New(d Deps) (*Runtime, error)               // checks Deps; opens and starts nothing
+func (r *Runtime) Run(ctx context.Context) error // §2.2's start, reconcile until ctx ends, then §2.2's stop
+```
+
+The runtime exports no status call. Readiness and conditions come from
+[RFC 25](rfc-25-observability.md#3.%20Health)'s health registry, which the root
+hands the API, so the API never calls the runtime and the runtime, which holds
+the API, forms no cycle with it.
+
+> decision: the runtime exports `New` and `Run` only. Start and stop are one
+> function, so no caller can run half of either, and a runtime is not
+> restartable: a second `Run` is an error. Overturned if something other than
+> the server's start command and the test harness must drive a node's
+> lifecycle, and then by a second root, not by exporting the steps.
+
 ### 2.2 Start and stop
 
 **Start.** Each step completes before the next begins:
@@ -308,35 +416,56 @@ make the share's existence depend on which node took the request.
    nothing.
 2. **Open the metadata store** and read its format record
    ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)). From here the node's health endpoints answer
-   (§2.5): live, not ready.
+   (§2.5): live, not ready. The node's API address opens here. Until step 4,
+   every `/api/v1` route but `/api/v1/health` answers `503` `starting`. On a
+   node without `storage` every `/api/v1` route but `/api/v1/health` answers
+   `404`.
 3. **Load the runtime.** Register the node's version ranges and roles in its
    node record ([RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap)) — refusing to go on if an active version lies
    outside them — then read the settings, the share list and the principals
-   generation, and apply the provisioning file if one is named
+   generation, and, with `storage`, apply the provisioning file if one is named
    ([RFC 13 §2.4](rfc-13-configuration.md#2.4%20Records%20can%20be%20declared%20in%20a%20provisioning%20file)).
-4. With `storage`: the **content subsystem and shard placement** in the order
-   [RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) and RFC 15 give; then a share context for every share the
-   records say this node serves; then the **operation runner** (§4.6), which
-   resumes the operations this node holds; then the **management API**, which
-   starts accepting calls.
-5. With `protocol`: the router and the filesystem service, then the
-   **adapters**, each from configured to serving as its records say, then the
-   **sidecars**, synced with the adapters now serving. Readiness turns true once
-   every adapter the records enable is serving.
+4. With `storage`, in this order:
+   - **(cluster)** shard placement ([RFC 11](rfc-11-ownership.md));
+   - the **content subsystem**, in [RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)'s order, handed the whole
+     set of shares this node serves in one call;
+   - **namespace metadata and open state** for the shards this node acquires
+     ([RFC 14](rfc-14-open-state.md));
+   - **(cluster)** the pNFS data server;
+   - the **operation runner** (§4.6), which resumes the operations this node
+     holds;
+   - the **management API**, which starts accepting calls.
+
+   Only a share created while the node serves is attached alone.
+5. With `protocol`, in this order:
+   - the router and the client-address agent;
+   - the filesystem service (`Start`, [RFC 17 §2.5](rfc-17-vfs.md#2.5%20Lifecycle));
+   - the **adapters**, each from configured to serving as its records say, then
+     the **sidecars**, synced with the adapters now serving.
+
+   Readiness turns true once every adapter the records enable is serving.
 
 **Stop.** The reverse, and each step completes before the next:
 
 1. Readiness turns false, so whatever steers clients stops sending them
    ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)).
-2. Sidecars are synced with the empty set, so nothing is advertised that is
-   about to stop; then adapters drain and stop, then the router and the
-   filesystem service.
+2. In this order:
+   - sidecars are synced with the empty set, so nothing is advertised that is
+     about to stop;
+   - every adapter is `Stop`ped, which drains it
+     ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)), all of them concurrently, under one
+     drain deadline;
+   - then the filesystem service's `Drain`, then its `Close`
+     ([RFC 17 §2.5](rfc-17-vfs.md#2.5%20Lifecycle));
+   - then the router and the client-address agent.
 3. The management API stops accepting calls; calls in flight run to their answer
    within the drain deadline.
 4. The operation runner stops: each operation it drives is left at its last
    durable step, and its claim is released (§4.6).
-5. With `storage`: shards are handed over ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)), share contexts
-   are joined and closed, then the content subsystem in RFC 8's reverse order.
+5. With `storage`: **(cluster)** the pNFS data server stops and shards are
+   handed over ([RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries)); then namespace metadata and open state; then the
+   content subsystem in RFC 8 §2.5's reverse order, which joins and closes
+   every share context.
 6. The metadata store closes last.
 
 The API outlives the adapters on purpose: an operator watching a drain reads its
@@ -344,6 +473,12 @@ progress through the API. A failure at any start step stops the start, closes
 what the earlier steps opened in reverse, and leaves `/health/ready`
 answering `not ready` and `/api/v1/health` naming the step and its error until
 the process exits.
+
+**A stop step that misses its bound** leaves open every component that a later
+step would close under it, and the stop goes on to the steps that do not depend
+on it ([RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), step 5). The process then exits non-zero, naming
+the step. The next start recovers as after a crash, so a stop never closes a
+store under a live loop in order to exit cleanly.
 
 ### 2.3 The runtime reconciles; it does not take orders
 
@@ -355,10 +490,12 @@ The runtime holds two pictures: the **desired** one, read from records, and the
 | a share created | adds the share's context and, on a protocol node, nothing: the share list reaches the filesystem service through `ShareList.Version` ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)) |
 | a share's state changed | moves the share's context to quiescing and back ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)); admission reads the state itself on every call ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)), and a removal's steps run in their owner ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)) |
 | a share's live setting | hands the new value to the context, within RFC 13's live bound |
-| a share's backends (its namespace's store configuration) | replaces the context, as [RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition) requires |
+| a remote store's live or next-write setting — endpoint, credential reference, storage class, block target, the transform chain but its encrypt stage, as [RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings) classes them | is applied once, to the one store client every context on that store shares ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)), after [RFC 13 §5.2](rfc-13-configuration.md#5.2%20Reaching%20the%20same%20content%20another%20way%20is%20not%20a%20change) has proven a new endpoint or credential. No share context is replaced |
+| a `Secret`'s new version | the component holding the reference resolves it again within the live bound, and the node reports the version it holds (§2.4, [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)) |
+| a change [RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition) counts as a change of a share's backends | builds the new context beside the old, switches admission to it, then joins and closes the old one. A new context that fails to build leaves the old one serving and the record refused |
 | an adapter enabled or disabled | starts it, or drains and stops it |
 | an adapter's live setting | applies it to connections set up afterwards ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)) |
-| an adapter's restart-class setting | drains and starts that adapter, alone; the others keep serving |
+| an adapter's restart-class setting | builds a new adapter through its factory with the new settings. `New` opens nothing, so a setting it refuses leaves the old adapter serving and the record refused. Only then the runtime drains and stops the old adapter and starts the new one; the others keep serving. If the new one fails to start, the runtime builds and starts one with the last settings that served, and reports the record refused (§2.4) |
 | a sidecar enabled or disabled | `Sync` with the serving adapters, or with none ([RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars)) |
 | a node-scoped or installation-scoped restart-class setting | nothing until the process next starts; the node reports the record as restart-pending (§2.4) |
 | a principal, grant or export policy | nothing of its own: their generations and versions are in the identity and admission cache keys ([RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)) |
@@ -373,6 +510,8 @@ A reconcile step is idempotent: run twice on the same records it does nothing
 the second time. So the runtime **MUST** also run a full reconcile at start and
 after any read of the store that failed, not only on a moved generation: a
 change missed during a store outage is then found at the next read that works.
+A full reconcile lists records by kind in pages
+([RFC 16 §3.1](rfc-16-metadata-store.md#3.1%20Lookups%20by%20ID%2C%20listings%2C%20and%20who%20may%20use%20them)); what bounds its rate is open (§13).
 
 ### 2.4 What a node reports
 
@@ -558,9 +697,12 @@ each host ([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%
   whose effective record enables it; a setting the adapter cannot apply fails
   at configured ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)) and is reported refused by that node;
 - **disable** drains and stops it, within the drain deadline;
-- a **live** setting reaches new connections; a **restart-class** one drains and
-  starts that adapter on each node, one adapter at a time on a node, so a change
-  to SMB never drops an NFS client.
+- a **live** setting reaches new connections; a **restart-class** one builds a
+  new adapter through its factory on each node, and only once `New` has
+  accepted the settings drains and stops the old one and starts the new; one
+  adapter at a time on a node, so a change to SMB never drops an NFS client.
+  If the new one fails to start, the last settings that served are built and
+  started again and the record is reported refused (§2.3).
 
 The status of an adapter shows, per node, its state and the generation it runs.
 A namespace move's release of an address is not an adapter edit: it is RFC 27's
@@ -1053,6 +1195,9 @@ The CLI is a client of the management API and of nothing else:
 - it **MUST NOT** open the metadata store, a journal or a remote store, or read
   the server's host file. Every command is one or more API calls; a command the
   API cannot serve does not exist;
+- the API's wire types are a leaf package that imports nothing of the server,
+  and the CLI links no package of the metadata store, the block stores or the
+  control-plane server;
 - it resolves names to IDs with the list filters (§4.1), reads before it writes
   and sends the generation it read in `If-Match` (§4.4), generates one
   idempotency key per command and reuses it across that command's retries
@@ -1146,6 +1291,7 @@ These rules bind from the single node on, where most of them cost nothing
 | CP13 | The unauthenticated health endpoints answer one word and nothing else. |
 | CP14 | The CLI reaches the installation only through the API. |
 | CP15 | No request field is accepted before every node can read the record that holds it. |
+| CP16 | No package under the control plane imports an adapter, a sidecar or a component's implementation; each is reached through an interface it declares or a table the root hands it. |
 
 ## 11. Observability
 
@@ -1226,6 +1372,18 @@ marked **(cluster)**.
 5. **Server-sent changes.** Clients poll operations and resources. A watch
    (a stream of changes from a generation) would serve the Kubernetes operator
    better; whether it is worth a second read path is open.
+6. **Lifecycles the owning RFCs have yet to state.** §2.1's table marks
+   "pending" what this RFC cannot state for another: the construction and
+   lifecycle of open state and namespace metadata (RFC 14), the identity
+   resolver and authenticator, and whether they hold directory connections or
+   keytabs to close (RFC 18), the event sink and the admin-stream writer
+   (RFC 25), the pools (RFC 24), the router and the client-address agent
+   (RFC 15), shard placement (RFC 11) and the metadata store's close (RFC 16).
+7. **The cost of a full reconcile.** A full reconcile after every failed read
+   re-lists every record of every kind; during a flapping store, at 10⁴ shares,
+   that is once a second. Whether it needs a rate bound, and whether reconciling
+   only the records above the reconciled position needs an index by (kind,
+   position) in RFC 16, is unmeasured.
 
 ## Appendix A — prior art
 
@@ -1260,6 +1418,8 @@ marked **(cluster)**.
 | § | This RFC | The code today |
 | --- | --- | --- |
 | §2.1 | one composition root | the start command composes the node; a second, partial root in `pkg/controlplane/controlplane.go` builds store, runtime and API only and has no importer; the adapter and NFSv3 handler test fixtures build their own |
+| §2.1, RFC 20 §3.4 | adapters hold the filesystem service only; the runtime drives them through `Adapter` | adapters are handed the whole runtime by `SetRuntime(rt any)`, and 22 adapter files (16 internal, 6 public) import the runtime; the runtime knows protocols by name (`GetNFSSettings`, `GetSMBSettings`, `SetNFSExportPolicy`, an NFS mount tracker, an SMB oplock-breaker hook) |
+| §2.1 | the runtime exports `New` and `Run` | `*Runtime` exports 156 methods, in 23 of the package's 35 files, and hosts GC, the snapshot scheduler, trash and integrity scans, which are their components' own |
 | §2.1, §2.3 | the API writes records, the runtime applies them | handlers write the database and then call the runtime directly — `AddShare`, `UpdateShare`, `RebindShareBlockStore`, adapter start and stop; a runtime failure after the write is logged as a warning and the request still succeeds (a share whose `AddShare` fails returns `201` and loads at the next restart); share create builds the runtime's share configuration field by field in the handler |
 | §2.2 | start: store, runtime, content, API, adapters; stop the reverse with the API after adapters | start opens the control-plane database, seeds the admin, default groups and default adapters, opens metadata stores, loads shares, then serves; inside `Serve` the settings watcher and adapters start before the API; shutdown stops adapters, closes stores and then the API |
 | §2.3, §8 | every node reconciles by generation, once a second | changes are applied in-process by direct calls and change callbacks; only adapter settings are polled, every 10 s; there are no node records, so a second node sharing the database sees shares, adapters and users only after a restart |
