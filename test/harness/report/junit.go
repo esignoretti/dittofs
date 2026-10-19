@@ -40,16 +40,18 @@ func (c Cell) JUnit() ([]byte, error) {
 	}
 	for _, t := range c.Tests {
 		tc := junitCase{Name: t.Name, Classname: strings.Join(append([]string{c.Name}, t.Suite...), "/"), Time: seconds(t.Duration)}
+		// decision: a failure or an error the tool said nothing about gets its
+		// grade as its message, so an unexpected pass isn't a blank failure.
 		switch t.Status {
 		case Failed:
 			s.Failures++
-			tc.Failure = &junitResult{t.Message, t.Message}
+			tc.Failure = &junitResult{cmp.Or(t.Message, t.Grade), t.Message}
 		case Skipped:
 			s.Skipped++
 			tc.Skipped = &junitResult{cmp.Or(t.Reason, t.Message), t.Message}
 		case Other:
 			s.Errors++
-			tc.Error = &junitResult{t.Message, t.Message}
+			tc.Error = &junitResult{cmp.Or(t.Message, t.Grade), t.Message}
 		}
 		if t.Flaky {
 			tc.Properties = &junitProperties{[]junitProperty{{"flaky", "true"}}}
