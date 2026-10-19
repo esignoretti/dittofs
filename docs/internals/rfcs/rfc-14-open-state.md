@@ -549,13 +549,6 @@ type Lock struct {
 	Exclusive bool
 }
 
-// LockRange is one range of a lock request: a request names several, and
-// they are taken all or none (below).
-type LockRange struct {
-	ByteRange
-	Exclusive bool
-}
-
 // LockState is what an NFSv4 lock stateid names: one lock-owner's locks under
 // one open of one file. Its seqid rises with every LOCK and LOCKU that changes
 // them; the locks themselves stay Lock records.
@@ -588,16 +581,17 @@ An NLM lock names no open: it is held by its owner alone and released by
 unlock, by its host's restart ([§4.5](#4.5%20NLM%20locks%20and%20restart%20notification)) or by revocation. Every other lock
 names the open it was taken under, and closing that open releases it.
 
-**A lock request is atomic at the primary.** `Lock` takes a list of ranges —
-an SMB `LOCK` of several elements; one range for NFSv4 and NLM — and the
-file's one primary grants them all in one step or none: when a range
-conflicts, the ranges this call took are released before the conflict is
-answered, so no other request ever sees part of the list held. Only a
-single-range request may wait (§2.10). `Unlock` releases its list in order and
-stops at the first range its owner does not hold, answering
-`ErrRangeNotLocked`; the ranges before it stay unlocked, as MS-SMB2 3.3.5.14.1
-requires. Only an SMB owner meets it: an NFSv4 or NLM owner's unlock of a range
-it holds none of releases nothing and succeeds, as a POSIX unlock does.
+**A multi-range request is the service's.** An SMB `LOCK` of several elements
+reaches this table as one `Lock` per range, in order, and the filesystem
+service releases the ranges it took when a later one fails (RFC 17 §5.11); a
+request meanwhile refused against such a range was refused against a lock that
+existed. Only a single-range request may wait; one naming several that asks to
+wait is refused `ErrInvalid` (RFC 17 §5.11). `Unlock` releases one range; an
+SMB owner unlocking a range it does not hold exactly is answered
+`ErrRangeNotLocked`, and the service stops a multi-range unlock there, the
+ranges before it staying unlocked, as MS-SMB2 3.3.5.14.1 requires. An NFSv4 or
+NLM owner's unlock of a range it holds none of releases nothing and succeeds,
+as a POSIX unlock does.
 
 ### 2.4 CachingGrant
 
@@ -2064,14 +2058,13 @@ type OpenState interface {
 	// answers ErrLocked (NFSv4) or ErrBlocked (NLM, SMB). A recall of another
 	// client's grant answers ErrBlocked with a waiter (NLM, SMB with wait) or
 	// ErrDelay (every other request).
-	// rs is granted all or none (§2.3); wait is honoured only for one range.
-	Lock(ctx context.Context, c ClientID, file FileID, owner LockOwner, o OpenID, rs []LockRange, wait, reclaim bool, seq *LockSequence) error
+	Lock(ctx context.Context, c ClientID, file FileID, owner LockOwner, o OpenID, r ByteRange, exclusive, wait, reclaim bool, seq *LockSequence) error
 	// CancelLock is ordered with the grant: it drops the waiter, or reports
 	// granted when the lock was granted first. An adapter calls it before any
 	// answer to a waiting request other than the grant (§2.10).
 	CancelLock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange) (granted bool, err error)
 	TestLock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange, exclusive bool) (*Lock, error)
-	Unlock(ctx context.Context, c ClientID, file FileID, owner LockOwner, rs []ByteRange) error // in order; ErrRangeNotLocked at the first range not held, the earlier ones staying unlocked (§2.3)
+	Unlock(ctx context.Context, c ClientID, file FileID, owner LockOwner, r ByteRange) error // ErrRangeNotLocked for an SMB owner not holding r (§2.3)
 
 	// Restart notification from an NLM host (§4.5): expires its old ClientID.
 	HostRestarted(ctx context.Context, host []byte, state uint32) error
@@ -2155,7 +2148,7 @@ var (
 | L14 | A delete-pending file refuses every new open and every rename, keeps its name until its last open closes, and then loses that name through the ordinary unlink; it is durable while the file has a persistent open. |
 | L15 | A reconnect matches an open only on client, principal, create GUID (v2) and lease key; a replayed create or lock returns its first result; a create with a held app instance closes the earlier open first only when that open is another client's and the caller may read the file. A persistent open's record holds all of it. A matching reconnect rebinds the open to the reconnecting session, named with its protocol node. |
 | L16 | One grant per (client, lease key, file); opens under one key never break their own lease; a v2 lease's epoch rises with every change of its kind; an NFS delegation is never a handle grant. |
-| L17 | A lock names an owner, and an NFSv4 or NLM owner's locks never conflict with each other; an NLM lock needs no open. A lock request's ranges are granted all or none at the file's primary; an unlock stops at the first range its owner does not hold, `ErrRangeNotLocked`, which an NFSv4 or NLM owner never meets. A loss of NLM locks raises the durable NSM state number and notifies every recorded host before grace. |
+| L17 | A lock names an owner, and an NFSv4 or NLM owner's locks never conflict with each other; an NLM lock needs no open. A lock or unlock names one range; a multi-range SMB request is the service's, which rolls back the ranges it took. An SMB owner's unlock of a range it does not hold exactly is `ErrRangeNotLocked`, which an NFSv4 or NLM owner never meets. A loss of NLM locks raises the durable NSM state number and notifies every recorded host before grace. |
 | L18 | A lost asynchronous copy is reported unknown, never done. |
 | L19 | The NFSv4.1 server owner's major ID and server scope are the installation's identity on every node; the minor ID is the node's. |
 | L20 | Each write request is applied whole under one version at the file's primary; overlapping writes resolve byte by byte in the primary's arrival order. |

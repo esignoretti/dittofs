@@ -310,15 +310,13 @@ Signatures are indicative; the obligations are normative. `Service` embeds the
 groups, so an adapter holds one value and a test can fake one group.
 
 `Identity` below is what the adapter authenticated — the protocol, the
-authentication flavour and Kerberos level, the handshake's proof (RFC 18 §3.1)
-or the numeric IDs an `AUTH_SYS` credential carried, and the client's address —
-not yet mapped through any share's policy. The service resolves it per share
-(§4.9) into the caller RFC 18 §6.1 defines — principal, groups, share access
-narrowed by admission, and flags — and passes that to the metadata store as
-its identity. Among the flags, `authenticated` is set when the flavour proved
-who the caller is (Kerberos, an NTLMv2 SMB session), and `admin` when, on such
-a flavour, the share grant names the principal `admin`
-([RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)); RFC 18 §6.5 decides which callers get each. A Kerberos principal the ID mapping maps to
+authentication flavour and Kerberos level, the principal or numeric IDs the
+credential carried, and the client's address — not yet mapped through any
+share's policy. The service resolves it per share (§4.9), and sets two fields
+on the identity it passes the metadata store: `authenticated` when the flavour
+proved who the caller is (Kerberos, an SMB session established by
+authentication), and `admin` when, on such a flavour, the share grant names the
+principal `admin` ([RFC 7 §7.4](rfc-7-namespace-metadata.md#7.4%20The%20identity%20arrives%20resolved)). A Kerberos principal the ID mapping maps to
 uid 0 is privileged exactly when the export leaves root unsquashed, as an
 AUTH_SYS root is. An `OpenRef` carries
 the `Identity` of the call that presents it, so calls that name only an open
@@ -337,7 +335,6 @@ type Service interface {
 	Locking
 	Volumes
 	Shares
-	Identities
 }
 
 // Clients: who is talking to us, and how to call them back (RFC 14).
@@ -403,17 +400,10 @@ type Data interface {
 
 // Locking: byte-range locks, caching grants, watches (RFC 14).
 type Locking interface {
-	// Lock is all or nothing: if any range cannot be granted, the ranges this
-	// call took are released before it answers that range's error. wait is
-	// honoured only for a single range: a conflict leaves a waiter (RFC 14),
-	// answered ErrLocked (NFSv4 polls) or ErrBlocked (NLM, SMB).
-	Lock(ctx context.Context, o OpenRef, rs []metadata.LockRange, wait, reclaim bool) error
+	Lock(ctx context.Context, o OpenRef, r metadata.ByteRange, exclusive, wait, reclaim bool) error // wait: a conflict leaves a waiter (RFC 14), answered ErrLocked (NFSv4 polls) or ErrBlocked (NLM, SMB)
 	CancelLock(ctx context.Context, o OpenRef, r metadata.ByteRange) (granted bool, err error)     // drops a waiting lock, or reports it granted first; called before any answer to an ErrBlocked request but the grant (RFC 14 §2.10)
 	TestLock(ctx context.Context, o OpenRef, r metadata.ByteRange, exclusive bool) (*metadata.Lock, error)
-	// Unlock releases rs in order and stops at the first range the owner does
-	// not hold, ErrRangeNotLocked; the ranges before it stay unlocked. An NFSv4
-	// or NLM owner holds every sub-range it locked, so it never meets the error.
-	Unlock(ctx context.Context, o OpenRef, rs []metadata.ByteRange) error
+	Unlock(ctx context.Context, o OpenRef, r metadata.ByteRange) error
 	ReturnGrant(ctx context.Context, c metadata.ClientID, g metadata.GrantID) error
 	AckBreak(ctx context.Context, c metadata.ClientID, g metadata.GrantID, to GrantKind) error
 	Watch(ctx context.Context, c metadata.ClientID, id Identity, dir Handle, recursive bool, filter metadata.ChangeMask) (metadata.WatchID, error)
@@ -438,24 +428,7 @@ type Volumes interface {
 	StatFS(ctx context.Context, id Identity, h Handle) (metadata.FilesystemInfo, error) // the share's, or the tighter of it and h's project (RFC 7 §2.8)
 	Quota(ctx context.Context, id Identity, h Handle, p metadata.Principal) (metadata.Usage, metadata.Quota, error) // p's own quota, else the share's default for its kind
 }
-
-// Identities: how an adapter encodes and decodes a principal — a file's owner,
-// an ACL entry's who, a quota's target, a name in an lsarpc lookup. It holds
-// no policy: squashing and grants are applied at admission (§4.9), not here.
-// The mapping is RFC 18 §4's; an adapter never derives one spelling from
-// another, and an error other than not-found reaches the client as a server
-// failure, never as an unknown principal.
-type Identities interface {
-	Spell(ctx context.Context, p metadata.Principal, scheme Scheme) (Spelling, error) // p's spelling in scheme: uid, gid, SID, Kerberos name, owner string; ErrNoSpelling when it has none
-	Find(ctx context.Context, s Spelling) (metadata.Principal, error)                 // the principal holding s; ErrUnknownPrincipal when none does
-}
 ```
-
-**A protocol request naming several ranges is one call.** An SMB `LOCK` of
-several elements is one `Lock` or one `Unlock` carrying every range in order;
-NFSv4 and NLM pass a one-element list. Rollback of a partial acquisition is the
-service's, never the adapter's: the ranges go to the file's one primary in one
-call, which takes them all or none ([RFC 14 §2.3](rfc-14-open-state.md#2.3%20Lock)).
 
 Every open-state call names the `ClientID` it acts for, and the service
 **MUST** refuse, with `ErrNotYours`, an `OpenID`, `GrantID`, `WatchID`,
@@ -611,7 +584,7 @@ each waits on metadata commits, and none is a lack of space. One still
 `ErrDelay` with `DelayConflict` is held the same way up to `smb_pending_cap` and
 only there answered `STATUS_FILE_NOT_AVAILABLE`, the retry-later status a
 freeze or grace ends with: a conflict is contention, not a failure. One
-answered `ErrDelay` with `DelayHoldBudget` or `DelayResources` is never held: it is answered
+answered `ErrDelay` with `DelayHoldBudget` is never held: it is answered
 `STATUS_INSUFFICIENT_RESOURCES` at once (§4.3, §5.9). One answered `ErrUnavailable` — a read, query or
 IOCTL that needs content the remote tier cannot serve now — **MUST** be held and
 re-driven the same way up to `smb_pending_cap`, and only there answered
@@ -747,7 +720,7 @@ Adapters own, and the service never sees:
 ### 4.3 Errors are neutral values
 
 The service returns `ErrNotFound`, `ErrExist`, `ErrAccess`, `ErrPerm`, `ErrStale`,
-`ErrNotEmpty`, `ErrNotDir`, `ErrIsDir`, `ErrNoSpace`, `ErrQuota`, `ErrLocked`, `ErrRangeNotLocked`,
+`ErrNotEmpty`, `ErrNotDir`, `ErrIsDir`, `ErrNoSpace`, `ErrQuota`, `ErrLocked`,
 `ErrShareViolation`, `ErrGrace`, `ErrDelay`, `ErrBlocked`, `ErrNotYours`, `ErrRevoked`, `ErrBadLayout`, `ErrWrongSecurity`, `ErrInvalid`, `ErrCrossNamespace`, `ErrCrossShard`, `ErrCrossProject`, `ErrInconsistent`, `ErrClientInUse`, `ErrClientBusy`, `ErrSeqMisordered`, `ErrStaleClient`, `ErrStaleState`, `ErrBadState`, RFC 14's `ErrNoReclaim`, `ErrReclaimRevoked`, `ErrDeletePending`, `ErrNoCopy` and `ErrBadSeqID`, `ErrIncomplete`, and the content errors of
 [RFC 8](rfc-8-engine.md) (`ErrLost`, `ErrUnavailable`, `ErrCorrupt`). Each adapter maps them
 once. `ErrDelay` means "retry shortly", and every one the service returns is a
@@ -796,7 +769,6 @@ const (
 	DelayQuotaSlack                   // the reservation slack is spent (§5.6)
 	DelayConflict                     // a metadata conflict still unresolved at the call's deadline (RFC 0 §9.2)
 	DelayHoldBudget                   // the call's hold budget is spent, and the node's hold pool too where it may draw on it (§5.9)
-	DelayResources                    // a node memory pool is spent: the share cap, open state, or a reply reservation's deadline (RFC 24)
 )
 ```
 
@@ -809,11 +781,7 @@ or `NFS3ERR_JUKEBOX`, and NLM to `NLM4_DENIED_GRACE_PERIOD`; SMB holds the
 request pending and re-drives it (§3.2). `DelayHoldBudget` is answered at
 once and never held: NFSv4.1, the one NFS transport that passes a policy,
 maps it to `NFS4ERR_DELAY`, and SMB to `STATUS_INSUFFICIENT_RESOURCES`
-(RFC 22). `DelayResources` is answered at once and never held, like
-`DelayHoldBudget`, since holding it would spend the hold pool on the share that
-is short of memory: `NFS4ERR_DELAY` over NFSv4, `NFS3ERR_JUKEBOX` over NFSv3,
-`NLM4_DENIED_NOLOCKS` over NLM and `STATUS_INSUFFICIENT_RESOURCES` over SMB
-(RFC 24 §4.2). **A transient refusal never becomes
+(RFC 22). **A transient refusal never becomes
 `ErrNoSpace` because a deadline ran out**: a space refusal still `ErrDelay` when
 the caller's deadline passes is answered `ErrDelay` — the NFS client retries, for
 as long as the outage lasts — and an SMB request held pending for it is answered
@@ -939,7 +907,7 @@ parse or compare their contents.
 `Read` fills the caller's buffer and `Write` takes the caller's. The service
 passes them to the engine, which lends or streams below
 ([RFC 8](rfc-8-engine.md)); the service **MUST NOT** add a copy of its own. Buffer budgets
-are RFC 24 §3's.
+are RFC 24's.
 
 ### 4.6 One chokepoint
 
@@ -1504,13 +1472,11 @@ at one point in the source's history. The two kinds differ in atomicity:
    holds; SMB passes its connection as the key, with the per-connection
    figures RFC 22 states as a floor (`Pooled`). **Each node that counts holds
    keeps one hold pool**, which takes what pooled keys hold past their floors:
-   a sixteenth of the process memory limit (RFC 24 §2.1) — derived, not a
-   setting; a test
+   a sixteenth of the process's memory limit — the limit its runtime enforces,
+   or the host's memory where none is set — derived, not a setting; a test
    sizes it by setting that limit, 128 MiB giving an 8 MiB pool. A call
-   drawn on it is charged its whole receive reservation, buffer class and
-   overhead (RFC 24 §4.3); the per-key byte budget counts its write's bytes,
-   and at least 64 KiB, one SMB credit's size, so the pool bounds held calls
-   as well as bytes. A call that
+   drawn on it is charged its write's bytes, and at least 64 KiB, one SMB
+   credit's size, so the pool bounds held calls as well as bytes. A call that
    would pass a hard budget, or a pooled key's floor while the pool cannot take
    it, is answered `ErrDelay` with `DelayHoldBudget` at once, holds nothing,
    and is counted as a refusal (§7).
