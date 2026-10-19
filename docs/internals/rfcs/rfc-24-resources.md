@@ -557,8 +557,8 @@ reply's wait never waits on a receive reservation (§2.6).
 
 ### 3.4 The per-connection cap for protocols without flow control
 
-Where the protocol has no flow control of its own — NFSv3, NFSv4.0, NLM and the
-side programs — the per-connection cap of
+Where the protocol has no flow control of its own — NFSv3, NFSv4.0 and
+NFS's auxiliary services (MOUNT, NLM, NSM) and the port mapper — the per-connection cap of
 [RFC 20 §6.3](rfc-20-adapters.md#6.3%20Flow%20control%20is%20the%20protocol%27s%20own)
 is **64 requests in flight**, fixed: the same as one NFSv4.1 session's fore
 channel ([RFC 21 §3.1](rfc-21-nfs.md#3.1%20Slot%20tables)), so a connection
@@ -832,7 +832,7 @@ from here. The inventory, from the socket down:
 | readers waiting for receive bytes | one per connection | §3.2, §4.1 | turns |
 | requests waiting for reply bytes | the requests admitted | §3.3 | the call's deadline, then `DelayResources` |
 | the writer's queue | the connection's flow-control bound | [RFC 20 §6.2](rfc-20-adapters.md#6.2%20The%20writer) | the reader stops; the write deadline closes |
-| datagram side programs | a fixed queue | [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states) | dropped; the client retries |
+| datagram listeners (the port mapper, NLM and NSM over UDP) | a fixed queue | [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states) | dropped; the client retries |
 | held SMB requests | the hold budget and floor per key, the hold pool | [RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone), §4.3 | `DelayHoldBudget` |
 | blocked lock waiters | the open-state pool | [RFC 14](rfc-14-open-state.md), §4.6 | `DelayResources` |
 | callbacks to clients | the writer's queue, the callback deadline | [RFC 20 §3.3](rfc-20-adapters.md#3.3%20Callbacks%20are%20the%20adapter%27s%20to%20deliver) | the client is not answering |
