@@ -719,6 +719,17 @@ remote-tier credentials and password hashes it cannot open. A deployment **MAY**
 further by secret kind; it **MUST NOT** merge the two roles' keys unless every
 node runs both roles, which is the single-node default.
 
+> decision: sealing under a role's public half protects a secret's
+> confidentiality, not its integrity: a node that can write `SEC‖` can replace
+> any role's secret with one it sealed, the API's signing key included. That is
+> no wider than what such a node can already do to unsealed control-plane
+> records — a token or session record, a role, a grant — so the integrity of
+> all of them rests on [RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)'s rule that protocol nodes write no
+> control-plane record, which the store does not enforce. Revisit when a
+> deployment runs protocol nodes it trusts less than storage nodes: the fix then
+> is per-role write credentials in the metadata store, not a MAC on secrets
+> alone.
+
 **One interface, two providers.** Every secret is resolved through one
 interface. The built-in provider above — sealed `Secret` records under the role
 wrapping keys — ships now; an external key-management provider comes later,
