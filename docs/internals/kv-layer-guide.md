@@ -106,9 +106,10 @@ The backend builds on Linux with cgo, the build `dfs` ships for Linux, and needs
 | Create, one client | 2.7–2.9 ms | 1.0–3.2 ms |
 | Creates, 64 clients, one directory | 3,900–5,100/s | 7,650/s |
 | List a page, 10,000 entries | 6.8 ms | 0.5 ms |
-| Offload commit, about 330 reads and 455 writes | 29 ms | 7.4 ms |
+| List with attributes, 1,000 of 10,000 entries | 19.8 ms (90.2 ms before `GetMany`) | — |
+| Offload commit, about 330 reads and 455 writes | 16 ms (29 ms before `GetMany`) | 7.4 ms |
 
-Writes are close: a sync dominates both, and creates in one directory don't queue on its guard. Reads are 40 to 80 times slower, because each is a round trip to the cluster, about 100 µs even locally, and each transaction first fetches a read version. Operations that read many known keys one after another, an offload commit or a listing, pay that per key; FoundationDB would run those reads in parallel, but `Get` returns one value per call.
+Writes are close: a sync dominates both, and creates in one directory don't queue on its guard. Reads are 40 to 80 times slower, because each is a round trip to the cluster, about 100 µs even locally, and each transaction first fetches a read version. Operations that read many known keys read them with `GetMany`, one round trip per batch: a listing with attributes reads its page's records that way, and an offload commit its chunk and block records, which made them 4.5 and 1.8 times faster.
 
 ## 3. Group commit
 
