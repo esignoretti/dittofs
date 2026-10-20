@@ -47,6 +47,7 @@ type smbRuntime interface {
 	// Identity / auth backends.
 	GetUserStore() models.UserStore
 	GetIdentityMappingStore() store.IdentityMappingStore
+	identityMapper
 
 	// Metrics returns the inline metrics sink (may be nil; all Record* methods
 	// are nil-receiver safe). SESSION_SETUP uses it to record SMB auth attempts.

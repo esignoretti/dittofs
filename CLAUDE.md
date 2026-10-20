@@ -113,10 +113,11 @@ composition layer over six sub-services: `adapters/`, `stores/`, `shares/`, `mou
    for v3, `ExtractV4HandlerContext` for v4). The handler then builds the `*metadata.AuthContext`,
    with share permission and squashing applied (`BuildAuthContextWithMapping` for v3, reached
    through `GetCachedAuthContext`; `buildV4AuthContext` for v4). For SMB it is built in the SMB
-   session layer. It threads through handler → store. Export-level squashing (`AllSquash`,
-   `RootSquash`) is applied via `ResolveSharePermission`
-   (`internal/adapter/nfs/auth/share_permission.go`) and the SMB Tree Connect check
-   (`internal/adapter/smb/handlers/tree_connect.go`).
+   session layer (`BuildAuthContextFromUser`). It threads through handler → store. The share's
+   squash maps the identity in one place both adapters call, `Runtime.ApplyIdentityMapping`
+   (`pkg/controlplane/runtime/identity`); its share-level counterpart, root's admin bypass, is in
+   `ResolveSharePermission` (`internal/adapter/nfs/auth/share_permission.go`) and the SMB Tree
+   Connect check (`internal/adapter/smb/handlers/tree_connect.go`).
 
    The export auth-flavor policy (`AllowAuthSys`, `RequireKerberos`, `MinKerberosLevel`) lives in
    `CheckExportAccess` (`internal/adapter/nfs/auth/export_access.go`), which also applies the

@@ -444,8 +444,11 @@ before DittoFS checks permissions. Its classic use is to stop a remote `root`
 from acting as `root` on your files — a remote machine's superuser should not
 automatically be the superuser of your export.
 
-This is a **per-share, NFS-only** policy. It does not apply to SMB (which has its
-own [guest mapping](smb.md)). Crucially, squashing happens at the *identity*
+This is a **per-share** policy, and it applies to SMB sessions too: an SMB user
+is squashed by its user record's UID as an NFS caller is by the UID it sends, so
+the built-in `admin` (UID 0) is the anonymous identity on a `root_to_guest`
+share. Guest and anonymous SMB sessions keep their own
+[guest mapping](smb.md). Crucially, squashing happens at the *identity*
 layer — **after** the client authenticates but **before** the
 [export gate and POSIX/ACL checks](access-control.md). It rewrites *who you are*;
 it never grants access on its own.

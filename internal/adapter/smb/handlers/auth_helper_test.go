@@ -8,6 +8,15 @@ import (
 	"github.com/marmos91/dittofs/pkg/metadata"
 )
 
+func mustAuthContextFromUser(t *testing.T, ctx *SMBHandlerContext, user *models.User) *metadata.AuthContext {
+	t.Helper()
+	authCtx, err := BuildAuthContextFromUser(ctx, user)
+	if err != nil {
+		t.Fatalf("BuildAuthContextFromUser: %v", err)
+	}
+	return authCtx
+}
+
 func TestBuildAuthContextFromUser_PopulatesSID(t *testing.T) {
 	uid := uint32(1001)
 	user := &models.User{
@@ -22,7 +31,7 @@ func TestBuildAuthContextFromUser_PopulatesSID(t *testing.T) {
 		User:    user,
 	}
 
-	authCtx := BuildAuthContextFromUser(ctx, user)
+	authCtx := mustAuthContextFromUser(t, ctx, user)
 	if authCtx == nil || authCtx.Identity == nil {
 		t.Fatal("nil Identity")
 	}
@@ -45,7 +54,7 @@ func TestBuildAuthContextFromUser_NoSIDLeavesIdentityEmpty(t *testing.T) {
 	user := &models.User{ID: "user-2", Username: "bob", UID: &uid}
 	ctx := &SMBHandlerContext{Context: context.Background(), User: user}
 
-	authCtx := BuildAuthContextFromUser(ctx, user)
+	authCtx := mustAuthContextFromUser(t, ctx, user)
 	if authCtx.Identity.SID != nil {
 		t.Errorf("Identity.SID = %v, want nil for user without SID", *authCtx.Identity.SID)
 	}

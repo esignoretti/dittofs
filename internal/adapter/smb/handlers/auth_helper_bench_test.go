@@ -47,7 +47,7 @@ func BenchmarkBuildAuthContextFromUser_Uncached(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = BuildAuthContextFromUser(ctx, user)
+		_, _ = BuildAuthContextFromUser(ctx, user)
 	}
 }
 
@@ -57,10 +57,10 @@ func BenchmarkBuildAuthContextFromUser_Cached(b *testing.B) {
 	user := benchAuthUser()
 	sess := session.NewSessionWithUser(1, "10.0.0.1:445", user, "")
 	ctx := benchAuthCtx(user, sess)
-	_ = BuildAuthContextFromUser(ctx, user) // prime the cache
+	_, _ = BuildAuthContextFromUser(ctx, user) // prime the cache
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = BuildAuthContextFromUser(ctx, user)
+		_, _ = BuildAuthContextFromUser(ctx, user)
 	}
 }

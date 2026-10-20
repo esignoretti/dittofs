@@ -27,13 +27,13 @@ func userWithGrant(perm models.SharePermission, uid uint32, groupGID uint32) *mo
 	}
 }
 
-// buildDispatchIdentity resolves the identity a file operation on this session
-// would be authorized with: the same prime-then-build the dispatch path runs
-// before every metadata call.
-func buildDispatchIdentity(t *testing.T, h *Handler, sessionID uint64) *metadata.Identity {
+// buildDispatchIdentity resolves the identity a file operation on this session's
+// tree would be authorized with: the same prime-then-build the dispatch path
+// runs before every metadata call.
+func buildDispatchIdentity(t *testing.T, h *Handler, sessionID uint64, treeID uint32) *metadata.Identity {
 	t.Helper()
-	ctx := NewSMBHandlerContext(context.Background(), "127.0.0.1:12345", sessionID, 0, 1)
-	h.primeAuthContext(ctx, 0, sessionID)
+	ctx := NewSMBHandlerContext(context.Background(), "127.0.0.1:12345", sessionID, treeID, 1)
+	h.primeAuthContext(ctx, treeID, sessionID)
 	authCtx, err := BuildAuthContext(ctx)
 	if err != nil {
 		t.Fatalf("BuildAuthContext: %v", err)
@@ -56,16 +56,16 @@ func TestRevalidateAuthorization_PublishesRefreshedIdentity(t *testing.T) {
 	// The record the operator has since edited: moved to UID 1500 and regrouped.
 	store := &revalidateUserStore{resolveFromRecord: true, user: userWithGrant(models.PermissionReadWrite, 1500, 2000)}
 
-	h, sessionID, _ := newRevalidateHandler(t, sessionRecord, store, models.PermissionReadWrite, false)
+	h, sessionID, treeID := newRevalidateHandler(t, sessionRecord, store, models.PermissionReadWrite, true)
 
-	before := buildDispatchIdentity(t, h, sessionID)
+	before := buildDispatchIdentity(t, h, sessionID, treeID)
 	if *before.UID != 1000 {
 		t.Fatalf("fixture is wrong: operations start out authorized as UID %d, want 1000", *before.UID)
 	}
 
 	h.RevalidateAuthorization(context.Background())
 
-	after := buildDispatchIdentity(t, h, sessionID)
+	after := buildDispatchIdentity(t, h, sessionID, treeID)
 	if *after.UID != 1500 {
 		t.Errorf("a file operation is still authorized as UID %d after the sweep, want 1500: "+
 			"the ownership check runs against the identity captured at SESSION_SETUP", *after.UID)
@@ -87,7 +87,7 @@ func TestRevalidateAuthorization_ReauthDuringLookupLeavesRecord(t *testing.T) {
 	sessionRecord := userWithGrant(models.PermissionReadWrite, 1000, 1000)
 	store := &revalidateUserStore{resolveFromRecord: true, user: userWithGrant(models.PermissionReadWrite, 1500, 2000)}
 
-	h, sessionID, _ := newRevalidateHandler(t, sessionRecord, store, models.PermissionReadWrite, false)
+	h, sessionID, treeID := newRevalidateHandler(t, sessionRecord, store, models.PermissionReadWrite, true)
 	sess, ok := h.GetSession(sessionID)
 	if !ok {
 		t.Fatal("fixture is wrong: no session")
@@ -101,7 +101,7 @@ func TestRevalidateAuthorization_ReauthDuringLookupLeavesRecord(t *testing.T) {
 
 	h.RevalidateAuthorization(context.Background())
 
-	got := buildDispatchIdentity(t, h, sessionID)
+	got := buildDispatchIdentity(t, h, sessionID, treeID)
 	if *got.UID != bobUID {
 		t.Errorf("operations authorized as UID %d, want %d: the sweep published alice's record "+
 			"onto a session that had already re-authenticated as bob", *got.UID, bobUID)

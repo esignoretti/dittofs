@@ -560,6 +560,11 @@ func resolveSharePermissionForIdentity(
 
 	// 1. Root user bypass: UID 0 with a squash mode that allows root access gets
 	// admin regardless of grants. Mirrors resolveNFSSharePermission.
+	//
+	// decision: the bypass follows the uid where over SMB only the share grant
+	// should decide. It holds exactly where the share's squash leaves the
+	// session at uid 0, and so privileged in the metadata layer anyway
+	// (BuildAuthContextFromUser); withdraw it with that privilege.
 	if user != nil && isRootUser(user) && rootHasAdminAccess(share) {
 		logger.Debug("Root user granted admin access via squash mode",
 			"shareName", share.Name, "user", user.Username, "squash", share.Squash)

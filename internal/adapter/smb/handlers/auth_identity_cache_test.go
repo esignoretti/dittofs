@@ -19,8 +19,8 @@ func TestAuthIdentityCache_HitReturnsSamePointer(t *testing.T) {
 	ctx := benchAuthCtx(user, sess)
 	ctx.PACGroupSIDs = nil // no PAC; identity comes purely from the user
 
-	first := BuildAuthContextFromUser(ctx, user).Identity
-	second := BuildAuthContextFromUser(ctx, user).Identity
+	first := mustAuthContextFromUser(t, ctx, user).Identity
+	second := mustAuthContextFromUser(t, ctx, user).Identity
 	if first != second {
 		t.Fatalf("expected cache hit to reuse the same *Identity, got distinct pointers")
 	}
@@ -34,14 +34,14 @@ func TestAuthIdentityCache_OpenerSnapshotNotCached(t *testing.T) {
 	// A handle-bound op passes a different (frozen opener) user than the
 	// session-current ctx.User. It must not hit or populate the session cache.
 	opener := benchAuthUser() // distinct pointer
-	a := BuildAuthContextFromUser(ctx, opener).Identity
-	b := BuildAuthContextFromUser(ctx, opener).Identity
+	a := mustAuthContextFromUser(t, ctx, opener).Identity
+	b := mustAuthContextFromUser(t, ctx, opener).Identity
 	if a == b {
 		t.Fatalf("opener snapshot must not be cached on the session")
 	}
 	// And the real session user must still cache normally.
-	c := BuildAuthContextFromUser(ctx, user).Identity
-	d := BuildAuthContextFromUser(ctx, user).Identity
+	c := mustAuthContextFromUser(t, ctx, user).Identity
+	d := mustAuthContextFromUser(t, ctx, user).Identity
 	if c != d {
 		t.Fatalf("session-current user should cache")
 	}
@@ -54,7 +54,7 @@ func TestAuthIdentityCache_InvalidatedOnPACRefresh(t *testing.T) {
 	ctx := benchAuthCtx(user, sess)
 	reprimePAC(ctx, sess)
 
-	before := BuildAuthContextFromUser(ctx, user).Identity
+	before := mustAuthContextFromUser(t, ctx, user).Identity
 	if !slices.Contains(before.GroupSIDs, "S-1-5-21-OLD") {
 		t.Fatalf("expected old PAC SID before refresh, got %v", before.GroupSIDs)
 	}
@@ -63,7 +63,7 @@ func TestAuthIdentityCache_InvalidatedOnPACRefresh(t *testing.T) {
 	sess.SetPACIdentity([]string{"S-1-5-21-NEW"}, user.SID)
 	reprimePAC(ctx, sess)
 
-	after := BuildAuthContextFromUser(ctx, user).Identity
+	after := mustAuthContextFromUser(t, ctx, user).Identity
 	if after == before {
 		t.Fatalf("PAC refresh must invalidate the cached identity")
 	}
@@ -82,7 +82,7 @@ func TestAuthIdentityCache_InvalidatedOnPACClear(t *testing.T) {
 	ctx := benchAuthCtx(user, sess)
 	reprimePAC(ctx, sess)
 
-	before := BuildAuthContextFromUser(ctx, user).Identity
+	before := mustAuthContextFromUser(t, ctx, user).Identity
 	if !slices.Contains(before.GroupSIDs, "S-1-5-21-OLD") {
 		t.Fatalf("expected old PAC SID before clear, got %v", before.GroupSIDs)
 	}
@@ -91,7 +91,7 @@ func TestAuthIdentityCache_InvalidatedOnPACClear(t *testing.T) {
 	sess.SetPACIdentity(nil, "")
 	reprimePAC(ctx, sess)
 
-	after := BuildAuthContextFromUser(ctx, user).Identity
+	after := mustAuthContextFromUser(t, ctx, user).Identity
 	if after == before {
 		t.Fatalf("PAC clear must invalidate the cached identity")
 	}

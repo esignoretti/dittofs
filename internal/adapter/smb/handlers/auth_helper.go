@@ -68,7 +68,7 @@ func setUnprivilegedIdentity(authCtx *metadata.AuthContext) {
 func BuildAuthContext(ctx *SMBHandlerContext) (*metadata.AuthContext, error) {
 	// Authenticated user - delegate to BuildAuthContextFromUser
 	if ctx.User != nil {
-		return BuildAuthContextFromUser(ctx, ctx.User), nil
+		return BuildAuthContextFromUser(ctx, ctx.User)
 	}
 
 	authCtx := &metadata.AuthContext{
@@ -148,14 +148,16 @@ func uidGIDFromSessionUser(user *models.User) (uid, gid uint32) {
 // Identity Resolution:
 // UID comes from User.UID. GID is User.GID when set, otherwise the first group
 // with a GID (uidGIDFromSessionUser); the groups' GIDs are the supplementary
-// set. Falls back to defaults (1000/1000) if not configured.
+// set. Falls back to defaults (1000/1000) if not configured. The share's squash
+// then maps that identity, as it does an NFS caller's; it fails when the share
+// cannot be resolved.
 //
 // Share Permission:
 // ShareReadOnly is set from the SMB context's share permission (the read-only
 // ceiling). Per-handle write authorization (WriteAuthorizedByHandle) is NOT set
 // here — it is set by the WRITE / SET_INFO op handlers from the open handle's
 // GrantedAccess, since SMB write authorization is handle-based.
-func BuildAuthContextFromUser(ctx *SMBHandlerContext, user *models.User) *metadata.AuthContext {
+func BuildAuthContextFromUser(ctx *SMBHandlerContext, user *models.User) (*metadata.AuthContext, error) {
 	// The identity is fixed for the life of a session's authentication, so reuse
 	// the session's memoized one instead of re-deriving it (UID/GID lookup, GID
 	// slice, group-SID concat + dedup) on every op. Handle-bound callers pass the
@@ -169,6 +171,29 @@ func BuildAuthContextFromUser(ctx *SMBHandlerContext, user *models.User) *metada
 			identity = buildIdentity(ctx, user)
 			ctx.maybeCacheIdentity(user, identity)
 		}
+	}
+
+	// The squash is the runtime's, the one the NFS auth-context builders apply.
+	// It runs on every call, after the cache, so the session caches the user's
+	// own identity whichever share a request names, and a squash change applies
+	// from the next call.
+	//
+	// decision: a context primeAuthContext did not prime has no share to squash
+	// for, and keeps the user's own identity. Only tests build one with a user,
+	// since primeAuthContext is the one writer of ctx.User; refuse here instead
+	// if another path ever sets it.
+	//
+	// decision: a share that leaves uid 0 unsquashed (none, root_to_admin)
+	// leaves a uid-0 session privileged, because the metadata layer derives
+	// privilege from uid 0. Over SMB only an open with backup intent should be
+	// privileged; that needs a privilege field on the identity for the metadata
+	// layer to read instead of the uid. Withdraw this when it has one.
+	if ctx.squash != nil {
+		squashed, err := ctx.squash.ApplyIdentityMapping(ctx.ShareName, identity)
+		if err != nil {
+			return nil, fmt.Errorf("apply identity mapping: %w", err)
+		}
+		identity = squashed
 	}
 
 	authCtx := &metadata.AuthContext{
@@ -186,7 +211,12 @@ func BuildAuthContextFromUser(ctx *SMBHandlerContext, user *models.User) *metada
 	// is handle-based.
 	authCtx.ShareReadOnly = ctx.Permission == models.PermissionRead
 
-	return authCtx
+	return authCtx, nil
+}
+
+// identityMapper maps an identity through a share's squash.
+type identityMapper interface {
+	ApplyIdentityMapping(shareName string, ident *metadata.Identity) (*metadata.Identity, error)
 }
 
 // buildIdentity derives the metadata.Identity for user from its UID/GID, group
@@ -337,6 +367,7 @@ func openFileBelongsToRequest(ctx *SMBHandlerContext, openFile *OpenFile) bool {
 func (h *Handler) primeAuthContext(ctx *SMBHandlerContext, treeID uint32, sessionID uint64) {
 	ctx.TreeID = treeID
 	ctx.SessionID = sessionID
+	ctx.squash = h.Registry
 	if tree, ok := h.GetTree(treeID); ok {
 		ctx.ShareName = tree.ShareName
 		ctx.Permission = tree.Permission
@@ -428,8 +459,9 @@ func (h *Handler) CaptureOpenerIdentity(ctx *SMBHandlerContext, openFile *OpenFi
 // before issuing the metadata op — same contract as the BuildAuthContext
 // callsites in close.go and set_info.go.
 //
-// Returns nil only when ctx is nil-equivalent for BuildAuthContext;
-// callers MUST nil-check and may fall back to the session-current authCtx.
+// Returns nil when the auth context cannot be built, as when the share's
+// squash cannot be resolved; callers MUST nil-check and may fall back to the
+// session-current authCtx.
 func (h *Handler) buildOpenerAuthContext(ctx *SMBHandlerContext, openFile *OpenFile) *metadata.AuthContext {
 	if openFile == nil {
 		ac, _ := BuildAuthContext(ctx)
@@ -444,7 +476,8 @@ func (h *Handler) buildOpenerAuthContext(ctx *SMBHandlerContext, openFile *OpenF
 	}
 
 	if openFile.OpenerUser != nil {
-		return BuildAuthContextFromUser(ctx, openFile.OpenerUser)
+		ac, _ := BuildAuthContextFromUser(ctx, openFile.OpenerUser)
+		return ac
 	}
 
 	// Guest / null opener: synthesise the same identity BuildAuthContext

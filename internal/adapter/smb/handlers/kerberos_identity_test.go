@@ -92,7 +92,7 @@ func TestBuildAuthContextFromUser_PopulatesSupplementaryGIDs(t *testing.T) {
 		GIDs: []uint32{10000, 10007, 10042}, Found: true,
 	})
 
-	authCtx := BuildAuthContextFromUser(&SMBHandlerContext{Context: context.Background()}, user)
+	authCtx := mustAuthContextFromUser(t, &SMBHandlerContext{Context: context.Background()}, user)
 
 	if authCtx.Identity.GID == nil || *authCtx.Identity.GID != 10000 {
 		t.Fatalf("primary GID = %v, want 10000", authCtx.Identity.GID)

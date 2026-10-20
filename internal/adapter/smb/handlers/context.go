@@ -162,6 +162,10 @@ type SMBHandlerContext struct {
 	// falls back to constructing the identity fresh).
 	session *session.Session
 
+	// squash applies ShareName's squash to the identity an auth context is
+	// built with. Set by primeAuthContext, the one writer of User.
+	squash identityMapper
+
 	// PACGroupSIDs carries the Kerberos PAC group SIDs of the request's
 	// session (when it authenticated via Kerberos against AD). Populated from
 	// Session.PACGroupSIDs by primeAuthContext and the Kerberos SESSION_SETUP
