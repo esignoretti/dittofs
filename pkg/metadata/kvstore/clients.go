@@ -22,18 +22,25 @@ type Clients struct{ s *Store }
 
 func (s *Store) Clients() Clients { return Clients{s} }
 
-// Create records a new client under a freshly issued ID, with its owner
-// index row, and returns it. An owner already recorded under its protocol
-// is refused as existing: a reboot replaces its record through Reboot.
+// NextClientID issues a client ID never issued before in this installation,
+// for a client answered an ID before its record is written: an NFSv4 client
+// is told its ID when it proposes itself, and recorded only at its confirm.
+func (s *Store) NextClientID(ctx context.Context) (entity.ClientID, error) {
+	id, err := s.nextID(ctx, idClient)
+	return entity.ClientID(id), err
+}
+
+// Create records a new client, with its owner index row, and returns it: under
+// cl.ID when NextClientID issued it, or a freshly issued ID when it is zero.
+// An owner already recorded under its protocol is refused as existing: a
+// reboot replaces its record through Reboot.
 func (c Clients) Create(ctx context.Context, cl entity.Client) (entity.Client, error) {
 	if len(cl.Owner) == 0 || cl.Protocol == 0 {
 		return entity.Client{}, merrs.NewInvalidArgumentError("a client needs a protocol and an owner")
 	}
-	id, err := c.s.nextID(ctx, idClient)
-	if err != nil {
+	if err := c.issue(ctx, &cl); err != nil {
 		return entity.Client{}, err
 	}
-	cl.ID = entity.ClientID(id)
 	return cl, c.s.kv.Update(ctx, func(tx kv.Txn) error {
 		owner := clientOwnerKey(cl.Protocol, cl.Owner)
 		if _, ok, err := get(tx, owner); err != nil {
@@ -49,14 +56,12 @@ func (c Clients) Create(ctx context.Context, cl entity.Client) (entity.Client, e
 }
 
 // Reboot replaces old, the record of a client that came back with a new
-// boot verifier, by cl under a new ID: the owner index moves to it, and old
-// goes with its shard records, in one transaction.
+// boot verifier, by cl under a new ID, issued as Create issues one: the owner
+// index moves to it, and old goes with its shard records, in one transaction.
 func (c Clients) Reboot(ctx context.Context, old entity.ClientID, cl entity.Client) (entity.Client, error) {
-	id, err := c.s.nextID(ctx, idClient)
-	if err != nil {
+	if err := c.issue(ctx, &cl); err != nil {
 		return entity.Client{}, err
 	}
-	cl.ID = entity.ClientID(id)
 	return cl, c.s.kv.Update(ctx, func(tx kv.Txn) error {
 		prev, err := clientIn(tx, old)
 		if err != nil {
@@ -73,6 +78,16 @@ func (c Clients) Reboot(ctx context.Context, old entity.ClientID, cl entity.Clie
 		}
 		return tx.Set(clientKey(cl.ID), encodeClient(cl))
 	})
+}
+
+// issue gives cl a fresh ID unless NextClientID already issued it one.
+func (c Clients) issue(ctx context.Context, cl *entity.Client) error {
+	if cl.ID != 0 {
+		return nil
+	}
+	id, err := c.s.NextClientID(ctx)
+	cl.ID = id
+	return err
 }
 
 // Get reads one client record.

@@ -2,6 +2,7 @@ package openstate
 
 import (
 	"sync"
+	"time"
 
 	"github.com/marmos91/dittofs/pkg/metadata/entity"
 )
@@ -10,6 +11,8 @@ import (
 // file's state lives in its own entry, created with the file's first piece of
 // state and freed with its last, so a file with none costs nothing.
 type Table struct {
+	d Deps
+
 	// ponytail: one mutex guards the file map, held only to find, add or
 	// free an entry, never while a step runs. Shard the map by FileID when a
 	// profile shows contention on it under many files' steps at once.
@@ -22,6 +25,14 @@ type Table struct {
 	idx    sync.Mutex
 	refs   map[refKey]holder
 	shards map[ShardID]shardGrace
+
+	// cmu guards the client area: the leases of the clients this node is the
+	// lease owner of, and the proposals it answered. It is never held with a
+	// file's step or idx.
+	cmu       sync.Mutex
+	leases    map[entity.ClientID]time.Time // when each NFSv4 client's lease ends
+	proposals map[proposalKey]unconfirmed
+	stop      func() // Stop's; nil before Start
 }
 
 // entry is one file's state. Its mutex is the file's open-state step: every
@@ -30,14 +41,6 @@ type entry struct {
 	mu     sync.Mutex
 	users  int // steps running or waiting on this entry, guarded by Table.mu
 	states int // pieces of state held, guarded by mu
-}
-
-func New() *Table {
-	return &Table{
-		files:  map[entity.FileID]*entry{},
-		refs:   map[refKey]holder{},
-		shards: map[ShardID]shardGrace{},
-	}
 }
 
 // step runs fn under file f's step, creating the file's entry if it has none

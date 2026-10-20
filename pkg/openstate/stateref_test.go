@@ -30,7 +30,7 @@ func releaseIn(t *testing.T, tab *Table, f entity.FileID, ref StateRef) {
 // No flip of one of a reference's 64 random bits names another record: the
 // token is random, not a counter, so holding one reveals no other.
 func TestStateRefTokenIsUnguessable(t *testing.T) {
-	tab := New()
+	tab := newFixture(t).Table
 	f := entity.NewFileID()
 	refs := make([]StateRef, 1<<16)
 	for i := range refs {
@@ -61,7 +61,7 @@ func TestMissIsStaleOrBad(t *testing.T) {
 		{"earlier instance", shardGrace{instance: 4}, ErrStaleState},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tab := New()
+			tab := newFixture(t).Table
 			tab.shards[9] = shardGrace{instance: 3}
 			ref := mintIn(t, tab, f, 1, 9)
 			releaseIn(t, tab, f, ref)
@@ -76,7 +76,7 @@ func TestMissIsStaleOrBad(t *testing.T) {
 // A reference resolves only for its own client and, when the request names a
 // file, only for its own file.
 func TestResolveChecksClientAndFile(t *testing.T) {
-	tab := New()
+	tab := newFixture(t).Table
 	f, other := entity.NewFileID(), entity.NewFileID()
 	ref := mintIn(t, tab, f, 1, 0)
 	if _, err := tab.resolve(1, f, ref); err != nil {
@@ -101,7 +101,7 @@ func TestResolveChecksClientAndFile(t *testing.T) {
 // A file's entry exists while it holds state and is freed with its last
 // piece, also when steps on the file run concurrently.
 func TestEntryFreedWithLastState(t *testing.T) {
-	tab := New()
+	tab := newFixture(t).Table
 	f := entity.NewFileID()
 	a, b := mintIn(t, tab, f, 1, 0), mintIn(t, tab, f, 1, 0)
 	releaseIn(t, tab, f, a)
