@@ -275,8 +275,13 @@ This RFC **MUST NOT** be read as specifying:
 `node.New(cfg)` is the one composition root: the server's start command calls
 it, and it alone names concrete component types. It builds every component from
 that component's own `Deps`, in the order below, and returns the **node**, a
-`*node.Node` that holds them all. `New` opens nothing and starts nothing. From
-then on the node is the only code that starts, changes or stops a component:
+`*node.Node` that holds them all. `New` opens only the metadata store and
+starts nothing: every view it hands out is bound to that store, so `New` calls
+`metadata.Open` ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)) before it builds anything that takes one. No
+constructor takes settings: each component's first settings arrive through its
+`Apply`, which the node calls once it has read the records (§2.2 step 4) and
+before it calls that component's `Start`. From then on the node is the only
+code that starts, changes or stops a component:
 
 - it adds, replaces and removes a share's context in the engine
   ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) — adding, removing and quiescing a share never restarts
@@ -322,12 +327,12 @@ store configuration, and the last share's context to close one releases it.
 
 | # | Component | `Deps` | Calls | Start / stop step (§2.2) |
 | --- | --- | --- | --- | --- |
-| 1 | metadata store ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)) | the KV, the host's bootstrap | the KV | 2 / 9 |
+| 1 | metadata store ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)) | the KV, the host's bootstrap | the KV | opened by `New` / 9 |
 | 2 | remote stores ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)), one client per store configuration | the store configuration, its `Secret` | the remote service | 5 / 8 |
 | 3 | syncer ([RFC 3](rfc-3-syncer.md)) | the remote stores | the remote stores | 5 / 8 |
 | 4 | engine ([RFC 8 §2.6](rfc-8-engine.md#2.6%20Dependencies%20and%20wiring)) | `Devices` and `Open`, the journal opener; the carver; the syncer; the `Existence`, `Content` and `Lifecycle` views | the journals, the syncer, the block-metadata views | 5 / 8 |
 | 5 | GC ([RFC 9 §2.5](rfc-9-gc.md#2.5%20Composition%20and%20lifecycle)), a sibling of the engine, never passed into it | its scheduler, the syncer; at each namespace's `Add`, the `View` of its `Blocks`, `Remote` and `Keys` | `Blocks`, `Remote`, the syncer, `Keys` | 5 / drains at 5, closes at 7 |
-| 6 | open state ([RFC 14](rfc-14-open-state.md)) | `Store`, the metadata store; `Sink`, which the server implements | the metadata store, the `Sink` | 5 / 7 |
+| 6 | open state ([RFC 14](rfc-14-open-state.md)) | `Store`, the metadata store; at `Start`, its `Sink`, which the server implements | the metadata store, the `Sink` | 5 / 7 |
 | 7 | identity ([RFC 18 §2.6](rfc-18-identity.md#2.6%20Components%2C%20wiring%20and%20lifecycle)) | RFC 18 §2.6's `Deps` | the metadata store, the directory | 5 / 7 |
 | 8 | `*vfs.Server`, by `vfs.New` ([RFC 17](rfc-17-vfs.md)) | `Meta` (the metadata store), `Open` (open state), `Engine` (the engine), `Identity` | identity, open state, the metadata views, the engine | 6 / 6 |
 | 9 | **(cluster)** `vfs.Serve`, then the gateway by `vfs.NewGateway` ([RFC 17](rfc-17-vfs.md)) | `Serve`: the server, the `Transport`, the `Router`; the gateway: `Local` (the checked `Service` that `Serve` returns), `Router`, `Transport` | `Serve`: the fence, the dedup, then the server; the gateway: `Service`, `Router`, `Transport` | 6 / 4 |
@@ -336,20 +341,20 @@ store configuration, and the last share's context to close one releases it.
 **What `New` looks like.** The sketch is illustrative and elides errors and
 the values beside the rows. Where a component's RFC declares a constructor or a
 `Deps` field, the sketch uses that name; where none is declared yet (the remote
-stores, the syncer, the metadata store's build step, see §13), it names one.
+stores and the syncer), it names one.
 
 ```go
 func New(cfg Config) (*Node, error) {
 	n := &Node{}
-	n.meta   = metadata.New(cfg.KV, metadata.Options{...})               // RFC 16 §3.2; Start opens it (§2.2 step 2); everyone takes a view of it; closed last
+	n.meta   = metadata.Open(context.Background(), cfg.KV, metadata.Options{...}) // RFC 16 §3.2; the one thing New opens; everyone takes a view of it; closed last
 	n.remote = remote.NewPool(remote.Deps{...})                         // one client per store configuration, ref-counted
 	n.syncer = syncer.New(syncer.Deps{Remote: n.remote, ...})
 	n.engine = engine.New(engine.Deps{
 		Devices: cfg.Bootstrap.Devices, Open: journal.Open, Syncer: n.syncer, // the engine opens its journals at Start
 		Existence: n.meta.Existence(), Content: n.meta.Content(), Lifecycle: n.meta.Lifecycle(), ...})
 	n.gc     = gc.New(gc.Deps{Sched: sched.New(cfg.Clock), Syncer: n.syncer, ...}) // a sibling of the engine, never passed into it
-	n.open   = openstate.New(openstate.Deps{Store: n.meta, ...})
-	n.ident  = identity.New(identity.Deps{Principals: n.meta.Principals(), ...}, ...)
+	n.open   = openstate.New(openstate.Deps{Store: n.meta, ...})         // its Sink, the server, is handed to its Start (§2.2 step 5)
+	n.ident  = identity.New(identity.Deps{Principals: n.meta.Principals(), ...}) // no settings: the first Apply brings them
 	n.server = vfs.New(vfs.Deps{Meta: n.meta, Open: n.open, Engine: n.engine, Identity: n.ident, ...})
 
 	var svc vfs.Service = n.server                                      // one node: the adapters call the server
@@ -358,13 +363,13 @@ func New(cfg Config) (*Node, error) {
 		svc = vfs.NewGateway(vfs.GatewayDeps{Local: checked, Router: n.router, Transport: cfg.Transport})
 	}
 	n.adapters = core.Deps{Service: svc, Auth: n.ident, ...}            // handed to each adapter's factory as reconcile enables it
-	return n, nil                                                       // nothing opened or started
+	return n, nil                                                       // only the metadata store opened; nothing started
 }
 ```
 
-`Start` opens the metadata store, registers the node (§2.2 step 3), and then
-starts the rest in build order; `Stop` hands over the node's shards before
-`vfs.Serve` stops, and otherwise stops everything in reverse.
+`Start` registers the node (§2.2 step 3), applies the records' settings to
+every component (step 4), and then starts the rest in build order; `Stop`
+hands over the node's shards before `vfs.Serve` stops, and otherwise stops everything in reverse.
 
 **A call routed locally is fenced too.** In a cluster the gateway's `Local` is
 the checked service `vfs.Serve` returns, never the bare `*vfs.Server`, so a
@@ -401,7 +406,7 @@ node starts and stops nothing for it.
 package node // internal/node
 
 // New builds every component of §2.1's table, in its order, each from its own
-// Deps. It opens and starts nothing.
+// Deps. It opens only the metadata store, and starts nothing.
 func New(cfg Config) (*Node, error)
 func (n *Node) Start(ctx context.Context) error // §2.2's start, then reconcile until Stop
 func (n *Node) Stop(ctx context.Context) error  // §2.2's stop: the components in reverse build order
@@ -450,10 +455,10 @@ API, forms no cycle with it.
 begins. Steps 5, 6, 7 and 9 start the components in build order (§2.1):
 
 1. **Refuse** what [RFC 15 §2.2](rfc-15-topology.md#2.2%20Startup%20refuses%20what%20cannot%20work) lists, and a missing or foreign
-   installation ([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)), before anything opens. A start creates
-   nothing.
-2. **Open the metadata store** and read its format record
-   ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)). From here the node's health endpoints answer
+   installation ([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)). `New` has already refused both: the first
+   before it opens the metadata store, the second as `metadata.Open` reads the
+   format record ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)). A start creates nothing.
+2. **Open the listeners.** From here the node's health endpoints answer
    (§2.5): live, not ready. The node's API address and the metrics listener
    open here. Until step 7, every `/api/v1` route but `/api/v1/health` answers
    `503` `starting`.
@@ -463,12 +468,15 @@ begins. Steps 5, 6, 7 and 9 start the components in build order (§2.1):
    transaction runs or any adapter serves.
 4. **Read the records**: the settings, the share list and the principals
    generation, and apply the provisioning file if one is named
-   ([RFC 13 §2.4](rfc-13-configuration.md#2.4%20Records%20can%20be%20declared%20in%20a%20provisioning%20file)).
+   ([RFC 13 §2.4](rfc-13-configuration.md#2.4%20Records%20can%20be%20declared%20in%20a%20provisioning%20file)). Then `apply` (§2.3) hands identity,
+   `*vfs.Server`, the engine and GC their first settings through `Apply`, so
+   every component holds the records' values before any of them starts.
 5. **The content side and the state the server reads**, in build order:
    **(cluster)** shard placement ([RFC 11](rfc-11-ownership.md)); the engine, in
    [RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)'s order, handed the whole set of shares this node serves in
    one call; GC, with each served share's namespace; open state for the shards
-   this node acquires ([RFC 14](rfc-14-open-state.md)); identity and the event sink. Only a share
+   this node acquires, handed the built server as its `Sink`
+   ([RFC 14 §11.2](rfc-14-open-state.md#11.2%20Lifecycle)); identity and the event sink. Only a share
    created while the node serves is attached alone.
 6. **`*vfs.Server`** (`Start`, [RFC 17](rfc-17-vfs.md)); then, **(cluster)**, `vfs.Serve`, the
    gateway, the client-address agent and the pNFS data server.
@@ -514,7 +522,7 @@ before `vfs.Serve` stops (step 4), while other nodes can still reach it:
 
 The API outlives the adapters on purpose: an operator watching a drain reads its
 progress through the API. A failure at any start step stops the start, closes
-what the earlier steps opened in reverse, and leaves `/health/ready`
+what the earlier steps opened in reverse, the metadata store `New` opened last, and leaves `/health/ready`
 answering `not ready` and `/api/v1/health` naming the step and its error until
 the process exits.
 
@@ -1503,7 +1511,8 @@ builds a node any other way, and an architecture test fails on a caller of
    better; whether it is worth a second read path is open.
 4. **Lifecycles the owning RFCs have yet to state.** §2.1 places, but does not
    specify, what this RFC cannot state for another: the construction and
-   lifecycle of open state and namespace metadata (RFC 14), the identity
+   lifecycle of namespace metadata (RFC 14; open state's is
+   [RFC 14 §11.2](rfc-14-open-state.md#11.2%20Lifecycle)'s), the identity
    resolver and authenticator, and whether they hold directory connections or
    keytabs to close (RFC 18), the event sink and the admin-stream writer
    (RFC 25), the pools (RFC 24), the router and the client-address agent
@@ -1513,18 +1522,6 @@ builds a node any other way, and an architecture test fails on a caller of
    that is once a second. Whether it needs a rate bound, and whether reconciling
    only the records above the reconciled position needs an index by (kind,
    position) in RFC 16, is unmeasured.
-6. **What `New` cannot have yet.** §2.1's sketch builds every component before
-   anything is opened or read, and three declarations do not fit that yet:
-   [RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)
-   declares only `metadata.Open`, which reads the format record, so the views
-   `New` hands out need a build step before `Start` opens the store;
-   [RFC 14](rfc-14-open-state.md#11.1%20Package%2C%20dependencies%20and%20wiring)'s
-   `Deps.Sink` is implemented by `*vfs.Server`, which is built after open state
-   and takes it in its own `Deps`, so one of the two is bound after it is built;
-   and identity's `New` and the engine's `Deps.Settings` take settings that the
-   node reads from records only at start step 4. Whether each is built with
-   defaults and handed the records' values by `apply` before it starts is for
-   those RFCs to state.
 
 ## Appendix A — prior art
 
