@@ -10,7 +10,7 @@ import "time"
 // decision: the stub returns the zero Stats because the signature has no
 // error to carry ErrNotImplemented. A zero Stats reads as an empty journal, so
 // no caller may depend on it until the counters land.
-func (h *Handle) Stats() Stats {
+func (h *Journal) Stats() Stats {
 	return Stats{}
 }
 

@@ -20,6 +20,7 @@ var (
 	_ = func(j *Journal) error { return j.Strand(ShareTag(0)) }
 	_ = func(j *Journal) (Version, error) { return j.Draw() }
 	_ = func(j *Journal) { j.SetVersionLimit(Version{}) }
+	_ = func(h *Journal) Stats { return h.Stats() }
 
 	_ = func(h *Handle) error { return h.Close() }
 	_ = func(h *Handle) error { return h.SetSyncPolicy(Standard) }
@@ -39,7 +40,6 @@ var (
 	_ = func(h *Handle) ([]Extent, error) { return h.Extents(FileID{}) }
 	_ = func(h *Handle) iter.Seq[FileID] { return h.Files() }
 	_ = func(h *Handle) iter.Seq2[FileID, time.Time] { return h.DirtyFiles() }
-	_ = func(h *Handle) Stats { return h.Stats() }
 
 	_ = func(r *Reservation) (Version, error) { return r.WriteAt(FileID{}, int64(0), []byte(nil), int64(0)) }
 	_ = func(r *Reservation) error { return r.Close() }
