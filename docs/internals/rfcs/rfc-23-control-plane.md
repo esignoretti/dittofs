@@ -7,6 +7,7 @@ depends_on:
   - "[[rfc-0-data-lifecycle]]"
   - "[[rfc-8-engine]]"
   - "[[rfc-9-gc]]"
+  - "[[rfc-11-ownership]]"
   - "[[rfc-12-snapshots]]"
   - "[[rfc-13-configuration]]"
   - "[[rfc-15-topology]]"
@@ -29,8 +30,7 @@ tags:
 ---
 # RFC 23 — the control plane
 
-**Status:** draft. [§13](#13.%20Open%20questions) lists what is known to be undecided, and
-records the one question since settled.
+**Status:** draft. [§13](#13.%20Open%20questions) lists what is known to be undecided.
 **Audience:** anyone adding a management-API resource or action, changing how a
 node is composed or how it applies a record, or writing a client of the API —
 the CLI, the Kubernetes operator, a script.
@@ -55,13 +55,13 @@ protocols listen. It has two halves.
   operator, checks the change, and writes it as records in the metadata store
   ([RFC 16](rfc-16-metadata-store.md#2.3%20Server-wide%20and%20control-plane%20entities)).
   It never reaches into a running component.
-- The **runtime** on every node reads those records and makes the node match
-  them: it adds a share's context to the engine, starts or drains an adapter,
-  applies a live setting. It is the part of the node that is built once at start
-  and then follows the records.
+- The **node** — the one object each process builds — reads those records and
+  makes its components match them: it adds a share's context to the engine,
+  starts or drains an adapter, applies a live setting. It builds every
+  component once at start and then follows the records.
 
 Think of a restaurant: the API is the order desk, the metadata store is the
-ticket rail, and each node's runtime is a cook who reads the rail. Where the
+ticket rail, and each node is a cook who reads the rail. Where the
 picture breaks: an order the desk would refuse — a setting bound to stored
 content ([RFC 13 §5.1](rfc-13-configuration.md#5.1%20A%20bound%20setting%20refuses%20change)) — never reaches the rail at all.
 
@@ -69,8 +69,8 @@ content ([RFC 13 §5.1](rfc-13-configuration.md#5.1%20A%20bound%20setting%20refu
 what changing it does. [RFC 16](rfc-16-metadata-store.md) says what the records
 are. This RFC says how they are written and how a node applies them: the
 resources and their lifecycles, the API's shape and its rules for concurrent
-operators, long work and retries, who may call it, what is audited, and how the
-runtime composes and changes a node.
+operators, long work and retries, who may call it, what is audited, and how a
+node composes and changes its components.
 
 **The problem, with one example.** Two operators look after `builds`. At 10:00
 Dana opens the share's export policy to add build02's subnet. At 10:01 Eli opens
@@ -85,8 +85,8 @@ will finish.
 
 Under this RFC:
 
-1. Every resource read returns its **generation** as an entity tag. Eli's write
-   carries the generation he read, which Dana's save has moved on; the API
+1. Every resource read returns an **entity tag**. Eli's write carries the tag
+   he read, which Dana's save has moved on; the API
    refuses it with "changed since read" (`412`), and his client shows him
    Dana's version to merge into (§4.4).
 2. Every create and every action carries an **idempotency key**. Eli's retry
@@ -99,17 +99,18 @@ Under this RFC:
 4. Both operators' writes, refusals included, are in the **audit log** with
    who, when, from where and the generation before and after (§6).
 
-![A node's composition: the start order on the left — refuse, metadata store, health endpoints, runtime load, storage components in RFC 8's order, the operation runner and the management API, then the protocol components with adapters last — and the stop order on the right, the exact reverse, with the API kept until adapters have drained](img/rfc23-composition.svg)
-
 **The words you need.**
 
-- **runtime** — the node's control loop: built by the composition root
-  ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)), it reconciles the running components with the
-  records (§2).
+- **node** — `node.Node`, built by `node.New`: it builds every component of the
+  process, starts and stops them, and reconciles them with the records (§2).
 - **resource** — one thing the API names: a share, a user, a remote store, an
   operation. Each maps onto records RFC 16 defines (§3.1).
 - **generation** — the counter every record carries, raised by every change
-  ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)); the API's entity tag (§4.4).
+  ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)); the entity tag of most resources (§4.4).
+- **position** — the value of its kind's counter that a record's last change
+  raised; how "applied" is computed, and a quota's entity tag (§2.4, §4.4).
+- **node-status record** — the one record each node writes about itself: what
+  it has reconciled, refused and holds restart-pending (§2.4).
 - **operation** — a resource that stands for work longer than one request, with
   a state and progress, readable from any node until it ends (§4.6).
 - **API account** — a `User` record that holds an API role. Its role grants
@@ -136,7 +137,7 @@ Under this RFC:
   it runs, so "applied everywhere" is something an operator can read.
 
 **How the rest is organised.** §1 gives the purpose and non-goals. §2 is the
-runtime: composition, start and stop, and how a node applies records. §3 is the
+node: composition, start and stop, and how it applies records. §3 is the
 resources and their lifecycles — shares above all. §4 is the API's shape:
 resources, reads, writes, concurrency, idempotency, operations, errors. §5 is
 authentication and authorization of API accounts; §6 the audit; §7 the CLI; §8
@@ -180,38 +181,41 @@ Outcome: one deletion, visible throughout, finished after the restart.
 
 **Two operators edit the export policy of `builds`.**
 
-1. Dana and Eli each `GET` the policy; both see `ETag: "g14"`.
-2. Dana's `PUT` with `If-Match: "g14"` commits generation 15.
-3. Eli's `PUT` with `If-Match: "g14"` is refused `412`, code
-   `generation_mismatch`, naming generation 15. The CLI re-reads, shows the
+1. Dana and Eli each `GET` the policy; both see the same `ETag`.
+2. Dana's `PUT` with `If-Match` and that tag commits, and the policy has a new
+   tag.
+3. Eli's `PUT` with `If-Match` and the old tag is refused `412`, code
+   `generation_mismatch`, naming the current tag. The CLI re-reads, shows the
    difference, and asks Eli to apply his change to Dana's version.
 
 Outcome: no write overwrites one its author never saw.
 
-**(cluster) An operator changes the `atime` policy of `profiles` on S1.**
+**(cluster) An operator changes the `atime` policy of `profiles` on N1.**
 
-1. The API on S1 validates the value with the share component's own validator
+1. The API on N1 validates the value with the share component's own validator
    and commits the setting, raising the settings generation, and the audit record,
    in one transaction (§4.3).
 2. Every node reads the settings generation each second, re-reads the record,
    and applies it, live, within 5 s ([RFC 13 §5](rfc-13-configuration.md#5.%20Binding%20classes)).
-3. Each node reports the generation it has applied. `GET` on the setting shows
-   `applied: 3 of 3 nodes` — S1, P1 and P2; had P2 been frozen, it would show P2 behind and a
-   health condition naming it.
+3. Each node reports the position it has reconciled through. `GET` on the
+   setting shows `applied: 3 of 3 nodes` — N1, N2 and N3; had N3 been frozen,
+   it would show N3 behind and the `config_generation_behind` condition naming
+   it.
 
 Outcome: one write, and an answer to "is it applied everywhere?" that is read,
 not guessed.
 
 ## In short
 
-- One composition root builds a node ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)); the runtime it
-  builds then follows the records. Start brings up the store, the content
-  subsystem, the API, then the adapters; stop is the reverse.
-- The API writes records; it never calls a component. Every node's runtime
+- `node.New` builds every component of a node, and the node then follows the
+  records. Start brings up the store, the content side, the filesystem service,
+  the API, then the adapters; stop is the reverse. Every node runs both roles.
+- The API writes records; it never calls a component. Every node
   applies records by their binding class and reports the generation it runs.
 - A resource is addressed by ID. Reads are consistent; lists page by an opaque
-  cursor. Every update and delete carries `If-Match` with the generation read;
-  every create and action but a credential call carries an idempotency key.
+  cursor. Every update and delete carries `If-Match` with the `ETag` read;
+  every create and action carries an idempotency key, except the credential
+  calls (§4.5).
 - Work longer than one request is an operation: `202`, an operation ID, progress
   read from the owning component's durable cursor, readable from any node, and
   resumed after a crash by the component that owns the work.
@@ -236,7 +240,7 @@ answer to the same questions — what a retry does, what two concurrent edits do
 who may call it, what is recorded — and the answers differ. This RFC answers
 them once:
 
-- the runtime: how a node is composed, started, stopped and kept matching its
+- the node: how it is composed, started, stopped and kept matching its
   records (§2);
 - the resources and their lifecycles (§3);
 - the API's shape and its rules for concurrency, retries and long work (§4);
@@ -261,18 +265,18 @@ This RFC **MUST NOT** be read as specifying:
   events: [RFC 25](rfc-25-observability.md)'s. This RFC owns the management
   API's surface, including that health and readiness endpoints exist and who may
   call them;
-- which components a role composes and where each runs:
-  [RFC 15](rfc-15-topology.md)'s; this RFC builds on its composition root.
+- a node that runs only the `protocol` or only the `storage` role: every node
+  runs both, as [RFC 15](rfc-15-topology.md)'s `ponytail:` marker records.
 
-## 2. The runtime
+## 2. The node
 
-### 2.1 One root composes, the runtime follows
+### 2.1 The node builds its components
 
-The composition root is [RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)'s: one place, in the server's start
-command, builds a node from its roles and alone names concrete component types.
-This RFC does not add a second. What the root builds for control is the
-**runtime**, and the runtime is the only code that changes the set of running
-components after start:
+`node.New(cfg)` is the one composition root: the server's start command calls
+it, and it alone names concrete component types. It builds every component from
+that component's own `Deps`, in the order below, and returns the **node**, a
+`*node.Node` that holds them all. `New` opens nothing and starts nothing. From
+then on the node is the only code that starts, changes or stops a component:
 
 - it adds, replaces and removes a share's context in the engine
   ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) — adding, removing and quiescing a share never restarts
@@ -280,64 +284,184 @@ components after start:
 - it moves each adapter between configured, serving, draining and stopped, and
   reconfigures its listeners ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states));
 - it runs the sidecars, calling each one's `Sync` with the adapters it serves
-  that are serving; it declares the `Adapter` and `Sidecar` interfaces it drives
-  beside its own code, so it imports no adapter
-  ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface),
-  [§3.5](rfc-20-adapters.md#3.5%20Sidecars));
+  that are serving ([RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars));
 - it hands a live setting to the component that reads it;
 - it runs the operations no other component owns (§4.6).
 
-A component **MUST NOT** build another component, and the API **MUST NOT** call
-a component to change it: both go through records the runtime applies. A
-handler that called the engine to add a share "because it is quicker" would
-make the share's existence depend on which node took the request.
+A component **MUST NOT** build another component or close anything it was
+handed, and the API **MUST NOT** call a component to change it: both go through
+records the node applies. A handler that called the engine to add a share
+"because it is quicker" would make the share's existence depend on which node
+took the request.
 
-> decision: the API writes and the runtime applies, even on a single node where
+> decision: the API writes and the node applies, even on a single node where
 > a direct call would be shorter. A direct call is a second path: it runs on one
 > node, it can succeed while the record write fails or the reverse, and a
 > restart replays only the record. Revisit only if a change must take effect
 > faster than the one-second generation read, and then shorten the read, not the
 > path.
 
+> ponytail: the node both builds and drives its components. Split the builder
+> out when it gains dependencies a multi-node test cannot fake cheaply.
+
+**The node is never on the request path.** `New` hands each adapter a
+`vfs.Service` once, and an adapter's call goes to that service, never to the
+node. The management API calls the node for nothing: it writes the
+control-plane store, and the node applies the change through reconcile (§2.3).
+So every change takes effect by one path — API, store, reconcile, the
+component's call — on every node alike. The node holds no routing or cluster
+logic: in a cluster, the one thing `New` does differently is build `vfs.Serve`
+and the gateway.
+
+![The node and what it builds. On the left, the management API writes records to the control-plane store, and the node reads its generations and drives every component: New builds them, Start starts them in build order, Stop stops them in reverse, and reconcile calls addShare, removeShare and apply; the node is never on the request path. On the right, the components in build order from the bottom: 1 the metadata store and 2 the remote stores; 3 the syncer, beside the journals the engine opens itself; 4 the engine and 5 GC, its sibling, which is never passed into it; 6 open state and 7 identity; 8 the vfs server; 9, in a cluster only, vfs.Serve and the gateway; 10 the adapters. The arrows are calls: the adapters call the vfs service and sign in through identity; the gateway calls the server locally, or another node's Serve over the transport, using the router; Serve calls the local server; the server calls identity, open state, the metadata views and the engine; the engine calls the journal, the syncer and the metadata views; GC calls the metadata store's Blocks view, the syncer and the remote stores; the syncer calls the remote stores](img/rfc23-node.svg)
+
+**What `New` builds, in order.** Each row is built from its own `Deps`; the
+Calls column is the call graph once it is built. The node owns every row and
+closes it at the stop step named (§2.2); the remote stores are ref-counted per
+store configuration, and the last share's context to close one releases it.
+
+| # | Component | `Deps` | Calls | Start / stop step (§2.2) |
+| --- | --- | --- | --- | --- |
+| 1 | metadata store ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)) | the KV, the host's bootstrap | the KV | 2 / 9 |
+| 2 | remote stores ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)), one client per store configuration | the store configuration, its `Secret` | the remote service | 5 / 8 |
+| 3 | syncer ([RFC 3](rfc-3-syncer.md)) | the remote stores | the remote stores | 5 / 8 |
+| 4 | engine ([RFC 8 §2.6](rfc-8-engine.md#2.6%20Dependencies%20and%20wiring)) | `Open`, the journal opener; the syncer; the `Existence`, `Content` and `Lifecycle` views | the journals, the syncer, the block-metadata views | 5 / 8 |
+| 5 | GC ([RFC 9 §2.5](rfc-9-gc.md#2.5%20Composition%20and%20lifecycle)), a sibling of the engine, never passed into it | `Blocks`, the syncer | `Blocks`, `Remote`, the syncer, `Keys` | 5 / drains at 5, closes at 7 |
+| 6 | open state ([RFC 14](rfc-14-open-state.md)) | the metadata store | the metadata store | 5 / 7 |
+| 7 | identity ([RFC 18 §2.6](rfc-18-identity.md#2.6%20Components%2C%20wiring%20and%20lifecycle)) | RFC 18 §2.6's `Deps` | the metadata store, the directory | 5 / 7 |
+| 8 | `*vfs.Server`, by `vfs.New` ([RFC 17](rfc-17-vfs.md)) | `Namespace`, `Open` (open state), `Content` (the engine), `Identity` | identity, open state, the metadata views, the engine | 6 / 6 |
+| 9 | **(cluster)** `vfs.Serve`, then the gateway by `vfs.NewGateway` ([RFC 17](rfc-17-vfs.md)) | `Serve`: the server, the `Transport`; the gateway: `Local` (the server), `Router`, `Transport` | `Serve`: the local `Service`; the gateway: `Service`, `Router`, `Transport` | 6 / 4 |
+| 10 | adapters ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)) | `FS`, the `vfs.Service` — the gateway in a cluster, the server on one node; `Auth`, identity | `vfs.Service`, identity's `Authenticator` and `Identities` | 8 / 2 |
+
+**The node builds no journal.** The engine opens each device's journal itself,
+through the opener the node passes as `Open`, once it has read the version floor
+and the journal identity the store records ([RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)); it closes them at its
+stop. A journal built before that read could open with the wrong floor.
+
+Beside the rows: the clock, the fault seam ([RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition)), the
+metrics registry, the logger and the pools ([RFC 24 §2.3](rfc-24-resources.md#2.3%20The%20pools)) are values built
+first and live until exit; the event sink ([RFC 25 §4.3](rfc-25-observability.md#4.3%20From%20the%20emit%20point%20to%20the%20spool)) is built with
+identity and closed after the server; the operation runner (§4.6) and the API
+address (§2.5, §4) are built after row 9 and stop after the adapters; the
+sidecars ([RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars)) come with the adapters; and, **(cluster)**, shard placement
+([RFC 11](rfc-11-ownership.md)) comes before the engine, and the client-address agent and the pNFS data server
+([RFC 15](rfc-15-topology.md)) with row 9. Two things are not built by `New`, because records decide
+them: share contexts, which the node attaches through the engine, and each
+adapter the records enable, which the node builds through its factory
+([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)).
+
+**The carver is not a component.** It holds no state ([RFC 2](rfc-2-carver.md)). The engine's
+offload pipeline calls its `Cut`, at the pass's Carve stage
+([RFC 8 §6.3](rfc-8-engine.md#6.3%20The%20offload%20pipeline)); it reaches the engine as a value in its `Deps`, and the
+node starts and stops nothing for it.
+
+**The node's surface.**
+
+```go
+package node // internal/node
+
+// New builds every component of §2.1's table, in its order, each from its own
+// Deps. It opens and starts nothing.
+func New(cfg Config) (*Node, error)
+func (n *Node) Start(ctx context.Context) error // §2.2's start, then reconcile until Stop
+func (n *Node) Stop(ctx context.Context) error  // §2.2's stop: the components in reverse build order
+
+// Config is what the host supplies and the node cannot build.
+type Config struct {
+	Bootstrap config.Bootstrap // RFC 13 §2.2
+	KV        kv.KV            // what the metadata store opens on; an in-memory one in a multi-node test
+	Transport vfs.Transport    // (cluster): nil on one node; a loopback one in a multi-node test
+	Clock     clock.Clock
+	Fault     Fault            // RFC 8 §2.1
+	Metrics   *metrics.Registry
+	Logger    *slog.Logger
+}
+
+// Records is the node's view of the control-plane store; not RFC 16's
+// ControlPlane, which is the API's write view.
+type Records interface {
+	RegisterNode(ctx context.Context, n NodeRecord) error                      // §2.2 step 3: roles and version ranges, refused in the same transaction if an active version lies outside them (RFC 13 §5.5)
+	List(ctx context.Context, kind Kind, after string) iter.Seq2[Record, error] // paged (RFC 16 §3.1)
+	Counters(ctx context.Context) (Counters, error)                            // settings, share list, principals
+	PutNodeStatus(ctx context.Context, s NodeStatus) error                     // §2.4
+}
+
+// Reconcile's three calls (§2.3). Unexported, so nothing but reconcile makes them.
+func (n *Node) addShare(ctx context.Context, s metadata.Share) error      // a share context in the engine, its namespace in GC, the share open in *vfs.Server
+func (n *Node) removeShare(ctx context.Context, id metadata.ShareID) error // the same three, in reverse
+func (n *Node) apply(ctx context.Context, c Counters) error                // Apply on identity, *vfs.Server, the engine and GC, each with the values it reads
+```
+
+The node exports no status call. Readiness and conditions come from
+[RFC 25](rfc-25-observability.md#3.%20Health)'s health registry, which `New`
+hands the API, so the API never calls the node and the node, which holds the
+API, forms no cycle with it.
+
+> decision: the node exports `New`, `Start` and `Stop` only, and is not
+> restartable: a second `Start` is an error. Reconcile's calls are unexported,
+> so no caller, the API included, can change a component by a second path.
+> Overturned if something other than the server's start command and the test
+> harness must drive a node, and then by a second root, not by exporting the
+> calls.
+
 ### 2.2 Start and stop
 
-**Start.** Each step completes before the next begins:
+**Start.** `Node.Start` runs these steps, each completing before the next
+begins. Steps 5 to 8 start the components in build order (§2.1):
 
 1. **Refuse** what [RFC 15 §2.2](rfc-15-topology.md#2.2%20Startup%20refuses%20what%20cannot%20work) lists, and a missing or foreign
    installation ([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)), before anything opens. A start creates
    nothing.
 2. **Open the metadata store** and read its format record
    ([RFC 16 §3.2](rfc-16-metadata-store.md#3.2%20How%20it%20is%20assembled)). From here the node's health endpoints answer
-   (§2.5): live, not ready.
-3. **Load the runtime.** Register the node's version ranges and roles in its
-   node record ([RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap)) — refusing to go on if an active version lies
-   outside them — then read the settings, the share list and the principals
+   (§2.5): live, not ready. The node's API address and the metrics listener
+   open here. Until step 7, every `/api/v1` route but `/api/v1/health` answers
+   `503` `starting`.
+3. **Register the node**: its version ranges and roles in its node record
+   ([RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap)), refused in the same transaction if an active version lies
+   outside them. A refusal stops the node here, before the engine's start
+   transaction runs or any adapter serves.
+4. **Read the records**: the settings, the share list and the principals
    generation, and apply the provisioning file if one is named
    ([RFC 13 §2.4](rfc-13-configuration.md#2.4%20Records%20can%20be%20declared%20in%20a%20provisioning%20file)).
-4. With `storage`: the **content subsystem and shard placement** in the order
-   [RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing) and RFC 15 give; then a share context for every share the
-   records say this node serves; then the **operation runner** (§4.6), which
-   resumes the operations this node holds; then the **management API**, which
-   starts accepting calls.
-5. With `protocol`: the router and the filesystem service, then the
-   **adapters**, each from configured to serving as its records say, then the
-   **sidecars**, synced with the adapters now serving. Readiness turns true once
-   every adapter the records enable is serving.
+5. **The content side and the state the server reads**, in build order:
+   **(cluster)** shard placement ([RFC 11](rfc-11-ownership.md)); the engine, in
+   [RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing)'s order, handed the whole set of shares this node serves in
+   one call; GC, with each served share's namespace; open state for the shards
+   this node acquires ([RFC 14](rfc-14-open-state.md)); identity and the event sink. Only a share
+   created while the node serves is attached alone.
+6. **`*vfs.Server`** (`Start`, [RFC 17](rfc-17-vfs.md)); then, **(cluster)**, `vfs.Serve`, the
+   gateway, the client-address agent and the pNFS data server.
+7. The **operation runner** (§4.6), which resumes the operations this node
+   holds; then the **management API**, which starts accepting calls.
+8. The **adapters**, each from configured to serving as its records say, then
+   the **sidecars**, synced with the adapters now serving.
+9. **Reconcile** (§2.3) until `Stop`.
 
-**Stop.** The reverse, and each step completes before the next:
+Readiness turns true once every adapter the records enable is serving.
+
+**Stop.** `Node.Stop` stops the components in reverse build order, each step
+completing before the next:
 
 1. Readiness turns false, so whatever steers clients stops sending them
-   ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)).
-2. Sidecars are synced with the empty set, so nothing is advertised that is
-   about to stop; then adapters drain and stop, then the router and the
-   filesystem service.
-3. The management API stops accepting calls; calls in flight run to their answer
-   within the drain deadline.
-4. The operation runner stops: each operation it drives is left at its last
-   durable step, and its claim is released (§4.6).
-5. With `storage`: shards are handed over ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)), share contexts
-   are joined and closed, then the content subsystem in RFC 8's reverse order.
-6. The metadata store closes last.
+   ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)), and reconcile stops.
+2. The sidecars are synced with the empty set, so nothing is advertised that is
+   about to stop; then every adapter is `Stop`ped, which drains it
+   ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)), all of them concurrently, under one drain deadline.
+3. The management API stops accepting calls, and calls in flight run to their
+   answer within the drain deadline; then the operation runner stops, leaving
+   each operation it drives at its last durable step and releasing its claim
+   (§4.6).
+4. **(cluster)** The pNFS data server, the client-address agent and the
+   gateway stop, then `vfs.Serve`.
+5. GC drains ([RFC 9 §2.5](rfc-9-gc.md#2.5%20Composition%20and%20lifecycle)).
+6. `*vfs.Server`'s `Drain`, then its `Close` ([RFC 17](rfc-17-vfs.md)).
+7. **(cluster)** Shards are handed over ([RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries)); then the event sink,
+   identity and open state close, and then GC.
+8. The engine stops in RFC 8 §2.5's reverse order, which joins and closes every
+   share context, its journals and its flows; then the syncer and the remote
+   stores close.
+9. The metadata store closes last.
 
 The API outlives the adapters on purpose: an operator watching a drain reads its
 progress through the API. A failure at any start step stops the start, closes
@@ -345,34 +469,52 @@ what the earlier steps opened in reverse, and leaves `/health/ready`
 answering `not ready` and `/api/v1/health` naming the step and its error until
 the process exits.
 
-### 2.3 The runtime reconciles; it does not take orders
+**A stop step that misses its bound** leaves open every component that a later
+step would close under it, and the stop goes on to the steps that do not depend
+on it ([RFC 8 §2.5](rfc-8-engine.md#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), step 5). The process then exits non-zero, naming
+the step. The next start recovers as after a crash, so a stop never closes a
+store under a live loop in order to exit cleanly.
 
-The runtime holds two pictures: the **desired** one, read from records, and the
+### 2.3 The node reconciles; it does not take orders
+
+The node holds two pictures: the **desired** one, read from records, and the
 **running** one, the components it built. It acts only on the difference:
 
-| Record changed | The runtime on each node it concerns |
+| Record changed | The node, on each node it concerns |
 | --- | --- |
-| a share created | adds the share's context and, on a protocol node, nothing: the share list reaches the filesystem service through `ShareList.Version` ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)) |
+| a share created | `addShare`: a share context in the engine, the share's namespace in GC, the share open in `*vfs.Server`; admission reads the share list through `ShareList.Version` ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)) |
+| a share removed | `removeShare`, at the step its removal names ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)): the same three, in reverse |
 | a share's state changed | moves the share's context to quiescing and back ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)); admission reads the state itself on every call ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)), and a removal's steps run in their owner ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)) |
 | a share's live setting | hands the new value to the context, within RFC 13's live bound |
-| a share's backends (its namespace's store configuration) | replaces the context, as [RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition) requires |
+| a remote store's live or next-write setting — endpoint, credential reference, storage class, block target, the transform chain but its encrypt stage, as [RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings) classes them | is applied once per store, to the component that reads it: endpoint, credential reference and storage class to the one store client every context on that store shares ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)), after [RFC 13 §5.2](rfc-13-configuration.md#5.2%20Reaching%20the%20same%20content%20another%20way%20is%20not%20a%20change) has proven a new endpoint or credential; the block target to the block assembler ([RFC 2 §5](rfc-2-carver.md#5.%20The%20block%20assembler)) and the transform chain to the engine's codec ([RFC 5 §2.2](rfc-5-transforms.md#2.2%20Where%20it%20runs)), GC's relocation included, for the store's contexts. No share context is replaced |
+| a `Secret`'s new version | the component holding the reference resolves it again within the live bound, and the node reports the version it holds (§2.4, [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)) |
+| a change [RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition) counts as a change of a share's backends | builds the new context beside the old, switches admission to it, then joins and closes the old one. A new context that fails to build leaves the old one serving and the record refused |
 | an adapter enabled or disabled | starts it, or drains and stops it |
 | an adapter's live setting | applies it to connections set up afterwards ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)) |
-| an adapter's restart-class setting | drains and starts that adapter, alone; the others keep serving |
+| an adapter's restart-class setting | builds a new adapter through its factory with the new settings. `New` opens nothing, so a setting it refuses leaves the old adapter serving and the record refused. Only then the node drains and stops the old adapter and starts the new one; the others keep serving. If the new one fails to start, the node builds and starts one with the last settings that served, and reports the record refused (§2.4) |
 | a sidecar enabled or disabled | `Sync` with the serving adapters, or with none ([RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars)) |
 | a node-scoped or installation-scoped restart-class setting | nothing until the process next starts; the node reports the record as restart-pending (§2.4) |
-| a principal, grant or export policy | nothing of its own: their generations and versions are in the identity and admission cache keys ([RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)) |
+| a principal, grant or export policy | `apply`, handing identity and `*vfs.Server` the new generation; their generations and versions are in the identity and admission cache keys ([RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)) |
+| a shard record | nothing: the gateway's `Router` reads shard records itself, and [RFC 11](rfc-11-ownership.md)'s epochs keep its routing correct |
 
-The runtime learns of changes the way RFC 13 and RFC 18 already require — by
-reading the settings generation, the share list version and the principals
-generation once a second — and never from the API request that made them. A record that does not
+Every row is one of reconcile's three calls (§2.1): a share created or removed
+is `addShare` or `removeShare`, a change of its backends is both, and every
+other row is `apply`, which hands each component — identity, `*vfs.Server`, the
+engine, GC, the adapters and the sidecars — the values it reads.
+
+The node learns of changes the way RFC 13 and RFC 18 already require — by
+reading the three counters (the settings generation, the share list version and
+the principals generation) once a second — and never from the API request that
+made them. A record that does not
 validate when the component is built stops only what it configures
 ([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)), and the node reports it refused.
 
 A reconcile step is idempotent: run twice on the same records it does nothing
-the second time. So the runtime **MUST** also run a full reconcile at start and
+the second time. So the node **MUST** also run a full reconcile at start and
 after any read of the store that failed, not only on a moved generation: a
 change missed during a store outage is then found at the next read that works.
+A full reconcile lists records by kind in pages
+([RFC 16 §3.1](rfc-16-metadata-store.md#3.1%20Lookups%20by%20ID%2C%20listings%2C%20and%20who%20may%20use%20them)); what bounds its rate is open (§13).
 
 ### 2.4 What a node reports
 
@@ -386,9 +528,10 @@ when a value changed:
 - the records it refused, each with the generation and the error;
 - the records whose restart-class field has changed since it started — its
   restart-pending set;
-- its health conditions, as [RFC 25](rfc-25-observability.md) derives them.
+- its health conditions, as [RFC 25](rfc-25-observability.md) derives them;
 - the version of each secret it holds, so that an old version is deleted only
-  once every node that resolves the secret holds the new one (RFC 13 §7).
+  once every node that resolves the secret holds the new one
+  ([RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)).
 
 A record's own generation (§4.4) counts its changes; it is not comparable with
 these counters. So every control-plane record **MUST** also carry its
@@ -397,21 +540,18 @@ written in that change's transaction. A record at position *S* is **applied**
 on a node once that node has reconciled its kind through at least *S* and the
 record is in neither its refused set nor its restart-pending set. The API joins
 these reports into each resource's status (§4.1), so "applied on 2 of 3 nodes;
-P2 behind by 7 s" is a read, not an inference.
+N3 behind by 7 s" is a read, not an inference.
 
 > ponytail: a node reports three reconciled positions and the exceptions, not
 > one generation per record, so the report stays one small record at 10⁴
 > shares. The cost is that "applied" is inferred from a high-water mark, which
-> holds only because the runtime acts on changes in counter order and lists
+> holds only because the node acts on changes in counter order and lists
 > every change it did not apply. Report per-record positions if a component
 > ever applies records out of order.
 
-A protocol-only node writes only node records ([RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)); its
-node-status record is one of them.
-
 ### 2.5 Health and readiness endpoints
 
-Every node, of either role, serves on its API address:
+Every node serves on its API address these three endpoints:
 
 | Endpoint | Answers | Authentication |
 | --- | --- | --- |
@@ -427,6 +567,19 @@ adapter is not ready is [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27
 of start (§2.2), so a node stuck recovering its journal says so instead of
 refusing connections.
 
+**The metrics listener** ([RFC 25 §2.8](rfc-25-observability.md#2.8%20Export)) has an address of its own, separate
+from the API's, a bootstrap fact of the host
+([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)). It is served without authentication, over the API's TLS on
+every address but loopback, and opens at start step 2.
+
+> decision: the metrics listener asks for no token, because a scraper must
+> reach every node and holds no API account. What it
+> exposes to anyone who reaches the address is RFC 25 §2.4's labels: share and
+> remote store names and counts, never a file name, user content or a secret
+> ([RFC 25 §2.8](rfc-25-observability.md#2.8%20Export)). Overturned if those names are themselves sensitive in
+> a deployment, and then by binding the address to a management network or by
+> requiring a token.
+
 ## 3. Resources and their lifecycles
 
 ### 3.1 The resources
@@ -438,7 +591,7 @@ that component's surface:
 | Resource | Records | Lifecycle | Written through |
 | --- | --- | --- | --- |
 | installation | `Installation`, the store format record | created by the initialisation step only; active versions raised by `:raise-format` | [RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap) |
-| node | `Node`, node status | registered at each start; drained, decommissioned by the operator | [RFC 30 §5.3](rfc-30-kubernetes.md#5.3%20Storage%20scale-down%20is%20a%20drain), RFC 11 |
+| node | `Node`, node status | registered at each start; drained, decommissioned by the operator | [RFC 30 §5.3](rfc-30-kubernetes.md#5.3%20Storage%20scale-down%20is%20a%20drain), [RFC 11 §4](rfc-11-ownership.md#4.%20Moving%20files%20and%20primaries) |
 | remote store | store configuration settings, its credential `Secret` | created; edited under RFC 13's classes; deleted only when no namespace names it | RFC 13 |
 | namespace | namespace settings and key records | created with its bound fields; deleted when no share names it and drained | [RFC 9 §7.6](rfc-9-gc.md#7.6%20A%20namespace%20no%20share%20names%20is%20drained) |
 | share | `Share` (info, state, namespaces), `ExportPolicy`, share settings | §3.2 | `ControlPlane` |
@@ -457,7 +610,7 @@ that component's surface:
 | audit record | audit record | §6 | the API, in the change's transaction |
 
 Operation, token, session and audit records, and the node-status record of
-§2.4, are records this RFC adds; [§13](#13.%20Open%20questions) asks RFC 16 for their keys.
+§2.4, are records this RFC adds; [RFC 16](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed) defines their keys.
 
 ### 3.2 A share
 
@@ -491,7 +644,7 @@ A new share is reachable by nobody until an operator grants it.
 > Revisit if a provisioning workflow shows the extra grant call to be the common
 > error, and then make the default a named template, not an open one.
 
-A share is **serving** on a node once that node's runtime has added its context
+A share is **serving** on a node once that node has added its context
 and the context reports serving ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)). Create returns at commit,
 before that; the share's status shows each node's state, and `?wait=serving`
 on a `GET` returns when every node that serves it reports serving or a node
@@ -554,17 +707,20 @@ An adapter is configured by settings at installation scope, which a node record
 each host ([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)), not records. The resource is
 `/adapters/{protocol}`, with `enabled` and the protocol's settings:
 
-- **enable** moves the adapter from configured to serving on every protocol node
+- **enable** moves the adapter from configured to serving on every node
   whose effective record enables it; a setting the adapter cannot apply fails
   at configured ([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)) and is reported refused by that node;
 - **disable** drains and stops it, within the drain deadline;
-- a **live** setting reaches new connections; a **restart-class** one drains and
-  starts that adapter on each node, one adapter at a time on a node, so a change
-  to SMB never drops an NFS client.
+- a **live** setting reaches new connections; a **restart-class** one builds a
+  new adapter through its factory on each node, and only once `New` has
+  accepted the settings drains and stops the old one and starts the new; one
+  adapter at a time on a node, so a change to SMB never drops an NFS client.
+  If the new one fails to start, the last settings that served are built and
+  started again and the record is reported refused (§2.3).
 
 The status of an adapter shows, per node, its state and the generation it runs.
 A namespace move's release of an address is not an adapter edit: it is RFC 27's
-reconfigure, which the runtime applies as RFC 20 §3.1 describes.
+reconfigure, which the node applies as RFC 20 §3.1 describes.
 
 ### 3.5 Users, groups, grants and netgroups
 
@@ -626,7 +782,8 @@ parts in every resource:
 - **`status`** is what the system records — a share's state and namespaces, a
   location's check outcome, per-node application (§2.4). A write that sets a
   status field is refused, as RFC 13 §2.4 refuses a file that declares a system
-  field.
+  field. A listing page reads the node-status records once and computes
+  every row's `applied` from them.
 - **Paths take IDs, never names.** `/shares/sh_7Qk2…`, not `/shares/builds`. A
   name is found by `GET /shares?name=builds`, which answers a list of zero or
   one.
@@ -637,13 +794,36 @@ parts in every resource:
 > with the list filter. Overturned only if a resource ever lacks a stable ID,
 > which no record in RFC 16 does.
 
-**Actions** that are not a field change — quiesce, rehome, rebuild-index,
-raise-format, set-password, drain — are `POST` on `{resource}:{verb}`.
+**Actions** that are not a field change are `POST` on `{resource}:{verb}`, and
+this table is all of them:
+
+| Verb | Resource | Role (§5.2) | Operation (§4.6) | Owning RFC |
+| --- | --- | --- | --- | --- |
+| `quiesce`, `resume` | share | `operator` | no | [RFC 16 §2.3.1](rfc-16-metadata-store.md#2.3.1%20Share%20names%2C%20paths%20and%20state) |
+| `rehome` | share | `admin` | yes | [RFC 27 §2.7](rfc-27-namespace-migration.md#2.7%20Moving%20one%20share%20out%20of%20a%20shared%20namespace) |
+| `rebuild-index` | namespace | `operator` | yes | [RFC 9 §7.4](rfc-9-gc.md#7.4%20The%20index%20can%20be%20dropped%20and%20rebuilt) |
+| `rebuild-reverse-index` | share | `operator` | yes | [RFC 9 §7.4](rfc-9-gc.md#7.4%20The%20index%20can%20be%20dropped%20and%20rebuilt) |
+| `raise-format` | installation | `admin` | no | [RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap) |
+| `rotate-signing-key` | installation | `admin` | yes | §5.3 |
+| `reload-provisioning` | node | `admin` | yes | [RFC 13 §2.4](rfc-13-configuration.md#2.4%20Records%20can%20be%20declared%20in%20a%20provisioning%20file) |
+| `set-password` | user | `operator`; `admin` for an account with a role | no | §3.5, [RFC 18 §8](rfc-18-identity.md#8.%20Management-API%20users) |
+| `drain` | node | `operator` | yes | [RFC 30 §5.3](rfc-30-kubernetes.md#5.3%20Storage%20scale-down%20is%20a%20drain) |
+| `decommission` | node | `admin` | no | [RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap) |
+| `declare-lost` | backup location | `admin` | yes | [RFC 13 §2.5](rfc-13-configuration.md#2.5%20A%20backup%20location%20is%20its%20own%20record), [RFC 26 §4.1](rfc-26-catalog-backups.md#4.1%20Interfaces) |
+| `cancel` | operation | the role that may start its kind | no | §4.6 |
+
+An operation's `Kind` is an `OpKind`, a closed set read from this table and
+§4.6's list: one value per action above that is an operation, and one per
+create or delete §4.6 makes one. So `api_operations{kind}` is a closed set
+([RFC 25 §2.4](rfc-25-observability.md#2.4%20Labels)), and `operation_running`
+keys on the same value.
 
 ### 4.2 Reads and listings
 
 - **A read is consistent.** A `GET` reads the metadata store, not a node's
-  cache, so a write acknowledged by any node is visible to a read on any node.
+  cache, so a write acknowledged by any node is visible to a read on any node,
+  except the node-local reads, which name their node: a node's open connections
+  (below) and the event streams (§6).
 - **A listing pages by cursor.** `?limit=` (default 100, at most 1,000) and
   `?after=`, an opaque cursor the previous page returned; the page ends with
   `next` when more follow. A cursor resumes from a key, never an offset, so a
@@ -656,7 +836,7 @@ raise-format, set-password, drain — are `POST` on `{resource}:{verb}`.
   not offered.
 - **Secrets are never read.** A secret-bearing field reads as its reference and
   version, never its value ([RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)).
-- **A node's open connections are the one live read.**
+- **A node's open connections are a node-local read.**
   `GET /nodes/{id}/connections` answers what each adapter's `Connections()`
   lists now — protocol, remote address, session, since
   ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)) — from that node, not
@@ -667,13 +847,11 @@ raise-format, set-password, drain — are `POST` on `{resource}:{verb}`.
 
 | Method | Meaning | Precondition |
 | --- | --- | --- |
-| `POST /collection` | create | `Idempotency-Key` |
+| `POST /collection` | create | `Idempotency-Key`, except §4.5's credential calls |
 | `PUT /resource` | replace the whole `spec` | `If-Match`; `If-None-Match: *` to create a resource whose path the client names |
 | `PATCH /resource` | merge patch of `spec` (RFC 7396): a field present is set, `null` resets it to its default | `If-Match` |
 | `DELETE /resource` | delete, or start the deletion | `If-Match` and `Idempotency-Key` |
-| `POST /resource:verb` | an action | `Idempotency-Key`; and `If-Match` when the action changes the resource's `spec` |
-
-A credential call (§4.5) takes no `Idempotency-Key`.
+| `POST /resource:verb` | an action | `Idempotency-Key`, except §4.5's credential calls; and `If-Match` when the action changes the resource's `spec` |
 
 **One request is one transaction.** A write validates with the components'
 validators ([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)), then commits its records, the generation they
@@ -683,6 +861,14 @@ step that way and returns an operation (§4.6). A write **MUST NOT** answer
 success before its transaction commits, and **MUST NOT** depend on any call to
 a running component.
 
+**Validators are pure and handed in.** Each component exports, from its
+settings package, one function per record kind it reads. The function takes the
+value and the current values of the settings a cross-setting rule relates it
+to, read tracked in the write's transaction
+([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)). It imports nothing that
+runs. The root hands the API a table of them, keyed by setting prefix, so the
+API imports no component. A prefix with no validator is refused `400`.
+
 **Unknown fields are refused**, in requests as in records
 ([RFC 13 §6](rfc-13-configuration.md#6.%20Validation)): `400`, naming the field.
 
@@ -690,34 +876,45 @@ a running component.
 data path's pools ([RFC 24](rfc-24-resources.md)). A node runs at most 64 API
 calls at once, a fixed value, and answers the next `503` with `Retry-After`, so
 a script in a loop cannot take memory or store transactions from file clients.
+A long poll (`?wait=`) holds no call slot while it waits: it is parked, and a
+node parks at most a fixed number of them (proposed: 256, settled by the
+parked count the conformance harness reaches with every CLI of a deployment
+running `--wait`), the next answered `503`. Both bounds are fixed values
+[RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings)
+lists.
 
-### 4.4 Concurrency: the generation is the entity tag
+> ponytail: one node-wide bound of 64, no per-account share. One script can
+> hold every slot. Give each account a fair share of the 64 when an operator is
+> refused `503` while another account's script runs.
 
-Every resource read returns `ETag: "g<generation>"`, the generation of the
-record behind the resource's `spec` ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)). A resource built from
+### 4.4 Concurrency: the entity tag is what the write expects
+
+Every resource read returns an `ETag` that is the value RFC 16's write of that
+record takes as `expect`
+([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)): its
+generation ([RFC 13 §2.3](rfc-13-configuration.md#2.3%20A%20record%20is%20versioned)), its version (a grant, an export policy, a
+netgroup) or its position (a quota, §2.4). A client compares it only for
+equality. A resource built from
 several records — a share's info, its state and its namespaces are three
 ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)) — takes its tag from the one its `spec` writes; the others
 change through actions that name their expected value, as quiesce names the
 state it expects.
 
-A quota record carries no generation of its own, so a quota's tag is
-`ETag: "p<position>"`, its record's position (§2.4), and a quota write names
-that position as its expected value.
-
 - **Every `PUT`, `PATCH` and `DELETE` MUST carry `If-Match`.** One without is
-  refused `428`. One whose tag is not the current generation is refused `412`,
-  code `generation_mismatch`, with the current generation in the body.
+  refused `428`. One whose tag is not the current one is refused `412`, code
+  `generation_mismatch` (RFC 16's `ErrGenerationMismatch`), with the current
+  tag in the body.
 - **A resource with no record is created by `POST` on its collection**, or —
   where the client names its path, as a grant, a setting at a scope, a
   netgroup or a quota — by `PUT` with `If-None-Match: *` in place of
   `If-Match`. That `PUT` is refused `412` `generation_mismatch` if a record
-  exists, with its generation in the body; so a retried create that had
+  exists, with its tag in the body; so a retried create that had
   committed gets `412`, and the client reads what is there. An absent resource
   has no tag, so `If-Match` on it is `412`.
 - **The check is in the transaction.** The write reads the record with conflict
-  tracking and compares its generation there ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)), so two writes
+  tracking and compares its tag there ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)), so two writes
   with the same tag on two nodes cannot both commit: one commits and the other
-  conflicts, retries, reads the new generation and is refused `412`.
+  conflicts, retries, reads the new tag and is refused `412`.
 - **A background writer is not overwritten.** The parts of a resource that a
   component changes — a share's state during a cut or removal, its namespaces
   during a re-home — are never in a `spec`, so a stale `PUT` cannot revert them.
@@ -730,8 +927,9 @@ that position as its expected value.
 
 ### 4.5 Idempotency
 
-Every `POST` and every `DELETE` but the credential calls below **MUST** carry an `Idempotency-Key`, a client
-value unique per intended action; one without is refused `428`. The server
+Every `POST` and every `DELETE` **MUST** carry an `Idempotency-Key`, a client
+value unique per intended action, except the credential calls below; one
+without is refused `428`. The server
 keeps, per (account, key), the digest of the request — method, path, body — and
 the answer it gave, written in the request's own transaction:
 
@@ -773,14 +971,14 @@ changed. A client **MUST** reuse a key across its own retries of one action and
 
 > ponytail: an idempotency record per mutating call, kept a day. At an
 > operator's call rate that is nothing; a script making 10⁶ calls a day keeps
-> 10⁶ small records. Shorten the window, or key it per client instance, if the
-> records show up in the store's size.
+> 10⁶ small records. Shorten the window, or key it per client instance, when
+> `api_idempotency_records_written_total` (§11) shows 10⁶ written per day.
 
 ### 4.6 Long-running operations
 
 Work that does not finish in one transaction — a share's removal, a user's
 deletion, a clone, a restore, a backup, a re-home, a move, a credential
-rotation, a signing-key rotation, an index rebuild — is an **operation**. Its call commits the work's
+rotation, a signing-key rotation, an index rebuild, a location's loss — is an **operation**. Its call commits the work's
 first durable step and answers `202 Accepted` with `Location:
 /api/v1/operations/{id}` and the operation's body.
 
@@ -792,7 +990,7 @@ first durable step and answers `202 Accepted` with `Location:
 // when, and the answer.
 type Operation struct {
 	ID       OperationID
-	Kind     string     // "share.delete", "user.delete", "share.rehome", "namespace.rebuild-index", ...
+	Kind     OpKind     // closed set (§4.1): "share.delete", "user.delete", "share.rehome", "namespace.rebuild-index", ...
 	Target   ResourceRef
 	Account  Principal  // who started it
 	State    OpState    // pending, running, succeeded, failed, cancelling, cancelled
@@ -818,9 +1016,9 @@ type Progress struct {
   is read from the owner's durable cursor, so a restart loses none of it.
 - **Work no component drives on its own** — a credential or signing-key rotation, GC's index
   rebuilds, a provisioning reload — is driven by the operation runner (§2.2) of a
-  storage node, under a claim in the operation record: (node, node epoch,
+  node, under a claim in the operation record: (node, node epoch,
   expiry), the expiry 30 s ahead and renewed every 10 s, both fixed.
-  **(cluster)** A claim that lapses is taken by any storage node, which resumes from the
+  **(cluster)** A claim that lapses is taken by any node, which resumes from the
   record's last step. Each such kind **MUST** record its steps durably and make
   each idempotent, or it is not an operation.
 - **Reading.** `GET /operations/{id}` on any node answers from the store.
@@ -922,7 +1120,7 @@ second store.
 - **A secret is written as its owner is.** A write of a `Secret` is authorized
   as a write of the resource that names it — a remote store's credential as the
   store, a backup location's as the location — and no route writes a secret by
-  reference alone. An account's password and NT hash are written only through
+  reference alone. An account's password and every hash derived from it ([RFC 18](rfc-18-identity.md#8.%20Management-API%20users)) are written only through
   `:set-password` and `POST /auth/password`, under the account rules here. The
   signing key of §5.3 and the wrapping keys are written by no route; the
   signing key changes only by `POST /installation:rotate-signing-key`.
@@ -970,7 +1168,9 @@ second store.
 - **Throttling.** After 5 consecutive failed sign-ins for an account, or from
   one source address, each further attempt waits twice as long as the last,
   from 1 s up to 5 min, answered `429` with `Retry-After`. A success resets the
-  account's count. Every failure is audited (§6).
+  account's count. Every failure is audited (§6). The counts are kept in the
+  store, written in the failure's audit transaction, so the bound is 5 per
+  account and per source installation-wide, not per node.
 - **Transport.** The API **MUST** be served over TLS on every address but
   loopback. Its certificate and key are bootstrap facts of the host.
 
@@ -994,7 +1194,7 @@ second store.
   must-change or not: a stolen first-sign-in token must not set a password on
   its own.
 - **Recovery.** Lost admin credentials are reset by an offline command of the
-  server binary on a storage node that is stopped, with the host's bootstrap. It sets a new generated password with must-change, writes
+  server binary on a node that is stopped, with the host's bootstrap. It sets a new generated password with must-change, writes
   an audit record naming the host and the command, and nothing else. It is the
   one change not made through the API.
 
@@ -1036,11 +1236,13 @@ Every management action leaves an **audit record**:
   [RFC 25 §4](rfc-25-observability.md#4.%20Event%20streams)'s `admin` event
   stream, fed from these records. The export's position is a cursor record per
   node that takes requests, kept in the metadata store; a lost node's cursor is
-  taken over by a live storage node
+  taken over by a live node
   ([RFC 25 §4.3](rfc-25-observability.md#4.3%20From%20the%20emit%20point%20to%20the%20spool)).
 - **The event streams** are read at `GET /api/v1/events/{stream}`, filtered by
-  share, time and sequence range, from the spool
-  ([RFC 25 §4.7](rfc-25-observability.md#4.7%20Export)), with the roles of §5.2.
+  share, time and sequence range, from the spool of the node that answers
+  ([RFC 25 §4.7](rfc-25-observability.md#4.7%20Export)), with the roles of §5.2. The spool is
+  node-local ([RFC 25 §4.3](rfc-25-observability.md#4.3%20From%20the%20emit%20point%20to%20the%20spool)), so this is a node-local read (§4.2); a
+  per-node path needs RFC 25 §4.7, which names this one.
 
 This is the audit of the management plane. A file client's access events
 ([RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)) are a separate stream, and what an ACL's audit entries select is
@@ -1051,10 +1253,13 @@ This is the audit of the management plane. A file client's access events
 The CLI is a client of the management API and of nothing else:
 
 - it **MUST NOT** open the metadata store, a journal or a remote store, or read
-  the server's host file. Every command is one or more API calls; a command the
+  the host's bootstrap ([RFC 13 §2.2](rfc-13-configuration.md#2.2%20A%20host%20holds%20only%20its%20bootstrap)). Every command is one or more API calls; a command the
   API cannot serve does not exist;
+- the API's wire types are a leaf package that imports nothing of the server,
+  and the CLI links no package of the metadata store, the block stores or the
+  control-plane server;
 - it resolves names to IDs with the list filters (§4.1), reads before it writes
-  and sends the generation it read in `If-Match` (§4.4), generates one
+  and echoes the `ETag` it read, opaque, in `If-Match` (§4.4), generates one
   idempotency key per command and reuses it across that command's retries
   (§4.5), and on `412` shows the difference and stops rather than retrying;
 - for an operation it prints the operation's ID and, with `--wait`, follows it
@@ -1080,27 +1285,37 @@ role is `admin`, because a scale-down decommissions node records
 These rules bind from the single node on, where most of them cost nothing
 ([RFC 0 §1.4](rfc-0-data-lifecycle.md#1.4%20The%20single-node%20profile)); the ones marked **(cluster)** bind once there is a second node.
 
-![One API write in a cluster: the CLI sends a PUT to the API on S1; S1 validates with the component's validator, checks If-Match, and commits the record, the settings generation and the audit record in one transaction in the metadata store; every node, S1, P1 and P2, reads the settings generation each second, re-reads the record, applies it by its binding class and writes its applied generation to its node-status record; a GET on any API node joins those reports into the resource's status](img/rfc23-write-path.svg)
+![One API write in a cluster: the CLI sends a PUT to the API on N1; N1 validates with the component's validator, checks If-Match, and commits the record, the settings generation and the audit record in one transaction in the metadata store; every node, N1, N2 and N3, reads the settings generation each second, re-reads the record, applies it by its binding class and writes the position it has reconciled through to its node-status record; a GET on any API node joins those reports into the resource's status](img/rfc23-write-path.svg)
 
-- **Any API node answers any call.** The management API is composed on every
-  `storage` node ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)); a protocol-only node serves the health
-  endpoints only (§2.5). A client may send any call to any API node and gets
+- **Any node answers any call.** The management API is composed on every
+  node (§2.1). A client may send any call to any node and gets
   the same answer, because every read and every precondition is evaluated
-  against the store.
-- **Writes go through the metadata store**, as control-plane records written by
-  storage nodes only ([RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)). No node forwards a write to a
+  against the store, except the node-local reads of §4.2, which name their
+  node.
+- **Writes go through the metadata store**, as control-plane records. No node forwards a write to a
   "leader": there is none, and the store's transactions order concurrent writes.
-- **Application spreads by generation.** A node learns of a change only through
-  the settings generation, the share list version and the principals generation
+- **Application spreads by counter.** A node learns of a change only through
+  the three counters of §2.3
   ([RFC 13 §5](rfc-13-configuration.md#5.%20Binding%20classes)), and reports what it applied (§2.4). A live change
-  reaches every node within 5 s; a node behind is a health condition, named in
-  the resource's status.
+  reaches every node within 5 s; a node behind is RFC 25's
+  `config_generation_behind` condition, named in the resource's status.
 - **(cluster)** **Operations are claimed, not pinned.** Work the operation runner drives is
-  claimed by one storage node and taken over on lapse (§4.6); work a component
+  claimed by one node and taken over on lapse (§4.6); work a component
   owns follows that component's failover.
 - **(cluster)** **A rolling upgrade keeps the API served.** Nodes are upgraded one at a time
   ([RFC 30 §5.1](rfc-30-kubernetes.md#5.1%20Rolling%20upgrade)); a call that needs a newer record schema is
   refused until the schema's active version is raised (§9).
+
+### 8.1 Failure modes
+
+| Failure | What the API answers | What the node does |
+| --- | --- | --- |
+| metadata store unreachable | `503` `unavailable`, `Retry-After`; health detail names it | keeps the running set; a full reconcile at the next read that works (§2.3) |
+| a record fails to build its component | the write committed; status shows the node refused it | stops only what it configures; keeps the old component where one was serving (§2.3) |
+| an adapter fails to start | — | reports the record refused and keeps the others serving; readiness as §2.2 sets it |
+| a node frozen or partitioned | status names it behind; `config_generation_behind` | — |
+| **(cluster)** the runner's node dies | `GET` on any node keeps reporting the last step | another node takes the claim after it expires (§4.6) |
+| a stop step misses its bound | — | §2.2's rule: leaves its dependencies open and exits non-zero |
 
 ## 9. Versioning and compatibility
 
@@ -1131,11 +1346,11 @@ These rules bind from the single node on, where most of them cost nothing
 
 | # | Invariant |
 | --- | --- |
-| CP1 | One composition root builds the node; after start, only the runtime changes which components run, and only from records. |
+| CP1 | `node.New` builds every component; after start, only the node changes which components run, and only from records. |
 | CP2 | The API changes nothing but records; it never calls a component to change it, and a write answers success only after its transaction commits. |
 | CP3 | Every node applies records by their binding class, in counter order, and reports the position it has reconciled through per kind, the records it refused and those awaiting a restart; a record is applied on a node only when that position reaches the record's own and it is in neither set. |
 | CP4 | Stop is the reverse of start; the API outlives the adapters and the store outlives everything. |
-| CP5 | Every `PUT`, `PATCH` and `DELETE` carries `If-Match` — or, for a `PUT` that creates, `If-None-Match: *` — checked inside the write's transaction; a write never commits over a generation, or over a record, its author did not read. |
+| CP5 | Every `PUT`, `PATCH` and `DELETE` carries `If-Match` — or, for a `PUT` that creates, `If-None-Match: *` — checked inside the write's transaction; a write never commits over a tag, or over a record, its author did not read. |
 | CP6 | A request with a recorded idempotency key is answered from the record and applied at most once. |
 | CP7 | Long work is an operation whose progress is the owning component's durable cursor; it survives a crash, and is readable from every API node. |
 | CP8 | Every error reaches the client as the component's own error by name, and every error has a status in the API's table. |
@@ -1146,6 +1361,7 @@ These rules bind from the single node on, where most of them cost nothing
 | CP13 | The unauthenticated health endpoints answer one word and nothing else. |
 | CP14 | The CLI reaches the installation only through the API. |
 | CP15 | No request field is accepted before every node can read the record that holds it. |
+| CP16 | No package under the control plane imports an adapter, a sidecar or a component's implementation; each is reached through an interface it declares or a table the node hands it. Only `node`, the composition root, imports them, and only the server's start command and the test harness import `node`. |
 
 ## 11. Observability
 
@@ -1155,77 +1371,99 @@ labels and histogram buckets follow
 
 | Answers | Metric | Type |
 | --- | --- | --- |
-| How many API calls, by route and outcome? | `api_requests_total{route, method, status}` | counter |
-| How long do they take? | `api_request_seconds{route, method}` | histogram (`request`) |
+| How many API calls, by call and outcome? | `api_requests_total{op, outcome}` — `op` the route and method from §4.1's resources and Actions table, `outcome` the problem `code` or `ok` | counter |
+| How long do they take? | `api_request_seconds{op}` | histogram (`request`) |
+| How many calls run now, against the bound of §4.3? | `api_calls_in_flight`, `api_calls_in_flight_limit` | gauge |
 | How often is authentication refused, and why? | `api_auth_failures_total{reason}` | counter |
 | How often are writes refused on a precondition? | `api_precondition_failures_total{kind}` — `generation`, `idempotency`, `missing` | counter |
 | How often are retries answered from an idempotency record? | `api_idempotent_replays_total` | counter |
+| How many idempotency records are written, and deleted at expiry? | `api_idempotency_records_written_total`, `api_idempotency_records_deleted_total` | counter |
 | How many operations, by kind and state? | `api_operations{kind, state}` | gauge |
 | How long has the oldest running operation of each kind been running? | `api_operation_oldest_seconds{kind}` | gauge |
 | How often is an error answered with no row? | `api_unmapped_errors_total` | counter |
-| What has each node applied? | `runtime_applied_generation{kind}` — `settings`, `shares`, `principals` | gauge |
-| How often does a reconcile step fail, by what it applies? | `runtime_reconcile_errors_total{kind}` | counter |
-| How many records await a restart on this node? | `runtime_restart_pending` | gauge |
+| What has each node reconciled through? | `node_reconciled_position{kind}` — `settings`, `shares`, `principals` | gauge |
+| How often does a reconcile step fail, by what it applies? | `node_reconcile_errors_total{kind}` | counter |
+| How many records await a restart on this node? | `node_restart_pending` | gauge |
 | Audit records written, by outcome | `audit_records_total{outcome}` | counter |
 
 `api_unmapped_errors_total` is zero on a healthy node. Records refused by
-validation are RFC 13's `config_refused_total`, not counted again here.
+validation are RFC 13's `config_refused_total`, not counted again here. A node
+behind is RFC 25's `config_generation_behind` condition
+([RFC 25 §3.9](rfc-25-observability.md#3.9%20The%20condition%20registry)), fed by `node_reconciled_position`.
+
+**Spans.** One span per API call, named by its `op`, its attributes the
+resource kind and ID and the outcome, never a body field
+([RFC 25 §6.1](rfc-25-observability.md#6.1%20Spans)). An operation's work opens a root span of its own that
+*links* to the request span that started it.
 
 ## 12. Conformance
 
-Conventions and tiers are the index's ([Test tiers](rfc-index.md#Test%20tiers)). Each check
-runs against the composed single-node harness, with the API in front, unless
-marked **(cluster)**.
+Conventions are the index's ([Test tiers](rfc-index.md#Test%20tiers)). The tiers for the node and what it builds:
+
+| Tier | What runs |
+| --- | --- |
+| unit | `*vfs.Server` through `vfs.New`, with a fake engine and in-memory metadata, and no node |
+| unit | the gateway through `vfs.NewGateway`, with a fake `Router` and `Transport` |
+| integration | `*vfs.Server` with the real engine and in-memory stores, without the node |
+| multi-node | two `node.New` over one in-memory control-plane store and a loopback `Transport`, driven by writes to the store, with fault injection: a lost reply, a duplicate send, a stale epoch |
+| e2e | the adapters |
+
+Each check below runs, through the API, against the node `node.New`
+builds, unless marked **(cluster)**, which runs at the multi-node tier. No check
+builds a node any other way, and an architecture test fails on a caller of
+`node.New` other than the server's start command and the test harness.
 
 | Requirement | Check | Catches |
 | --- | --- | --- |
-| §2.1 API writes only records | Fault the metadata store's commit of a share create; assert `503`, no share context exists, and none appears after the store recovers and a full reconcile runs. Then let the commit succeed and kill the node before the runtime reads the share list; restart: assert the share serves. | a handler calling the engine directly |
-| §2.2 order | Record each component's start and stop. Assert the order of §2.2, that the health endpoints answered `starting` before step 4 ended, and that an operation readable before stop is readable through the API until step 3. | an API that stops before the drain it reports |
+| §2.1 API writes only records | Fault the metadata store's commit of a share create; assert `503`, no share context exists, and none appears after the store recovers and a full reconcile runs. Then let the commit succeed and kill the node before it reads the share list; restart: assert the share serves. | a handler calling the engine directly |
+| §2.2 order | Record each component's start and stop. Assert the order of §2.2, that the health endpoints answered `starting` before step 5 ended, that a refused registration started no component, and that an operation readable before stop is readable through the API until step 3. | an API that stops before the drain it reports |
 | §2.3 reconcile | Change a live share setting while the store is unreachable to the node's reads but not its writes; restore reads: assert the change applies at the next read, not at the next generation move. | a missed generation lost for good |
-| §2.4 applied | Freeze one node's runtime after a share setting changes. Assert the resource's status names that node as behind and, after 5 s, a health condition names it. Change a setting whose own generation is 2 while the settings generation stands at 100, and freeze a node at 100: assert the setting reads not applied there. Change a node-scoped restart-class setting, then a live one: assert the first reads not applied and the second applied on that node until it restarts. | "applied" inferred from the writing node, from a record's own generation, or past a pending restart |
+| §2.4 applied | Freeze one node's reconcile after a share setting changes. Assert the resource's status names that node as behind and, after 5 s, a health condition names it. Change a setting whose own generation is 2 while the settings generation stands at 100, and freeze a node at 100: assert the setting reads not applied there. Change a node-scoped restart-class setting, then a live one: assert the first reads not applied and the second applied on that node until it restarts. | "applied" inferred from the writing node, from a record's own generation, or past a pending restart |
+| §2.5 health | Call the unauthenticated endpoints during start, serving, drain and stop: assert `live` from the live endpoint and one of the four readiness words from the ready one, and nothing else, and that `GET /api/v1/health` without a token is `401`. Assert the metrics listener answers without a token. | grace state or names leaked to anonymous callers |
 | §3.2 create admits nobody | Create a share; mount it as alice over SMB and NFS: refused. Grant alice; mount: admitted. | an open default |
-| §3.2 delete | Delete a share with 10⁵ files; kill the node during phase "files"; restart: assert the same operation ID reports `running` with its count not lower than before, and ends `succeeded`. Delete again with a new key: `409` `stale`. | progress the API made up |
+| §3.2 delete | Delete a share with 10⁵ files; kill the node during phase "files" once `Done` > 0; restart: assert the same operation ID reports `running`, that `Done` is at least that value and rises, and that it ends `succeeded`. Delete again with a new key: `409` `stale`. | progress the API made up |
+| §3.5 grants | Grant `Finance` read on a share and alice, a member, `none`: assert alice refused. `DELETE` alice's grant: assert her grant gone and alice granted read through `Finance`. `PUT` a grant naming a machine principal: assert `400` `ErrInvalid` and no grant written. | `none` stored as no grant, or a machine granted file access |
 | §4.4 lost update | Two clients read a policy, both `PUT` with the same `If-Match`, sent to two API nodes at once **(cluster)** and on one node in a tight loop: assert exactly one commits and the other is `412`. Send a `PUT` without `If-Match`: `428`. Two clients `PUT` the first grant of one principal with `If-None-Match: *`: assert one commits and the other is `412`. | the Start-here lost update; a create overwriting a concurrent one |
 | §4.4 background field | Start a re-home of a share; `PUT` its spec with a stale copy that includes its old namespace: assert the namespace is unchanged and the `PUT` refused. | a `PUT` reverting a component's write |
 | §4.5 idempotency | Send a `DELETE` with a key, drop the answer, resend: assert one operation, the same ID and body. Resend with the same key and another body: `422`. Send a create that fails validation, fix it and resend with the same key: accepted. Sign in, refresh and create an API token, each twice; read the store's raw keys: assert no idempotency record exists for them and no token value or password appears; assert the second refresh revoked the session. | double application on retry; a credential kept in a replay record |
-| §4.6 runner claim | **(cluster)** Start a credential rotation; kill the node that claims it; assert another storage node claims it after the claim expires and it completes, deleting the old version once. | an operation lost with its node |
+| §4.6 runner claim | **(cluster)** Start a credential rotation; kill the node that claims it; assert another node claims it after the claim expires and it completes, deleting the old version once. | an operation lost with its node |
 | §4.7 error table | For every error value in every closed set, provoke it through the API, or inject it at the seam where none can be provoked; assert each has a status and code, and `api_unmapped_errors_total` stays 0. | an error with no row |
 | §5.1 roles grant nothing | With the bootstrap admin and every role, mount every share over every flavour: assert every mount refused. Read the admin's record: no uid, gid, SID, Kerberos name or grant. | an API role leaking into file access ([RFC 18 §11](rfc-18-identity.md#11.%20Conformance)) |
-| §3.5 grants | Grant `Finance` read on a share and alice, a member, `none`: assert alice refused. `DELETE` alice's grant: assert her grant gone and alice granted read through `Finance`. `PUT` a grant naming a machine principal: assert `400` `ErrInvalid` and no grant written. | `none` stored as no grant, or a machine granted file access |
-| §5.2 roles | For every route, call it as `viewer`, `operator` and `admin`; assert the table of §5.2, `404` where the caller may not read. As an operator, give yourself `admin`: refused. As an operator, write the password secret of an admin account, and the signing key, through every secret-bearing route: refused, and neither changed. Demote the last admin: `409` `last_admin`. | a route missing its check; privileged credentials replaced through a secret write |
+| §5.2 roles | Read the route list from the router and compare it with §4.1's resources and Actions table; a route in neither fails the check. For every route, call it as `viewer`, `operator` and `admin`; assert the table of §5.2, `404` where the caller may not read. As an operator, give yourself `admin`: refused. As an operator, write the password secret of an admin account, and the signing key, through every secret-bearing route: refused, and neither changed. Demote the last admin: `409` `last_admin`. | a route missing its check; privileged credentials replaced through a secret write |
 | §5.3 revocation | Sign in on two nodes; disable the account; assert every call on both is refused within 1 s, with the access token unexpired. Reuse an already-rotated refresh token: assert the session is revoked. | a token outliving its account |
 | §5.4 first password | Initialise without a password; assert it is printed by the step and appears in no log. Sign in: every call but the password change is `403`. Change it without the current password: refused. | a first-login token setting a password alone |
 | §6 audit | Run every mutating route once, applied and refused. Assert one audit record each, with generations before and after, and no secret value; fault the commit of one change and assert neither the change nor its record exists. | a change with no record |
-| §2.5 health | Call the unauthenticated endpoints during start, serving, drain and stop: assert `live` from the live endpoint and one of the four readiness words from the ready one, and nothing else, and that `GET /api/v1/health` without a token is `401`. | grace state or names leaked to anonymous callers |
-| §7 CLI | Run the CLI's whole suite with the server's host file and store unreadable to the CLI's user: assert every command still works. Assert the generated reference matches the command tree. | a command that bypasses the API |
+| §7 CLI | Run the CLI's whole suite with the host's bootstrap and the store unreadable to the CLI's user: assert every command still works. Assert the generated reference matches the command tree. Assert `go list -deps` of the CLI names no package of the metadata store, the block stores or the control-plane server. | a command that bypasses the API |
 | §9 schema gate | **(cluster)** With one node not upgraded, send a field the new schema adds: refused `400` naming the version. Raise the version after upgrading it: accepted. | a record an old node refuses |
 
 ## 13. Open questions
 
-1. **Sealing a protocol secret on a storage-only node** — resolved by
-   [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets). Each role's wrapping key
-   is a key pair, and every node holds the public half of every role's key, so
-   any node seals. A password hash and the signing key are sealed under the
-   `storage` key, whose private half every `storage` node, and so every API
-   node, holds: sign-in (§5.3) and the current-password check (§5.4) verify on
-   a storage-only node. The NT hash, keytabs and bind credentials stay under
-   the `protocol` key; a storage-only node seals them and never opens them.
-2. **Records this RFC adds.** Operation, idempotency, session, API token, audit
-   and node-status records, and a `User`'s role and not-before time, need keys
-   and codecs in [RFC 16](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed); every control-plane record needs its position
-   (§2.4); and `SetGrant` and `SetQuota` need an expected generation, and every put an
-   expected absence, for §4.4's check to sit inside their transaction.
-3. **Audit volume at scale.** An audit record per change is nothing for
+1. **Which counter a position is of.** [RFC 16](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)
+   defines the records this RFC adds and their keys, a `User`'s role and
+   not-before time, every record's `Position`, and `expect` on every write,
+   `SetGrant` and `SetQuota` included. One question is left: which counter
+   (`CFGGEN`, `SL` or `PGEN`) a grant's, an export policy's, a netgroup's and a
+   quota's `Position` is of. [RFC 18 §7.2](rfc-18-identity.md#7.2%20Local%20changes%20take%20effect%20within%20a%20second)
+   keeps grants and export policies off the principals generation.
+2. **Audit volume at scale.** An audit record per change is nothing for
    operators; a provisioning reload that rewrites 10⁴ shares writes 10⁴ records
    in its transactions. Whether a reload's records are summarised per record
    kind is unmeasured.
-4. **The API on protocol-only nodes.** A split deployment exposes the API only
-   on storage nodes. Whether a protocol node should serve reads, forwarding
-   writes over the shard service's `ControlPlane` calls, depends on whether
-   operators reach the storage tier's network.
-5. **Server-sent changes.** Clients poll operations and resources. A watch
+3. **Server-sent changes.** Clients poll operations and resources. A watch
    (a stream of changes from a generation) would serve the Kubernetes operator
    better; whether it is worth a second read path is open.
+4. **Lifecycles the owning RFCs have yet to state.** §2.1 places, but does not
+   specify, what this RFC cannot state for another: the construction and
+   lifecycle of open state and namespace metadata (RFC 14), the identity
+   resolver and authenticator, and whether they hold directory connections or
+   keytabs to close (RFC 18), the event sink and the admin-stream writer
+   (RFC 25), the pools (RFC 24), the router and the client-address agent
+   (RFC 15), shard placement (RFC 11) and the metadata store's close (RFC 16).
+5. **The cost of a full reconcile.** A full reconcile after every failed read
+   re-lists every record of every kind; during a flapping store, at 10⁴ shares,
+   that is once a second. Whether it needs a rate bound, and whether reconciling
+   only the records above the reconciled position needs an index by (kind,
+   position) in RFC 16, is unmeasured.
 
 ## Appendix A — prior art
 
@@ -1259,9 +1497,11 @@ marked **(cluster)**.
 
 | § | This RFC | The code today |
 | --- | --- | --- |
-| §2.1 | one composition root | the start command composes the node; a second, partial root in `pkg/controlplane/controlplane.go` builds store, runtime and API only and has no importer; the adapter and NFSv3 handler test fixtures build their own |
-| §2.1, §2.3 | the API writes records, the runtime applies them | handlers write the database and then call the runtime directly — `AddShare`, `UpdateShare`, `RebindShareBlockStore`, adapter start and stop; a runtime failure after the write is logged as a warning and the request still succeeds (a share whose `AddShare` fails returns `201` and loads at the next restart); share create builds the runtime's share configuration field by field in the handler |
-| §2.2 | start: store, runtime, content, API, adapters; stop the reverse with the API after adapters | start opens the control-plane database, seeds the admin, default groups and default adapters, opens metadata stores, loads shares, then serves; inside `Serve` the settings watcher and adapters start before the API; shutdown stops adapters, closes stores and then the API |
+| §2.1 | one composition root, `node.New` | the start command composes the node; a second, partial root in `pkg/controlplane/controlplane.go` builds store, runtime and API only and has no importer; the adapter and NFSv3 handler test fixtures build their own |
+| §2.1, RFC 20 §3.4 | adapters hold the filesystem service only; the node drives them | adapters are handed the whole runtime by `SetRuntime(rt any)`, and 22 adapter files (16 internal, 6 public) import the runtime; the runtime knows protocols by name (`GetNFSSettings`, `GetSMBSettings`, `SetNFSExportPolicy`, an NFS mount tracker, an SMB oplock-breaker hook) |
+| §2.1 | the node exports `New`, `Start` and `Stop` | `*Runtime` exports 156 methods, in 23 of the package's 35 files, and hosts GC, the snapshot scheduler, trash and integrity scans, which are their components' own |
+| §2.1, §2.3 | the API writes records, the node applies them | handlers write the database and then call the runtime directly — `AddShare`, `UpdateShare`, `RebindShareBlockStore`, adapter start and stop; a runtime failure after the write is logged as a warning and the request still succeeds (a share whose `AddShare` fails returns `201` and loads at the next restart); share create builds the runtime's share configuration field by field in the handler |
+| §2.2 | start: store, content, the server, API, adapters; stop the reverse with the API after adapters | start opens the control-plane database, seeds the admin, default groups and default adapters, opens metadata stores, loads shares, then serves; inside `Serve` the settings watcher and adapters start before the API; shutdown stops adapters, closes stores and then the API |
 | §2.3, §8 | every node reconciles by generation, once a second | changes are applied in-process by direct calls and change callbacks; only adapter settings are polled, every 10 s; there are no node records, so a second node sharing the database sees shares, adapters and users only after a restart |
 | §2.4 | nodes report what they applied | no per-node report; nothing records whether a change took effect |
 | §2.5 | anonymous health answers one word | `/health` and `/health/ready` are unauthenticated and return control-plane database status, share and adapter counts and NFS grace state; the grace route under `/api/v1` with the same data is admin-only |
@@ -1278,8 +1518,8 @@ marked **(cluster)**.
 | §5.1, §5.4 | the bootstrap admin is not a file user | the bootstrap admin is created with uid 0 "for permission bypass" and is added to an `admins` group |
 | §5.2 | `viewer`, `operator`, `admin`, checked against the record | roles `admin`, `operator`, `user`, carried in the token; `operator` can only list adapters |
 | §5.3 | tokens checked against the account each call; installation-wide signing key | the access token is checked for signature and expiry only, so disabling a user or changing a role takes up to 15 min; refresh tokens last 7 days and re-check `Enabled`; the signing secret is per process, from the environment or the host file, and must be copied between nodes by hand (RFC 13 Appendix A, C6); no throttling of sign-in |
-| §5.4 | first password printed once by initialisation; current password always required | the admin is seeded at start from an environment variable, a configured hash, or a random 24-character password printed only when standard output is a terminal; while must-change is set, the password change does not ask for the current password |
 | §5.3, CP11 | no secret is read | store configurations are redacted, identity-provider secrets are write-only, but the settings routes return raw values, and the NETLOGON machine secret is kept as a setting |
+| §5.4 | first password printed once by initialisation; current password always required | the admin is seeded at start from an environment variable, a configured hash, or a random 24-character password printed only when standard output is a terminal; while must-change is set, the password change does not ask for the current password |
 | §6 | an audit record per action, in its transaction | none; nine adapter-settings handlers write an informational log line naming the user |
 | §7 | the CLI only calls the API | `dfsctl` is a REST client over `pkg/apiclient`, with contexts in `~/.config/dfsctl/config.json` (mode 0600, access and refresh tokens); `share mount` and `unmount` run the host's mount tools, which is client-side and allowed; `docs/guide/cli.md` is generated by `cmd/gendocs` from both command trees |
 | §9 | version discovery and schema gate | only the `/api/v1` prefix; no version endpoint, header or client check; `dfsctl version` is local |
