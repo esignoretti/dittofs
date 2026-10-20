@@ -129,7 +129,7 @@ func parseSessionSetupRequest(body []byte) (*SessionSetupRequest, error) {
 // Both raw NTLM and SPNEGO-wrapped NTLM are supported.
 //
 // [MS-SMB2] Section 2.2.5, 2.2.6, 3.3.5.5
-func (h *Handler) SessionSetup(ctx *SMBHandlerContext, body []byte) (*HandlerResult, error) {
+func (h *Handler) SessionSetup(ctx *SMBHandlerContext, body []byte) (result *HandlerResult, err error) {
 	// Wait for any in-progress session cleanups to complete before proceeding.
 	// When a client disconnects, its session cleanup (file close, lease release,
 	// notify unregister) runs asynchronously in the old connection's goroutine.
@@ -173,6 +173,16 @@ func (h *Handler) SessionSetup(ctx *SMBHandlerContext, body []byte) (*HandlerRes
 	// routed as a bind, not as a re-auth of the existing session.
 	if req.Flags&SMB2_SESSION_FLAG_BINDING != 0 {
 		return h.handleSessionBind(ctx, req)
+	}
+
+	// The previous session is superseded only by a sign-in that succeeded, so
+	// the decision waits for this request's own verdict (MS-SMB2 3.3.5.5.3).
+	if req.PreviousSessionID != 0 {
+		defer func() {
+			if err == nil && result != nil && result.Status == types.StatusSuccess {
+				h.closePreviousSession(ctx, req.PreviousSessionID)
+			}
+		}()
 	}
 
 	// Check if this is a continuation of pending authentication
@@ -231,7 +241,7 @@ func (h *Handler) SessionSetup(ctx *SMBHandlerContext, body []byte) (*HandlerRes
 		// LoggedOff sessions are zombies kept in the manager only so any
 		// in-flight response can still be signed (e.g. an explicit LOGOFF on
 		// the prior SessionID after a PreviousSessionID supersession — see
-		// the supersession block below). They are not re-authable: a client
+		// closePreviousSession). They are not re-authable: a client
 		// targeting a LoggedOff session for re-auth must observe
 		// STATUS_USER_SESSION_DELETED, matching what it would have seen
 		// after the manager entry was reaped. Without this guard a fresh
@@ -317,45 +327,6 @@ func (h *Handler) SessionSetup(ctx *SMBHandlerContext, body []byte) (*HandlerRes
 		}
 	}
 
-	// Tear down old session per MS-SMB2 3.3.5.5.3.
-	//
-	// Strategy: drain resources inline, mark the prior session LoggedOff, and
-	// leave the session record in the manager as a zombie. Cleanup of the
-	// record itself defers to connection close (cleanupSessions fan-out).
-	//
-	// Why keep the zombie rather than delete immediately: the prior session's
-	// signing key MUST remain reachable so any error response we still owe on
-	// the old SessionID can be signed. smbtorture smb2.notify.session-reconnect
-	// supersedes the prior session and then issues an explicit LOGOFF on the
-	// OLD SessionID. With the record gone, prepareDispatch returns
-	// STATUS_USER_SESSION_DELETED but SendMessage finds no session for
-	// signing, the reply goes out unsigned, and the client rejects it as
-	// STATUS_ACCESS_DENIED. dispatch (response.go:269) and the verifier
-	// (framing.go:343) already treat LoggedOff sessions correctly: signature
-	// verification is skipped and handlers that require a session are
-	// short-circuited to STATUS_USER_SESSION_DELETED. The LOGOFF handler uses
-	// the same pattern (logoff.go step 2 — session NOT deleted there either).
-	if req.PreviousSessionID != 0 {
-		if prevSess, ok := h.GetSession(req.PreviousSessionID); ok {
-			logger.Info("SESSION_SETUP: tearing down previous session",
-				"previousSessionID", req.PreviousSessionID)
-			prevSess.MarkLoggedOff()
-			// Treat PreviousSessionID supersession as a transport disconnect for
-			// durable-handle purposes: per MS-SMB2 3.3.5.5.3 / 3.3.5.9.7, the
-			// new session inherits the right to reconnect the prior session's
-			// durable handles via DHnC/DH2C. Closing with isDisconnect=false
-			// would prematurely tear down the open and break the lease-backed
-			// durable reopen paths (smb2.durable-open.reopen1a*).
-			h.CloseAllFilesForSession(ctx.Context, req.PreviousSessionID, true)
-			h.releaseSessionLeasesAndNotifies(ctx.Context, req.PreviousSessionID)
-			h.DeleteAllTreesForSession(req.PreviousSessionID)
-			h.DeleteAllPendingAuthForSession(req.PreviousSessionID)
-			// Session record stays in the manager (LoggedOff zombie) — see
-			// rationale at the top of this block. cleanupSessions reaps it on
-			// connection close.
-		}
-	}
-
 	// Try SPNEGO parsing to detect Kerberos vs NTLM
 	if len(req.SecurityBuffer) >= 2 &&
 		(req.SecurityBuffer[0] == 0x60 || req.SecurityBuffer[0] == 0xa0 || req.SecurityBuffer[0] == 0xa1) {
@@ -414,6 +385,52 @@ func (h *Handler) SessionSetup(ctx *SMBHandlerContext, body []byte) (*HandlerRes
 
 	// No recognized auth mechanism - create guest session
 	return h.createGuestSession(ctx)
+}
+
+// closePreviousSession tears down the session a successful SESSION_SETUP named
+// in PreviousSessionId, when that session belongs to the user who just signed
+// in as ctx.SessionID (MS-SMB2 3.3.5.5.3). Any other previous session is left
+// as it was, and the request's answer does not change either way.
+//
+// decision: "the same user" is decided by bindIdentityMatchesSession, the rule
+// a bind uses, so a guest or anonymous sign-in — which carries no user record —
+// never supersedes anything, not even a previous guest session. A client
+// reconnecting as guest leaves its old session to be reaped with its
+// connection. Revisit if a keyless client must reclaim durable handles.
+//
+// The prior session's resources are drained inline and it is marked LoggedOff,
+// but its record stays in the manager as a zombie until connection close
+// (cleanupSessions). Its signing key must stay reachable so an error response
+// still owed on the old SessionID can be signed: smbtorture
+// smb2.notify.session-reconnect supersedes the prior session and then sends an
+// explicit LOGOFF on the OLD SessionID, and an unsigned reply to that is
+// rejected as STATUS_ACCESS_DENIED. Dispatch and the verifier already treat
+// LoggedOff sessions as deleted, as LOGOFF does.
+func (h *Handler) closePreviousSession(ctx *SMBHandlerContext, prevID uint64) {
+	if prevID == ctx.SessionID {
+		return
+	}
+	prevSess, ok := h.GetSession(prevID)
+	if !ok || prevSess.LoggedOff.Load() {
+		return
+	}
+	newSess, ok := h.GetSession(ctx.SessionID)
+	if !ok || !bindIdentityMatchesSession(prevSess.CurrentUser(), newSess.CurrentUser()) {
+		logger.Debug("SESSION_SETUP: previous session not superseded (different or no user)",
+			"previousSessionID", prevID, "sessionID", ctx.SessionID)
+		return
+	}
+	logger.Info("SESSION_SETUP: tearing down previous session",
+		"previousSessionID", prevID, "sessionID", ctx.SessionID)
+	prevSess.MarkLoggedOff()
+	// Supersession counts as a transport disconnect for durable handles: the
+	// new session inherits the right to reconnect them via DHnC/DH2C
+	// (MS-SMB2 3.3.5.9.7), so closing them outright would break the
+	// lease-backed durable reopen paths (smb2.durable-open.reopen1a*).
+	h.CloseAllFilesForSession(ctx.Context, prevID, true)
+	h.releaseSessionLeasesAndNotifies(ctx.Context, prevID)
+	h.DeleteAllTreesForSession(prevID)
+	h.DeleteAllPendingAuthForSession(prevID)
 }
 
 // verifyReauthChannelSignature enforces the SESSION_SETUP request-signature
