@@ -401,7 +401,7 @@ source. The same rule applies to `shard`. This is the "stated rule" that
 [RFC 16 §8.1](rfc-16-metadata-store.md#8.1%20Metrics) refer to.
 
 **Series budget.** At the reference profile — 10⁴ shares, every entity label at
-its cap of 64 values, every protocol in use, every role on one node — a node **MUST** export no more than **50,000** series in
+its cap of 64 values, every protocol in use — a node **MUST** export no more than **50,000** series in
 all and no single metric more than **10,000**, histogram buckets included. Both
 are fixed design limits, checked by counting after the reference workload (§12);
 a table whose metric cannot fit is a defect in that table. `vfs_op_seconds` sets
@@ -621,19 +621,15 @@ listener clients are sent to is down.
 | draining: stop requested | yes | no | draining |
 | watchdog stalled | no | no | — |
 
-For each role ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)):
-
-- a node with the `protocol` role is ready once its adapters accept clients and
-  the share list is loaded;
-- a node with the `storage` role is ready once it has joined the store
-  **(cluster)**. A shard it holds and cannot serve does not make it unready,
-  since sending clients elsewhere would not serve that shard either; it is the
-  shard's own condition, `shard_relinquished` or `replication_under_floor`
-  (§3.9). A rolling upgrade
-  ([RFC 30 §5.1](rfc-30-kubernetes.md#5.1%20Rolling%20upgrade)) waits on those
-  conditions as well as on readiness, so the one readiness answer serves traffic
-  and the upgrade alike;
-- a node with both roles is ready when both are.
+Every node runs both roles, so readiness has one rule: a node is ready once its
+adapters accept clients, the share list is loaded and, **(cluster)**, it has
+joined the store. A shard it holds and cannot serve does not make it unready,
+since sending clients elsewhere would not serve that shard either; it is the
+shard's own condition, `shard_relinquished` or `replication_under_floor`
+(§3.9). A rolling upgrade
+([RFC 30 §5.1](rfc-30-kubernetes.md#5.1%20Rolling%20upgrade)) waits on those
+conditions as well as on readiness, so the one readiness answer serves traffic
+and the upgrade alike.
 
 ### 3.7 What the health answers report
 
@@ -672,7 +668,7 @@ unhealthy on one node as in a cluster. With more than one:
 - any node answers the installation's health by reading every node record; a
   node whose lease has lapsed is the installation condition `node_lost` naming it,
   and its last written conditions are shown as stale;
-- a share's conditions come from its primary's record; a protocol node that
+- a share's conditions come from its primary's record; a gateway that
   cannot reach a primary writes the condition RFC 15 already gives it
   ([RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)).
 
@@ -1062,7 +1058,7 @@ them.
 - **(cluster)** The route envelope ([RFC 15 §4.3](rfc-15-topology.md#4.3%20The%20route%20envelope))
   carries a **trace context** — the trace ID, the parent span ID and the sampled
   flag, in the standard trace-context encoding — beside the request ID. The
-  primary's service span is the child of the forwarding node's. The trace context
+  primary's service span is the child of the gateway's. The trace context
   **MUST NOT** enter the request ID, the dedup key or any durable record: a retry
   carries a new span and the same request ID.
 - A client's own trace context is not read from the wire; NFS and SMB carry none.
@@ -1126,8 +1122,7 @@ route that failed, and the bug counters above.
 
 ## 8. Components and lifecycle
 
-The composition root ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role),
-[RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows))
+`node.New` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components))
 builds each component below once per process and hands it to its consumers as a
 `Deps` field: no global, no registry lookup, no value carried in a context. A
 field is a concrete type where there is one implementation, as in
@@ -1139,11 +1134,11 @@ steps are [RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)'s.
 | Component | Package | Built by, owned by | Depends on | Injected as | Lifecycle |
 | --- | --- | --- | --- | --- | --- |
 | log handler | `internal/logger` | the root, first | settings | `Logger *slog.Logger`; each consumer adds `With("component", prefix)` (§5.3) | `New` only; a `Debug` level set through the API expires on a timer the handler owns (§5.2) |
-| metrics registry | `pkg/metrics` | the root | build version and commit | `Metrics *metrics.Registry` | `New` registers only the process and runtime collectors; the metrics listener (§2.8) starts before start step 2 and stops after stop step 6, so a stuck stop can still be scraped |
-| watchdog | `pkg/health` | the root | clock | `Watchdog *health.Watchdog`; each watched loop takes its own `*health.Loop` from `Watchdog.Loop(name)` and closes it when the loop ends — a listener on unbind, since [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)'s reconfiguration adds and removes listeners at run time | starts before start step 2, stops after stop step 6; the liveness answer reads it (§3.5) |
-| health evaluator | `pkg/health` | the root; the runtime reads its `Snapshot` and writes node status (§3.8) | clock, logger, registry, watchdog, §3.9's table as Go, the `Source`s | injected into nothing: each component is a `Source`, added with `Add` and removed with `Remove` by the runtime, which owns the set of running components ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)) | `Start` before start step 2 takes `Watchdog.Loop("health")` and turns it after each evaluation, every second; `Close` after stop step 6 closes it |
-| event sink | `pkg/events` | the root | clock, logger, registry, `events.path` | `Events *events.Sink`, to the filesystem service and the authenticator only | `New` opens nothing; `Start` after start step 2 and before step 5 opens the spool, writes the `restart` gap record (§4.4) and starts the writers; `Close(ctx)` after stop step 2 drains the rings until `ctx` ends, drops and counts the rest, and syncs the spool |
-| tracer | none: the tracing API | the root builds the provider when `tracing.endpoint` is set (§6.3), a no-op provider otherwise | settings | `Tracer`, the tracing API's tracer type, in the `Deps` of every component that opens spans (§6.1): the adapters, the service, the metadata store, the engine and each background pass | the provider shuts down after stop step 2, flushing within the drain deadline; spans it cannot flush are counted (§10) |
+| metrics registry | `pkg/metrics` | the root | build version and commit | `Metrics *metrics.Registry` | `New` registers only the process and runtime collectors; the metrics listener (§2.8) starts at start step 2 and stops after stop step 9, so a stuck stop can still be scraped |
+| watchdog | `pkg/health` | the root | clock | `Watchdog *health.Watchdog`; each watched loop takes its own `*health.Loop` from `Watchdog.Loop(name)` and closes it when the loop ends — a listener on unbind, since [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)'s reconfiguration adds and removes listeners at run time | starts before start step 2, stops after stop step 9; the liveness answer reads it (§3.5) |
+| health evaluator | `pkg/health` | the root; the node reads its `Snapshot` and writes node status (§3.8) | clock, logger, registry, watchdog, §3.9's table as Go, the `Source`s | injected into nothing: each component is a `Source`, added with `Add` and removed with `Remove` by the node, which owns the set of running components ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components)) | `Start` before start step 2 takes `Watchdog.Loop("health")` and turns it after each evaluation, every second; `Close` after stop step 9 closes it |
+| event sink | `pkg/events` | the root | clock, logger, registry, `events.path` | `Events *events.Sink`, to the filesystem service and the authenticator only | `New` opens nothing; `Start` after start step 2 and before step 5 opens the spool, writes the `restart` gap record (§4.4) and starts the writers; `Close(ctx)` after stop step 6 drains the rings until `ctx` ends, drops and counts the rest, and syncs the spool |
+| tracer | none: the tracing API | the root builds the provider when `tracing.endpoint` is set (§6.3), a no-op provider otherwise | settings | `Tracer`, the tracing API's tracer type, in the `Deps` of every component that opens spans (§6.1): the adapters, the service, the metadata store, the engine and each background pass | the provider shuts down after stop step 6, flushing within the drain deadline; spans it cannot flush are counted (§10) |
 
 ### 8.2 The packages
 
@@ -1273,7 +1268,7 @@ func (s *Sink) Close(ctx context.Context) error
 
 A share's per-share gauges are computed at export from the live share list, so a
 removed share leaves at the next scrape with nothing to delete. Its conditions
-leave when the runtime removes its context's `Source`. No counter carries the
+leave when the node removes its context's `Source`. No counter carries the
 share, so none changes. A removed store, namespace or journal has its series
 deleted by the component that created them (§2.4).
 
@@ -1362,13 +1357,13 @@ names, on the composed single-node harness of the [index](rfc-index.md#Test%20ha
 | --- | --- | --- |
 | §2.1, §2.2 names | Scrape a node that has run the reference workload. Assert every name's prefix is in §2.1's registry, every counter ends `_total`, every unit word is one of §2.2's. `metrics.golden` lists every name, type and label set; the scrape is diffed against it, and `-update` rewrites it. | a metric with a borrowed prefix, milliseconds; a quiet rename |
 | §2.4 forbidden labels | On the same scrape assert no series carries a forbidden label, and no counter or histogram carries `share` or `shard`. Plant a share named like a file and a user named like a path: assert neither value appears in any label. | a share label slipped onto a histogram |
-| §2.5 budget | Configure 10⁴ shares and every entity label at 64 values, run every protocol and role on one node, scrape. Assert at most 50,000 series and no metric above 10,000. Raise `metrics.top_shares` to 10⁴: assert the count rises by the per-share gauges only. | a label that scales with shares or clients |
+| §2.5 budget | Configure 10⁴ shares and every entity label at 64 values, run every protocol on one node, scrape. Assert at most 50,000 series and no metric above 10,000. Raise `metrics.top_shares` to 10⁴: assert the count rises by the per-share gauges only. | a label that scales with shares or clients |
 | §2.3 zero start | Start a node, scrape before any traffic. Assert every closed-set series of every bug counter is present at 0. | an alert on "any increase" that misses the first event |
 | §2.8 export does not block | Hold the engine's state lock; scrape. Assert the scrape returns within 6 s without the engine's series and `health_export_partial_total` rose; release; assert a write completed during the scrape. | an export that takes a request-path lock |
 | §3.3 share does not set node | Deny puts on one store under one share of a hundred: assert the share unhealthy naming the store, the node's status unchanged by it, `health_shares{state="unhealthy"}` = 1, readiness and liveness true. | a readiness probe that restarts for a bucket policy |
 | §3.4 never latched | Make a store get-unhealthy, then fix it without touching DittoFS. Assert the condition clears within its owner's bound and the share returns healthy, with no operator action. | a latched condition |
 | §3.5 liveness | Stop the metadata store and the remote, fill the journal's device: assert liveness stays true throughout. Block the request scheduler: assert liveness fails within 60 s. | liveness on a dependency |
-| §3.6 readiness | Assert not ready during recovery, ready in grace, ready while self-fenced, not ready with the metadata store lost and while draining. Drop one listener: assert not ready and `adapter_listener_lost`. Fail a start step: assert `not_ready` and `start_failed` naming the step. **(cluster)** Relinquish a shard on a storage node: assert the node stays ready and `shard_relinquished` is raised. | a node unreachable for reclaim; a probe stricter than §3.6 |
+| §3.6 readiness | Assert not ready during recovery, ready in grace, ready while self-fenced, not ready with the metadata store lost and while draining. Drop one listener: assert not ready and `adapter_listener_lost`. Fail a start step: assert `not_ready` and `start_failed` naming the step. **(cluster)** Relinquish a shard on a node: assert the node stays ready and `shard_relinquished` is raised. | a node unreachable for reclaim; a probe stricter than §3.6 |
 | §3.9 registry | §3.9's Go table and the RFC table agree, and every `Name` is returned by some `Source` in a test that injects its cause, with the severity the registry's rule gives that cause. | a condition no alert knows |
 | §4.3 never blocks | With the access policy at every decision, stop the writer; run 10⁵ operations. Assert all 10⁵ operations complete, `events_dropped_total{reason="ring_full"}` equal to the events beyond the ring, and, once the writer resumes, one gap record covering exactly those sequence numbers, after every record below them and before every record above. Stop again, drop, and emit nothing more: assert the gap record is written within a second of the writer resuming. | a blocking sink; a silent drop; a gap out of order |
 | §4.4 coalescing | Hammer a full quota with 10⁴ writes in a minute. Assert exactly two hard-refusal records: the first, at once, and one summary carrying the count of the rest. | a quota stream that floods |
