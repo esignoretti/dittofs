@@ -60,10 +60,20 @@ func setupReopen2Env(t *testing.T) *reopen2Env {
 
 	metaSvc := rt.GetMetadataService()
 
+	// The test sessions are anonymous, so they act as nobody. smbtorture's user
+	// owns the directory and the file it opens with every right, so nobody
+	// owns both here: the open's delete comes from the directory's mode.
+	nobody, nogroup := nobodyUID, nobodyGID
+	if _, err := metaSvc.SetFileAttributes(rootAuth, rootHandle, &metadata.SetAttrs{UID: &nobody, GID: &nogroup}); err != nil {
+		t.Fatalf("chown the share root: %v", err)
+	}
+
 	// Create the file that the durable handle will reference.
 	_, _, err := metaSvc.CreateFile(rootAuth, rootHandle, "durable.txt", &metadata.FileAttr{
 		Type: metadata.FileTypeRegular,
 		Mode: 0o644,
+		UID:  nobody,
+		GID:  nogroup,
 	})
 	if err != nil {
 		t.Fatalf("CreateFile: %v", err)

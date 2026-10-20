@@ -278,17 +278,16 @@ func TestCheckFileAccess_NilACLOwnerGrantsRequested(t *testing.T) {
 	require.Equal(t, rightReadData|rightWriteData, granted)
 }
 
-// TestCheckFileAccess_NilACLNonOwnerGrantsRequested verifies the open-time
-// gate does NOT deny a non-owner's request when file.ACL == nil — even when
-// the POSIX mode would deny the same operation downstream. This is the WPTS
-// BVT load-bearing case (and smb2.create.multi): CREATE asks for DELETE,
-// WRITE_DAC, or higher-namespace rights that the rwx mapping cannot encode,
-// and the pre-#529 server granted those opens. We must keep granting them at
-// open time; per-op enforcement in read/write/delete catches abuse.
-func TestCheckFileAccess_NilACLNonOwnerGrantsRequested(t *testing.T) {
+// TestCheckFileAccess_NilACLNonOwnerGetsTheModeGrant verifies that a file
+// with no stored ACL is governed by its mode at the open: a non-owner is
+// granted what the mode gives it and refused the rest, write data and the
+// rights no mode bit gives (DELETE, WRITE_DAC, WRITE_OWNER) included. The
+// open's grant is the handle's authority later, so granting the request
+// would let the handle write or delete past the mode.
+func TestCheckFileAccess_NilACLNonOwnerGetsTheModeGrant(t *testing.T) {
 	f := newTestFixture(t)
 
-	created, _, err := f.service.CreateFile(f.rootContext(), f.rootHandle, "posix_owner_only.txt",
+	ownerOnly, _, err := f.service.CreateFile(f.rootContext(), f.rootHandle, "posix_owner_only.txt",
 		&metadata.FileAttr{
 			Type: metadata.FileTypeRegular,
 			Mode: 0o600,
@@ -299,26 +298,38 @@ func TestCheckFileAccess_NilACLNonOwnerGrantsRequested(t *testing.T) {
 
 	authCtx := f.authContext(1001, 1001)
 
-	// Non-owner requesting WRITE_DATA on a 0o600 file. Open succeeds
-	// (no DACL to enforce); the actual WRITE op denies via POSIX mode.
-	granted, err := f.service.CheckFileAccess(created, authCtx, rightWriteData|rightAppendData)
-	require.NoError(t, err)
-	require.Equal(t, rightWriteData|rightAppendData, granted)
+	_, err = f.service.CheckFileAccess(ownerOnly, authCtx, rightWriteData|rightAppendData)
+	var storeErr *metadata.StoreError
+	require.ErrorAs(t, err, &storeErr)
+	require.Equal(t, metadata.ErrAccessDenied, storeErr.Code)
 
-	// DELETE / WRITE_DAC / WRITE_OWNER — bits the POSIX rwx mapping cannot
-	// encode — must also pass the open gate when there is no DACL.
 	const rightWriteDac uint32 = 0x00040000
 	const rightWriteOwner uint32 = 0x00080000
-	probe := rightDelete | rightWriteDac | rightWriteOwner
-	granted, err = f.service.CheckFileAccess(created, authCtx, probe)
+	for _, right := range []uint32{rightDelete, rightWriteDac, rightWriteOwner} {
+		_, err = f.service.CheckFileAccess(ownerOnly, authCtx, right)
+		require.ErrorAs(t, err, &storeErr, "right 0x%x", right)
+		require.Equal(t, metadata.ErrAccessDenied, storeErr.Code, "right 0x%x", right)
+	}
+
+	// A mode that lets others read and write grants them both.
+	shared, _, err := f.service.CreateFile(f.rootContext(), f.rootHandle, "posix_shared.txt",
+		&metadata.FileAttr{
+			Type: metadata.FileTypeRegular,
+			Mode: 0o666,
+			UID:  9999,
+			GID:  9999,
+		})
 	require.NoError(t, err)
-	require.Equal(t, probe, granted)
+	granted, err := f.service.CheckFileAccess(shared, authCtx, rightReadData|rightWriteData|rightAppendData)
+	require.NoError(t, err)
+	require.Equal(t, rightReadData|rightWriteData|rightAppendData, granted)
 }
 
-// TestCheckFileAccess_NilACLMaxAllowedReturnsGenericAll verifies that
-// MAXIMUM_ALLOWED on a no-DACL file returns the full GENERIC_ALL set, mirroring
-// the MxAc reply produced by computeMaximalAccess.
-func TestCheckFileAccess_NilACLMaxAllowedReturnsGenericAll(t *testing.T) {
+// TestCheckFileAccess_NilACLMaxAllowedOwner verifies that MAXIMUM_ALLOWED on
+// a no-DACL file gives its owner GENERIC_ALL less DELETE, which no mode bit
+// gives a file: the owner gets DELETE only from a parent whose mode lets the
+// owner write.
+func TestCheckFileAccess_NilACLMaxAllowedOwner(t *testing.T) {
 	f := newTestFixture(t)
 
 	ownerUID := uint32(1001)
@@ -333,9 +344,15 @@ func TestCheckFileAccess_NilACLMaxAllowedReturnsGenericAll(t *testing.T) {
 
 	authCtx := f.authContext(ownerUID, 1001)
 
+	// GENERIC_ALL = 0x001F01FF
 	granted, err := f.service.CheckFileAccess(created, authCtx, rightMaxAllowed)
 	require.NoError(t, err)
-	// GENERIC_ALL = 0x001F01FF
+	require.Equal(t, uint32(0x001F01FF)&^rightDelete, granted)
+
+	root, err := f.service.GetFile(f.rootContext().Context, f.rootHandle)
+	require.NoError(t, err)
+	granted, err = f.service.CheckFileAccessWithParent(created, root, authCtx, rightMaxAllowed)
+	require.NoError(t, err)
 	require.Equal(t, uint32(0x001F01FF), granted)
 }
 
@@ -530,13 +547,14 @@ func TestCheckFileAccessWithParent_OverrideDoesNotApplyToNonDeleteBits(t *testin
 	require.Error(t, err)
 }
 
-// TestCheckFileAccessWithParent_NullParentDACLGrantsDelete pins MS-DTYP
-// §2.5.3: a NULL DACL on the parent grants every right to every principal,
-// including FILE_DELETE_CHILD, so the parent override grants DELETE on the
-// child. This is the load-bearing case for smbtorture deltree recovery —
-// new dirs in DittoFS are created without an explicit ACL, so parent.ACL
-// is nil for most filesystem state.
-func TestCheckFileAccessWithParent_NullParentDACLGrantsDelete(t *testing.T) {
+// TestCheckFileAccessWithParent_NoACLParentGrantsDeleteByItsMode pins the
+// override for a parent with no stored ACL, which is governed by its mode: it
+// grants DELETE on the child to a caller its mode lets write, as an NFS unlink
+// in it requires, and to nobody else. This is the load-bearing case for
+// smbtorture deltree recovery: new dirs in DittoFS are created without an
+// explicit ACL, so parent.ACL is nil for most filesystem state, and the
+// deleting user owns them.
+func TestCheckFileAccessWithParent_NoACLParentGrantsDeleteByItsMode(t *testing.T) {
 	f := newTestFixture(t)
 
 	requesterUID := uint32(1001)
@@ -579,6 +597,13 @@ func TestCheckFileAccessWithParent_NullParentDACLGrantsDelete(t *testing.T) {
 	granted, err := f.service.CheckFileAccessWithParent(childCreated, parentCreated, authCtx, rightDelete)
 	require.NoError(t, err)
 	require.Equal(t, rightDelete, granted)
+
+	// Another user, whom the parent's 0755 does not let write, is refused.
+	other := f.authContext(2002, 2002)
+	_, err = f.service.CheckFileAccessWithParent(childCreated, parentCreated, other, rightDelete)
+	var storeErr *metadata.StoreError
+	require.ErrorAs(t, err, &storeErr)
+	require.Equal(t, metadata.ErrAccessDenied, storeErr.Code)
 }
 
 // TestCheckFileAccessWithParent_NoOverrideWhenParentLacksDeleteChild verifies

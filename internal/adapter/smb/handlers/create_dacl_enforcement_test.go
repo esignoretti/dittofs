@@ -287,12 +287,11 @@ func TestCreate_DaclEnforcement_MaximumAllowedNeverDenies(t *testing.T) {
 	}
 }
 
-// TestCreate_DaclEnforcement_NilACLPermissive guards against the WPTS BVT
-// regression that triggered the post-PR rework: a file with no DACL must NOT
-// have any bits denied at the open gate, even for non-POSIX-rwx bits like
-// DELETE / WRITE_DAC / WRITE_OWNER. POSIX-mode enforcement happens later in
-// the per-op layer, not here.
-func TestCreate_DaclEnforcement_NilACLPermissive(t *testing.T) {
+// TestCreate_DaclEnforcement_NilACLGovernedByMode pins the open of a file with
+// no DACL to its mode: a non-owner asking for DELETE / WRITE_DAC / WRITE_OWNER,
+// which no mode bit gives it, is refused at the open, since the handle's grant
+// is what a later delete on close is authorized by.
+func TestCreate_DaclEnforcement_NilACLGovernedByMode(t *testing.T) {
 	h, rt, smbCtx, rootHandle, rootAuth := setupDaclTest(t)
 	tree := &TreeConnection{TreeID: smbCtx.TreeID, SessionID: smbCtx.SessionID, ShareName: smbCtx.ShareName}
 	h.StoreTree(tree)
@@ -321,9 +320,6 @@ func TestCreate_DaclEnforcement_NilACLPermissive(t *testing.T) {
 		},
 	}
 
-	// Non-owner requesting DELETE | WRITE_DAC | WRITE_OWNER — bits the POSIX
-	// rwx mapping cannot encode. Pre-#529 server permitted these opens; the
-	// reworked gate must continue to permit them when there's no DACL.
 	const (
 		rightDelete     uint32 = 0x00010000
 		rightWriteDac   uint32 = 0x00040000
@@ -332,8 +328,8 @@ func TestCreate_DaclEnforcement_NilACLPermissive(t *testing.T) {
 	desired := rightDelete | rightWriteDac | rightWriteOwner
 	draft := makeDraft(t, tree, requesterAuth, rootHandle, existingFile, "no_dacl.txt", desired)
 	resp := h.completeCreateAfterBreak(smbCtx, draft)
-	if resp.Status != types.StatusSuccess {
-		t.Fatalf("nil-ACL high-namespace request: status = 0x%08x, expected STATUS_SUCCESS",
+	if resp.Status != types.StatusAccessDenied {
+		t.Fatalf("nil-ACL non-owner DELETE|WRITE_DAC|WRITE_OWNER: status = 0x%08x, expected STATUS_ACCESS_DENIED",
 			uint32(resp.Status))
 	}
 }
