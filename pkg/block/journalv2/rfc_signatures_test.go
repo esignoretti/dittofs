@@ -1,6 +1,7 @@
 package journalv2
 
 import (
+	"io"
 	"iter"
 	"time"
 )
@@ -45,4 +46,29 @@ var (
 	_ = CloneSpec{SrcShare: ShareID{}, Src: FileID{}, SrcOff: 0, DstOff: 0, Len: 0, AsOf: Version{}}
 	_ = Change{Kind: ChangeWrite, Extent: Extent{}, Version: Version{}, Mtime: 0, Clone: (*CloneSpec)(nil)}
 	_ = []ChangeKind{ChangeWrite, ChangeTruncate, ChangeDeallocate, ChangeDelete, ChangeCloneTarget, ChangeLoss}
+
+	_ = func(h *Handle) error {
+		return h.Offload(FileID{}, Version{}, int64(0), int64(0), func(o Offer, report func(offloaded []Extent) error) error {
+			return report([]Extent(nil))
+		})
+	}
+	_ = func(h *Handle) error {
+		return h.OffloadMany([]Capture(nil), int64(0), int64(0), func(offers []Offer, report func(id FileID, offloaded []Extent) error) error {
+			return report(FileID{}, []Extent(nil))
+		})
+	}
+	_ = func(h *Handle) error { return h.MarkOffloaded(FileID{}, []Extent(nil), Version{}, Version{}) }
+	_ = func(h *Handle) error { return h.Unmark(FileID{}, []Extent(nil)) }
+	_ = func(h *Handle) error { return h.Release(FileID{}, []Extent(nil)) }
+	_ = func(h *Handle) error { return h.Hold(ShareID{}, SnapshotCut(0), map[FileID]Version(nil)) }
+	_ = func(h *Handle) error { return h.Unhold(ShareID{}, SnapshotCut(0)) }
+	_ = func(h *Handle) int64 { return h.Held(ShareID{}) }
+	_ = func(h *Handle) error { return h.Stamp(FileID{}, Version{}, SnapshotCut(0)) }
+	_ = func(j *Journal) (int64, error) { return j.Repack(int64(0), RepackScope{}) }
+
+	_ = Offer{ID: FileID{}, Dirty: []OfferedExtent(nil), Neighbours: []Held(nil), Superseded: []OfferedExtent(nil),
+		Oldest: Version{}, Newest: Version{}, Offered: io.ReaderAt(nil)}
+	_ = OfferedExtent{Extent: Extent{}, Version: Version{}, Cut: SnapshotCut(0), Stamped: false}
+	_ = Capture{ID: FileID{}, Through: Version{}}
+	_ = RepackScope{Share: ShareTag(0), Segments: []SegmentID(nil)}
 )
