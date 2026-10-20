@@ -39,7 +39,7 @@
   <text x="580.0" y="79" class="m">transfers</text>
   <rect x="663.0" y="58" width="213.0" height="34" fill="#ffffff" stroke="#9aa3ad" stroke-dasharray="4 3"/>
   <text x="743.1" y="79" class="m">unpooled</text>
-  <text x="24" y="122" class="h">pool</text><text x="190" y="122" class="h">share</text><text x="250" y="122" class="h">floor</text><text x="330" y="122" class="h">at its ceiling</text>
+  <text x="24" y="122" class="h">pool</text><text x="190" y="122" class="h">fraction</text><text x="250" y="122" class="h">floor</text><text x="330" y="122" class="h">at its ceiling</text>
   <rect x="24" y="134" width="150" height="26" rx="4" class="sv"/>
   <text x="34" y="151" class="m">receive</text>
   <text x="190" y="151" class="k">1/16</text><text x="250" y="151" class="k">16 MiB</text>
@@ -51,7 +51,7 @@
   <rect x="24" y="198" width="150" height="26" rx="4" class="am"/>
   <text x="34" y="215" class="m">hold</text>
   <text x="190" y="215" class="k">1/16</text><text x="250" y="215" class="k">none</text>
-  <text x="330" y="215" class="e">refuses at once: ErrDelay · DelayHoldBudget (RFC 17)</text>
+  <text x="330" y="215" class="e">refuses at once: the adapter answers out-of-resources (RFC 20 §4.6)</text>
   <rect x="24" y="230" width="150" height="26" rx="4" class="am"/>
   <text x="34" y="247" class="m">connection state</text>
   <text x="190" y="247" class="k">1/16</text><text x="250" y="247" class="k">4 MiB</text>
