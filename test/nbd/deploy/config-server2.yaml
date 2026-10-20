@@ -1,0 +1,83 @@
+# DittoFS on demo-host.example (demo-es-2), serving 4 GiB VM boot disks over NBD.
+#
+# Data disk: /dev/sdc (23GB spare) mounted at /var/lib/dittofs.
+# /dev/sdb is deliberately NOT used: it is /data/agent00, backing a live Cubbit
+# agent container.
+#
+# ---------------------------------------------------------------------------
+# MEMORY BUDGET (this host has 3910 MiB and wedged once from overcommit)
+# ---------------------------------------------------------------------------
+# The auto-deduced defaults are per-share and sum to more than is safe here:
+#   MaxLogBytes     25% of RAM  -> ~975 MiB   (append-log write buffer)
+#   ReadBufferSize  12.5%       -> ~490 MiB   (in-memory read cache)
+#   Badger block    ~15%        -> ~614 MiB
+#   Badger index    ~7.5%       -> ~307 MiB
+#                                 ---------
+#                                 ~2386 MiB of 3910
+# An earlier attempt raised only the read buffer to 1.86 GiB without lowering
+# anything else; combined with a 4 GiB image write that left the host pingable
+# but with no listening ports. So the sizes below are explicit and sum to a
+# number that leaves room for the OS.
+#
+# The trade is deliberate: this workload is READ-dominated (boot a disk, run it),
+# so the write buffer gives up space to the read cache.
+#
+#   MaxLogBytes     512 MiB
+#   ReadBufferSize 1024 MiB   (set per share, see the deploy script)
+#   Badger          ~921 MiB  (left auto)
+#                   ---------
+#                  ~2457 MiB, leaving ~1.4 GiB
+
+logging:
+  level: "INFO"
+  format: "text"
+  output: "stdout"
+
+shutdown_timeout: 30s
+
+database:
+  type: sqlite
+  sqlite:
+    path: "/var/lib/dittofs/state/controlplane.db"
+
+controlplane:
+  # Loopback only. The API has full control over shares and credentials, and
+  # these hosts have no firewall.
+  host: "127.0.0.1"
+  port: 18080
+  jwt:
+    secret: "CHANGE-ME-before-running-this-config"
+
+blockstore:
+  journal:
+    # The on-disk local tier. Per-share --journal-size caps it; this is where
+    # the segments live. Does not consume RAM.
+    path: "/var/lib/dittofs/blocks"
+
+    # THE READ-AMPLIFICATION KNOB, and the biggest single win available here.
+    #
+    # The default profile is 1 MiB / 4 MiB / 16 MiB (Min/Avg/Max), and the
+    # chunker's own comment says the effective average is ≈ Min, not Avg. So a
+    # 4 KiB random read that misses the cache makes the server fetch a whole
+    # 1 MiB chunk: up to 256x amplification. A boot disk is exactly the workload
+    # that reads scattered small blocks (inodes, directory entries, journal).
+    #
+    # 128 KiB is the value pkg/config/blockstore.go recommends by name for
+    # "VM images or databases". Derived profile is Min 128K / Avg 512K / Max 1M.
+    #
+    # IMPORTANT: reads never re-chunk (the manifest freezes boundaries), so this
+    # affects only NEWLY WRITTEN data. The volumes must be recreated to benefit,
+    # which is why the deploy script rewrites them from scratch.
+    #
+    # Cost: more manifest rows (a 4 GiB volume is ~32768 rows instead of ~4096)
+    # and weaker dedup. Both are acceptable for a boot disk.
+    chunk_size: 131072
+    chunk_max: 1048576
+
+    # Cap the append-log buffer. See the memory budget above.
+    max_log_bytes: 536870912
+
+    # How long a write may sit unflushed before the journal fsyncs it. The
+    # default is fine; stated so the durability window is visible rather than
+    # implied.
+    dirty_expire: 5s
