@@ -171,8 +171,8 @@ lapsed. The fence is enforced by every receiver, never by S1's own check.
 - Nothing a replaced primary sends or commits takes effect after the takeover.
 - A read never returns bytes older than the last acknowledged write, nor bytes a
   takeover later takes back: the primary serves only what the whole replica set
-  holds, and any other node confirms the version with the primary or forwards
-  the read.
+  holds, and any other node, once one serves reads, confirms the version with
+  the primary or refuses the read.
 - Adding a replica never pauses writes, and a single node runs the same code
   with a replica set of one.
 
@@ -242,14 +242,15 @@ dirty-region map is the recorded upgrade ([§7.3](#7.3%20Joining)).
 A never runs on one isolated copy. If both replicas are truly lost, only an
 operator's acknowledgement lets S1 claim A alone.
 
-**A client's read lands on a replica.**
+**A read is served by a replica (deferred).** The gateway forwards every read to
+the primary today ([RFC 11 §6](rfc-11-ownership.md#6.%20Reads%20on%20other%20nodes)); once a path delivers one to a replica:
 
-1. A read of a file in A reaches S2 ([§8](#8.%20Reads)).
+1. A read of a file in A reaches S2's server ([§8](#8.%20Reads)).
 2. S2 asks S1 for the newest version of each extent the read covers. The
    answer carries no bytes ([§8](#8.%20Reads)).
 3. S2 serves its own bytes only if each extent carries exactly that version,
    and the answer is still fresh by S2's own clock ([§8](#8.%20Reads)).
-4. Otherwise S2 forwards the read to S1.
+4. Otherwise S2 refuses it, naming S1, and the gateway re-routes it there.
 
 One round trip spreads reads over the replicas without ever serving stale bytes.
 
@@ -279,7 +280,8 @@ moves operations between them, and fences the ones that must no longer count.
 
 1. **Durability across node loss.** An acknowledged write survives the loss of
    every node of its replica set but one that is not a learner.
-2. **Reads anywhere.** Any node **MAY** serve recently written bytes it
+2. **Reads anywhere (deferred).** Once a path delivers reads off the primary
+   ([RFC 11 §6](rfc-11-ownership.md#6.%20Reads%20on%20other%20nodes)), any node **MAY** serve recently written bytes it
    holds, after one round trip to the primary that carries no bytes ([§8](#8.%20Reads)).
 3. **No consensus among nodes.** The metadata store is the only consensus
    ([§3](#3.%20What%20it%20assumes%20of%20shard%20placement)); it is consulted when the replica set changes, never per write.

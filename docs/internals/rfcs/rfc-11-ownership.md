@@ -98,7 +98,7 @@ doing the writing.
 | the primary | `vfs.Serve`: fence by node epoch, shard epoch and hop count, dedup by request ID; then `vfs.Server` | everything: admission, identity, squash, ordering, open state, metadata, content |
 
 ```text
- adapter ─► vfs.Gateway ─┬─ local primary ──────────────────────────► vfs.Server
+ adapter ─► vfs.Gateway ─┬─ local primary ───────────────────────────► vfs.Server
                          └─ envelope ─► transport ─► vfs.Serve ──────► vfs.Server
                                                     (fence, dedup)   (decides: open state,
                                                                       metadata, engine)
@@ -192,8 +192,8 @@ capacity, so alice's and bob's shards land on different nodes
 One shard stays the unit of parallelism: a directory's entries are never split
 across shards and neither is a file, so one huge flat directory or one hot file
 — alice's 30 GB container — is still bounded by one node; per-file and range
-shards are deferred ([Appendix C](#Appendix%20C%20%E2%80%94%20later%3A%20per-file%20and%20range%20shards)). Reads spread further:
-any node may serve an extent, from its journal or by fetching from the
+shards are deferred ([Appendix C](#Appendix%20C%20%E2%80%94%20later%3A%20per-file%20and%20range%20shards)). Reads can later spread
+further, once a path delivers them off the primary: any node may then serve an extent, from its journal or by fetching from the
 bucket, after one round trip asking the primary for the newest version, which
 carries no bytes ([§6](#6.%20Reads%20on%20other%20nodes)). Placing whole shares on separate nodes
 behind a balancer, without shards that move, is an open question, and its
@@ -305,7 +305,7 @@ Users spread across nodes by slot, and new children start in their own shard.
 
 1. N1 still renews its lease, but the gateways of P1 and P2 cannot reach it
    ([§5.1](#5.1%20Gateways%20forward%20to%20the%20primary)).
-2. They report the failed forwards, as they report every forward, and the store records a health condition on
+2. Their nodes record the failed forwards and the store records a health condition on
    N1 ([§5.1](#5.1%20Gateways%20forward%20to%20the%20primary)).
 3. After the unreachable delay, proposed 30 s, each of N1's shards is handed to a
    replica they can reach ([§5.1](#5.1%20Gateways%20forward%20to%20the%20primary)).
@@ -974,14 +974,15 @@ orders nothing, and calls neither open state, the metadata store nor the engine
   epoch the sender expects; the sending node and its node epoch; and a **hop
   count**;
 - the receiver's `vfs.Serve` refuses the call if the epoch is not its current
-  one, if the file's recorded shard is not the one named, or if the sender's
-  node epoch has been fenced, and answers a retry from the dedup table below;
-  only then does the primary's `vfs.Server` see the call and decide it. The
+  one or if the sender's node epoch has been fenced, and answers a retry from
+  the dedup table below; only then does the primary's `vfs.Server` see the
+  call, refuse it with `ErrWrongShard` if the file's recorded shard is not the
+  one named, and otherwise decide it. The
   gateway re-reads the shard record and retries with backoff
   until the call's deadline ([RFC 0 §10.3](rfc-0-data-lifecycle.md#10.3%20Every%20wait%20on%20a%20request%20ends%20at%20a%20deadline)), never for a fixed count, so a
   failover's stall is waited out rather than turned into an error;
-- only the gateway forwards. A node that receives a call it is not primary
-  for refuses it, naming the primary it knows, and **MUST NOT** forward a call
+- only the gateway forwards. `vfs.Serve` never forwards: it refuses a call
+  for a shard it is not primary of, naming the primary it knows, and any call
   whose hop count is not zero, so a call never cycles between stale caches.
 
 ![Routing and a stale route](img/rfc11-routing.svg)
@@ -1029,8 +1030,9 @@ comes under a new session and is a new request, and an SMB replay is matched by
 the primary from its open's own state.
 
 **A primary the gateways cannot reach** while it still reaches the store would
-keep its lease forever. Gateways report failed forwards to the store, which
-records a health condition on the node. If it persists for the **unreachable
+keep its lease forever. Each node records, from its gateway's counts of failed
+forwards, a health condition on the unreachable node in the store; the gateway
+itself writes nothing. If it persists for the **unreachable
 delay** (`shard.unreachable_delay`), each of the node's shards is handed over to
 a replica the gateways can reach; a primary that does not complete a handover
 within the **unreachable handover bound** (`shard.unreachable_handover_bound`)
@@ -1083,7 +1085,9 @@ read covers — one version per extent, since a read can span bytes written at
 many versions — and only bytes that carry exactly the version named for their
 extent, under the checks [RFC 10 §8](rfc-10-journal-replication.md#8.%20Reads) makes of the
 answer's epoch and lease — its own checks, not the primary's. **Otherwise it MUST
-forward the read.** Metadata
+refuse the read, naming the primary, and the gateway re-routes it.** No path
+delivers a read to a node other than the primary yet (decision below), so this
+paragraph binds only once one does. Metadata
 alone cannot tell it: the primary acknowledges a write before offloading it, so
 the current ref ([RFC 6 §2.1](rfc-6-block-metadata.md#2.1%20ChunkRef)) can be older than an acknowledged write, and a
 replica's copy can be older than one the primary holds. A cached copy older than

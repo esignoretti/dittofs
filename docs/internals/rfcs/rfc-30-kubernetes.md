@@ -52,6 +52,7 @@ unannounced loses nothing — it only costs a short pause.
                 │
    StatefulSet: identical pods (local NVMe journal, stable node ID)
                 │  node channel between pods: gRPC over mTLS
+        ┌───────┴─────────────────┐
         │                         │
  metadata store (own operator)   bucket (outside the cluster)
 ```

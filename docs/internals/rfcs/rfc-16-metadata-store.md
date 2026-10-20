@@ -1109,9 +1109,9 @@ entry, decrements `Nlink`, moves usage and writes the pending release in one
 open a transaction of their own.
 
 The composition root ([RFC 15](rfc-15-topology.md)) calls `Open` and hands each consumer only the
-view it declared ([RFC 0 §1.2](rfc-0-data-lifecycle.md#1.2%20Component%20autonomy)). In a split deployment ([RFC 15](rfc-15-topology.md)) a view may instead be
-a network client satisfying the same interface; the consumer cannot tell, which
-is why every method must be safe to call remotely ([RFC 15](rfc-15-topology.md)).
+view it declared ([RFC 0 §1.2](rfc-0-data-lifecycle.md#1.2%20Component%20autonomy)). A view is always local to its consumer's
+node: what crosses between nodes is a whole filesystem-service call
+([RFC 15 §2.5](rfc-15-topology.md#2.5%20The%20cut)), never a view's.
 
 ## 4. Persistence pattern
 
