@@ -368,3 +368,154 @@ func TestShareRemove_CancelledPurgeKeepsJournal(t *testing.T) {
 		t.Fatalf("after a cancelled purge the share reads %q, want %q", got, "kept")
 	}
 }
+
+// pause holds the first call through hit after arm until resume is closed.
+type pause struct {
+	armed          atomic.Bool
+	paused, resume chan struct{}
+}
+
+func newPause() *pause { return &pause{paused: make(chan struct{}), resume: make(chan struct{})} }
+
+func (p *pause) hit() {
+	if p.armed.CompareAndSwap(true, false) {
+		close(p.paused)
+		<-p.resume
+	}
+}
+
+// pausingControlPlane holds the share handler between its control-plane calls:
+// after a share lookup by name or ID, and before or after a share row is
+// deleted.
+type pausingControlPlane struct {
+	store.Store
+	afterGetShare, beforeDeleteShare, afterDeleteShare *pause
+}
+
+func (p *pausingControlPlane) GetShare(ctx context.Context, name string) (*models.Share, error) {
+	share, err := p.Store.GetShare(ctx, name)
+	p.afterGetShare.hit()
+	return share, err
+}
+
+func (p *pausingControlPlane) DeleteShare(ctx context.Context, name string) error {
+	p.beforeDeleteShare.hit()
+	err := p.Store.DeleteShare(ctx, name)
+	p.afterDeleteShare.hit()
+	return err
+}
+
+func (s *shareServer) pauseControlPlane() *pausingControlPlane {
+	p := &pausingControlPlane{Store: s.cp, afterGetShare: newPause(), beforeDeleteShare: newPause(), afterDeleteShare: newPause()}
+	s.h = NewShareHandler(p, s.rt)
+	return p
+}
+
+// A removal that found its share before another removal finished and the name
+// was taken again leaves the share now under the name alone: what it found is
+// gone, and the share it would reach by the name is another one.
+func TestShareRemove_StaleLookupLeavesTheNewShare(t *testing.T) {
+	s := newShareServer(t)
+	cp := s.pauseControlPlane()
+	s.create("/team")
+
+	cp.afterGetShare.armed.Store(true)
+	stale := make(chan int, 1)
+	go func() { stale <- s.remove("/team") }()
+	<-cp.afterGetShare.paused
+	resume := sync.OnceFunc(func() { close(cp.afterGetShare.resume) })
+	defer resume()
+
+	if code := s.remove("/team"); code != http.StatusNoContent {
+		t.Fatalf("remove /team = %d, want 204", code)
+	}
+	s.create("/team")
+	const text = "written to the new share"
+	f := s.write("/team", "docs", "new.txt", []byte(text))
+
+	resume()
+	if code := <-stale; code != http.StatusNotFound {
+		t.Fatalf("the removal that found the old share = %d, want 404", code)
+	}
+	if _, err := s.rt.GetRootHandle("/team"); err != nil {
+		t.Fatalf("the new share is no longer served: %v", err)
+	}
+	if got := s.read(f, len(text)); got != text {
+		t.Fatalf("the new share reads %q, want %q", got, text)
+	}
+}
+
+// A removal keeps its share's name until the row is deleted, so a second
+// removal arriving after the purge is refused rather than claiming the name
+// for a purge of its own, and a share created once the first removal is done
+// is served instead of being refused by that second removal's claim.
+func TestShareRemove_NameHeldUntilRowDeleted(t *testing.T) {
+	ps := &pausingStore{paused: make(chan struct{}), resume: make(chan struct{})}
+	ps.held.Store(true)
+	s := newShareServerWith(t, func(md metadata.Store) metadata.Store {
+		ps.Store = md
+		return ps
+	})
+	cp := s.pauseControlPlane()
+	s.create("/team")
+
+	cp.beforeDeleteShare.armed.Store(true)
+	first := make(chan int, 1)
+	go func() { first <- s.remove("/team") }()
+	<-cp.beforeDeleteShare.paused
+	resumeFirst := sync.OnceFunc(func() { close(cp.beforeDeleteShare.resume) })
+	defer resumeFirst()
+
+	// Arm the purge pause for the second removal, should it get as far.
+	ps.held.Store(false)
+	second := make(chan int, 1)
+	go func() { second <- s.remove("/team") }()
+	resumeSecond := sync.OnceFunc(func() { close(ps.resume) })
+	defer resumeSecond()
+	select {
+	case code := <-second:
+		if code != http.StatusConflict {
+			t.Fatalf("a second removal while the first deletes the row = %d, want 409", code)
+		}
+	case <-ps.paused:
+		// The second removal holds the name and is purging.
+	}
+
+	resumeFirst()
+	if code := <-first; code != http.StatusNoContent {
+		t.Fatalf("the first removal = %d, want 204", code)
+	}
+	s.create("/team")
+}
+
+// A share created while a removal of the name has deleted its row but not yet
+// let the name go is refused before its row is inserted, rather than stored
+// and then refused by the runtime, which would leave it unserved.
+func TestShareCreate_RefusedWhileRemovalHoldsName(t *testing.T) {
+	s := newShareServer(t)
+	cp := s.pauseControlPlane()
+	s.create("/team")
+
+	cp.afterDeleteShare.armed.Store(true)
+	removed := make(chan int, 1)
+	go func() { removed <- s.remove("/team") }()
+	<-cp.afterDeleteShare.paused
+	resume := sync.OnceFunc(func() { close(cp.afterDeleteShare.resume) })
+	defer resume()
+
+	body := `{"name":"/team","metadata_store_id":"md","block_store":"mem","default_permission":"read-write"}`
+	w := httptest.NewRecorder()
+	s.h.Create(w, httptest.NewRequest(http.MethodPost, "/api/v1/shares", strings.NewReader(body)))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("create /team while its removal holds the name = %d, want 409", w.Code)
+	}
+	if _, err := s.cp.GetShare(context.Background(), "/team"); !errors.Is(err, models.ErrShareNotFound) {
+		t.Fatalf("a refused create left a row: %v", err)
+	}
+
+	resume()
+	if code := <-removed; code != http.StatusNoContent {
+		t.Fatalf("remove /team = %d, want 204", code)
+	}
+	s.create("/team")
+}

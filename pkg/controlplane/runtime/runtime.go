@@ -547,11 +547,25 @@ func (r *Runtime) CloseMetadataStores() {
 // --- Share Management (delegated to shares.Service) ---
 
 func (r *Runtime) AddShare(ctx context.Context, config *ShareConfig) error {
+	return r.addShare(ctx, config, false)
+}
+
+// AddClaimedShare is AddShare for a caller holding the name's claim from
+// ClaimShareName; the claim stays held, for the caller to release.
+func (r *Runtime) AddClaimedShare(ctx context.Context, config *ShareConfig) error {
+	return r.addShare(ctx, config, true)
+}
+
+func (r *Runtime) addShare(ctx context.Context, config *ShareConfig, claimed bool) error {
 	r.mu.RLock()
 	localDefaults := r.localStoreDefaults
 	syncDefaults := r.syncerDefaults
 	r.mu.RUnlock()
-	if err := r.sharesSvc.AddShare(ctx, config, r.storesSvc, r.metadataService, r.store, localDefaults, syncDefaults); err != nil {
+	add := r.sharesSvc.AddShare
+	if claimed {
+		add = r.sharesSvc.AddClaimedShare
+	}
+	if err := add(ctx, config, r.storesSvc, r.metadataService, r.store, localDefaults, syncDefaults); err != nil {
 		return err
 	}
 	// The share is serving now, so any earlier refusal no longer describes it.
@@ -678,12 +692,13 @@ func (r *Runtime) RemoveShare(name string) error {
 	return rmErr
 }
 
-// BeginShareRemoval claims a share's name for the whole of a removal: RemoveShare,
-// PurgeShare, and whatever the caller does in between. While it is held, adding
-// the share again or beginning a second removal of it fails with
-// shares.ErrShareBusy. The caller must call end once the purge is done.
-func (r *Runtime) BeginShareRemoval(name string) (end func(), err error) {
-	return r.sharesSvc.BeginRemoval(name)
+// ClaimShareName claims a share's name while the caller changes the share's row
+// and its runtime state together: a removal from RemoveShare until the row is
+// deleted, a creation from the row's insertion through AddClaimedShare. While it
+// is held, AddShare and a second claim of the name fail with
+// shares.ErrShareBusy. The caller must call release once done.
+func (r *Runtime) ClaimShareName(name string) (release func(), err error) {
+	return r.sharesSvc.ClaimShareName(name)
 }
 
 // PurgeShare deletes what a removed share leaves on this server: its records

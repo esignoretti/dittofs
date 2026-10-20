@@ -561,6 +561,24 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 		share.SetBlockedOps(*req.BlockedOperations)
 	}
 
+	// The name stays claimed from the row's insertion until the runtime has the
+	// share, so a removal of an earlier share under the name, still between
+	// purging and deleting its row, cannot refuse the share this row describes.
+	releaseName := func() {}
+	if h.runtime != nil {
+		release, err := h.runtime.ClaimShareName(req.Name)
+		if err != nil {
+			if errors.Is(err, shares.ErrShareBusy) {
+				Conflict(w, "Share is being added or removed; retry")
+				return
+			}
+			InternalServerError(w, "Failed to create share")
+			return
+		}
+		releaseName = release
+		defer release()
+	}
+
 	if _, err := h.store.CreateShare(r.Context(), share); err != nil {
 		if errors.Is(err, models.ErrDuplicateShare) {
 			Conflict(w, "Share already exists")
@@ -626,13 +644,14 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 			RetentionTTL:                     retTTL,
 		}
 
-		if err := h.runtime.AddShare(r.Context(), shareConfig); err != nil {
+		if err := h.runtime.AddClaimedShare(r.Context(), shareConfig); err != nil {
 			// Share created in DB but failed to load into runtime
 			// Log but don't fail the request - share can be loaded on restart
 			logger.Warn("Share created but failed to add to runtime",
 				"share", req.Name, "error", err)
 		}
 	}
+	releaseName()
 
 	ctx, cancel := context.WithTimeout(r.Context(), HealthCheckTimeout)
 	defer cancel()
@@ -1036,14 +1055,28 @@ func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	// Remove from runtime first (if runtime is available)
 	removedFromRuntime := false
 	if h.runtime != nil {
-		// The name stays claimed until the purge is done: the share leaves the
+		// The name stays claimed until the row is deleted: the share leaves the
 		// registry at once, while its block store is still closing, and a second
 		// removal or a share created again under the name in that window would
-		// race the purge for the same directory.
-		end, err := h.runtime.BeginShareRemoval(name)
+		// race the purge for the same directory, or insert a row the runtime then
+		// refuses to serve.
+		release, err := h.runtime.ClaimShareName(name)
 		if err != nil {
 			if errors.Is(err, shares.ErrShareBusy) {
 				Conflict(w, "Share is being added or removed; retry")
+				return
+			}
+			InternalServerError(w, "Failed to delete share")
+			return
+		}
+		defer release()
+		// The lookup above ran before the claim, so the share it found may have
+		// been removed since and a new one created under its name. Look the row
+		// up again by its ID: if it is gone, the share this request named is
+		// gone, and the name now belongs to a share it must not touch.
+		if _, err := h.store.GetShareByID(r.Context(), share.ID); err != nil {
+			if errors.Is(err, models.ErrShareNotFound) {
+				NotFound(w, "Share not found")
 				return
 			}
 			InternalServerError(w, "Failed to delete share")
@@ -1062,15 +1095,7 @@ func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		// root and serve its files. The cost is that a share on a metadata store
 		// that is not loaded cannot be removed until the store loads. Revisit
 		// once the server records a removal and finishes it on its own.
-		err = h.runtime.PurgeShare(r.Context(), share)
-		// decision: the claim is released before the row goes, not after. With
-		// the purge finished nothing of this removal touches the name again,
-		// and the row still standing refuses a create as a duplicate; holding
-		// the claim past the row's deletion would instead let a create insert
-		// its row and then be refused by the runtime, leaving a share that is
-		// not served until a restart.
-		end()
-		if err != nil {
+		if err := h.runtime.PurgeShare(r.Context(), share); err != nil {
 			logger.Error("Failed to delete share data; the share is kept so its removal can be repeated",
 				"share", name, "error", err)
 			InternalServerError(w, "Failed to delete share data; repeat the removal")

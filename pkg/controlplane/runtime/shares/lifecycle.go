@@ -33,6 +33,35 @@ func (s *Service) AddShare(
 	localStoreDefaults *LocalStoreDefaults,
 	syncerDefaults *SyncerDefaults,
 ) error {
+	return s.addShare(ctx, config, storeProvider, metadataSvc, blockStoreProvider, localStoreDefaults, syncerDefaults, false)
+}
+
+// AddClaimedShare is AddShare for a caller already holding the name's claim
+// (ClaimShareName): it skips the reservation, which the claim stands in for,
+// and leaves the claim held whatever the outcome, for the caller to release.
+// The config's name must already be folded, so it matches the claimed one.
+func (s *Service) AddClaimedShare(
+	ctx context.Context,
+	config *ShareConfig,
+	storeProvider MetadataStoreProvider,
+	metadataSvc MetadataServiceRegistrar,
+	blockStoreProvider BlockStoreConfigProvider,
+	localStoreDefaults *LocalStoreDefaults,
+	syncerDefaults *SyncerDefaults,
+) error {
+	return s.addShare(ctx, config, storeProvider, metadataSvc, blockStoreProvider, localStoreDefaults, syncerDefaults, true)
+}
+
+func (s *Service) addShare(
+	ctx context.Context,
+	config *ShareConfig,
+	storeProvider MetadataStoreProvider,
+	metadataSvc MetadataServiceRegistrar,
+	blockStoreProvider BlockStoreConfigProvider,
+	localStoreDefaults *LocalStoreDefaults,
+	syncerDefaults *SyncerDefaults,
+	claimed bool,
+) error {
 	// Fold the name before anything keys off it: spellings differing only in
 	// leading slashes share a journal directory, so the second one must fail the
 	// reservation below as a duplicate instead of opening the first one's journal.
@@ -77,13 +106,16 @@ func (s *Service) AddShare(
 	// The reservation is NOT inserted into registry, so a half-built share is
 	// never visible to handlers; it is converted to a registry entry only in
 	// Phase 4 after all init succeeds.
-	if err := s.reserveShareName(config.Name); err != nil {
-		return err
+	if !claimed {
+		if err := s.reserveShareName(config.Name); err != nil {
+			return err
+		}
 	}
 	// Track whether the reservation still needs releasing. Phase 4 hands the
 	// reservation off to the registry entry (under the same lock) and clears
-	// this flag; every failure path releases it.
-	reservationHeld := true
+	// this flag; every failure path releases it. A caller's claim is the
+	// caller's to release.
+	reservationHeld := !claimed
 	defer func() {
 		if reservationHeld {
 			s.releaseShareName(config.Name)
@@ -181,7 +213,9 @@ func (s *Service) AddShare(
 	if share.BlockStore != nil {
 		s.blockStoreCache.Store(config.Name, share.BlockStore)
 	}
-	delete(s.reservations, config.Name)
+	if !claimed {
+		delete(s.reservations, config.Name)
+	}
 	reservationHeld = false
 	s.mu.Unlock()
 
@@ -370,14 +404,15 @@ func (s *Service) reserveShareName(name string) error {
 	return nil
 }
 
-// BeginRemoval claims a share name for a removal, covering the steps that
-// outlast RemoveShare: the share leaves the registry at once, but its block
-// store is still closing and its data is still to be purged. While the claim is
-// held AddShare and a second BeginRemoval for the name fail with ErrShareBusy,
-// so a share created again under the name cannot open the journal directory
-// the removal is about to delete, and two removals never purge at once. end
-// releases the claim and is idempotent.
-func (s *Service) BeginRemoval(name string) (end func(), err error) {
+// ClaimShareName claims a share name for a change to the share's row and its
+// runtime state that must not interleave with another: a removal holds it from
+// before RemoveShare until the row is deleted, a creation from before the row is
+// inserted until AddClaimedShare returns. While the claim is held AddShare and a
+// second ClaimShareName for the name fail with ErrShareBusy, so a share created
+// again under the name cannot open the journal directory a removal is about to
+// delete, two removals never purge at once, and a creation never inserts a row
+// that a removal still in flight would refuse to serve. release is idempotent.
+func (s *Service) ClaimShareName(name string) (release func(), err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, reserved := s.reservations[name]; reserved {
