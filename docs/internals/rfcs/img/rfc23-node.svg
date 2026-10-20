@@ -30,7 +30,7 @@
 
   <rect x="16" y="238" width="200" height="118" rx="6" class="st"/>
   <text x="28" y="258" class="h">node.Node</text>
-  <text x="28" y="276" class="k">New</text><text x="62" y="276" class="s">builds 1 → 11</text>
+  <text x="28" y="276" class="k">New</text><text x="62" y="276" class="s">builds 1 → 10</text>
   <text x="28" y="292" class="k">Start</text><text x="70" y="292" class="s">in build order</text>
   <text x="28" y="308" class="k">Stop</text><text x="62" y="308" class="s">in reverse</text>
   <text x="28" y="326" class="s">reconcile calls</text>
@@ -45,15 +45,15 @@
 
   <!-- 11 adapters -->
   <rect x="250" y="56" width="634" height="40" rx="6" class="sv"/>
-  <text x="262" y="74" class="h">11 · adapters</text>
+  <text x="262" y="74" class="h">10 · adapters</text>
   <text x="262" y="89" class="s">call vfs.Service: the gateway in a cluster, the server on one node · sign in through identity</text>
 
   <!-- 10 gateway, Serve -->
   <rect x="290" y="128" width="270" height="44" rx="6" class="pr"/>
-  <text x="302" y="146" class="h">10 · vfs.Gateway (cluster)</text>
+  <text x="302" y="146" class="h">9 · vfs.Gateway (cluster)</text>
   <text x="302" y="162" class="s">forwards: Router, then local or Transport</text>
   <rect x="614" y="128" width="270" height="44" rx="6" class="pr"/>
-  <text x="626" y="146" class="h">10 · vfs.Serve (cluster)</text>
+  <text x="626" y="146" class="h">9 · vfs.Serve (cluster)</text>
   <text x="626" y="162" class="s">fence, dedup, local Service</text>
   <path d="M420,98 L420,124" class="ln"/>
   <path d="M562,150 L610,150" class="dl"/>
@@ -61,22 +61,22 @@
 
   <!-- 9 server -->
   <rect x="290" y="204" width="594" height="40" rx="6" class="sv"/>
-  <text x="302" y="222" class="h">9 · *vfs.Server, at the primary</text>
+  <text x="302" y="222" class="h">8 · *vfs.Server, at the primary</text>
   <text x="302" y="237" class="s">decides: admission, identity, squash, ordering, open state, metadata, content</text>
   <path d="M420,174 L420,200" class="ln"/><text x="428" y="192" class="s">local shortcut</text>
   <path d="M750,174 L750,200" class="ln"/>
 
   <!-- row D: 8 identity, 7 open state, 5 engine, 6 GC -->
   <rect x="250" y="284" width="145" height="40" rx="6" class="sv"/>
-  <text x="262" y="302" class="h">8 · identity</text>
+  <text x="262" y="302" class="h">7 · identity</text>
   <text x="262" y="317" class="s">resolver, authenticator</text>
   <rect x="413" y="284" width="145" height="40" rx="6" class="sv"/>
-  <text x="425" y="302" class="h">7 · open state</text>
+  <text x="425" y="302" class="h">6 · open state</text>
   <rect x="576" y="284" width="145" height="40" rx="6" class="sv"/>
-  <text x="588" y="302" class="h">5 · engine</text>
+  <text x="588" y="302" class="h">4 · engine</text>
   <text x="588" y="317" class="s">called by the server only</text>
   <rect x="739" y="284" width="145" height="40" rx="6" class="sv"/>
-  <text x="751" y="302" class="h">6 · GC</text>
+  <text x="751" y="302" class="h">5 · GC</text>
   <text x="751" y="317" class="s">sibling, not in the engine</text>
   <path d="M265,98 L265,280" class="ln"/>
   <path d="M330,246 L322,280" class="ln"/>
@@ -85,10 +85,10 @@
 
   <!-- row E: 3 journal, 4 syncer -->
   <rect x="600" y="364" width="121" height="40" rx="6" class="st"/>
-  <text x="612" y="382" class="h">3 · journal</text>
-  <text x="612" y="397" class="s">one per device</text>
+  <text x="612" y="382" class="h">journals</text>
+  <text x="612" y="397" class="s">opened by the engine</text>
   <rect x="739" y="364" width="120" height="40" rx="6" class="st"/>
-  <text x="751" y="382" class="h">4 · syncer</text>
+  <text x="751" y="382" class="h">3 · syncer</text>
   <path d="M660,326 L660,360" class="ln"/>
   <path d="M712,326 L748,360" class="ln"/>
   <path d="M800,326 L800,360" class="ln"/>
@@ -108,6 +108,6 @@
   <path d="M800,406 L800,440" class="ln"/>
   <path d="M872,326 L872,440" class="ln"/>
 
-  <text x="16" y="516" class="s">Arrows are calls. Numbers are build order: Start runs 1 → 11, Stop 11 → 1, GC drained before the server stops.</text>
+  <text x="16" y="516" class="s">Arrows are calls. Numbers are build order: Start runs 1 → 10, Stop 10 → 1, GC drained before the server stops.</text>
   <text x="16" y="531" class="s">Blue: built in a cluster only; on one node the adapters call the server directly.</text>
 </svg>
