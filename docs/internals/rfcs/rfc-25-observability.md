@@ -707,6 +707,9 @@ row.
 | `config_generation_behind` | [RFC 13 §8](rfc-13-configuration.md#8.%20Observability) | node | degraded, past the 5 s propagation bound | ticket at 5 min |
 | `provisioning_refused` | [RFC 13 §2.4](rfc-13-configuration.md#2.4%20Records%20can%20be%20declared%20in%20a%20provisioning%20file) | node | degraded | ticket |
 | `gc_hold`, `gc_deletion_backlog` | [RFC 9 §10](rfc-9-gc.md#10.%20Observability) | namespace | degraded | ticket |
+| `gc_clock_skew` | [RFC 9 §10](rfc-9-gc.md#10.%20Observability) | node | degraded: raised while the local clock differs from store time by more than GC's clock skew limit, and the deleter stops; cleared once it is back within the limit | ticket |
+| `gc_audit_behind` | [RFC 9 §10](rfc-9-gc.md#10.%20Observability) | namespace | degraded: raised when a hash range was not covered within its period, or the derived rate is above the scheduler's cap; cleared when every range is covered within its period and the rate is under the cap | ticket |
+| `gc_lost_refs` | [RFC 9 §10](rfc-9-gc.md#10.%20Observability) | namespace, naming the file and offset | unhealthy: raised while any Lost ref is recorded and not yet dropped; cleared when the last is dropped, never by an operator's acknowledgement | page at once |
 | `namespace_count_underflow` | [RFC 7 §11.2](rfc-7-namespace-metadata.md#11.2%20Observability) | share, naming the directory's FileID | degraded | ticket |
 | `snapshot_policy_skipping` | [RFC 12 §6](rfc-12-snapshots.md#6.%20Observability) | share, at 3 skipped ticks | degraded | ticket |
 | `backup_failing`, `backup_location_mismatch` | [RFC 26 §7](rfc-26-catalog-backups.md#7.%20Observability) | share; location | degraded | ticket |
