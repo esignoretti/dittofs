@@ -141,6 +141,18 @@ func ServeHandshake(ctx context.Context, conn net.Conn, ex Exporter) (*Export, e
 	noZeroes := clientFlags&clientFlagNoZeroes != 0
 
 	for {
+		// Polled before each option, because the deadline armed by the caller is
+		// the only thing bounding a client that sends nothing at all, and a
+		// cancelled context has to end the handshake too: a shutdown that has to
+		// wait out the whole handshake budget for every half-open connection is
+		// a shutdown that can outlive its own drain deadline. The deadline and
+		// the context are separate bounds and both are needed — the deadline
+		// catches a client that is silent, the context catches a server that is
+		// stopping.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		h, err := ReadOptionHeader(conn)
 		if err != nil {
 			return nil, err

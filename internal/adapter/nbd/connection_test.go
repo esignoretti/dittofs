@@ -1607,3 +1607,96 @@ func TestConnection_IdleDeadlineClosesASilentConnection(t *testing.T) {
 	}
 	_ = client.Close()
 }
+
+// A client that connects and then never speaks must not hold a connection open
+// forever. Before the handshake is bounded it can: ServeHandshake arms no
+// deadline, the base adapter's accept loop sets none on the accepted socket, and
+// the dispatch loop's first arm only runs after the handshake has returned. The
+// result is one goroutine and one file descriptor per idle socket, held
+// indefinitely and before the client has named an export.
+//
+// The budget is Timeouts.Read, so the test sets it low and leaves Idle high: an
+// arm that read Idle instead would let this test pass on the 2s guard without
+// the handshake ever being bounded by the field it claims to use.
+func TestConnection_HandshakeIsBounded(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192),
+		Timeouts{Read: 200 * time.Millisecond, Write: 5 * time.Second, Idle: 30 * time.Second})
+
+	server, client := pipe(t)
+	done := serveConn(h, server)
+	defer func() { _ = client.Close() }()
+
+	// Read the greeting so the server is definitely past its first write and
+	// parked in readClientFlags, then say nothing at all.
+	readGreeting(t, client)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil for a client that never sent client flags")
+		}
+		t.Logf("handshake ended as expected: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not return within 2s of a 200ms Read timeout: the handshake is unbounded")
+	}
+}
+
+// The same bound, but for a client that completes the flags exchange and then
+// stalls between options. This is the loop that has to poll the context and
+// honour the deadline: the flags read is one ReadFull, while the option loop is
+// unbounded in principle and runs until the client asks for an export.
+func TestConnection_HandshakeOptionLoopIsBounded(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192),
+		Timeouts{Read: 200 * time.Millisecond, Write: 5 * time.Second, Idle: 30 * time.Second})
+
+	server, client := pipe(t)
+	done := serveConn(h, server)
+	defer func() { _ = client.Close() }()
+
+	readGreeting(t, client)
+	sendClientFlags(t, client, 1) // NBD_FLAG_C_FIXED_NEWSTYLE, then nothing
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil for a client that stalled in the option loop")
+		}
+		t.Logf("handshake ended as expected: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not return within 2s of a 200ms Read timeout: the option loop is unbounded")
+	}
+}
+
+// A shutdown that begins during a handshake must end it promptly rather than
+// waiting out the handshake budget. The deadline bounds a silent client; the
+// context poll bounds a server that is stopping, and only the second one keeps a
+// drain inside its own deadline when a half-open connection is in handshake.
+func TestConnection_HandshakeHonoursContextCancellation(t *testing.T) {
+	st := newStoreFake()
+	h := newTestHandler(st, testExport(8192),
+		Timeouts{Read: 30 * time.Second, Write: 30 * time.Second, Idle: 30 * time.Second})
+
+	server, client := pipe(t)
+	defer func() { _ = client.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- h.serve(ctx, server) }()
+
+	readGreeting(t, client)
+	sendClientFlags(t, client, 1) // now parked in the option loop
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil after the context was cancelled")
+		}
+		t.Logf("handshake ended as expected: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not return within 2s of cancellation: the option loop does not poll ctx")
+	}
+}

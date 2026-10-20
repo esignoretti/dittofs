@@ -175,6 +175,28 @@ func (c *Conn) Serve(ctx context.Context) {
 // dispatch tests call it directly so they keep the error return and never need
 // the Conn wrapper.
 func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
+	// Bound the handshake before it starts. Nothing else in the path does:
+	// ServeHandshake arms no deadline of its own, the base adapter's accept
+	// loop sets none on the accepted socket (pkg/adapter/base.go), and the
+	// dispatch loop's first arm is below, after the handshake has already
+	// returned. Without this a client can connect, send nothing, and hold a
+	// goroutine and a file descriptor indefinitely — before it has named an
+	// export, so before any authorisation decision exists to fail.
+	//
+	// The budget is the Read timeout, not the Idle one: a handshake is work the
+	// server is actively doing on the client's behalf, so it belongs with the
+	// budget for finishing started work rather than the budget for waiting on an
+	// idle client. It is the same choice NFS makes for its own handshake
+	// (pkg/adapter/nfs/connection.go:214, tlsHandshakeTimeout).
+	//
+	// SetDeadline rather than SetReadDeadline: the greeting and the option
+	// replies are server writes, so a client that stops reading has to be bounded
+	// as well as one that stops writing. The dispatch loop below re-arms only the
+	// read deadline, which is why this does not leak into it.
+	if err := conn.SetDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
+		return err
+	}
+
 	exp, err := ServeHandshake(ctx, conn, h.exporter)
 	if err != nil {
 		// The handshake already told the client why, where the protocol has a
