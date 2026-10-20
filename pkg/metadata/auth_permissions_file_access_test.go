@@ -890,3 +890,43 @@ func TestCheckFileAccess_StrictGenericReadGranted(t *testing.T) {
 	require.NotZero(t, granted&acl.ACE4_READ_DATA, "expected READ_DATA in granted mask, got 0x%x", granted)
 	require.Zero(t, granted&uint32(0xF0000000), "granted mask must not retain raw GENERIC_* bits, got 0x%x", granted)
 }
+
+// TestCheckFileAccessWithParent_NoACLWritableDirGrantsDeleteChild pins the
+// non-owner write bundle on a directory with no DACL: write carries
+// FILE_DELETE_CHILD, as the synthesized DACL maps it, for both a group and an
+// other writer, through an explicit request and through MAXIMUM_ALLOWED.
+func TestCheckFileAccessWithParent_NoACLWritableDirGrantsDeleteChild(t *testing.T) {
+	const requester uint32 = 1001
+	cases := []struct {
+		name  string
+		mode  uint32
+		gid   uint32
+		grant bool
+	}{
+		{"other writer on 0777", 0o777, 9999, true},
+		{"group writer on 0775", 0o775, requester, true},
+		{"other reader on 0775", 0o775, 9999, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestFixture(t)
+			dir, _, err := f.service.CreateDirectory(f.rootContext(), f.rootHandle, "d",
+				&metadata.FileAttr{Type: metadata.FileTypeDirectory, Mode: tc.mode, UID: 9999, GID: tc.gid})
+			require.NoError(t, err)
+			root, err := f.service.GetFile(f.rootContext().Context, f.rootHandle)
+			require.NoError(t, err)
+			authCtx := f.authContext(requester, requester)
+
+			_, err = f.service.CheckFileAccessWithParent(dir, root, authCtx, acl.ACE4_DELETE_CHILD)
+			maxAccess, maxErr := f.service.CheckFileAccessWithParent(dir, root, authCtx, rightMaxAllowed)
+			require.NoError(t, maxErr)
+			if tc.grant {
+				require.NoError(t, err, "explicit FILE_DELETE_CHILD")
+				require.NotZero(t, maxAccess&acl.ACE4_DELETE_CHILD, "MAXIMUM_ALLOWED = 0x%x lacks FILE_DELETE_CHILD", maxAccess)
+			} else {
+				require.Error(t, err, "explicit FILE_DELETE_CHILD")
+				require.Zero(t, maxAccess&acl.ACE4_DELETE_CHILD, "MAXIMUM_ALLOWED = 0x%x carries FILE_DELETE_CHILD", maxAccess)
+			}
+		})
+	}
+}

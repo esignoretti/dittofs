@@ -980,7 +980,8 @@ func (s *Service) parentGrantsDeleteChild(file, parent *File, authCtx *AuthConte
 //
 // When file.ACL is nil, the POSIX fallback maps the file's mode bits:
 //   - Owner: GENERIC_ALL.
-//   - Group member / other: the rwx bundles (accessMaskPosixRead/Write/Execute).
+//   - Group member / other: the rwx bundles (accessMaskPosixRead/Write/Execute),
+//     with FILE_DELETE_CHILD added to write on a directory.
 //   - Any authenticated user with no granted bits still receives the minimal
 //     READ_CONTROL | SYNCHRONIZE set.
 func (s *Service) ComputeMaximalAccess(file *File, authCtx *AuthContext) uint32 {
@@ -1035,6 +1036,11 @@ func (s *Service) ComputeMaximalAccess(file *File, authCtx *AuthContext) uint32 
 	}
 	if permBits&0x2 != 0 { // write
 		access |= accessMaskPosixWrite
+		// Write on a directory carries FILE_DELETE_CHILD, as the synthesized
+		// DACL maps it (acl.rwxToFullMask).
+		if file.Type == FileTypeDirectory {
+			access |= acl.ACE4_DELETE_CHILD
+		}
 	}
 	if permBits&0x1 != 0 { // execute
 		access |= accessMaskPosixExecute
