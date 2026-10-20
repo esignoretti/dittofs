@@ -17,16 +17,18 @@ CHECKOUT=/srv/perf/dittofs
 CRON=/etc/cron.d/dittofs-perf
 PERF_USER="${PERF_USER:-dittofs-perf}"
 
+# installed PACKAGE: whether PACKAGE is installed, not merely known (a removed one keeps its config).
+installed() { dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii'; }
+
 install() {
-    local fresh_samba=no
-    dpkg -s samba >/dev/null 2>&1 || fresh_samba=yes
-    local packages=(fio samba cifs-utils nvme-cli python3 git iproute2 util-linux)
-    if ! dpkg -s "${packages[@]}" >/dev/null 2>&1; then
+    local p missing=()
+    for p in fio samba cifs-utils nvme-cli python3 git iproute2 util-linux; do installed "$p" || missing+=("$p"); done
+    if test "${#missing[@]}" -gt 0; then
         apt-get update -qq
-        apt-get install -y -qq --no-install-recommends "${packages[@]}" >/dev/null
+        apt-get install -y -qq --no-install-recommends "${missing[@]}" >/dev/null
     fi
     # The run starts its own smbd; a host that had no Samba keeps none running.
-    if test "$fresh_samba" = yes && command -v systemctl >/dev/null; then
+    if [[ " ${missing[*]} " == *" samba "* ]] && command -v systemctl >/dev/null; then
         systemctl disable --now smbd nmbd 2>/dev/null || true
     fi
     # The Unix account the Samba baseline maps its SMB user to; the DittoFS user gets its uid.
