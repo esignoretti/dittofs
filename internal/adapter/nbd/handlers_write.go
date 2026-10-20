@@ -301,13 +301,30 @@ func (h *Handler) rejectWrite(conn net.Conn, req *Request, nbdErr NBDError) erro
 
 	// Re-armed from the request budget rather than left to the deadline set
 	// before ReadRequest: that read consumed part of the budget, and the drain
-	// is where a hostile or stalled client parks. io.CopyN rather than a buffer
-	// of req.Length bytes, so a client that declares a gigabyte costs a bounded
-	// buffer instead of an allocation.
+	// is where a hostile or stalled client parks.
 	if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
 		return err
 	}
-	if _, err := io.CopyN(io.Discard, conn, int64(req.Length)); err != nil {
+	return h.drainWritePayload(conn, req.Length)
+}
+
+// drainWritePayload consumes length bytes of a WRITE payload the client has
+// already sent, so that the next request header is read from the right offset.
+//
+// It arms no deadline of its own, and that is the point of the split: the caller
+// owns the choice. rejectWrite arms the Read budget because the connection is
+// otherwise idle and a stalled client would park in the drain; the draining path
+// deliberately does not, because the shutdown path has already put a short
+// deadline on the connection and replacing it would hold the drain open (see the
+// call site in serve).
+//
+// io.CopyN rather than a buffer of length bytes, so a client that declares a
+// gigabyte costs a bounded buffer instead of an allocation.
+func (h *Handler) drainWritePayload(conn net.Conn, length uint32) error {
+	if length == 0 {
+		return nil
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(length)); err != nil {
 		// The stream position is unknown now, so the connection cannot be
 		// reused for another command: returning ends Serve, which closes it.
 		return err

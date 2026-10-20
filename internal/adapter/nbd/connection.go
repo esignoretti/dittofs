@@ -254,6 +254,27 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 			if err := h.writeReply(conn, req.Cookie, ErrESHUTDOWN, nil); err != nil {
 				return err
 			}
+
+			// A WRITE's payload is already in flight: the spec requires the
+			// client to follow the request header with length bytes whatever the
+			// server answers. Replying without consuming them leaves the next
+			// header to be read out of payload bytes, which desynchronizes the
+			// stream — the connection then dies on a later command with a
+			// confusing NBD_EBADMAGIC instead of pausing as intended, which is
+			// exactly what this branch exists to prevent. Only WRITE carries a
+			// payload, so every other command skips the drain.
+			//
+			// decision: the drain does NOT arm the Read budget, unlike
+			// rejectWrite. initiateShutdown has already put a short deadline on
+			// the connection to unblock the pending read (pkg/adapter/base.go:452)
+			// and that deadline is what bounds this drain too; replacing it with
+			// the full request budget would hold the drain open for minutes on a
+			// client that announced a payload and stalled.
+			if req.Type == CmdWrite {
+				if err := h.drainWritePayload(conn, req.Length); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 

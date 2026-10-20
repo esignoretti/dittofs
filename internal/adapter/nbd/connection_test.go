@@ -691,6 +691,70 @@ func TestConnection_DrainingAnswersESHUTDOWN(t *testing.T) {
 	}
 }
 
+// A WRITE that arrives while draining must have its payload consumed, or the
+// next header is parsed out of payload bytes and the connection dies on a later
+// command with NBD_EBADMAGIC.
+//
+// This is the case TestConnection_DrainingAnswersESHUTDOWN does not reach: it
+// only sends READ, which carries no payload, so the drain is never exercised.
+// A WRITE is the one command where answering without draining corrupts the
+// stream — and it is the command a rolling restart of an fsync-heavy workload
+// will actually hit.
+func TestConnection_DrainingWriteDrainsPayload(t *testing.T) {
+	st := newStoreFake()
+	st.data[testPayloadID] = make([]byte, 4096)
+
+	var draining atomic.Bool
+	h := NewHandler(exporterFor(testExport(8192)), resolverFor(st), nil,
+		Identity{UID: 65534, GID: 65534}, testTimeouts(), draining.Load)
+
+	server, client := pipe(t)
+	serveConn(h, server)
+	completeHandshake(t, client, testExportName)
+
+	draining.Store(true)
+
+	// A real WRITE: the header and its payload both go out, because the spec
+	// requires a client to send the payload whatever the server answers.
+	payload := make([]byte, 512)
+	for i := range payload {
+		payload[i] = 0xAB
+	}
+	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 11, Offset: 0, Length: uint32(len(payload))})
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("writing payload: %v", err)
+	}
+
+	rep := readReplyHeader(t, client)
+	if rep.Error != ErrESHUTDOWN {
+		t.Fatalf("WRITE while draining reply error = %d, want ErrESHUTDOWN (%d)", rep.Error, uint32(ErrESHUTDOWN))
+	}
+	if rep.Cookie != 11 {
+		t.Fatalf("draining reply cookie = %d, want 11", rep.Cookie)
+	}
+	// Answered, not served: the payload must never reach the store.
+	if st.writes != 0 {
+		t.Fatalf("the store saw %d writes for a command answered while draining", st.writes)
+	}
+
+	// The assertion the bug fails. If the payload was not drained, the server
+	// reads 0xabababab as the next request magic and closes the connection, so
+	// this second command gets no reply at all. The deadline makes that a fast
+	// failure with a message instead of a 60-second hang until the Go test
+	// timeout.
+	if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("arming the read deadline: %v", err)
+	}
+	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 12, Offset: 0, Length: 4096})
+	rep = readReplyHeader(t, client)
+	if rep.Error != ErrESHUTDOWN {
+		t.Fatalf("command after a draining WRITE reply error = %d, want ErrESHUTDOWN (%d): the WRITE payload was not drained", rep.Error, uint32(ErrESHUTDOWN))
+	}
+	if rep.Cookie != 12 {
+		t.Fatalf("reply cookie after a draining WRITE = %d, want 12", rep.Cookie)
+	}
+}
+
 func flagName(f CommandFlags) string {
 	switch f {
 	case FlagFUA:
