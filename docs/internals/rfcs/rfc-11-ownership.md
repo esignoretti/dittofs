@@ -961,7 +961,7 @@ operation, and does nothing else: it authenticates, admits, maps, squashes and
 orders nothing, and calls neither open state, the metadata store nor the engine
 ([RFC 15 §2.3](rfc-15-topology.md#2.3%20The%20gateway%20forwards%2C%20the%20server%20decides)):
 
-![The cut is vfs.Service: an adapter calls vfs.Gateway, which either calls the local vfs.Server or stamps the envelope and sends the call over the transport to vfs.Serve at the primary, which fences and deduplicates it before vfs.Server decides it against open state, metadata and the engine; the metadata store and the bucket sit below](img/rfc15-cut.svg)
+![The cut is vfs.Service: on the gateway node an adapter signs in and calls vfs.Gateway, which decides nothing; the gateway either calls the local vfs.Server or stamps an envelope (request ID, shard and epoch, node and node epoch, hop 0) and sends it over vfs.Transport to vfs.Serve at the primary, which checks the fence and dedup; vfs.Server at the primary then decides admission, identity, squash and ordering and calls open state, the metadata store and the engine, while the legend gives the reasons the cut is not under the VFS](img/rfc15-cut.svg)
 
 - it looks up the shard of the handle the operation names, and the shard's
   primary, through `vfs.Router` over a cache of shard records read from the
