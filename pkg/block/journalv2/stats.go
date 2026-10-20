@@ -56,7 +56,7 @@ type Stats struct {
 
 	// ExtentCount is the number of placement index entries: held extents,
 	// retained extents and removal markers. Kind: gauge.
-	ExtentCount int
+	ExtentCount int64
 
 	// DropRanges is the number of ranges the removal-drop test keeps per file
 	// and segment. Kind: gauge.
@@ -107,7 +107,7 @@ type Stats struct {
 	NextVersion  Version
 
 	// ExtentLimit is the configured index entry bound. Kind: gauge.
-	ExtentLimit int
+	ExtentLimit int64
 
 	// Counters are the cumulative counts since open. Kind: counters.
 	Counters Counters
