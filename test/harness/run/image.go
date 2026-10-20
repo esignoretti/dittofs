@@ -90,12 +90,12 @@ func pull(ctx context.Context, image, dir string, env []string, w io.Writer) err
 	// decision: an image docker already has isn't pulled again, as docker
 	// run pulls only a missing one, so a machine without the registry still
 	// runs the image it has.
-	if code, err := execute(ctx, []string{"docker", "image", "inspect", image}, dir, env, io.Discard); err == nil && code == 0 {
+	if code, err := execute(ctx, []string{"docker", "image", "inspect", image}, dir, env, io.Discard, false); err == nil && code == 0 {
 		return nil
 	}
 	shown := "docker pull " + image
 	_, _ = fmt.Fprintf(w, "[dt] $ %s\n", shown)
-	code, err := execute(ctx, []string{"docker", "pull", image}, dir, env, w)
+	code, err := execute(ctx, []string{"docker", "pull", image}, dir, env, w, false)
 	switch {
 	case err != nil:
 		return err
@@ -112,7 +112,7 @@ func removeContainer(name, dir string, env []string, w io.Writer) {
 	defer cancel()
 	argv := []string{"docker", "rm", "-f", name}
 	_, _ = fmt.Fprintf(w, "[dt] $ %s\n", strings.Join(argv, " "))
-	_, _ = execute(ctx, argv, dir, env, w)
+	_, _ = execute(ctx, argv, dir, env, w, false)
 }
 
 // renderTemplates fills the placeholders in each file glob matches in the
