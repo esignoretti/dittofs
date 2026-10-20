@@ -322,19 +322,15 @@ each for the five small pools, 12 GiB for the metadata store, 8 GiB each for
 the index and transfers, and 16 GiB unpooled; on an 8 GiB container, 512 MiB
 each, 1.5 GiB, 1 GiB each and 2 GiB unpooled.
 
-A pool belongs to the role that composes what it holds
-([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)): a
-`protocol`-only node has no journal index, transfers or open state, and their
-fractions are left unpooled; a `storage`-only node serves no client connection.
-The fractions do not move between roles.
+Every node holds all eight pools, because every node composes everything they
+hold ([RFC 15 §2.1](rfc-15-topology.md#2.1%20One%20node%20type)).
 
 > ponytail: fixed fractions, the same on every node. The metadata store's
 > fraction is the guess most likely wrong — a namespace-heavy workload wants more, a
-> streaming one less — and a `protocol`-only node leaves about five sixteenths
-> idle. Move fractions by measurement when §8's M3 shows the store's hit rate
-> limiting a workload while another pool sits below half its ceiling, or a split
-> deployment's protocol node is shown memory-bound; make a fraction a setting only
-> when two named workloads want different values on the same hardware.
+> streaming one less. Move fractions by measurement when §8's M3 shows the store's
+> hit rate limiting a workload while another pool sits below half its ceiling;
+> make a fraction a setting only when two named workloads want different values
+> on the same hardware.
 
 > decision: the hold pool is a sixteenth of *L*, derived, not a setting; a
 > test sizes it by setting the process limit, 128 MiB giving 8 MiB. Sized from
@@ -458,14 +454,14 @@ So no wait is unbounded and none forms a cycle.
 
 ### 2.7 Wiring and lifecycle
 
-The composition root
-([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)) builds the
+The node
+([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition)) builds the
 budget in two phases, inside the start order
 [RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop) owns:
 
 - **(a) before that order opens the metadata store**, because the store's size
   is one of the figures: learn *L* (§2.1), set the runtime's soft limit, and
-  compute the fixed fractions, which need only *L* and the bootstrap roles;
+  compute the fixed fractions, which need only *L*;
 - **(b) once the settings are read**: check `upload_workers`, `fetch_workers`,
   `ExtentLimit` and `connection_limit` against their figures (§4.4, §7), and
   build the budgets.
@@ -473,7 +469,7 @@ budget in two phases, inside the start order
 ```go
 lim, err := resources.Detect()                     // (a) §2.1; refuses an unreadable control group
 debug.SetMemoryLimit(lim.Bytes * 15 / 16)          // (a) before any pool fills
-sp := resources.SplitFor(lim, roles)               // (a) §2.3, §2.4: the fractions and floors
+sp := resources.SplitFor(lim)                      // (a) §2.3, §2.4: the fractions and floors
 st, _ := metadata.Open(ctx, kv, metadata.Options{CacheBytes: sp.Meta /* … */}) // a size, §7.3
 err = sp.Check(settings)                           // (b) §4.4, §7: refuses what does not fit
 pools := &resources.Pools{
@@ -492,7 +488,7 @@ svc, _ := vfs.New(vfs.Deps{Shares: resources.NewShareCap(pools.Receive, pools.Re
 | Component | Built by | Owned by | Lifecycle |
 | --- | --- | --- | --- |
 | `Limit` | the root, first | the root | read once; never changes |
-| `Split` | the root, from `Limit` and roles | the root, a value | recomputed only at the next start |
+| `Split` | the root, from `Limit` | the root, a value | recomputed only at the next start |
 | `Pools`: receive, reply, connection state, hold | the root | shared by every adapter's `core` | none; checked at zero after the adapters stop |
 | open-state `Budget` | the root | the open-state table; **(cluster)** also the dedup table | as above |
 | `ShareCap` | the root, over receive and reply | the service's admission, in `*vfs.Server` | entries dropped at zero |
@@ -510,10 +506,10 @@ svc, _ := vfs.New(vfs.Deps{Shares: resources.NewShareCap(pools.Receive, pools.Re
   zero, and the test harness fails on it.
 - **Shared budgets are the root's.** The receive, reply, connection-state and
   hold budgets are shared by every adapter; no adapter may replace or close
-  one, and an adapter restarted by the runtime gets the same ones back.
+  one, and an adapter restarted by the node gets the same ones back.
 - **Reconfiguration.** *L* and the split change only at a restart (§2.1). A
   live setting a figure bounds — `connection_limit` — is checked against the
-  split when the runtime applies it, and refused there as at start.
+  split when the node applies it, and refused there as at start.
 - **Failure halfway.** Phase (a) fails before anything is opened, and phase (b)
   before anything serves, so a start refused here closes only what RFC 23's
   order already opened.
@@ -1021,13 +1017,13 @@ payload. Its in-flight bytes are bounded as follows, answering
   chunk in flight, charged to the same reservation;
 - at the primary, a forwarded call is charged to the primary's receive and reply
   pools as any call is, under the client key of the original client the envelope
-  carries, not the forwarding node's — otherwise every client of one protocol
+  carries, not the forwarding node's — otherwise every client of one gateway
   node would be one client to the primary's turns;
 - a stream whose receiver cannot reserve closes its window, which reaches the
   forwarding node as a slow call, and through it the client.
 
 ([RFC 0 §1.4](rfc-0-data-lifecycle.md#1.4%20The%20single-node%20profile):
-binds only once a second storage node can serve a share.)
+binds only once a second node can serve a share.)
 
 ## 6. Concurrency
 
@@ -1269,7 +1265,8 @@ outside the pools has grown, and is a bug.
 
 ## 11. Open questions
 
-1. **Fractions that move.** Fixed fractions waste a role's idle pools (§2.3). A
+1. **Fractions that move.** Fixed fractions leave idle what a workload does not
+   use — a streaming workload's metadata-store fraction (§2.3). A
    budget that lends an idle pool's ceiling to a busy one must take it back
    under load, which is eviction by another name; whether a measured workload
    pays for that is open.
