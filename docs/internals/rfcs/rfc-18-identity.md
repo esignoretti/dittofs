@@ -738,8 +738,10 @@ NTLMv1 and LM are refused ([RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in)).
   ([RFC 23 §4.6](rfc-23-control-plane.md#4.6%20Long-running%20operations)). The
   authenticator refuses NTLM from the `Apply` that delivers the setting (§2.6),
   not from its commit. Until that `Apply`, a node may still verify against a
-  hash the deletion has not reached: a window of one reconcile read, the same one
-  a disable has (ID13).
+  hash the deletion has not reached: a window of at most one second, the node's
+  settings-generation read
+  ([RFC 23 §2.3](rfc-23-control-plane.md#2.3%20The%20node%20reconciles%3B%20it%20does%20not%20take%20orders)),
+  the same bound a disable has (ID13).
 - A local user with no NT hash **MUST** fail `ErrLogonFailure`; it never falls
   through to pass-through or to anonymous.
 - The NTLMv2 session key is weaker than a Kerberos one. Which shares may be
@@ -1455,6 +1457,7 @@ with the directory and KDC as local test services.
 | §7.1 directory deadline | Resolve bob over NTLM; remove bob from a directory group. Keep the session open past the TTL: assert his next call drops the group, with no generation change. | a derived cache outliving the directory answer |
 | §4.4 SID-less directory | An RFC 2307 directory entry with no SID: assert the minted principal holds a local SID from the RID counter, unchanged when the directory later adds one. | a directory principal with no SID |
 | §3.1 logon throttle | Send 10 wrong passwords for alice from one address, then an 11th attempt with the right one: assert refused, outcome `throttled`. | a throttle that still checks the credential, or none |
+| §7.3 full throttle | Size the throttle's share to hold four pairs, and bring four pairs to their limit under a fake clock. Sign in a fifth pair with the right password: assert refused `ErrUnavailable`, outcome `unavailable`, and the four pairs still throttled. Let one pair's window pass: assert the fifth pair's next sign-in is checked and succeeds. | a full throttle that evicts a pair at its limit, or admits a new pair untracked |
 | §3.1 expiry | Over `sec=krb5`, keep a context open past its ticket's `Expires`: assert the next request is refused with the expired-credential answer. | a context served past its ticket |
 | §3.3 replay | Send the same AP-REQ twice: assert the second refused, outcome `replay`. | no replay cache |
 | §3.2 `ManageGIDs` | On a share with `ManageGIDs`, a user in 20 store groups calls over `AUTH_SYS`: assert a file whose ACL grants only the 20th group is granted. | groups capped at the credential's 16 |
@@ -1468,7 +1471,7 @@ with the directory and KDC as local test services.
 **Fuzz.** `FuzzPAC`, `FuzzAPReq`, `FuzzSID` and `FuzzOwnerString` never panic, never
 allocate past the input's size times a constant, and decode∘encode is the identity on what decodes; the NTLM
 message decoder is RFC 20's. **Unit.** Resolution's five steps run as one table-driven test over (flavour ×
-squash × grant × machine) against a fake `Principals`.
+squash × grant × machine) against a fake `Principals` and a fake `Records`.
 
 ## 12. Migration
 

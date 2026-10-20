@@ -21,7 +21,7 @@
   <text x="16" y="26" class="t">From a credential to the caller: the adapter proves; the service maps, squashes and grants.</text>
 
   <rect x="24" y="44" width="236" height="290" rx="8" class="zone"/>
-  <text x="36" y="62" class="s">adapter — memory of the protocol node</text>
+  <text x="36" y="62" class="s">adapter — memory of the gateway node</text>
   <rect x="40" y="76" width="204" height="50" rx="5" class="pr"/>
   <text x="54" y="96" class="m">handshake</text><text x="54" y="114" class="s">AUTH_SYS, GSS, SPNEGO</text>
   <rect x="40" y="166" width="204" height="50" rx="5" class="pr"/>
