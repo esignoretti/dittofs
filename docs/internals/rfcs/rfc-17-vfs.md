@@ -238,7 +238,7 @@ reaches, then admits, authorises and runs the call. An adapter is handed a
 Every node runs the whole filesystem, so the identity resolver runs on every
 node. A cluster differs from a single node only by `Serve` and the gateway.
 Why every node runs both roles, and what would justify splitting them, is
-recorded in [RFC 15 §2.1](rfc-15-topology.md#2.1%20One%20binary%2C%20roles%20chosen%20at%20deployment)'s ponytail.
+recorded in [RFC 15 §2.1](rfc-15-topology.md#2.1%20One%20node%20type)'s ponytail.
 
 > decision: the cut between nodes is `vfs.Service`, not the interface between
 > the service and the engine. With the cut at `Service`:
