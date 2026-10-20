@@ -437,13 +437,31 @@ handed. The root hands each consumer the one interface it calls:
 package identity // internal/identity
 
 type Deps struct {
-	Principals metadata.Principals // RFC 16 §3: every read
-	Mint       Minter              // create-only PutUser and PutGroup: the only writes (§2.4, §5.1); RFC 16's ControlPlane satisfies it
+	Principals metadata.Principals // RFC 16 §3: lookups by spelling, groups, grants
+	Records    Records             // the record reads Principals lacks
+	Mint       Minter              // the only writes (§2.4, §5.1)
 	Secrets    SecretProvider      // RFC 13 §7: keytab, NT hashes, the bind credential, the machine-account password
 	Logons     LogonSink           // RFC 25 §4.1's logon stream
 	Clock      clock.Clock
 	Metrics    *metrics.Registry
 	Logger     *slog.Logger
+}
+
+// Records reads one principal's record: the spellings Spell shows (§4.1) and
+// the Disabled flag and deleted mark resolution checks (§3.7). RFC 16 §3's
+// Principals answers a Principal only, so RFC 16 gains these two reads.
+type Records interface {
+	User(ctx context.Context, p metadata.Principal) (metadata.User, error)
+	Group(ctx context.Context, p metadata.Principal) (metadata.Group, error)
+}
+
+// Minter never overwrites a record. Each write is one transaction, and fails
+// with ErrExist when another principal holds a row it would write (§2.2).
+// RFC 16 gains it as a view beside ControlPlane, whose PutUser overwrites whole.
+type Minter interface {
+	CreateUser(ctx context.Context, u metadata.User) error
+	CreateGroup(ctx context.Context, g metadata.Group) error
+	Rename(ctx context.Context, p metadata.Principal, name string) error // the record's Name and its name index only (§5.1)
 }
 
 // New validates the settings and starts nothing. *Server implements
@@ -544,11 +562,11 @@ type NTLMAuthenticate struct{ User, Domain, Workstation string; NTResponse, Encr
   of them as success.
 - An adapter **MUST NOT** turn any of these errors into a guest or anonymous
   session (§3.6).
-- The authenticator reads only the `Principals` view, the directory cache
+- The authenticator reads only the `Principals` and `Records` views, the directory cache
   (§5.2) and the secret provider
   ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer),
   [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)), writes only the records
-  a first sign-in mints (§2.4, §5.1), through `Minter`'s create-only writes,
+  a first sign-in mints (§2.4, §5.1), through `Minter`, which never overwrites a record,
   and **(cluster)** runs on the `protocol` node that holds the connection.
 - **A proof is bound to one principal for its life.** Before it returns a
   proof, the authenticator **MUST** map it to a principal and set
@@ -713,9 +731,11 @@ NTLMv1 and LM are refused ([RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in)).
   off **MUST** delete every stored NT hash, since an NT hash is equivalent to
   the password for NTLM. Turning it on again stores a hash only at a user's
   next password set. The deletion runs as an operation in bounded batches
-  ([RFC 23 §4.6](rfc-23-control-plane.md#4.6%20Long-running%20operations)); the
-  authenticator refuses NTLM from the setting's commit (§2.6), so a hash not
-  yet deleted is never read.
+  ([RFC 23 §4.6](rfc-23-control-plane.md#4.6%20Long-running%20operations)). The
+  authenticator refuses NTLM from the `Apply` that delivers the setting (§2.6),
+  not from its commit. Until that `Apply`, a node may still verify against a
+  hash the deletion has not reached: a window of one runtime read, the same one
+  a disable has (ID13).
 - A local user with no NT hash **MUST** fail `ErrLogonFailure`; it never falls
   through to pass-through or to anonymous.
 - The NTLMv2 session key is weaker than a Kerberos one. Which shares may be
@@ -972,13 +992,18 @@ finished fails whole (§2.5):
 
 - A directory principal's **record** is minted once, from the first answer,
   and holds its `PrincipalID`, name, SID, uid and gid from then on (§4.3).
-  Later answers update its name; they never change its
+  Later answers update its name through `Minter.Rename` (§2.6). A name that
+  another principal holds is refused, and the record keeps its old name. Later answers never change its
   `PrincipalID`, SID, uid or gid. An entry the directory gives no SID or no
   uid gets one allocated as §4.3 and §4.4 say, so a directory without Windows
   or without Unix attributes still yields principals that satisfy ID3.
 - A mint that loses the race for a spelling's protocol-ID row, which the store
-  refuses to give a second holder (§2.2), reads the principal that won and
-  binds to it. It never retries with a fresh `PrincipalID`.
+  refuses to give a second holder (§2.2), reads the principal that won. It
+  binds to that principal only if the winner's record holds every spelling the
+  directory supplied to the losing mint: its name (§4.6), its SID, and its uid
+  and gid in `rfc2307` mode. Otherwise two directory entries claim one spelling, and the
+  mint fails `ErrUnavailable`. It binds nothing, writes nothing, and logs both
+  `PrincipalID`s. It never retries with a fresh `PrincipalID`.
 - A directory principal's **groups and enabled state** are not written to the
   store. They are cached (§5.2), so a change in the directory takes effect at
   the next lookup.
@@ -1291,7 +1316,13 @@ Every table here is keyed on input a client controls, so each is charged to
 | caller cache | the least recently used entry is evicted, counted |
 | directory cache | the least recently used entry is evicted; an evicted entry is a miss, never "not found" |
 | replay cache | holds entries younger than `identity.clock_skew`; a sign-in that would need one more fails `ErrUnavailable` |
-| logon throttle | the oldest pair is evicted; a pair at its limit is never evicted early |
+| logon throttle | the oldest pair below its limit is evicted; a pair at its limit is never evicted early, and while every pair is at its limit a sign-in that would need one more fails `ErrUnavailable` |
+
+> decision: a full throttle refuses new pairs rather than leave them
+> untracked, because an untracked pair is an unthrottled guesser. The cost is
+> that a spray filling the table with pairs at their limit refuses every new
+> pair for up to the 10-minute window. Revisit, with a per-address limit
+> (§3.1's ponytail), when the logon stream shows sign-ins refused this way.
 
 ## 8. Management-API users
 
@@ -1351,20 +1382,6 @@ and grants. Their sign-in — passwords, tokens, roles, sessions — is
 | ID2 | No ID given to a principal is given to another: `PrincipalID`, allocated uid, gid and RID alike. | §2.3 no reuse |
 | ID3 | No uid or gid is ever a default; every user has a uid, every group a gid, every user and group a SID — an API-only account aside, which has none (§8). 65534 is anonymous's alone. | §2.3, §7.1 one uid, two proofs; §4.4 SID-less directory |
 | ID4 | A SID never changes once given. | §4.4 SID-less directory |
-| §3.1 logon throttle | Send 10 wrong passwords for alice from one address, then an 11th attempt with the right one: assert refused, outcome `throttled`. | a throttle that still checks the credential, or none |
-| §3.1 expiry | Over `sec=krb5`, keep a context open past its ticket's `Expires`: assert the next request is refused with the expired-credential answer. | a context served past its ticket |
-| §3.3 replay | Send the same AP-REQ twice: assert the second refused, outcome `replay`. | no replay cache |
-| §3.2 `ManageGIDs` | On a share with `ManageGIDs`, a user in 20 store groups calls over `AUTH_SYS`: assert a file whose ACL grants only the 20th group is granted. | groups capped at the credential's 16 |
-| §3.5 NTLM off | Hold an NTLM session, then turn `identity.ntlm` off: assert its next call refused, and once the deletion operation ends, no NT hash in the store. | an NTLM context outliving the setting; hashes left behind |
-| §5.1 TLS | A directory record asking for plain LDAP: assert refused at validation. | a bind credential sent in clear |
-| §5.2 one query per key | 100 concurrent lookups of one key against a counting fake directory: assert 1 query. | a sign-in storm multiplied per connection |
-| §4.4 anonymous lookup | Over an anonymous session on `IPC$`, `LookupSids` of an unminted directory SID: assert no record written. | an unauthenticated caller minting principals |
-| §4.6 name case | Create two users whose names differ only in case: assert the second refused as a duplicate. | names unique byte for byte |
-
-**Fuzz.** `FuzzPAC`, `FuzzAPReq`, `FuzzSID` and `FuzzOwnerString` never panic, never
-allocate past the input's size times a constant, and decode∘encode is the identity on what decodes; the NTLM
-message decoder is RFC 20's. **Unit.** Resolution's five steps run as one table-driven test over (flavour ×
-squash × grant × machine) against a fake `Principals`.
 | ID5 | Every cache of identity is keyed by everything its value was derived from, the proof's name and flavour included. | §2.3, §7.1 one uid, two proofs |
 | ID6 | A store or directory error is never read as "no such principal", and never yields a guest, anonymous or default grant. | §5.4 error is not "unknown" |
 | ID7 | A failed sign-in never yields a session. | §3.6 no map to guest |
@@ -1433,6 +1450,21 @@ with the directory and KDC as local test services.
 | §6.4 `none` is stored | Grant `Finance` read-write and alice `none`: assert alice refused. Remove alice's grant: assert alice granted through `Finance`. | `none` stored as no grant |
 | §7.1 directory deadline | Resolve bob over NTLM; remove bob from a directory group. Keep the session open past the TTL: assert his next call drops the group, with no generation change. | a derived cache outliving the directory answer |
 | §4.4 SID-less directory | An RFC 2307 directory entry with no SID: assert the minted principal holds a local SID from the RID counter, unchanged when the directory later adds one. | a directory principal with no SID |
+| §3.1 logon throttle | Send 10 wrong passwords for alice from one address, then an 11th attempt with the right one: assert refused, outcome `throttled`. | a throttle that still checks the credential, or none |
+| §3.1 expiry | Over `sec=krb5`, keep a context open past its ticket's `Expires`: assert the next request is refused with the expired-credential answer. | a context served past its ticket |
+| §3.3 replay | Send the same AP-REQ twice: assert the second refused, outcome `replay`. | no replay cache |
+| §3.2 `ManageGIDs` | On a share with `ManageGIDs`, a user in 20 store groups calls over `AUTH_SYS`: assert a file whose ACL grants only the 20th group is granted. | groups capped at the credential's 16 |
+| §3.5 NTLM off | Hold an NTLM session, then turn `identity.ntlm` off and apply it (fake clock and the runtime's read): assert its next call and a fresh NTLM sign-in refused, and once the deletion operation ends, no NT hash in the store. | an NTLM context outliving the setting; hashes left behind |
+| §5.1 TLS | A directory record asking for plain LDAP: assert refused at validation. | a bind credential sent in clear |
+| §5.2 one query per key | 100 concurrent lookups of one key against a counting fake directory: assert 1 query. | a sign-in storm multiplied per connection |
+| §4.4 anonymous lookup | Over an anonymous session on `IPC$`, `LookupSids` of an unminted directory SID: assert no record written. | an unauthenticated caller minting principals |
+| §4.6 name case | Create two users whose names differ only in case: assert the second refused as a duplicate. | names unique byte for byte |
+| §5.1 mint conflict | In `rfc2307` mode, mint directory user alice, then sign in bob, whose entry has another SID and alice's `uidNumber`: assert the sign-in fails, bob is bound to no principal, and alice's record is unchanged. | a lost mint bound to whichever principal holds the row |
+
+**Fuzz.** `FuzzPAC`, `FuzzAPReq`, `FuzzSID` and `FuzzOwnerString` never panic, never
+allocate past the input's size times a constant, and decode∘encode is the identity on what decodes; the NTLM
+message decoder is RFC 20's. **Unit.** Resolution's five steps run as one table-driven test over (flavour ×
+squash × grant × machine) against a fake `Principals`.
 
 ## 12. Migration
 
