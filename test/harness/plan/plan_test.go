@@ -152,6 +152,7 @@ func TestFixtureNeeds(t *testing.T) {
 	y := `version: 1
 defaults: { format: exit, tier: merge, timeout: { test: 30m, cell: 60m } }
 suites:
+  k: { cmd: "true", fixture: { server: knfsd, nfs: export }, needs: [linux] }
   a:
     cmd: "true"
     matrix: { profile: [memory, badger-s3], nfs: ["export", "4.1"] }
@@ -171,6 +172,7 @@ suites:
 		t.Fatal(err)
 	}
 	want := map[string][]string{
+		"k":                  {"linux", "root", "knfsd", "port:2049"},
 		"a/memory/export":    {"linux", "root"},
 		"a/memory/4.1":       {"linux", "root", "nfs-client"},
 		"a/badger-s3/export": {"linux", "root", "service:localstack"},

@@ -828,7 +828,7 @@ carry a script that builds it.
 
 | Field | Meaning |
 |---|---|
-| `server` | `dfs` (the default), or `knfsd` for the pynfs comparison, whose `{nfs-port}` is 2049 |
+| `server` | `dfs` (the default), or `knfsd` for the pynfs comparison: the kernel's NFS server, NFSv4 only, on 2049, its `{nfs-port}`. It exports a tmpfs of its own to `{server}` alone, as the NFSv4 root, with `/export` in it, since the kernel won't export the overlay file system a container's `/tmp` is. Where the kernel's tmpfs has no POSIX ACLs, as Docker Desktop's, the server has none either, and pynfs's ACL tests skip, which the cell reports. A `knfsd` fixture sets `nfs: export`, and at most `squash: none` and `lease`; it gives `{server}` and `{nfs-port}`, and no `{bin}`. It implies `root`, `knfsd` and `port:2049` (below), so the kernel's server that `dt` starts and stops is its own. It sets the server's grace period to 10 seconds, the least, and waits it out before the first test. The lease and grace times are the kernel's for every server on that network stack, so `dt` restores them when it stops the server |
 | `profile` | The store profile: `memory`, `badger` or `badger-s3`. Required for a `dfs` fixture. For an S3 profile `dt` creates the bucket |
 | `nfs` | Mount the share over NFS at this version (`3`, `4`, `4.1`), or `{ version, options }` with mount options, which may be a `matrix` placeholder (#3008's named option sets are one axis). An NFSv3 mount adds `nolock`, except from a namespaced `client`, which has NLM of its own. A `nolock` mount answers every lock in the client, so a test of NFSv3 locking runs from a namespaced `client`, or it tests the client rather than the server. In the mapping the version may be left out, for options that name it: their `vers=` gives it, and with none the kernel negotiates it, as cthon04's `default` set does. `export` exports the share without a mount, for pynfs and nfstest, which mounts by itself |
 | `smb` | `true` enables the SMB adapter; `{ encryption: preferred }` also sets SMB encryption; `{ port: 445 }` serves SMB on that port rather than a free one, for WPTS, which connects over TCP to 445 whatever its configuration says, and smbtorture, whose multichannel test opens its extra connections to 445 whatever `-p` gives, so `dt` starts that server as the user with one capability, `CAP_NET_BIND_SERVICE`, held as an ambient capability: `sudo -n setpriv --reuid=UID --regid=GID --init-groups --inh-caps=+net_bind_service --ambient-caps=+net_bind_service -- {bin}/dfs ...` (§3). Nothing on the host changes, so nothing needs restoring. A file capability on `{bin}/dfs` would put the binary in secure mode, where Go prints no trace when the server panics, and lowering `net.ipv4.ip_unprivileged_port_start` would let every process on the host bind low ports; `{ mount: true }` mounts the share at `{mount}` with the machine's own SMB client: `mount.cifs` on Linux, `mount_smbfs` on macOS, `net use /TCPPORT` on Windows |
@@ -1536,7 +1536,11 @@ file last changed on 2026-06-22, from `memory`. Both are manual:
   that didn't run to its end, whose lost tests would leave the file without a trace: one whose
   note gives any reason but new failures and unexpected passes, as a `not run` cell always does,
   such as a limit that stopped it, a crash or a test that didn't run;
-- `dt run pynfs --knfsd` runs the comparison.
+- `dt run pynfs --knfsd` runs the comparison, graded against pynfs's own known list: its known
+  failures are the tests both servers fail, its new failures those only the kernel's server fails,
+  and its unexpected passes the entries the kernel's server passes, which are DittoFS's alone. Its
+  results are a run's like any other's; `baseline-knfsd.sh` and the `baseline-knfsd.md` it writes
+  go with `nfs-pynfs.yml`'s baseline job (§8 step 3).
 
 The nightly job that pushes the file to develop goes. It has failed every night since the ruleset
 began requiring pull requests.
