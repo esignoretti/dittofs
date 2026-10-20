@@ -227,7 +227,7 @@ not specified here has its owner in §1.2.
 | how conditions combine into share, node and installation status | this RFC, §3.3 |
 | what liveness, readiness and health answers report | this RFC, §3.5–§3.7 |
 | the endpoints that serve them, and who may call them | [RFC 23](rfc-23-control-plane.md) |
-| the Kubernetes probes and the cluster resource's conditions | [RFC 30 §4.4](rfc-30-kubernetes.md#4.4%20Health), reading §3.5–§3.6 |
+| the Kubernetes probes and the cluster resource's conditions | [RFC 30 §4.3](rfc-30-kubernetes.md#4.3%20Health), reading §3.5–§3.6 |
 | where access and quota events are emitted, and their fields | [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) |
 | which operations produce an access event: the share's audit policy | [RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings), applied by [RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks) |
 | where logon events are emitted, and logon throttling | [RFC 18 §3.1](rfc-18-identity.md#3.1%20The%20authentication%20interface) |
@@ -577,6 +577,14 @@ owner.
 
 > decision: silencing is the alert router's, not the node's. Overturned by a
 > deployment with no alert router that still needs a silence.
+
+> decision: `start_failed` clears only when the process exits, and is still not
+> a latch under O7. Its evidence is a start that stopped at a named step, and
+> that evidence holds for as long as the process lives, because a failed start
+> does not retry ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)):
+> nothing could clear it sooner without lying. A restart is a new evaluation,
+> which derives it again or not. Overturned if any start step ever retries in
+> process; it must then clear when that step succeeds.
 
 ### 3.5 Liveness
 
