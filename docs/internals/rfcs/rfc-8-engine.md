@@ -736,8 +736,8 @@ type Deps struct {
 ```
 
 **Build, start and stop.** `node.New` builds, in order: the metadata store; the
-remote block stores, ref-counted per configuration; the journal; the syncer; the
-engine with `New(Deps)`, which opens nothing; GC, a sibling of the engine that is
+remote block stores, ref-counted per configuration; the syncer; the engine with
+`New(Deps)`, which opens nothing and is handed `Deps.Open`, not a journal; GC, a sibling of the engine that is
 never passed into it; open state; identity; `*vfs.Server`; in a cluster,
 `vfs.Serve` and the gateway; the adapters. `Node.Start`
 ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)) starts them in that order — the engine's `Start` opening the
