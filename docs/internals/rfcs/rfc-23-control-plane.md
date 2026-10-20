@@ -1404,7 +1404,7 @@ Conventions are the index's ([Test tiers](rfc-index.md#Test%20tiers)). The tiers
 | multi-node | two `node.New` over one in-memory control-plane store and a loopback `Transport`, driven by writes to the store, with fault injection: a lost reply, a duplicate send, a stale epoch |
 | e2e | the adapters |
 
-Each check below runs, with the API in front, against the node `node.New`
+Each check below runs, through the API, against the node `node.New`
 builds, unless marked **(cluster)**, which runs at the multi-node tier. No check
 builds a node any other way, and an architecture test fails on a caller of
 `node.New` other than the server's start command and the test harness.
