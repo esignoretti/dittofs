@@ -67,6 +67,21 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 		return nil
 	}
 
+	// A length beyond the maximum advertised in the handshake is refused before
+	// anything is allocated. The spec names this exact case as the one where
+	// NBD_EOVERFLOW is correct: "when a command without payload requests a length
+	// larger than an advertised maximum payload length". READ carries no payload
+	// from the client, so it is that case. Without this check the only bound was
+	// the export size, so a client could make the server allocate the whole
+	// export in one request — measured: a 256 MiB READ against a 1 GiB export was
+	// accepted despite a 32 MiB advertised maximum.
+	if payloadTooLarge(req.Length) {
+		if err := h.writeReply(conn, req.Cookie, ErrEOVERFLOW, nil); err != nil {
+			return err
+		}
+		return nil
+	}
+
 	// Allocated only after the bounds checks: a client that sends
 	// Length: 0xffffffff against a small export gets NBD_EINVAL without a
 	// multi-gigabyte allocation.

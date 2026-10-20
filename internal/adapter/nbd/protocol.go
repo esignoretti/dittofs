@@ -69,10 +69,18 @@ const (
 
 // NBDError is a transmission-phase error value, carried in a simple reply.
 //
-// NBD_EOVERFLOW (75) and NBD_ENOTSUP (95) are deliberately absent. The spec
-// reserves EOVERFLOW for NBD_CMD_READ with NBD_CMD_FLAG_DF, and ENOTSUP for
-// WRITE_ZEROES with FAST_ZERO; the adapter advertises neither SEND_DF nor
-// SEND_FAST_ZERO, so neither value is reachable.
+// NBD_ENOTSUP (95) is deliberately absent. The spec reserves it for
+// WRITE_ZEROES with NBD_CMD_FLAG_FAST_ZERO, and the adapter does not advertise
+// SEND_FAST_ZERO, so that value is unreachable.
+//
+// NBD_EOVERFLOW (75) IS reachable, and an earlier version of this comment was
+// wrong to say otherwise. The spec allows it "when a command without payload
+// requests a length larger than an advertised maximum payload length" — and
+// NBD_CMD_READ is exactly a command without payload, while the handshake
+// advertises maxBlockSize (32 MiB) as the maximum. A READ of more than that is
+// therefore both reachable and the one case the spec documents, so it is
+// answered with EOVERFLOW rather than silently allocating whatever the client
+// asked for. See checkPayloadLength.
 type NBDError uint32
 
 // Transmission-phase error values.
@@ -81,6 +89,7 @@ const (
 	ErrEIO       NBDError = 5
 	ErrEINVAL    NBDError = 22
 	ErrENOSPC    NBDError = 28
+	ErrEOVERFLOW NBDError = 75
 	ErrESHUTDOWN NBDError = 108
 )
 

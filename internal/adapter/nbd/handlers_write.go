@@ -62,6 +62,23 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
 		return h.rejectWrite(conn, req, ErrENOSPC)
 	}
 
+	// A payload beyond the advertised maximum is refused before allocating it.
+	//
+	// decision: EINVAL here, not EOVERFLOW, even though READ answers the same
+	// overage with EOVERFLOW. The spec's EOVERFLOW clause is specifically "when a
+	// command WITHOUT payload requests a length larger than an advertised
+	// maximum" — WRITE carries a payload, so that clause does not cover it and
+	// EINVAL is the general answer for a request that violates the advertised
+	// contract. The asymmetry is deliberate and is the spec's, not an oversight.
+	//
+	// The payload is in flight regardless ("The client MUST follow the request
+	// header with length number of bytes"), so rejectWrite drains it: replying
+	// and returning without draining would parse payload bytes as the next
+	// header.
+	if payloadTooLarge(req.Length) {
+		return h.rejectWrite(conn, req, ErrEINVAL)
+	}
+
 	// Read bounds finishing a request that has already started. The header read
 	// consumed the budget armed in the dispatch loop, and that budget is the
 	// Idle one when the operator has separated the two — so without a fresh arm
