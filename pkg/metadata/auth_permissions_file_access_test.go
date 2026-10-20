@@ -930,3 +930,53 @@ func TestCheckFileAccessWithParent_NoACLWritableDirGrantsDeleteChild(t *testing.
 		})
 	}
 }
+
+// TestCheckFileAccessWithParent_NoACLParentOverrideJudgedByMode pins the
+// delete-via-parent override when the child has a DACL lacking DELETE and the
+// parent has none: the parent is judged by its POSIX mode and sticky bit, as
+// NFS REMOVE is, not treated as a NULL DACL granting everything. The
+// requester owns neither the child nor the parent.
+func TestCheckFileAccessWithParent_NoACLParentOverrideJudgedByMode(t *testing.T) {
+	const requester uint32 = 1001
+	const requesterSID = "S-1-5-21-1-2-3-2001"
+	cases := []struct {
+		name  string
+		mode  uint32
+		grant bool
+	}{
+		{"0755 parent owned by another user", 0o755, false},
+		{"1777 sticky parent", 0o1777, false},
+		{"0777 non-sticky parent", 0o777, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestFixture(t)
+			parent, _, err := f.service.CreateDirectory(f.rootContext(), f.rootHandle, "p",
+				&metadata.FileAttr{Type: metadata.FileTypeDirectory, Mode: tc.mode, UID: 9999, GID: 9999})
+			require.NoError(t, err)
+			require.Nil(t, parent.ACL)
+			require.Equal(t, tc.mode, parent.Mode)
+			child := &metadata.File{FileAttr: metadata.FileAttr{
+				Type: metadata.FileTypeRegular, Mode: 0o644, UID: 9999, GID: 9999,
+				ACL: &acl.ACL{ACEs: []acl.ACE{{
+					Type:       acl.ACE4_ACCESS_ALLOWED_ACE_TYPE,
+					Who:        "sid:" + requesterSID,
+					AccessMask: acl.ACE4_READ_DATA | acl.ACE4_SYNCHRONIZE,
+				}}},
+			}}
+			authCtx := f.authContext(requester, requester)
+			authCtx.Identity.SID = strPtr(requesterSID)
+
+			_, err = f.service.CheckFileAccessWithParent(child, parent, authCtx, rightDelete)
+			maxAccess, maxErr := f.service.CheckFileAccessWithParent(child, parent, authCtx, rightMaxAllowed)
+			require.NoError(t, maxErr)
+			if tc.grant {
+				require.NoError(t, err, "explicit DELETE")
+				require.NotZero(t, maxAccess&rightDelete, "MAXIMUM_ALLOWED = 0x%x lacks DELETE", maxAccess)
+			} else {
+				require.Error(t, err, "explicit DELETE")
+				require.Zero(t, maxAccess&rightDelete, "MAXIMUM_ALLOWED = 0x%x carries DELETE", maxAccess)
+			}
+		})
+	}
+}
