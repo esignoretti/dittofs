@@ -230,8 +230,8 @@ type Counters struct {
 
 // Histogram is a distribution of durations over fixed buckets.
 //
-// decision: the RFC names the kind but not the shape. Bounds and Counts are
-// the minimum a reader needs to name and read each bucket.
+// decision: the RFC names the kind but not the shape. Bounds, Counts and Sum
+// are what a metrics exporter needs to publish the distribution.
 type Histogram struct {
 	// Bounds are the buckets' upper bounds, ascending.
 	Bounds []time.Duration
@@ -240,6 +240,9 @@ type Histogram struct {
 	// samples at or below Bounds[i] and above the bound before it, and the
 	// last entry the number above every bound.
 	Counts []uint64
+
+	// Sum is the total of every sample.
+	Sum time.Duration
 }
 
 // RecoveryStats is how an open rebuilt the journal.
