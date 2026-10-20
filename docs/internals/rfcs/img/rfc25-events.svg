@@ -19,15 +19,15 @@
     </style>
   </defs>
   <rect width="900" height="470" fill="#ffffff"/>
-  <text x="16" y="26" class="t">The service never waits on an event; every event lost becomes a gap record in its stream.</text>
+  <text x="16" y="26" class="t">No emitter waits on an event; every event lost becomes a gap record in its stream.</text>
 
   <rect x="24" y="44" width="852" height="236" rx="8" class="zone"/>
-  <text x="36" y="62" class="s">one node, access and quota streams</text>
+  <text x="36" y="62" class="s">one node: access, quota and logon streams</text>
 
   <rect x="40" y="80" width="150" height="62" rx="5" class="sv"/>
-  <text x="52" y="100" class="h">filesystem service</text>
-  <text x="52" y="116" class="s">at the chokepoint</text>
-  <text x="52" y="130" class="s">and at quota enforcement</text>
+  <text x="52" y="100" class="h">emitters</text>
+  <text x="52" y="116" class="s">service: access, quota</text>
+  <text x="52" y="130" class="s">authenticator, at logon</text>
 
   <rect x="214" y="80" width="140" height="62" rx="5" class="pr"/>
   <text x="226" y="100" class="h">sink</text>
@@ -35,9 +35,9 @@
   <text x="226" y="130" class="s">returns at once</text>
 
   <rect x="378" y="80" width="150" height="62" rx="5" class="pr"/>
-  <text x="390" y="100" class="h">ring per stream</text>
-  <text x="390" y="116" class="s">access 16,384 entries,</text>
-  <text x="390" y="130" class="s">quota 4,096; fixed at start</text>
+  <text x="390" y="100" class="h">ring per stream, fixed</text>
+  <text x="390" y="116" class="s">access 16,384 entries;</text>
+  <text x="390" y="130" class="s">quota, logon 4,096 each</text>
 
   <rect x="552" y="80" width="140" height="62" rx="5" class="pr"/>
   <text x="564" y="100" class="h">writer</text>
@@ -69,23 +69,23 @@
   <text x="40" y="262" class="s">At start: a "restart" gap record for the last unsynced second of the previous process. A file past its age retires with no gap.</text>
 
   <rect x="24" y="296" width="852" height="74" rx="8" class="zone"/>
-  <text x="36" y="314" class="s">admin stream: no ring, no drop</text>
+  <text x="36" y="314" class="s">admin stream: no ring, no spool</text>
   <rect x="40" y="322" width="230" height="40" rx="5" class="st"/>
   <text x="52" y="346" class="h">control plane's audit records</text>
-  <rect x="294" y="322" width="250" height="40" rx="5" class="pr"/>
-  <text x="306" y="340" class="h">writer with a cursor in the store</text>
-  <text x="306" y="354" class="s">this node's records, in commit order</text>
+  <rect x="294" y="322" width="320" height="40" rx="5" class="pr"/>
+  <text x="306" y="340" class="h">admin: RFC 23's audit, pulled by position</text>
+  <text x="306" y="354" class="s">no ring, no spool; the consumer keeps it</text>
   <path d="M272,342 L290,342" class="ln"/>
-  <path d="M546,342 L704,342 L704,130 L712,130" class="ln"/>
-  <text x="552" y="334" class="s">durable: a full spool waits</text>
+  <path d="M616,342 L760,342 L760,388" class="ln"/>
+  <text x="622" y="334" class="s">durable; read through the API</text>
 
   <rect x="40" y="392" width="390" height="62" rx="5" class="am"/>
   <text x="52" y="412" class="h">shipper tails the files</text>
   <text x="52" y="428" class="s">to the archive, write-once if required;</text>
   <text x="52" y="442" class="s">the spool is a buffer, not the archive</text>
   <rect x="470" y="392" width="390" height="62" rx="5" class="am"/>
-  <text x="482" y="412" class="h">management API reads the same files</text>
-  <text x="482" y="428" class="s">access and admin: the right to read the audit;</text>
+  <text x="482" y="412" class="h">management API: the spool and the audit</text>
+  <text x="482" y="428" class="s">access, logon, admin: the right to read the audit;</text>
   <text x="482" y="442" class="s">quota: operator; never a log, metric or health answer</text>
   <path d="M876,111 L886,111 L886,384 L235,384 L235,388" class="ln"/>
   <path d="M664,384 L664,388" class="ln"/>
