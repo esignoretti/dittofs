@@ -257,25 +257,33 @@ func nfsAdapterEnabled(ctx context.Context, s store.Store) (bool, error) {
 
 // buildShareConfig assembles the runtime ShareConfig for a persisted share row,
 // resolving its metadata store, NFS export options, and netgroup. It returns
-// (nil, nil) when the share references an unknown metadata store so the caller
-// can skip it (already logged). Extracted so both startup load and live
-// block-store rebind (#1532) build an identical config from the same row.
+// (nil, nil) only when the share's metadata store is not configured, so the
+// caller can skip it (already logged); a lookup that fails for any other
+// reason, a cancelled request among them, is returned as an error, since the
+// store may well exist. Extracted so both startup load and live block-store
+// rebind (#1532) build an identical config from the same row.
 func buildShareConfig(ctx context.Context, s store.Store, share *models.Share) (*ShareConfig, error) {
 	// Try by ID first, fall back to name lookup.
 	metaStoreCfg, err := s.GetMetadataStoreByID(ctx, share.MetadataStoreID)
-	if err != nil {
+	if errors.Is(err, models.ErrStoreNotFound) {
 		metaStoreCfg, err = s.GetMetadataStore(ctx, share.MetadataStoreID)
-		if err != nil {
+		if errors.Is(err, models.ErrStoreNotFound) {
 			logger.Warn("Share references unknown metadata store",
 				"share", share.Name,
 				"metadata_store_id", share.MetadataStoreID)
 			return nil, nil
 		}
 	}
+	if err != nil {
+		return nil, fmt.Errorf("look up the metadata store of share %q: %w", share.Name, err)
+	}
 
 	nfsOpts := models.DefaultNFSExportOptions()
 	nfsCfg, err := s.GetShareAdapterConfig(ctx, share.ID, "nfs")
-	if err == nil && nfsCfg != nil {
+	if err != nil {
+		return nil, fmt.Errorf("look up the NFS options of share %q: %w", share.Name, err)
+	}
+	if nfsCfg != nil {
 		_ = nfsCfg.ParseConfig(&nfsOpts)
 	}
 

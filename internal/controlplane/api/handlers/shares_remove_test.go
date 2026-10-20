@@ -336,3 +336,35 @@ func TestShareRemove_ByIDPurgesTheShare(t *testing.T) {
 		t.Fatalf("the metadata store still holds the share removed by ID: %v", names)
 	}
 }
+
+// A purge whose request is cancelled before it can look up the share's
+// metadata store deletes nothing: the store is not unknown, only unreached,
+// so its records and the share's journal both stay for a repeated removal.
+func TestShareRemove_CancelledPurgeKeepsJournal(t *testing.T) {
+	ctx := context.Background()
+	s := newShareServer(t)
+	s.create("/team")
+	h := s.write("/team", "docs", "a.txt", []byte("kept"))
+	if err := s.rt.RemoveShare("/team"); err != nil {
+		t.Fatalf("RemoveShare: %v", err)
+	}
+
+	row, err := s.cp.GetShare(ctx, "/team")
+	if err != nil {
+		t.Fatalf("GetShare: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := s.rt.PurgeShare(cancelled, row); err == nil {
+		t.Fatal("a purge with a cancelled request succeeded")
+	}
+	if _, err := os.Stat(shares.ShareJournalDir(s.journal, "/team")); err != nil {
+		t.Fatalf("a cancelled purge removed the journal directory: %v", err)
+	}
+	if err := runtime.LoadSharesFromStore(ctx, s.rt, s.cp); err != nil {
+		t.Fatalf("LoadSharesFromStore: %v", err)
+	}
+	if got := s.read(h, 4); got != "kept" {
+		t.Fatalf("after a cancelled purge the share reads %q, want %q", got, "kept")
+	}
+}
