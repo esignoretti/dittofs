@@ -44,6 +44,9 @@ type smbRuntime interface {
 	// Share-change notification (tree-connect cache invalidation).
 	OnShareChange(callback func(shares []string)) func()
 
+	// ApplyIdentityMapping applies the share's squash mode to an identity.
+	ApplyIdentityMapping(shareName string, ident *metadata.Identity) (*metadata.Identity, error)
+
 	// Identity / auth backends.
 	GetUserStore() models.UserStore
 	GetIdentityMappingStore() store.IdentityMappingStore
