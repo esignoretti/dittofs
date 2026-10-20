@@ -112,44 +112,10 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 		return NewErrorResult(types.StatusBadNetworkName), nil
 	}
 
-	// Refuse TREE_CONNECT on a disabled share. Matches
-	// MS-SMB2 2.2.9 — STATUS_NETWORK_NAME_DELETED is the spec error for a
-	// share that existed but is no longer available. The Enabled flag is
-	// flipped by shares.Service.DisableShare before restore; clients see
-	// the refusal and can re-TREE_CONNECT after re-enable.
-	if !share.Enabled {
-		logger.Warn("SMB TREE_CONNECT refused: share disabled",
-			"share", share.Name, "sessionID", ctx.SessionID)
-		return NewErrorResult(types.StatusNetworkNameDeleted), nil
-	}
-
-	// Get session and resolve permissions
 	sess, _ := h.SessionManager.GetSession(ctx.SessionID)
-	defaultPerm := models.ParseSharePermission(share.DefaultPermission)
-
-	// Resolve permission based on session type
-	permission, user, generation := resolveSharePermission(ctx, sess, share, defaultPerm, h.Registry.GetUserStore())
-
-	// Check for access denied
-	if permission == models.PermissionNone {
-		logger.Debug("Share access denied", "shareName", shareName, "user", user)
-		return NewErrorResult(types.StatusAccessDenied), nil
-	}
-
-	logger.Debug("Permission resolved for tree connect",
-		"shareName", shareName,
-		"user", user,
-		"permission", permission)
-
-	permission = capReadOnlyShare(share, permission)
-
-	// Encryption enforcement: in required mode, reject unencrypted sessions
-	// connecting to encrypted shares.
-	if shouldRejectUnencryptedTreeConnect(h.EncryptionConfig.Mode, share, sess) {
-		logger.Info("TREE_CONNECT rejected: encrypted share requires encrypted session",
-			"shareName", shareName,
-			"encryptionMode", h.EncryptionConfig.Mode)
-		return NewErrorResult(types.StatusAccessDenied), nil
+	permission, generation, status := h.admitTreeConnect(ctx, sess, share)
+	if status != types.StatusSuccess {
+		return NewErrorResult(status), nil
 	}
 
 	// Create tree connection with permission
@@ -249,6 +215,50 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 	w.WriteUint32(maximalAccess)          // MaximalAccess
 
 	return NewResult(types.StatusSuccess, w.Bytes()), nil
+}
+
+// admitTreeConnect decides whether the session may connect to share, and with
+// which permission. It is the whole admission rule: TREE_CONNECT applies it,
+// and the srvsvc share list applies it per share so a session is shown only
+// what it could connect to. A second copy of these checks would be one that
+// can drift. It returns the permission capped for a read-only share, the
+// identity generation it was resolved against, and StatusSuccess when the
+// session is admitted or the status TREE_CONNECT answers with when it is not.
+func (h *Handler) admitTreeConnect(ctx *SMBHandlerContext, sess *session.Session, share *runtime.Share) (models.SharePermission, uint64, types.Status) {
+	// Refuse TREE_CONNECT on a disabled share. Matches
+	// MS-SMB2 2.2.9 — STATUS_NETWORK_NAME_DELETED is the spec error for a
+	// share that existed but is no longer available. The Enabled flag is
+	// flipped by shares.Service.DisableShare before restore; clients see
+	// the refusal and can re-TREE_CONNECT after re-enable.
+	if !share.Enabled {
+		logger.Warn("SMB TREE_CONNECT refused: share disabled",
+			"share", share.Name, "sessionID", ctx.SessionID)
+		return models.PermissionNone, 0, types.StatusNetworkNameDeleted
+	}
+
+	defaultPerm := models.ParseSharePermission(share.DefaultPermission)
+	permission, user, generation := resolveSharePermission(ctx, sess, share, defaultPerm, h.Registry.GetUserStore())
+	if permission == models.PermissionNone {
+		logger.Debug("Share access denied", "shareName", share.Name, "user", user)
+		return models.PermissionNone, generation, types.StatusAccessDenied
+	}
+
+	logger.Debug("Permission resolved for tree connect",
+		"shareName", share.Name,
+		"user", user,
+		"permission", permission)
+
+	permission = capReadOnlyShare(share, permission)
+
+	// Encryption enforcement: in required mode, reject unencrypted sessions
+	// connecting to encrypted shares.
+	if shouldRejectUnencryptedTreeConnect(h.EncryptionConfig.Mode, share, sess) {
+		logger.Info("TREE_CONNECT rejected: encrypted share requires encrypted session",
+			"shareName", share.Name,
+			"encryptionMode", h.EncryptionConfig.Mode)
+		return models.PermissionNone, generation, types.StatusAccessDenied
+	}
+	return permission, generation, types.StatusSuccess
 }
 
 // calculateMaximalAccess returns the SMB2 MaximalAccess mask based on share permission.
