@@ -4,11 +4,34 @@
 single connection can have several commands in flight, converting the per-command
 latency floor into throughput.
 
-**Why it matters (measured):** the adapter dispatches commands inline. At queue
-depth 16 the server reached 14,027 random-read IOPS against an engine that does
-~250,000 IOPS for the same 4 KiB read in-process. So ~94% of the random-read cost
-at depth is the serialization, not the storage. A warm cache hit costs ~115 µs on
-the wire and ~4 µs of actual work.
+**Why it matters (measured):** the adapter dispatches commands inline, one at a time
+in the connection loop. The numbers, and what they actually mean:
+
+| Measurement | Value |
+|---|---|
+| Live server, random 4K read, depth 1 | 847 IOPS → **1.18 ms per command** |
+| Live server, same, depth 16 | 14,027 IOPS → 16 in flight × 1.18 ms ≈ 13.5k, consistent with **serialized 1.18 ms** |
+| Handler over loopback TCP, in-memory store, serial | **17–51 µs per command** (20k–58k IOPS) |
+| Same, 4 concurrent connections | **73,000 IOPS aggregate** |
+| Engine's own `ReadAt`, 4 KiB | **3 µs** (333k IOPS) |
+| Reply header encode | 22 ns — negligible |
+
+**The correction this table forced on an earlier draft:** dispatch overhead is *not*
+1.17 ms. It is tens of microseconds. The 1.18 ms is the **store path** — and the point
+of pipelining is not to make dispatch cheaper, it is to stop **serializing that 1.18 ms**.
+
+That distinction matters because it changes the expected gain. A serialized 1.18 ms wait
+per command caps a single connection at ~847 IOPS no matter how fast the store is. With
+N in flight the cap becomes N/1.18 ms — but only if the 1.18 ms is mostly *waiting*
+(overlappable) rather than CPU (not). The loopback measurement bounds the dispatch path
+itself at ~73k IOPS with 4 concurrent connections, so dispatch is not the wall; the
+store's latency is, and overlapping it is exactly what a worker pool does.
+
+**What this does not claim:** that 4 concurrent connections and 4 in-flight commands per
+connection are equivalent. They are not — separate connections each pay their own
+handshake and the kernel's client-side queueing differs. The loopback number only shows
+that the dispatch code path can sustain ~73k IOPS when driven concurrently, which is the
+precondition for a pool helping.
 
 **Scope:** `internal/adapter/nbd/` only. No engine, metadata, or control-plane
 changes. No new protocol commands. `NBD_FLAG_CAN_MULTI_CONN` stays OFF.
@@ -232,10 +255,16 @@ number, since that is where serialization is the binding constraint. If both mov
 by the same amount, the change bought nothing and the real bottleneck is
 elsewhere — which is worth knowing before touching anything else.
 
-**Honest expectation:** sequential reads are capped by the 80 MiB/s device, so
-pipelining will barely move them. The gain should appear in random I/O and in
-fsync-heavy workloads. If it does not, the next thing to check is whether the
-store path has its own internal serialization.
+**A sharper test, added after measuring:** depth-1 should barely move. A serialized
+connection at depth 1 has one command in flight either way, so pipelining cannot help
+it; if the depth-1 number improves materially, the change is doing something other than
+what it claims and the measurement is not measuring the intended thing.
+
+**Honest expectation, revised by the measurements above:** sequential reads are capped
+by the 80 MiB/s device, so pipelining will barely move them. Random I/O at depth is
+where the gain should be, bounded above by the store's own throughput. If depth 16 does
+not move, the 1.18 ms is CPU-bound inside the store rather than latency-bound, and the
+next thing to check is the store's internal concurrency rather than this adapter.
 
 ---
 
