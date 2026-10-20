@@ -422,16 +422,19 @@ nested groups included, and the groups a directory or a verified PAC reports
 ### 2.6 Components, wiring and lifecycle
 
 One component, the **identity server**, holds the authenticator (§3), `Identities` (§4), the directory client
-and its cache (§5), and resolution with its caches (§6, §7). The composition root
-([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)) builds it
-once on each node that runs `protocol`, from one `Deps`. It builds no other component and closes nothing it was
+and its cache (§5), and resolution with its caches (§6, §7). `runtime.New`
+([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20runtime%20builds%20the%20node)) builds it
+once on every node, since every node runs both roles, from one `Deps`. It builds no other component and closes nothing it was
 handed. The root hands each consumer the one interface it calls:
 
 | Interface | Consumer | Handed as |
 | --- | --- | --- |
 | `Authenticator` (§3.1) | the adapters | `core.Deps.Auth` ([RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface)) |
 | `Identities` (§4.1) | the adapters | `core.Deps.Names` |
-| `Resolver` (§6.1) | the filesystem service | `vfs.Deps.Identity` ([RFC 17 §2.3](rfc-17-vfs.md#2.3%20Dependencies%20and%20wiring)) |
+| `Resolver` (§6.1) | `*vfs.Server` | `vfs.Deps.Identity` ([RFC 17 §2.3](rfc-17-vfs.md#2.3%20Dependencies%20and%20wiring)) |
+
+The gateway calls neither: it forwards the adapter's `Identity` as a value to
+the primary of the file's shard, whose `*vfs.Server` resolves it.
 
 ```go
 package identity // internal/identity
@@ -472,9 +475,10 @@ func (s *Server) Apply(gen uint64, cfg config.Identity) // from the runtime: a n
 func (s *Server) Close() error                         // drops every in-memory table
 ```
 
-**Start and stop.** The runtime starts it after it has loaded the records
-([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop) step 3) and before the filesystem service.
-It stops it after the filesystem service, because a drain still delivers calls that resolve. A failed start
+**Start and stop.** The runtime starts it in build order, with open state, after
+the metadata store, the engine and GC and before `*vfs.Server`
+([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)). It stops it after `*vfs.Server`, because a drain still
+delivers calls that resolve. A failed start
 closes what it opened, as RFC 23 §2.2 says.
 
 **Reconfiguration** arrives only through `Apply`, from the runtime's reconcile
@@ -567,7 +571,7 @@ type NTLMAuthenticate struct{ User, Domain, Workstation string; NTResponse, Encr
   ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer),
   [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)), writes only the records
   a first sign-in mints (§2.4, §5.1), through `Minter`, which never overwrites a record,
-  and **(cluster)** runs on the `protocol` node that holds the connection.
+  and **(cluster)** runs on the node that holds the connection.
 - **A proof is bound to one principal for its life.** Before it returns a
   proof, the authenticator **MUST** map it to a principal and set
   `Principal`: a local NTLM user by the record it verified against, a
@@ -599,7 +603,7 @@ type NTLMAuthenticate struct{ User, Domain, Workstation string; NTResponse, Encr
   **MUST NOT** carry the credential — no response, ticket, hash or session key.
 
 > ponytail: throttling is in memory, per node. A restart forgets it, each
-> `protocol` node counts alone, and a guesser who spreads one name across many
+> node counts alone, and a guesser who spreads one name across many
 > addresses, or many names across one, stays under it. Keep the counts in the
 > metadata store, or add a per-address limit across names, when the logon
 > stream shows a spray that this rule did not slow.
@@ -649,7 +653,7 @@ Both call `AcceptKerberos`.
 
 - **Service names.** The installation accepts tickets for the service names
   its keytab holds — `nfs/<host>` for NFS, `cifs/<host>` for SMB, and `host/<host>`
-  for either — for every host name a `protocol` node answers on. A ticket for
+  for either — for every host name a node answers on. A ticket for
   any other name **MUST** be refused.
 - **The keytab is a secret.** Each key is a `Secret` record of kind keytab,
   sealed under the `protocol` wrapping key
@@ -664,7 +668,7 @@ Both call `AcceptKerberos`.
   rule [RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in) states.
 
 > ponytail: the replay cache is in memory, per process. A restart forgets it, so an AP-REQ captured within
-> `identity.clock_skew` before a restart can be accepted once after it, and **(cluster)** each `protocol` node
+> `identity.clock_skew` before a restart can be accepted once after it, and **(cluster)** each node
 > keeps its own. A replay yields no session key, so it can sign no SMB request and compute no RPCSEC_GSS
 > verifier. Refuse authenticators stamped before the process start, or share the cache between nodes, when a
 > replay across a restart or a fail-over is shown to reach anything.
@@ -696,7 +700,7 @@ group SIDs and their attributes, signed by the domain controller.
 
 > decision: only the PAC's server signature is verified; the KDC signature is not sent to a domain controller.
 > A forged PAC needs the service key, which the keytab's seal protects. Overturned if the keytab is ever readable
-> outside the `protocol` role, or a deployment requires KDC-signature checks.
+> without the `protocol` wrapping key, or a deployment requires KDC-signature checks.
 - The proof's `SIDs` are the user SID and every group SID the PAC lists:
   its group memberships, extra SIDs and resource groups, excluding any whose
   attributes mark them disabled and any marked `SE_GROUP_USE_FOR_DENY_ONLY`.
@@ -1023,7 +1027,7 @@ finished fails whole (§2.5):
 ![Directory lookup: a lookup first checks the node's cache; an entry younger than the TTL is used; an older one triggers a directory query; when the directory answers, the entry is refreshed, or a not-found answer is cached briefly; when it fails or times out, an entry younger than the stale grace is used and counted, and anything else is refused](img/rfc18-directory.svg)
 
 The identity server keeps one cache of directory answers, in memory;
-**(cluster)** one per `protocol` node.
+**(cluster)** one per node.
 
 - A positive answer is fresh for `identity.directory_ttl` (default
   5 minutes). A "no such entry" answer is fresh for
@@ -1078,7 +1082,7 @@ which is the store's, takes effect within §7.2's bound regardless.
 
 Resolution is admission's step 4
 ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)). It
-runs in the filesystem service on every call, after the share's state,
+runs in `*vfs.Server`, at the primary, on every call, after the share's state,
 flavour and client rules have admitted the call, and before `Authorize`:
 
 1. **Map** the `Identity` to a principal: an authenticated proof by the
@@ -1106,7 +1110,7 @@ type Identity struct {
 	Client   netip.Addr
 }
 
-// Resolver is admission's step 4 (RFC 17 §4.9); the front is its only caller.
+// Resolver is admission's step 4 (RFC 17 §4.9); *vfs.Server is its only caller.
 type Resolver interface {
 	Resolve(ctx context.Context, id Identity, share metadata.ShareID) (*Caller, error)
 }
@@ -1131,7 +1135,7 @@ type Caller struct {
 }
 ```
 
-Resolution answers with RFC 17 §4.3's errors, mapped at the front: `ErrAccess`
+Resolution answers with RFC 17 §4.3's errors, mapped by `*vfs.Server`: `ErrAccess`
 for a disabled or deleted principal, a deleted `Anonymous`, or a principal over
 the group cap; `ErrUnavailable` for an undecidable lookup or an incomplete
 closure. An expired proof never reaches it, because the adapter's `auth` layer
@@ -1473,7 +1477,7 @@ squash × grant × machine) against a fake `Principals`.
 | 0, now | fixed in today's code: no default uid (allocate), the bootstrap admin without uid 0, no guest on a failed or unparsable session setup, plain LDAP refused | the 1000 default; `root_to_admin`, `all_to_admin` |
 | 1 | the `pkg/identity` contract (§2.7) and allocation on RFC 16's uid, gid and RID counters; today's uid-derived SIDs written once as stored values, so no SID changes (ID4) | RID derivation from a uid |
 | 2 | the authenticator: Kerberos and NTLM behind `Authenticator`, logon events, the throttle | the five-domain NTLM retry; the RPCSEC_GSS "unmapped → nobody" path |
-| 3 | resolution in the front ([RFC 17 §9](rfc-17-vfs.md#9.%20Migration) slice 2), squash `none`/`root`/`all`, stored `none` grants | the NFS share-permission resolver, the NFSv3 auth-context cache, SID share permissions, `default_permission` |
+| 3 | resolution in `*vfs.Server` ([RFC 17 §9](rfc-17-vfs.md#9.%20Migration) slice 2), squash `none`/`root`/`all`, stored `none` grants | the NFS share-permission resolver, the NFSv3 auth-context cache, SID share permissions, `default_permission` |
 | 4 | the directory cache with stale grace; `Identities` with owner strings by name | the resolver cache's error TTL |
 
 ## 13. Open questions
