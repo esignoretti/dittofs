@@ -39,7 +39,7 @@
   <rect x="24" y="192" width="210" height="72" rx="6" class="pr"/>
   <text x="36" y="211" class="h">Unconfirmed</text>
   <text x="36" y="228" class="s">SETCLIENTID or EXCHANGE_ID not</text>
-  <text x="36" y="243" class="s">yet confirmed; held at the front of</text>
+  <text x="36" y="243" class="s">yet confirmed; held in open state on</text>
   <text x="36" y="258" class="s">the node that answered (§2.9)</text>
   <path d="M129,190 L129,174" class="cb"/>
   <text x="136" y="186" class="s">confirm: Connect</text>
