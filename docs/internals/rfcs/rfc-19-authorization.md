@@ -224,8 +224,8 @@ functions in the adapters' shared translation package
 ([RFC 20 §2.5](rfc-20-adapters.md#2.5%20Architecture%20and%20package%20layout)),
 handed RFC 18's mapping per call (§12, item 7). Every stateful input — the
 principal mapping, the share grant, the audit policy — is another RFC's, built
-by the composition root
-([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)),
+by the node
+([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components)),
 and reaches a decision through the caller or the file's record. The audit policy
 is the exception: the service applies it to the decision the chokepoint returns.
 
