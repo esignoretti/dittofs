@@ -15,13 +15,13 @@
 <text x="16" y="26" class="t">Who builds, owns, starts and closes what: solid arrows own or call, dashed arrows lend through Deps.</text>
 
 <rect x="20" y="40" width="860" height="48" rx="5" class="k"/>
-<text x="34" y="60" class="h">composition root (RFC 15 §2.4) builds and owns; the runtime (RFC 23 §2.2) starts, stops and sets shares</text>
-<text x="34" y="78" class="s">start: store → syncer → carver → engine.Start(shares) → GC → open state → vfs.Server → adapters · stop in reverse</text>
+<text x="34" y="60" class="h">node.New (RFC 23 §2.1) builds and owns; the node (RFC 23 §2.2) starts, stops and sets shares</text>
+<text x="34" y="78" class="s">start: store → remotes → journal → syncer → engine.Start(shares) → GC → open state → identity → vfs.Server → adapters; stop reverses</text>
 
 <path d="M170 90V106" class="arr"/><path d="M450 90V106" class="arr"/><path d="M730 90V106" class="arr"/>
 
 <rect x="20" y="108" width="300" height="58" rx="5" class="p"/>
-<text x="32" y="128" class="h">runtime (RFC 23 §2.1, §2.2)</text>
+<text x="32" y="128" class="h">node (RFC 23 §2.1, §2.2)</text>
 <text x="32" y="144" class="s">starts and stops the engine, sets and</text>
 <text x="32" y="158" class="s">stops shares, pre-warm pages, upload drain</text>
 
@@ -45,7 +45,7 @@
 <text x="608" y="201" class="s">and the other content methods (§12.1)</text>
 
 <rect x="20" y="218" width="860" height="234" rx="5" class="data"/>
-<text x="34" y="240" class="h">*engine.Engine (RFC 8): built by New(Deps), which opens nothing; started and stopped by the runtime</text>
+<text x="34" y="240" class="h">*engine.Engine (RFC 8): built by New(Deps), which opens nothing; started and stopped by the node</text>
 
 <rect x="36" y="252" width="404" height="190" rx="4" class="ext"/>
 <text x="48" y="272" class="h">engine-wide, owned by the engine</text>

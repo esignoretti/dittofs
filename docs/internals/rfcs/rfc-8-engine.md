@@ -708,7 +708,7 @@ can land.
 
 ### 2.6 Dependencies and wiring
 
-![Who builds, owns, starts and closes what: the composition root builds and owns the metadata store, the carver, the cut gate, the syncer, the ref-counted remote block stores, the clock and the filesystem service; the runtime starts and stops the engine and sets and stops its shares, the snapshot cut calls PrepareCut and CommitCut, and the filesystem service alone calls the content methods; the root lends the store's views, the carver, the cut gate, the syncer and the clock to the engine through Deps, and the remote block stores are reached only through the syncer's flows; the engine opens and owns the journals, one work queue per journal, the offload passes and a share table whose contexts each own their journal handles and a syncer flow; the engine moves from New, which opens nothing, through Start with its shares, serving with SetShare, StopShare and ForgetShare, to Close, and closes only what it opened](img/rfc8-composition.svg)
+![Who builds, owns, starts and closes what: the composition root builds and owns the metadata store, the carver, the cut gate, the syncer, the ref-counted remote block stores, the clock and the filesystem service; the node starts and stops the engine and sets and stops its shares, the snapshot cut calls PrepareCut and CommitCut, and the filesystem service alone calls the content methods; the root lends the store's views, the carver, the cut gate, the syncer and the clock to the engine through Deps, and the remote block stores are reached only through the syncer's flows; the engine opens and owns the journals, one work queue per journal, the offload passes and a share table whose contexts each own their journal handles and a syncer flow; the engine moves from New, which opens nothing, through Start with its shares, serving with SetShare, StopShare and ForgetShare, to Close, and closes only what it opened](img/rfc8-composition.svg)
 
 `node.New` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components)) builds the engine with `New(Deps)`. `New`
 validates the settings and opens nothing; the engine closes only what it opens:
@@ -1835,7 +1835,7 @@ names. It plans; the syncer's fetcher executes ([RFC 3 §4.5](rfc-3-syncer.md#4.
 still decides whether each fetched extent fills ([§7.3](#7.3%20Filling%20is%20a%20decision)).
 
 **Inputs:** each read's `(file, off, len, time)`; pre-warm pages, each one
-`PreWarm` call's list of files, which the runtime enumerated from a share or a
+`PreWarm` call's list of files, which the node enumerated from a share or a
 subtree and pages ([RFC 23 §4.6](rfc-23-control-plane.md#4.6%20Long-running%20operations)); the share's speculation budget; the journal's
 free capacity and the write low-water mark. **Output:** fetch hints —
 `(file, block)` — each labelled speculation, and cancellations of hints not yet
@@ -1858,7 +1858,7 @@ labelled speculation, and cancellations, to the syncer's `Prefetch`.
   its window.
 - **S4 — it is memory only.** A frontier lost to a restart is relearnt from the
   next reads; a pre-warm page that fails or is cancelled is re-issuable, and
-  the runtime counts the pages done.
+  the node counts the pages done.
 - **S5 — speculation fetches only what the journal does not hold.** A
   speculative fetch **MUST NOT** be issued for a block whose every byte the
   journal holds. For a block it holds in part, the fetch asks only for the
@@ -1886,14 +1886,14 @@ a window.
 it never holds the share's demand reads.
 
 > **Example — pre-warming a directory.** An operator pre-warms
-> `/datasets/train`, 10⁴ files of 64 KiB, with a budget of 2 GiB. The runtime
+> `/datasets/train`, 10⁴ files of 64 KiB, with a budget of 2 GiB. The node
 > enumerates the files and hands them to `PreWarm` a page at a time; the
 > speculator plans
 > by block, not by file: packed small files share blocks ([RFC 2 §5](rfc-2-carver.md#5.%20The%20block%20assembler)), so the
 > 10⁴ files resolve to about 160 whole-block fetches at a 4 MiB block target. It
 > issues them within the budget; the fetched blocks fill. When free capacity
 > falls to the low-water mark, it pauses; when a write meets pacing, it cancels
-> its queued hints. The runtime reports the pages done so far, and a re-issued
+> its queued hints. The node reports the pages done so far, and a re-issued
 > pre-warm skips files the journal already holds.
 
 **Proposal:** pre-warm fills only while free capacity is above the write
@@ -2597,7 +2597,7 @@ caller's deadline answers retry-later: `ErrDelay` with the cause `DelayConflict`
 The engine **MUST** report, per share and summed: dirty bytes, the drain rate
 over a recent window, and the time to drain at that rate; and **MUST** offer
 `WaitOffloaded`, which returns once every byte written to the node before the
-call is offloaded: the runtime's upload drain uses it. A benchmark of the write
+call is offloaded: the node's upload drain uses it. A benchmark of the write
 path **MUST** stop its clock at that wait, not at the last acknowledgement ([§15.4](#15.4%20Benchmarks)).
 
 The engine **MUST** also report the age of the oldest unoffloaded extent each
@@ -2614,7 +2614,7 @@ The engine is one concrete type, `*Engine`; nothing declares it as an
 interface. The filesystem service's per-file part, at the file's primary, is
 the only caller of the content methods ([RFC 17 §2.1](rfc-17-vfs.md#2.1%20What%20runs%20where)); adapters never reach
 the engine. The lifecycle, share and control methods are node-local. Their
-callers are the runtime ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components), [§2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)), which starts and stops the
+callers are the node ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components), [§2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)), which starts and stops the
 engine, sets and stops shares and runs pre-warm and the upload drain; a share's
 removal ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)); and the snapshot cut ([RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate)).
 
@@ -2663,11 +2663,11 @@ package engine // pkg/block/engine
 // New validates d (§2.6) and builds the engine. It opens nothing and starts no goroutine.
 func New(d Deps) (*Engine, error)
 
-// Lifecycle: called by the runtime (RFC 23 §2.2), never by the filesystem service.
+// Lifecycle: called by the node (RFC 23 §2.2), never by the filesystem service.
 func (e *Engine) Start(ctx context.Context, shares []Share) error // §2.5 steps 1–8 over these shares; all or nothing
 func (e *Engine) Close(ctx context.Context) error                // §2.5 Stop; before the syncer and the store close
 
-// Shares: called by the runtime (RFC 23 §2.1) and by a share's removal (RFC 16 §2.3.2).
+// Shares: called by the node (RFC 23 §2.1) and by a share's removal (RFC 16 §2.3.2).
 func (e *Engine) SetShare(ctx context.Context, s Share) error                     // attach above the floor, or apply a change: state, sync policy, write namespace, backends
 func (e *Engine) StopShare(ctx context.Context, id ShareID, keepHolds bool) error // removal step 3: refuse, join; with keepHolds, offload what kept snapshots' holds cover
 func (e *Engine) ForgetShare(ctx context.Context, id ShareID) error               // after every shard's step 3: Close the handle, Forget the tag, close the flow
