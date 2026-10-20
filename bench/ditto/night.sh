@@ -117,9 +117,9 @@ EOF
         dfsctl share permission grant /perf --user "$PERF_USER" --level read-write
         dfsctl adapter edit smb --port "$PORT_DFS" --enabled true \
             --config "{\"bind_address\":\"127.0.0.1\",\"encryption\":{\"encryption_mode\":\"disabled\"}}"
-    ' setup "$admin" "$data" "$first" >>"$RES/dfs-setup.log" 2>&1
+    ' setup "$admin" "$data" "$first" >>"$RES/dfs-setup.log" 2>&1 9<&-
     env HOME="$RUN" XDG_CONFIG_HOME="$RUN/config" XDG_STATE_HOME="$RUN/state" \
-        setsid "$WORK/build/bin/dfs" start --foreground --config "$RUN/config.yaml" >>"$RES/dfs.log" 2>&1 </dev/null &
+        setsid "$WORK/build/bin/dfs" start --foreground --config "$RUN/config.yaml" >>"$RES/dfs.log" 2>&1 </dev/null 9<&- &
     echo "$!" >"$RUN/pid"
     # Up to three minutes: the start waits for the block store's first probe, ten attempts with backoff.
     wait_port "$PORT_DFS" 280
@@ -133,17 +133,21 @@ start_samba() {
     mkdir -p "$WORK/samba/private" "$WORK/samba/lock" "$WORK/samba/state" "$WORK/samba/cache" "$WORK/samba/run" "$DATA/samba"
     chown "$PERF_USER:" "$DATA/samba"
     printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | smbpasswd -c "$HERE/smb.conf" -s -a "$PERF_USER" >/dev/null
-    setsid smbd --foreground --no-process-group --configfile="$HERE/smb.conf" >>"$RES/smbd.out" 2>&1 </dev/null &
+    setsid smbd --foreground --no-process-group --configfile="$HERE/smb.conf" >>"$RES/smbd.out" 2>&1 </dev/null 9<&- &
     echo "$!" >"$RUN/pid"
     wait_port "$PORT_SAMBA" 60
 }
 
-# start TARGET: a fresh server for TARGET (dittofs or samba), its share mounted on DIR.
+# start TARGET: a fresh server for TARGET (dittofs or samba), its share mounted on DIR. The servers
+# don't keep the lock's descriptor (9), so one that outlived the run could not hold the lock.
 start() {
     local port=$PORT_DFS p
     for p in "$PORT_API" "$PORT_DFS" "$PORT_SAMBA" "$PORT_DEAD"; do
         ! listening "$p" || { log "port $p is in use"; return 1; }
     done
+    # The host is shared: a target needs room for its data and the journal's dead data with some to spare.
+    p="$(df --output=avail -BG "$DATA" | tail -1 | tr -dc 0-9)"
+    test "$p" -ge "${MIN_FREE_GB:-80}" || { log "only ${p} GiB free on $DATA"; return 1; }
     mkdir -p "$RUN" "$RES" "$DIR"
     chmod 700 "$RUN"
     if test "$1" = samba; then port=$PORT_SAMBA && start_samba; else start_dittofs; fi
