@@ -343,3 +343,32 @@ one command in flight, the client's queue depth becomes a queue of waits.
 (measured above at ~114k IOPS in-process) rather than the 14k the serial loop
 reaches — bounded on the real host by its 2 vCPUs and S3 latency, so a 2–4× gain
 is the realistic expectation there, not 8×.
+
+---
+
+## The measurement that proves the ceiling is serialization
+
+Taken on the live 2-vCPU host after the chunk-size fix, reads only, against the
+4 GiB boot volume, each run 20 s with the read buffer warmed first:
+
+| queue depth | random 4K read IOPS |
+|---|---|
+| 1 | 5,328 |
+| 8 | 8,880 |
+| 16 | 8,955 |
+| 32 | 9,245 |
+| 64 | 8,918 |
+
+**Depth 8 through 64 are the same number.** If the server could use the queue,
+each doubling of depth would move throughput. Instead it flatlines at ~9,000 while
+depth-1 already reaches 5,300 — the signature of a dispatcher that serves one
+command at a time, so the client's queue is just a queue of waits.
+
+This is the case for the change, stated as a falsifiable prediction: **after
+pipelining, depth 32 must exceed depth 8 by a wide margin.** If it does not, the
+bottleneck moved into the store and this plan's premise was wrong.
+
+For contrast, the same volume before the chunk-size fix measured 847 IOPS at
+depth 1 — so chunk sizing was the bigger single win (6.3× at depth 1) and is
+already applied. Pipelining is what remains, and it is worth roughly the 9,000
+ceiling versus the ~114,000 the engine reaches concurrently in-process.
