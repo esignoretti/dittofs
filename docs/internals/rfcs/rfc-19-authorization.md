@@ -638,8 +638,12 @@ entry has effect only while object-access auditing is on.
 
 A cached decision is keyed as
 [RFC 7 §7.5](rfc-7-namespace-metadata.md#7.5%20A%20cached%20decision%20is%20keyed%20by%20everything%20it%20read)
-says. This RFC adds no input to a decision beyond the caller (its whole `Key`),
-the file's record, `via`'s record and the share's grant list. The audit policy
+says. This RFC adds no input to a decision beyond the request (its mapped
+rights and whether it asked maximum allowed or system security), the caller (its
+whole `Key`), the file's record, `via`'s record and the share's grant list. The
+outcome and the audit selection both read the request: one caller granted read
+and write, under a successful-read audit entry, is selected for a read and not
+for a write. The audit policy
 is applied after the decision, by the service, and is in no key of it.
 
 ## 4. Mode and ACL
@@ -853,10 +857,12 @@ type NFSv4ACE struct {
 type Normalised struct{ MaskBits, EntryFlags, DeletedPrincipals, NullDACL int }
 
 // owner, group: the file's before the set (§6.3). a holds only the lists the caller may read (§3.5).
+// p: the parts the request's security-information bits name; for a CREATE's descriptor, the parts it holds (§6.1).
+// flags: the list's aclflag4 for dacl and sacl; zero for acl, which carries none (§7.1).
 func DescriptorFromACL(a metadata.ACL, owner, group metadata.Principal, p metadata.ACLParts, sp Spelling) ([]byte, error)
-func ACLFromDescriptor(sd []byte, owner, group metadata.Principal, sp Spelling) (metadata.ACLSet, Normalised, error)
-func NFSv4FromACL(a metadata.ACL, attr Attr, sp Spelling) (v []NFSv4ACE, sidWhos int, err error)
-func ACLFromNFSv4(v []NFSv4ACE, attr Attr, owner, group metadata.Principal, sp Spelling) (metadata.ACLSet, Normalised, error)
+func ACLFromDescriptor(sd []byte, owner, group metadata.Principal, p metadata.ACLParts, sp Spelling) (metadata.ACLSet, Normalised, error)
+func NFSv4FromACL(a metadata.ACL, attr Attr, sp Spelling) (v []NFSv4ACE, flags uint32, sidWhos int, err error)
+func ACLFromNFSv4(v []NFSv4ACE, flags uint32, attr Attr, owner, group metadata.Principal, sp Spelling) (metadata.ACLSet, Normalised, error)
 ```
 
 A set names the parts it changes (`metadata.ACLSet`: owner, group, each list's
@@ -942,8 +948,9 @@ cannot match one after it, so no request is answered differently.
 The rights are asked of the chokepoint through the open the request came on
 ([RFC 17 §4.6](rfc-17-vfs.md#4.6%20One%20chokepoint)), so the open's grant
 decides, as Windows' set-security does. A query returns only the parts its
-security-information bits ask for. A set changes only the parts it names, and
-the parts it names change together, in one transaction, with `Mode` (§4.3).
+security-information bits ask for. A set changes only the parts its
+security-information bits name, whatever else the descriptor holds, and the parts
+it names change together, in one transaction, with `Mode` (§4.3).
 
 An owner or group SID on a set resolves through RFC 18 like any SID. One that
 cannot be resolved is refused `ErrInvalid`; it is never ignored with the rest of
@@ -951,12 +958,16 @@ the set applied.
 
 A descriptor sent with a `CREATE` (the `SecD` context) is the new file's ACL,
 owner and group, set under the same rules in the create's transaction, in place
-of the inherited ACL.
+of the inherited ACL. It carries no security-information bits, so its parts are
+those it holds; a part it does not hold is the one the create would give.
 
 The descriptor's own flags map to §2.6's. `SE_DACL_PRESENT` with no DACL is the
-null DACL of §2.6. The protected and unprotected security-information bits
-(`PROTECTED_DACL_SECURITY_INFORMATION` and its siblings) set or clear the
-protected flag of the list they name.
+null DACL of §2.6. The protected flag of a list is its descriptor's
+`SE_DACL_PROTECTED` or `SE_SACL_PROTECTED` control bit, set or clear, for a list
+the set names. The protected and unprotected security-information bits
+(`PROTECTED_DACL_SECURITY_INFORMATION` and its siblings) are an API's, which the
+client turns into that control bit; they are not among the bits a set request
+carries (MS-SMB2 2.2.39).
 
 ### 6.2 Entries
 
@@ -1265,7 +1276,7 @@ server.
 | §2.6 null DACL | Set a null DACL: assert everyone granted, and one allow-everyone entry read back. |
 | §2.8 lookup failure | Fail the principal lookup once, with an error other than `ErrUnknownPrincipal`, during an SMB set naming a SID: assert the set refused with that error, not `ErrInvalid`, and the stored ACL unchanged. |
 | Z1, §2.4 masks | Set over NFSv4 an allow whose mask holds generic read, `0x200`, `0x01000000` and a reserved bit: assert the stored mask is generic read's entry rights only, and the clearing counted. |
-| Z9 | For every principal kind RFC 18 can mint, and every well-known row, read a one-entry ACL over both protocols: assert no error and no entry missing. |
+| Z9 | For every principal kind an entry can name (§5.2), and every well-known row, read a one-entry ACL over both protocols: assert no error and no entry missing. |
 | Z11 | Set a directory's DACL over SMB with the auto-inherit request, and its `acl` over NFSv4: assert every child's `Version` unchanged. |
 
 **What must not stand in.** A round trip through the translation alone, without
