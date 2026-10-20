@@ -98,7 +98,10 @@ func (h *Handle) Reserve(n int64, writes int) (*Reservation, error) {
 // WriteAt draws a new content version and returns it. It reserves its record
 // bytes before accepting them; a refusal is a NoSpaceError naming LimitShare,
 // LimitJournal, LimitIndex, LimitVersion or LimitSpare, returned at once with
-// no byte written. It does not draw on the headroom.
+// no byte written. It does not draw on the headroom, but once less than half
+// the headroom remains it is refused with a NoSpaceError naming
+// LimitHeadroom, so what remains serves the records that return space. A
+// write through a Reservation is exempt.
 //
 // It takes the file append domain, in which its version is assigned, then
 // capacity, the file index and the segment's append domain.
@@ -142,7 +145,8 @@ func (h *Handle) ReadAt(id FileID, off int64, p []byte) (n int, missing []Extent
 // Fill is refused with ErrStaleFill, writing nothing, when the file changed
 // after asOf, the change version ReadAt returned. It reserves its record bytes
 // as WriteAt does, refused by a NoSpaceError naming LimitShare, LimitJournal,
-// LimitIndex or LimitSpare. Its absence check and its write are one step in
+// LimitIndex or LimitSpare, and, like WriteAt, by one naming LimitHeadroom
+// once less than half the headroom remains. Its absence check and its write are one step in
 // the file append domain, atomic with respect to WriteAt on the same file.
 func (h *Handle) Fill(id FileID, off int64, p []byte, asOf Version, v Version) error {
 	return ErrNotImplemented

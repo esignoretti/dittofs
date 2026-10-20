@@ -5,10 +5,12 @@ package journalv2
 // belongs, for as long as any segment holds one of its records, to the tag of
 // its records.
 //
-// floor is the share's version floor: the highest content version recorded
-// for any file of the share. Before it returns, Share raises the journal's
-// version counter above floor, so no write through the handle is given a
-// version below one the share's files already hold.
+// floor is the larger of the share's version floor, the highest content
+// version recorded for any file of the share, and the share's durable version
+// limit. Before it returns, Share raises the journal's version counter above
+// floor, so no write through the handle is given a version below one the
+// share's files already hold, nor one issued before a crash whose record was
+// lost.
 //
 // limit bounds the record bytes of the share's records on disk; zero means no
 // limit below the journal's maximum, and a negative limit is refused with
