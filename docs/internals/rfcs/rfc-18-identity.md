@@ -422,8 +422,8 @@ nested groups included, and the groups a directory or a verified PAC reports
 ### 2.6 Components, wiring and lifecycle
 
 One component, the **identity server**, holds the authenticator (§3), `Identities` (§4), the directory client
-and its cache (§5), and resolution with its caches (§6, §7). `runtime.New`
-([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20runtime%20builds%20the%20node)) builds it
+and its cache (§5), and resolution with its caches (§6, §7). `node.New`
+([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components)) builds it
 once on every node, since every node runs both roles, from one `Deps`. It builds no other component and closes nothing it was
 handed. The root hands each consumer the one interface it calls:
 
@@ -471,18 +471,18 @@ type Minter interface {
 // Authenticator, Identities and Resolver; only the composition root holds it.
 func New(d Deps, s config.Identity) (*Server, error)
 func (s *Server) Start(ctx context.Context) error        // loads the keytab's versions; the directory client dials lazily, so a down directory does not fail start
-func (s *Server) Apply(gen uint64, cfg config.Identity) // from the runtime: a new principals generation, identity settings, the directory record (§7.2)
+func (s *Server) Apply(gen uint64, cfg config.Identity) // from the node: a new principals generation, identity settings, the directory record (§7.2)
 func (s *Server) Close() error                         // drops every in-memory table
 ```
 
-**Start and stop.** The runtime starts it in build order, with open state, after
+**Start and stop.** The node starts it in build order, with open state, after
 the metadata store, the engine and GC and before `*vfs.Server`
 ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)). It stops it after `*vfs.Server`, because a drain still
 delivers calls that resolve. A failed start
 closes what it opened, as RFC 23 §2.2 says.
 
-**Reconfiguration** arrives only through `Apply`, from the runtime's reconcile
-([RFC 23 §2.3](rfc-23-control-plane.md#2.3%20The%20runtime%20reconciles%3B%20it%20does%20not%20take%20orders)):
+**Reconfiguration** arrives only through `Apply`, from the node's reconcile
+([RFC 23 §2.3](rfc-23-control-plane.md#2.3%20The%20node%20reconciles%3B%20it%20does%20not%20take%20orders)):
 
 | Change | Effect |
 | --- | --- |
@@ -738,7 +738,7 @@ NTLMv1 and LM are refused ([RFC 22 §4.1](rfc-22-smb.md#4.1%20Signing%20in)).
   ([RFC 23 §4.6](rfc-23-control-plane.md#4.6%20Long-running%20operations)). The
   authenticator refuses NTLM from the `Apply` that delivers the setting (§2.6),
   not from its commit. Until that `Apply`, a node may still verify against a
-  hash the deletion has not reached: a window of one runtime read, the same one
+  hash the deletion has not reached: a window of one reconcile read, the same one
   a disable has (ID13).
 - A local user with no NT hash **MUST** fail `ErrLogonFailure`; it never falls
   through to pass-through or to anonymous.
@@ -1296,8 +1296,8 @@ the same transaction: the `PGEN` key, kind 0x3B
 ([RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)). Every cached mapping and caller carries the generation
 it was built under.
 
-- The runtime reads the principals generation once a second
-  ([RFC 23 §2.3](rfc-23-control-plane.md#2.3%20The%20runtime%20reconciles%3B%20it%20does%20not%20take%20orders))
+- The node reads the principals generation once a second
+  ([RFC 23 §2.3](rfc-23-control-plane.md#2.3%20The%20node%20reconciles%3B%20it%20does%20not%20take%20orders))
   and hands each new value to the identity server (`Apply`, §2.6), which does
   not poll the store itself. An entry built under an older generation is not
   served after the `Apply` that delivers the new one.
@@ -1394,7 +1394,7 @@ and grants. Their sign-in — passwords, tokens, roles, sessions — is
 | ID10 | A squashed caller carries nothing of the principal it replaced. | §6.2 squash drops SIDs |
 | ID11 | A group closure is used whole or not at all. | §2.5 group cap |
 | ID12 | A directory answer is used no longer than the TTL plus the grace after it was given, read directly or through any cache derived from it. | §5.3 stale grace; §7.1 directory deadline |
-| ID13 | A disabled or deleted local principal is refused on every call admitted after the first principals-generation read that follows the change; the runtime reads it at most 1 s apart (§7.2). | §7.2 disable takes effect |
+| ID13 | A disabled or deleted local principal is refused on every call admitted after the first principals-generation read that follows the change; the node reads it at most 1 s apart (§7.2). | §7.2 disable takes effect |
 | ID14 | Adapters map, squash and grant nothing; every spelling they show or read goes through `Identities`. | the import test of [RFC 20 §7.1](rfc-20-adapters.md#7.1%20Imports%20and%20call%20sites): no adapter imports `internal/identity` or a store view |
 | ID15 | A security context acts as the principal its sign-in bound it to, for its whole life; its name is never mapped again. | §3.1 binding |
 | ID16 | An unlinked machine principal acts on files as `Anonymous`: never `authenticated`, and no share grant names it. | §2.4 machines |
@@ -1443,7 +1443,7 @@ with the directory and KDC as local test services.
 | §6.2 squash drops SIDs | On a share with `Squash = all`, a Kerberos caller whose PAC carries `Finance` reads a file whose ACL grants `Finance` only: assert refused. On `Squash = none`: assert granted. | a squash that kept the SIDs |
 | §6.5 admin needs proof | A share grant names uid 1500 `admin`. Over `AUTH_SYS` as uid 1500, read a mode-0600 file of another user: assert refused. Give the same user's principal a Kerberos name; over `sec=krb5`: assert granted. Put `S-1-5-32-544` in a test PAC for a non-admin: assert not `admin`. | `admin` derived from a uid or a SID |
 | §8 roles grant nothing | [RFC 23 §12](rfc-23-control-plane.md#12.%20Conformance)'s §5.1 check, which also asserts that the account holds no spelling | — |
-| §7.2 disable takes effect | bob holds an SMB open and an NFS GSS context; make one call on each and assert a cache hit. Disable bob, and before the generation is applied, assert the next call is still served from the cache. Apply it (fake clock and the runtime's read); assert every call from both is refused. | a cached resolution outliving a disable |
+| §7.2 disable takes effect | bob holds an SMB open and an NFS GSS context; make one call on each and assert a cache hit. Disable bob, and before the generation is applied, assert the next call is still served from the cache. Apply it (fake clock and the node's read); assert every call from both is refused. | a cached resolution outliving a disable |
 | §2.5 group cap | A principal in `identity.max_groups` + 1 groups: assert refused, never resolved with fewer. A nested group whose read fails mid-closure: assert the call fails. | truncated group lists |
 | §4.5 owner strings | Over `sec=krb5`, `chown` to `alice@corp.example` and to `alice@other.example`: assert success then `NFS4ERR_BADOWNER`. Over `AUTH_SYS`, `GETATTR`: assert numeric owners. A file owned by a deleted user: assert `nobody@…` and, over SMB, `S-1-0-0`. | names mapped by guesswork |
 | §3.4 PAC | A ticket whose PAC server signature is corrupted: assert the sign-in fails. A ticket with no PAC for a user in a store group: assert the group applies. | an unverified PAC trusted |
@@ -1458,7 +1458,7 @@ with the directory and KDC as local test services.
 | §3.1 expiry | Over `sec=krb5`, keep a context open past its ticket's `Expires`: assert the next request is refused with the expired-credential answer. | a context served past its ticket |
 | §3.3 replay | Send the same AP-REQ twice: assert the second refused, outcome `replay`. | no replay cache |
 | §3.2 `ManageGIDs` | On a share with `ManageGIDs`, a user in 20 store groups calls over `AUTH_SYS`: assert a file whose ACL grants only the 20th group is granted. | groups capped at the credential's 16 |
-| §3.5 NTLM off | Hold an NTLM session, then turn `identity.ntlm` off and apply it (fake clock and the runtime's read): assert its next call and a fresh NTLM sign-in refused, and once the deletion operation ends, no NT hash in the store. | an NTLM context outliving the setting; hashes left behind |
+| §3.5 NTLM off | Hold an NTLM session, then turn `identity.ntlm` off and apply it (fake clock and the node's read): assert its next call and a fresh NTLM sign-in refused, and once the deletion operation ends, no NT hash in the store. | an NTLM context outliving the setting; hashes left behind |
 | §5.1 TLS | A directory record asking for plain LDAP: assert refused at validation. | a bind credential sent in clear |
 | §5.2 one query per key | 100 concurrent lookups of one key against a counting fake directory: assert 1 query. | a sign-in storm multiplied per connection |
 | §4.4 anonymous lookup | Over an anonymous session on `IPC$`, `LookupSids` of an unminted directory SID: assert no record written. | an unauthenticated caller minting principals |
