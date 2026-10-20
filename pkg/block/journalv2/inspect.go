@@ -31,6 +31,9 @@ func (in Inspector) Segments() []SegmentInfo {
 
 // Verify checks the index against the segments and reports what does not
 // agree. It reports and never repairs: repair is a separate, explicit action.
+//
+// Verify checks each file against a stable view of that file, so a write in
+// flight during the pass is never reported as a disagreement.
 func (in Inspector) Verify() (VerifyReport, error) {
 	return VerifyReport{}, ErrNotImplemented
 }
@@ -57,6 +60,9 @@ type IndexEntry struct {
 	Kind    EntryKind
 	Extent  Extent
 	Version Version
+
+	// Tag is the tag of the share whose record backs the entry.
+	Tag ShareTag
 
 	// Location is where in local storage the entry's bytes sit.
 	//
@@ -102,9 +108,10 @@ type VerifyReport struct {
 	// segments supports.
 	Unsupported map[FileID][]IndexEntry
 
-	// Unreferenced are the records the segments hold that no index entry
-	// references.
-	Unreferenced []RecordRef
+	// Unindexed are the records precedence says the index should hold or
+	// retain, but for which it has no entry. A record that is superseded,
+	// released or header-only is not one.
+	Unindexed []UnindexedRecord
 
 	// BadFooters are the segments whose footer did not verify.
 	BadFooters []SegmentID
@@ -112,4 +119,12 @@ type VerifyReport struct {
 	// FootprintMismatch is the accounted footprint minus the sum of the
 	// segments' sizes, in bytes, when the two differ; nil when they agree.
 	FootprintMismatch *int64
+}
+
+// UnindexedRecord is a record the index should hold or retain but does not.
+type UnindexedRecord struct {
+	File    FileID
+	Extent  Extent
+	Version Version
+	Record  RecordRef
 }

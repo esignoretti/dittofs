@@ -134,7 +134,10 @@ type Stats struct {
 	TagConflicts []TagConflict
 
 	// Shares holds, for every tag that holds a record, attached or not, that
-	// share's statistics. Kind: per share.
+	// share's statistics.
+	//
+	// Every map and slice in a Stats belongs to the caller: Stats returns copies
+	// and never keeps them. Kind: per share.
 	Shares map[ShareTag]ShareStats
 }
 
