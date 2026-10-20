@@ -171,3 +171,31 @@ func TestCreate_NoACL_OtherUserCannotOpenForWrite(t *testing.T) {
 		t.Errorf("B's CREATE(FILE_WRITE_DATA) on A's 0644 file = %v, want STATUS_ACCESS_DENIED", resp.Status)
 	}
 }
+
+// MAXIMUM_ALLOWED resolves to the rights the mode grants B, which carry no
+// DELETE, so delete-on-close must be refused against the resolved grant rather
+// than accepted on the MAXIMUM_ALLOWED bit — CLOSE would otherwise unlink A's
+// file without re-checking.
+func TestCreate_NoACL_OtherUserMaximumAllowedCannotDeleteOnClose(t *testing.T) {
+	h, _, ctxB, dir := setupNoACLDeleteShare(t)
+
+	resp, err := h.Create(ctxB, &CreateRequest{
+		FileName:          "adir\\a.txt",
+		DesiredAccess:     uint32(types.MaximumAllowed),
+		ShareAccess:       0x07,
+		CreateDisposition: types.FileOpen,
+		CreateOptions:     types.FileNonDirectoryFile | types.FileDeleteOnClose,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if resp.Status == types.StatusSuccess {
+		closeNoACL(t, h, ctxB, resp.FileID)
+	}
+	if resp.Status != types.StatusAccessDenied {
+		t.Errorf("B's CREATE(MAXIMUM_ALLOWED, DELETE_ON_CLOSE) on A's 0644 file = %v, want STATUS_ACCESS_DENIED", resp.Status)
+	}
+	if !noACLFileExists(t, h, dir) {
+		t.Fatal("B deleted A's file through MAXIMUM_ALLOWED delete-on-close")
+	}
+}
