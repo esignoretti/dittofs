@@ -511,7 +511,8 @@ either serving or as it was built.
    list's version, and start the event sink's queue (§3.3).
 
 **Drain.** Called once every adapter has drained
-([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)), because an
+([RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)), and in a
+cluster once `Serve` has stopped, because an
 adapter's drain still delivers break acknowledgements, `CLOSE`s and unlocks
 into the service. The server then refuses every new call with `ErrUnavailable`
 and joins the calls already admitted. At the context's deadline it cancels
@@ -1285,6 +1286,10 @@ the handle or open it names, in this order:
    `ErrAccess`, or a narrowing to read-only;
 4. resolution, which turns the `Identity` into the caller it acts as on this
    share, squashing included ([RFC 18 §6.1](rfc-18-identity.md#6.1%20From%20Identity%20to%20caller)).
+
+In a cluster the gateway's router reads the handle's shard to route it, but
+nothing it learns reaches the client: a handle it cannot place goes to the
+local server, which admits first ([§2.1](#2.1%20What%20runs%20where)).
 
 Then the shard's `Authorize` evaluates the grant and the file (§4.6). **There is
 no call that skips admission**: lock, unlock, test-lock, watch, grant
