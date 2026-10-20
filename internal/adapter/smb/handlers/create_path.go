@@ -18,7 +18,9 @@ import (
 // report to sessionID: whether that session could TREE_CONNECT to it now. The
 // session is looked up on each call rather than captured, so a pipe held open
 // across a re-authentication answers for the identity the session holds.
-// Anything that cannot be resolved hides the share.
+// The admission check runs against the session's client address, so a check
+// that depends on the peer answers as it would at TREE_CONNECT. Anything that
+// cannot be resolved hides the share.
 func (h *Handler) shareConnectFilter(sessionID uint64) func(shareName string) bool {
 	return func(shareName string) bool {
 		if h.Registry == nil {
@@ -32,7 +34,7 @@ func (h *Handler) shareConnectFilter(sessionID uint64) func(shareName string) bo
 		if !ok || sess == nil {
 			return false
 		}
-		ctx := NewSMBHandlerContext(context.Background(), "", sessionID, 0, 0)
+		ctx := NewSMBHandlerContext(context.Background(), sess.ClientAddr, sessionID, 0, 0)
 		_, status := h.admitTreeConnect(ctx, sess, share)
 		return status == types.StatusSuccess
 	}
