@@ -116,9 +116,9 @@ type VerifyReport struct {
 	// segments supports.
 	Unsupported map[FileID][]IndexEntry
 
-	// Unindexed are the records precedence says the index should hold or
-	// retain, but for which it has no entry. A record that is superseded,
-	// released or header-only is not one.
+	// Unindexed are the records that need an index entry, held, retained or a
+	// removal marker, but have none. A record nothing needs any more, such as
+	// one superseded and past its retention or one released, is not one.
 	Unindexed []UnindexedRecord
 
 	// BadFooters are the segments whose footer did not verify.
@@ -129,7 +129,7 @@ type VerifyReport struct {
 	FootprintMismatch int64
 }
 
-// UnindexedRecord is a record the index should hold or retain but does not.
+// UnindexedRecord is a record that needs an index entry but has none.
 type UnindexedRecord struct {
 	File    FileID
 	Extent  Extent

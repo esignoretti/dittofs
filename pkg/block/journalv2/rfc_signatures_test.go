@@ -20,7 +20,6 @@ var (
 	_ = func(j *Journal) error { return j.Strand(ShareTag(0)) }
 	_ = func(j *Journal) (Version, error) { return j.Draw() }
 	_ = func(j *Journal) { j.SetVersionLimit(Version{}) }
-	_ = func(h *Journal) Stats { return h.Stats() }
 
 	_ = func(h *Handle) error { return h.Close() }
 	_ = func(h *Handle) error { return h.SetSyncPolicy(Standard) }
@@ -66,6 +65,13 @@ var (
 	_ = func(h *Handle) int64 { return h.Held(ShareID{}) }
 	_ = func(h *Handle) error { return h.Stamp(FileID{}, Version{}, SnapshotCut(0)) }
 	_ = func(j *Journal) (int64, error) { return j.Repack(int64(0), RepackScope{}) }
+
+	_ = func(j *Journal) Stats { return j.Stats() }
+	_ = func(j *Journal) Inspector { return j.Inspect() }
+	_ = func(in Inspector) ([]IndexEntry, error) { return in.File(FileID{}) }
+	_ = func(in Inspector) iter.Seq2[FileID, []IndexEntry] { return in.All() }
+	_ = func(in Inspector) []SegmentInfo { return in.Segments() }
+	_ = func(in Inspector) (VerifyReport, error) { return in.Verify() }
 
 	_ = Offer{ID: FileID{}, Dirty: []OfferedExtent(nil), Neighbours: []Held(nil), Superseded: []OfferedExtent(nil),
 		Oldest: Version{}, Newest: Version{}, Offered: io.ReaderAt(nil)}
