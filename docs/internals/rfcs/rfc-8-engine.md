@@ -2630,7 +2630,7 @@ request ID and result are persisted with the operation itself — in the journal
 operation's record ([RFC 10 §2.3](rfc-10-journal-replication.md#2.3%20The%20journal%20extension)) and, for a namespace mutation, in a
 request record written in the mutation's own transaction with an expiry of the
 retry window ([RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)) — and the new primary looks a retry up there on a
-miss, after a handover or a takeover alike ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Front-ends%20forward%20to%20the%20primary)). The open-state
+miss, after a handover or a takeover alike ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Gateways%20forward%20to%20the%20primary)). The open-state
 calls — an SMB `CLOSE` or `LOCK`, an NFSv4.1 `CLOSE` or `LOCKU`, a sequenced
 NFSv4.0 operation — leave no durable result, so their entries, few next to
 writes, ship with the open-state table ([RFC 14 §10](rfc-14-open-state.md#10.%20Shard%20placement)); without them a retry whose

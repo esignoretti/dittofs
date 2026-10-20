@@ -147,7 +147,7 @@ alice-pc's gateway node.
 Every node runs every box above; P1 is drawn as a gateway and S1 as a primary
 only because of where alice-pc connected and which shard her file is in.
 
-![A cluster: identical nodes over an external metadata store and one bucket](img/rfc0-cluster.svg)
+![A cluster of identical nodes S1, S2 and S3, each running adapters, vfs.Gateway, vfs.Serve with vfs.Server, open state, metadata transactions, and the journal, engine, syncer and GC; each is primary of one shard and replica of the others; S2's gateway forwards a write for shard A to S1's server with an envelope, and every node reads and writes one external replicated metadata store and shares one S3 bucket](img/rfc0-cluster.svg)
 
 ### The words you need
 
@@ -443,7 +443,7 @@ it, everything that call touches runs at the primary; above it, nothing holds
 file state. This binds every deployment; on a single node the cut is a function
 call.
 
-![The cut is vfs.Service: an adapter calls vfs.Gateway, which either calls the local vfs.Server or stamps the envelope and sends the call over the transport to vfs.Serve at the primary, which fences and deduplicates it before vfs.Server decides it against open state, metadata and the engine; the metadata store and the bucket sit below](img/rfc15-cut.svg)
+![The cut is vfs.Service: on the gateway node an adapter signs in and calls vfs.Gateway, which decides nothing; the gateway either calls the local vfs.Server or stamps an envelope (request ID, shard and epoch, node and node epoch, hop 0) and sends it over vfs.Transport to vfs.Serve at the primary, which checks the fence and dedup; vfs.Server at the primary then decides admission, identity, squash and ordering and calls open state, the metadata store and the engine, while the legend gives the reasons the cut is not under the VFS](img/rfc15-cut.svg)
 
 **Why the cut is at `vfs.Service` and not under it.** Forwarding the engine's,
 the metadata store's or open state's calls instead would keep the filesystem
@@ -614,10 +614,10 @@ Every call a node forwards to a primary carries one envelope:
 
 | Field | Means |
 | --- | --- |
-| request ID | derived from the protocol's own retry identity, not from the connection, because an NFSv4 client retries only on a new connection (RFC 7530 §3.1.1) and an NFSv3 one may: for NFSv3 and NFSv4.0, (client address, XID, procedure, checksum of the arguments), as a server's reply cache keys a retry; for NFSv4.1, (gateway node's ID, the node epoch the session was created under, session, slot, sequence ID), since each gateway node mints its own session IDs and nothing makes them unique across gateway nodes. Whatever its fields, a request ID is stored as one byte string ([RFC 16 §4.2.1](rfc-16-metadata-store.md#4.2.1%20Key%20encoding)) whose first byte tags its family — NFSv3, NFSv4.0, NFSv4.1 or SMB — so IDs of two families, whose fields can encode alike, never compare equal. The epoch is the session's, not the gateway node's current one: a gateway node marked lapsed re-acquires a higher node epoch without restarting, its sessions survive, and a retry on the same session, slot and sequence must still carry the ID its first send did. A retry carrying the same identity carries the same ID: for NFSv3 and NFSv4.0 on any connection and through any gateway node that holds the client's address; for NFSv4.1 on any connection of its session, which lives at one gateway node ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Front-ends%20forward%20to%20the%20primary)). An SMB request is given an ID the gateway node mints — its node ID and node epoch, the connection, and a number never reused on it — since SMB names its retries by open state instead (below); it is never derived from SMB message IDs, which are per connection, so two channels of one session can send two different requests under one (client GUID, session ID, message ID) |
+| request ID | derived from the protocol's own retry identity, not from the connection, because an NFSv4 client retries only on a new connection (RFC 7530 §3.1.1) and an NFSv3 one may: for NFSv3 and NFSv4.0, (client address, XID, procedure, checksum of the arguments), as a server's reply cache keys a retry; for NFSv4.1, (gateway node's ID, the node epoch the session was created under, session, slot, sequence ID), since each gateway node mints its own session IDs and nothing makes them unique across gateway nodes. Whatever its fields, a request ID is stored as one byte string ([RFC 16 §4.2.1](rfc-16-metadata-store.md#4.2.1%20Key%20encoding)) whose first byte tags its family — NFSv3, NFSv4.0, NFSv4.1 or SMB — so IDs of two families, whose fields can encode alike, never compare equal. The epoch is the session's, not the gateway node's current one: a gateway node marked lapsed re-acquires a higher node epoch without restarting, its sessions survive, and a retry on the same session, slot and sequence must still carry the ID its first send did. A retry carrying the same identity carries the same ID: for NFSv3 and NFSv4.0 on any connection and through any gateway node that holds the client's address; for NFSv4.1 on any connection of its session, which lives at one gateway node ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Gateways%20forward%20to%20the%20primary)). An SMB request is given an ID the gateway node mints — its node ID and node epoch, the connection, and a number never reused on it — since SMB names its retries by open state instead (below); it is never derived from SMB message IDs, which are per connection, so two channels of one session can send two different requests under one (client GUID, session ID, message ID) |
 | shard and epoch | the shard the sender routed by and the primary epoch it expects |
 | node and node epoch | the forwarding node and the node epoch of its lease; a primary refuses a call from a node epoch that has been fenced ([§5.3](#5.3%20Client%20addressing)) |
-| hop count | zero from the gateway node; a node that is not the primary refuses a call whose hop count is not zero rather than forward it ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Front-ends%20forward%20to%20the%20primary)) |
+| hop count | zero from the gateway node; a node that is not the primary refuses a call whose hop count is not zero rather than forward it ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Gateways%20forward%20to%20the%20primary)) |
 
 - The primary **MUST** refuse a call whose epoch is not its current one for the
   shard ([§6](#6.%20Learning%20primaries)), and one whose sending node epoch it has fenced.
@@ -675,7 +675,7 @@ Every call a node forwards to a primary carries one envelope:
   request ID into the journal and to every replica, and its record keeps the
   request ID and result ([RFC 10 §2.3](rfc-10-journal-replication.md#2.3%20The%20journal%20extension)); a namespace mutation writes a
   request record with its result in its own transaction
-  ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Front-ends%20forward%20to%20the%20primary)). A new primary rebuilds the table from both before it
+  ([RFC 11 §5.1](rfc-11-ownership.md#5.1%20Gateways%20forward%20to%20the%20primary)). A new primary rebuilds the table from both before it
   serves, so a retry after a failover is answered, not applied again.
 - **An SMB replay on another channel is recognised by SMB's own state at the
   primary**, not by request ID. A request the client flags as a replay carries

@@ -301,7 +301,7 @@ decided by one node, so locking scales across shards, not within one hot shard.
 ### 2.3 Dependencies and wiring
 
 The service is built once by the composition root
-([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)) from one
+([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition)) from one
 `Deps` struct. A field is an interface where it has two implementations and a
 concrete type where it has one, as in
 [RFC 20 §3.4](rfc-20-adapters.md#3.4%20Interface):
@@ -411,7 +411,7 @@ internal/vfs/                the service: one file per operation, each admit →
 The service is started, drained and closed by the node's composition root —
 the control-plane runtime on a server, at the steps
 [RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop) gives it
-([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)), the suite's
+([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition)), the suite's
 constructor in tests (§8) — and never by an adapter. `vfs.Service` carries no
 lifecycle method; `*vfs.Server`, which `New` returns and only the composition
 root holds, carries three:
