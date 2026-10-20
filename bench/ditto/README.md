@@ -45,12 +45,22 @@ files and mailbox points. The mailbox scenarios score as follows:
 
 `CALIBRATION=yes` in the cron file runs every point three times and posts nothing. That is the
 first week. When it is set to `no`, the night runs every point once, and `score.py` first sets
-each point's noise band from the calibration nights' repeats (`band.json`). It then posts one
-summary a night to the channel in `SLACK_DIR` (the scenarios' bot, through
-`test/scenarios/lib/report.sh`). The summary has the figure, the sub-scores, the worst point and
-the develop commits since the last night. It also lists the points below their 7-day median by
-more than their band, and the failed steps. A flag or a failure already reported in the last 7
-nights is counted, not listed again.
+each point's noise band from the calibration nights' repeats (`band.json`). A point is flagged
+when it falls below its 7-day median by more than its band.
+
+Slack gets the night by the scenarios' rules, through their reporting
+(`test/scenarios/lib/report.sh`): the same bot, the same channel (`SLACK_DIR`).
+
+- A quiet night posts nothing. It is still recorded, in its directory and `trend.csv`.
+- The first night with a new flag or failure (one the 7 nights before did not have) posts its
+  summary: the figure, the sub-scores, the worst point, the new flags and failures and the develop
+  commits since the last night. `slack-ts` beside the nights keeps that message.
+- While that alert is open, a night with another new flag or failure replies in its thread, and
+  a night that repeats the same ones posts nothing.
+- The first night with no flag and no failure replies in the thread, shown in the channel too,
+  and closes the alert.
+
+Smoke runs and calibration nights never post.
 
 ## Results
 

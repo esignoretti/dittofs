@@ -4,6 +4,8 @@
 Reads the fio results under RUN_DIR/r<repeat>/<target>/ and writes RUN_DIR/points.csv (one row per
 point, target and repeat) and RUN_DIR/summary.json (CTRF: the steps are its tests, the score is in
 its extra), then prints the Slack summary: the first line is the message, the rest its details.
+RUN_DIR/alert says what the night means for the Slack alert (night.sh post): new, a flag or a
+failure the 7 nights before did not have; same, only ones they had; clear, none.
 
 A point's value on a target is the median of its repeats. Its ratio is DittoFS's performance over
 Samba's: a throughput as it is, a time or a latency inverted, so above 1 DittoFS is faster. The
@@ -236,8 +238,13 @@ def main():
         past = [n["score"] for n in nights if n.get("score")]
         if past and score and "score" in bands and score < statistics.median(past) * (1 - bands["score"]):
             flags.append("score")
+    if score is None:
+        failures.append("score: nothing to score")
     new_flags = [f for f in flags if f not in seen_flags]
     new_failures = [f for f in failures if re.sub(r" r\d+:", ":", f) not in seen_failures]
+
+    with open(f"{run}/alert", "w") as f:
+        f.write("new\n" if new_flags or new_failures else "same\n" if flags or failures else "clear\n")
 
     commit = open(f"{run}/commit").read().strip() if os.path.exists(f"{run}/commit") else ""
     since = next((n.get("commit") for n in reversed(nights) if n.get("commit")), "")

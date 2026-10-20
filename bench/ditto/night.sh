@@ -8,8 +8,11 @@
 #            file and fsync it at its end
 #   mailbox  the mailbox simulator (bench/workloads/mailbox) with 2, 8 and 16 users, scaled down
 #   files    5,000 files of 4 KiB, 64 KiB and 1.75 MiB, created (each fsynced), then read back
-# score.py then compares the two targets point by point and writes the summary, which goes to Slack
-# through the scenarios' reporting (test/scenarios/lib/report.sh): same bot, same channel.
+# score.py then compares the two targets point by point and writes the summary. Slack gets it by the
+# scenarios' rules, through their reporting (test/scenarios/lib/report.sh), same bot, same channel:
+# a quiet night posts nothing; the first new flag or failure is a message; while that alert is open,
+# a new one replies in its thread and a repeat posts nothing; the night with no flag and no failure
+# replies there, shown in the channel too, and closes it. See post.
 #
 #   night.sh              as root, from cron at 18:45 (setup.sh writes the cron file)
 #   SMOKE=yes night.sh    one short point of each kind, a few minutes; never posts
@@ -247,8 +250,36 @@ files() {
     test "$failed" -eq 0
 }
 
+# post NIGHT: posts NIGHT's summary by the rules above. score.py's NIGHT/alert says new, same or clear,
+# and WORK/slack-ts keeps the open alert's message.
+post() {
+    local text ts
+    text="$(cat "$1/slack.txt")"
+    ts="$(cat "$WORK/slack-ts" 2>/dev/null || true)"
+    # shellcheck disable=SC2034 # report.sh reads them
+    HERE="$REPO/test/scenarios" CACHE="$WORK"
+    # shellcheck source-path=SCRIPTDIR source=../../test/scenarios/lib/report.sh
+    . "$REPO/test/scenarios/lib/report.sh"
+    case "$(cat "$1/alert" 2>/dev/null)" in
+    new)
+        if test -n "$ts"; then
+            slack "$text" "$ts" >/dev/null
+        else
+            ts="$(slack "$text")"
+            test -z "$ts" || echo "$ts" >"$WORK/slack-ts"
+        fi
+        ;;
+    clear)
+        test -n "$ts" || return 0
+        slack ":white_check_mark: *Nightly performance: nothing flagged or failing any more*
+$text" "$ts" yes >/dev/null
+        rm -f "$WORK/slack-ts"
+        ;;
+    esac
+}
+
 case "${1:-}" in
-build | start | matrix | mailbox | files) "$@"; exit ;;
+build | start | matrix | mailbox | files | post) "$@"; exit ;;
 "") ;;
 *) echo "usage: night.sh" >&2; exit 2 ;;
 esac
@@ -338,21 +369,15 @@ finish() {
     test -z "$STARTED" || stop "$STARTED"
     test -z "$STATE" || host_state after
     rm -rf "$WORK/build" "$RUN"
-    python3 "$HERE/score.py" "$NIGHT" "$REPO" >"$NIGHT/slack.txt" || echo "night.sh: scoring failed, see $NIGHT/night.log" >"$NIGHT/slack.txt"
+    if ! python3 "$HERE/score.py" "$NIGHT" "$REPO" >"$NIGHT/slack.txt"; then
+        echo ":x: Nightly performance: scoring failed, see $NIGHT/night.log" >"$NIGHT/slack.txt"
+        echo new >"$NIGHT/alert"
+    fi
     if test "$SMOKE" = no && test -s "$NIGHT/points.csv"; then
         test -s "$WORK/trend.csv" || head -1 "$NIGHT/points.csv" >"$WORK/trend.csv"
         tail -n +2 "$NIGHT/points.csv" >>"$WORK/trend.csv"
     fi
-    if test "$CALIBRATION" = no && test "$SMOKE" = no; then
-        (
-            # The scenarios' reporting, in a subshell since it reads HERE and CACHE.
-            # shellcheck disable=SC2034
-            HERE="$REPO/test/scenarios" CACHE="$WORK"
-            # shellcheck source-path=SCRIPTDIR source=../../test/scenarios/lib/report.sh
-            . "$REPO/test/scenarios/lib/report.sh"
-            slack "$(cat "$NIGHT/slack.txt")" >/dev/null
-        )
-    fi
+    test "$CALIBRATION" = yes || test "$SMOKE" = yes || "$HERE/night.sh" post "$NIGHT"
     log "end ($rc): $(head -1 "$NIGHT/slack.txt")"
 }
 STARTED="" STATE=""
