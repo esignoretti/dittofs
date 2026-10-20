@@ -368,17 +368,26 @@ interface:
 
 | Declared by | Component | What the engine calls |
 | --- | --- | --- |
-| [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | the journal | `Share`, passed the larger of the share's version floor and version limit and the share's sync policy ([RFC 1 §5.2](rfc-1-journal.md#5.2%20Sync%20policy)); `Forget` (drops a tag's extents, markers and index entries through one header-only record `Since` never yields, refused while a handle of the tag is open, for a namespace moved away, an import attach or a share's removal, [RFC 1 §3](rfc-1-journal.md#3.%20Interface)); `Strand`; `Stats` |
-| [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | a share's handle on the journal | `WriteAt`, passed the write's modification time ([RFC 28 §2.3](rfc-28-journal-format.md#2.3%20Records)), `ReadAt`, `Sync`, `Offload`, `OffloadMany`, `Fill`, `Release`, `Truncate`, `Deallocate`, `Delete`, `CloneTarget` with its `CloneSpec` ([§9.1](#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)), `Reserve(n, writes)` and the reservation's `WriteAt` and `Close`, for a clone's copies ([RFC 1 §6](rfc-1-journal.md#6.%20Capacity)), `Close`, before the tag's `Forget`, `Since`, `Settle`, `MarkOffloaded`, `Unmark`, `Draw` and `SetVersionLimit` ([RFC 1 §4.3](rfc-1-journal.md#4.3%20Versions)), `Repack` with its scope, `Hold`, `Stamp`, `Files`, `DirtyFiles`, and `SetSyncPolicy`, on every handle of a share whose `sync.policy` changes live ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) |
+| [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | the journal | `Share`, passed the larger of the share's version floor and version limit and the share's sync policy ([RFC 1 §5.2](rfc-1-journal.md#5.2%20Sync%20policy)); `Forget` (drops a tag's extents, markers and index entries through one header-only record `Since` never yields, refused while a handle of the tag is open, for a namespace moved away, an import attach or a share's removal, [RFC 1 §3](rfc-1-journal.md#3.%20Interface)); `Strand`; `Stats`; `Draw` and `SetVersionLimit` ([RFC 1 §4.3](rfc-1-journal.md#4.3%20Versions)); `Close`, after every handle ([RFC 1 §8.7](rfc-1-journal.md#8.7%20Shutdown)) |
+| [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | a share's handle on the journal | `WriteAt`, passed the write's modification time ([RFC 28 §2.3](rfc-28-journal-format.md#2.3%20Records)), `ReadAt`, `Sync`, `Offload`, `OffloadMany`, `Fill`, `Release`, `Truncate`, `Deallocate`, `Delete`, `CloneTarget` with its `CloneSpec` ([§9.1](#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)), `Reserve(n, writes)` and the reservation's `WriteAt` and `Close`, for a clone's copies ([RFC 1 §6](rfc-1-journal.md#6.%20Capacity)), `Close`, before the tag's `Forget`, `Since`, `Settle`, `MarkOffloaded`, `Unmark`, `Repack` with its scope, `Hold`, `Stamp`, `Files`, `DirtyFiles`, and `SetSyncPolicy`, on every handle of a share whose `sync.policy` changes live ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) |
 | [RFC 2 §2](rfc-2-carver.md#2.%20What%20one%20call%20covers), [§5](rfc-2-carver.md#5.%20The%20block%20assembler) | the carver and the block assembler | the carver's `Cut`; the assembler's fold |
-| [RFC 3 §1.3](rfc-3-syncer.md#1.3%20Interface) | a syncer flow | `Upload`, `Fetch`, `Prefetch`, `Healthy`, and `Health(d)` for the cause of an unhealthy direction — `ErrDenied` for quota, access or size, `ErrTransient`, `ErrCorrupt` or `ErrDrift` ([§11.1](#11.1%20Health%20is%20derived%20from%20recent%20outcomes%2C%20offload%20included), [§10.2](#10.2%20A%20capacity%20refusal%20comes%20back%20here)) |
-| [RFC 6 §10](rfc-6-block-metadata.md#10.%20API%20surface%20and%20observability) | block metadata's `Existence` and `Content` views | every method of both, except `Offloaded` while deduplication is deferred |
-| [RFC 16 §3.1](rfc-16-metadata-store.md#3.1%20Lookups%20by%20ID%2C%20listings%2C%20and%20who%20may%20use%20them) | the metadata store's `Inspect` view | `Refs`, for the reseed only ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), [RFC 6 §8.3](rfc-6-block-metadata.md#8.3%20A%20file%27s%20refs%20and%20the%20version%20floor)); every engine transaction goes through block metadata's views |
+| [RFC 3 §1.3](rfc-3-syncer.md#1.3%20Interface) | the syncer | `OpenFlow`, one flow per share at attach |
+| [RFC 3 §1.3](rfc-3-syncer.md#1.3%20Interface) | a syncer flow | `Close`, in `ForgetShare` or `Close`; `Upload`, `Fetch`, `Prefetch`, `Healthy`, and `Health(d)` for the cause of an unhealthy direction — `ErrDenied` for quota, access or size, `ErrTransient`, `ErrCorrupt` or `ErrDrift` ([§11.1](#11.1%20Health%20is%20derived%20from%20recent%20outcomes%2C%20offload%20included), [§10.2](#10.2%20A%20capacity%20refusal%20comes%20back%20here)) |
+| [RFC 6 §10](rfc-6-block-metadata.md#10.%20API%20surface%20and%20observability) | block metadata's `Existence` and `Content` views, held as two interfaces | every method of both, except `Offloaded` while deduplication is deferred |
+| here, over [RFC 16 §4.2](rfc-16-metadata-store.md#4.2%20Keys%3A%20per-file%2C%20per-share%2C%20content-addressed)'s keys | the metadata store's `Lifecycle` view | `JournalID`, the identity recorded for a device, for `Open` ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), step 1); `VersionLimits`, read for `Open`'s floor, and `RaiseVersionLimits`, a tracked max-write of `S‖id‖vl` within `K` keys a transaction ([§2.7](#2.7%20The%20version%20limit)); `RaiseIncarnations`, in the start transaction or at attach (step 2) |
+| [RFC 16 §3.1](rfc-16-metadata-store.md#3.1%20Lookups%20by%20ID%2C%20listings%2C%20and%20who%20may%20use%20them) | the metadata store's `Inspect` view | `Refs`, for the reseed only ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), [RFC 6 §8.3](rfc-6-block-metadata.md#8.3%20A%20file%27s%20refs%20and%20the%20version%20floor)); every other engine transaction goes through block metadata's views or `Lifecycle` |
 
 A call to a method no row names is a build failure, not a review comment, and a
 component method no row names is unreachable from the engine. The journal's
 `Init` and `Restamp` are not the engine's: the explicit initialisation step and
 the recovery import ([RFC 26](rfc-26-catalog-backups.md)) call them ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), step 1).
+
+> decision: `Lifecycle` is declared here, over RFC 16's keys, because no
+> view RFC 6 or RFC 16 declares reads a device's recorded journal identity,
+> writes the version limit or raises an incarnation, and the engine needs all
+> three. Its four methods are the engine's only store access outside block
+> metadata's views and `Refs`. Move it into RFC 16's views once another
+> component needs one of them.
 
 **One clock and one fault interface, declared here.** The root composes the
 node, so it declares the two interfaces every component takes at construction
@@ -470,8 +479,8 @@ share's removal calls `StopShare(id, keepHolds)` at its step 3
 ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)), on each shard's primary, after admission has begun refusing
 the share with `ErrStale`. `StopShare` moves the context to `removing` and
 **MUST**, in this order: admit no new call, clone, copy, offload pass or removal
-batch for the share, other than the phase-2 batches of a clone the join below
-waits on; join every call admitted before the refusal, every clone with the
+batch for the share, other than the offload of the hold marks below and the
+phase-2 batches of a clone the join below waits on; join every call admitted before the refusal, every clone with the
 share on either side, and every pass and batch in flight; cancel every
 asynchronous copy reading from the share, whatever share it writes
 ([RFC 14 §2.7](rfc-14-open-state.md#2.7%20Copy)); and, with `keepHolds` — a removal that keeps snapshots —
@@ -709,17 +718,19 @@ the journals, their share handles, the flows.
 // declared beside the engine's code and holds only the methods §2.1's table
 // names; the root passes each component's concrete type.
 type Deps struct {
-	Devices  []string // one journal directory per device; Start opens each (§2.5 step 1)
-	Open     func(dir string, floor Version, expect JournalID) (Journal, error) // RFC 1 §3 Open
-	Carver   Carver   // RFC 2: Cut and the block assembler's fold
-	Syncer   Syncer   // RFC 3 §1.3: OpenFlow, one flow per share
-	Blocks   Blocks   // RFC 6 §10: the Existence and Content views
-	Refs     Refs     // RFC 16 §3.1: Inspect.Refs, for the reseed only
-	Gate     Gate     // RFC 12 §2.3: the per-shard cut gate every existence commit passes
-	Clock    Clock    // Now, Elapsed, After: the subset of the node's clock the engine reads
-	Settings Settings // node-level; New refuses an invalid one (§2.4)
-	Metrics  *metrics.Registry
-	Logger   *slog.Logger
+	Devices   []string  // one journal directory per device; Start opens each (§2.5 step 1)
+	Open      func(dir string, floor Version, expect JournalID) (Journal, error) // RFC 1 §3 Open
+	Carver    Carver    // RFC 2: Cut and the block assembler's fold
+	Syncer    Syncer    // RFC 3 §1.3: OpenFlow, one flow per share
+	Existence Existence // RFC 6 §10; apart from Content, since both declare Commit
+	Content   Content   // RFC 6 §10
+	Lifecycle Lifecycle // journal identity, version limits, incarnations (§2.5 steps 1–2, §2.7)
+	Refs      Refs      // RFC 16 §3.1: Inspect.Refs, for the reseed only
+	Gate      Gate      // RFC 12 §2.3: the per-shard cut gate every existence commit passes
+	Clock     Clock     // Now, Elapsed, After: the subset of the node's clock the engine reads
+	Settings  Settings  // node-level; New refuses an invalid one (§2.4)
+	Metrics   *metrics.Registry
+	Logger    *slog.Logger
 }
 ```
 
@@ -739,12 +750,12 @@ journals, handles and flows it opened.
 | journal, one per device | [RFC 1](rfc-1-journal.md) | its directory, `Clock`, its fault seam | `Deps.Devices`, `Deps.Open` | engine at `Start` step 1, once it has read the floor and identity → engine | closed by `Close` after every handle; never after a failed join ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), stop step 5) |
 | journal handle, one per share per journal | [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | its journal | the journal's `Share` | engine → share context | `Close` then the tag's `Forget` in `ForgetShare`; `Close` alone at node stop |
 | work queue, one per journal | one instance of the shared work scheduler with the engine's source ([§6.1](#6.1%20The%20work%20queue)) | journal statistics, the policy functions | internal | engine at `Start` step 6 → engine | its consumer starts at step 7; it stops dispatching at `Close` |
-| offload pipeline | one state machine per pass ([§6.3](#6.3%20The%20offload%20pipeline)) | the offer, carver, assembler, flow, `Blocks` | internal | work queue → the pass | joined by `Close`; a pass outlives no component (E13) |
+| offload pipeline | one state machine per pass ([§6.3](#6.3%20The%20offload%20pipeline)) | the offer, carver, assembler, flow, `Existence`, `Content` | internal | work queue → the pass | joined by `Close`; a pass outlives no component (E13) |
 | speculator | per-open-file frontiers, pre-warm plans ([§7.4](#7.4%20The%20speculator)) | journal statistics, the flow's `Prefetch` | internal | engine → engine | memory only; cancelled by `Close` |
 | carver and block assembler | [RFC 2](rfc-2-carver.md) | — | `Deps.Carver` | root → root | stateless |
 | syncer | [RFC 3](rfc-3-syncer.md), shared pools | the remote block stores | `Deps.Syncer` | root → root | the engine opens one flow per share at attach and closes it in `ForgetShare` or `Close`; the root closes the syncer after the engine |
 | remote block store | [RFC 4](rfc-4-remote-tier.md)'s codec, [RFC 5](rfc-5-transforms.md)'s transforms | — | reached only through the share's flow | root, registered with the syncer, ref-counted per configuration → root | open while any flow names it |
-| metadata store | [RFC 16](rfc-16-metadata-store.md), with [RFC 6](rfc-6-block-metadata.md)'s views | — | `Deps.Blocks`, `Deps.Refs` | root → root | never closed by the engine |
+| metadata store | [RFC 16](rfc-16-metadata-store.md), with [RFC 6](rfc-6-block-metadata.md)'s views | — | `Deps.Existence`, `Deps.Content`, `Deps.Lifecycle`, `Deps.Refs` | root → root | never closed by the engine |
 | cut gate, one per shard | [RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate) | — | `Deps.Gate` | root → root | — |
 | clock, metrics, logger | one per node | — | `Deps` | root → root | — |
 
@@ -819,7 +830,7 @@ pkg/sched/                   the shared work scheduler (§6.1.1), used by the en
 ```
 
 `offload/` is the one subpackage. It is the largest state machine, and its tests
-import only fakes of the offer, the carver, a flow and `Blocks`, so the import
+import only fakes of the offer, the carver, a flow and block metadata's views, so the import
 rule enforces its boundary.
 
 ## 3. Policy
