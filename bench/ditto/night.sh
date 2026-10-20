@@ -344,7 +344,7 @@ finish() {
             # The scenarios' reporting, in a subshell since it reads HERE and CACHE.
             # shellcheck disable=SC2034
             HERE="$REPO/test/scenarios" CACHE="$WORK"
-            # shellcheck source=../../test/scenarios/lib/report.sh
+            # shellcheck source-path=SCRIPTDIR source=../../test/scenarios/lib/report.sh
             . "$REPO/test/scenarios/lib/report.sh"
             slack "$(cat "$NIGHT/slack.txt")" >/dev/null
         )

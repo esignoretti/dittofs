@@ -24,8 +24,8 @@ install() {
     local p missing=()
     for p in fio samba cifs-utils nvme-cli python3 git iproute2 util-linux; do installed "$p" || missing+=("$p"); done
     if test "${#missing[@]}" -gt 0; then
-        apt-get update -qq
-        apt-get install -y -qq --no-install-recommends "${missing[@]}" >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}" >/dev/null
     fi
     # The run starts its own smbd; a host that had no Samba keeps none running.
     if [[ " ${missing[*]} " == *" samba "* ]] && command -v systemctl >/dev/null; then

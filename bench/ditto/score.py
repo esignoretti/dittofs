@@ -110,6 +110,8 @@ def geomean(values):
 
 
 def label(name):
+    if name == "score":
+        return "the overall figure"
     m = re.match(r"(seq|rand)-(read|write)-(\w+)-t(\d+)$", name)
     if m:
         kind = "sequential" if m.group(1) == "seq" else "random"
@@ -177,7 +179,7 @@ def drive_wear(run):
 
 
 def main():
-    run, repo = sys.argv[1], sys.argv[2]
+    run, repo = os.path.abspath(sys.argv[1]), sys.argv[2]
     work, night = os.path.dirname(run), os.path.basename(run)
     mode = "smoke" if os.environ.get("SMOKE") == "yes" else "calibration" if os.environ.get("CALIBRATION") == "yes" else "night"
 
