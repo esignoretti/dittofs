@@ -457,9 +457,11 @@ misses what the other saw. §11 lists the duplicates in the set today.
   read within 5 s omits that component's series and counts it in
   `health_export_partial_total`, rather than block.
 - **Two ways to emit, one naming rule.** A leaf component that depends on no metrics
-  library (the journal, the carver, the syncer) keeps counters in a `Stats` snapshot,
+  library (the journal, the syncer) keeps counters in a `Stats` snapshot,
   and the component that composes it exports that snapshot under the leaf's prefix
-  through one read-through collector. Any other component is handed the registry in its
+  through one read-through collector. The carver keeps no counters at all: its
+  caller derives the `carver_` series from what `Cut` hands back
+  ([RFC 2 §2.3](rfc-2-carver.md#2.3%20What%20a%20pass%20makes%20observable)). Any other component is handed the registry in its
   `Deps` and records into series it resolved at construction (§2.9). Either way the
   name belongs to the RFC that owns the prefix, not to the code that exports it.
 - An export carries no file name, no user content and no secret (§2.4, §5.4). So
@@ -581,8 +583,11 @@ owner.
 **Liveness answers one question: is the process making progress?** It **MUST**
 fail only when a fixed set of internal loops — each adapter's accept loop, the
 request scheduler, the engine's work scheduler and the health evaluator — has
-not completed a turn, or reported itself idle, within 60 s. It **MUST NOT** read a
-condition, a store, the network or the disk.
+not completed a turn, or reported itself idle, within 60 s. An idle report is a
+heartbeat, not a state: a waiting loop wakes at least every 30 s to report again, an
+accept loop through an accept deadline, so a loop that wakes and stalls before its
+turn misses its next report. It **MUST NOT** read a condition, a store, the network
+or the disk.
 
 > decision: an idle loop is live. The watchdog catches a loop stuck mid-turn, not one
 > that never wakes: a lost wakeup with work queued passes liveness and shows as a queue
@@ -612,7 +617,7 @@ listener clients are sent to is down.
 | started from a copied image | yes | yes — reads of offloaded content continue | unhealthy, `copied_image` |
 | metadata store lost: no share served until a recovery import | yes | no | unhealthy, `metadata_store_lost` |
 | a listener lost (`adapter_listener_lost`) | yes | no — clients sent to it cannot connect | unhealthy |
-| a start step failed | yes | no | unhealthy, naming the step |
+| a start step failed | yes | no | unhealthy, `start_failed` |
 | draining: stop requested | yes | no | draining |
 | watchdog stalled | no | no | — |
 
@@ -703,6 +708,7 @@ row.
 | `backup_failing`, `backup_location_mismatch` | [RFC 26 §7](rfc-26-catalog-backups.md#7.%20Observability) | share; location | degraded | ticket |
 | `directory_unreachable` | [RFC 18 §10.2](rfc-18-identity.md#10.2%20Metrics) | installation | degraded within the stale grace; unhealthy past it, since sign-ins are refused | ticket; page at 5 min when unhealthy |
 | `adapter_listener_lost` | [RFC 20 §3.7](rfc-20-adapters.md#3.7%20Health%20and%20probes) | node, naming the adapter and address | unhealthy: a listener's socket failed while serving | page at 5 min |
+| `start_failed` | [RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop) | node, naming the step and its error | unhealthy; held until the process exits, since a failed start does not retry, and a restart starts it again | page at once |
 | `sidecar_failed` | [RFC 20 §3.5](rfc-20-adapters.md#3.5%20Sidecars) | node, naming the sidecar | degraded: the adapters keep serving | ticket |
 | `memory_limit_below_floors`, `fd_limit_low`, `memory_near_limit` | [RFC 24 §10](rfc-24-resources.md#10.%20Observability) | node | degraded | ticket |
 | `metrics_label_capped` | §2.4 | node | degraded | ticket |
@@ -737,13 +743,17 @@ selected it, and this RFC defines no second consumer that would need them apart.
 
 ### 4.2 What a record carries
 
-A record is one JSON object (RFC 8259) on one line. The event's own fields are
-[RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)'s; the sink stamps on the rest:
+A record of the `access`, `quota` and `logon` streams is one JSON object (RFC 8259)
+on one line. The event's own fields are
+[RFC 17 §3.3](rfc-17-vfs.md#3.3%20Event%20hooks)'s; the sink stamps on the rest. An
+`admin` record is RFC 23's audit record, with its fields, named and ordered by its
+commit position ([RFC 23 §6](rfc-23-control-plane.md#6.%20The%20audit)); none of the
+table below applies to it (§4.3).
 
 | Field | Set by | Means |
 | --- | --- | --- |
 | `v` | sink | the record format's version, 1; a consumer refuses a version it does not know |
-| `stream` | sink | `access`, `quota`, `logon`, `admin` |
+| `stream` | sink | `access`, `quota`, `logon` |
 | `node`, `boot`, `seq` | sink | the node's ID, a random ID drawn at each process start, and a sequence number counted from 0 per stream and boot; `(node, stream, boot, seq)` names a record uniquely and shows any gap |
 | `time` | event | the event's time, RFC 3339 in UTC with nanoseconds |
 | `trace_id` | sink, from the call's context | the trace the decision ran in (§6), when sampled |
@@ -840,7 +850,8 @@ lists what a quota event is for, but not its fields; §11 asks it to add
   second of the decision; a crash in between loses it, and the next start writes
   the `restart` gap record. Writing the event in the operation's own transaction
   would put a store write on every audited read.
-- **Order is per node and stream.** Within one `(node, stream, boot)` sequence
+- **Order is per node and stream** in the spooled streams; the `admin` stream is
+  ordered by the audit's commit position (§4.3). Within one `(node, stream, boot)` sequence
   numbers rise with the order the sink accepted events, which is the order of
   the decisions on that node. Across nodes there is no order but `time`
   **(cluster)**: a consumer merges by time and names records by
@@ -1130,9 +1141,9 @@ steps are [RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)'s.
 | log handler | `internal/logger` | the root, first | settings | `Logger *slog.Logger`; each consumer adds `With("component", prefix)` (§5.3) | `New` only; a `Debug` level set through the API expires on a timer the handler owns (§5.2) |
 | metrics registry | `pkg/metrics` | the root | build version and commit | `Metrics *metrics.Registry` | `New` registers only the process and runtime collectors; the metrics listener (§2.8) starts before start step 2 and stops after stop step 6, so a stuck stop can still be scraped |
 | watchdog | `pkg/health` | the root | clock | `Watchdog *health.Watchdog`; each watched loop takes its own `*health.Loop` from `Watchdog.Loop(name)` and closes it when the loop ends — a listener on unbind, since [RFC 20 §3.1](rfc-20-adapters.md#3.1%20The%20adapter%27s%20states)'s reconfiguration adds and removes listeners at run time | starts before start step 2, stops after stop step 6; the liveness answer reads it (§3.5) |
-| health evaluator | `pkg/health` | the root; the runtime reads its `Snapshot` and writes node status (§3.8) | clock, logger, registry, §3.9's table as Go, the `Source`s | injected into nothing: each component is a `Source`, added with `Add` and removed with `Remove` by the runtime, which owns the set of running components ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)) | `Start` before start step 2, evaluating every second; `Close` after stop step 6 |
+| health evaluator | `pkg/health` | the root; the runtime reads its `Snapshot` and writes node status (§3.8) | clock, logger, registry, watchdog, §3.9's table as Go, the `Source`s | injected into nothing: each component is a `Source`, added with `Add` and removed with `Remove` by the runtime, which owns the set of running components ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)) | `Start` before start step 2 takes `Watchdog.Loop("health")` and turns it after each evaluation, every second; `Close` after stop step 6 closes it |
 | event sink | `pkg/events` | the root | clock, logger, registry, `events.path` | `Events *events.Sink`, to the filesystem service and the authenticator only | `New` opens nothing; `Start` after start step 2 and before step 5 opens the spool, writes the `restart` gap record (§4.4) and starts the writers; `Close(ctx)` after stop step 2 drains the rings until `ctx` ends, drops and counts the rest, and syncs the spool |
-| tracer | none: the tracing API | the root builds the provider when `tracing.endpoint` is set (§6.3), a no-op provider otherwise | settings | `Tracer`, the tracing API's tracer type, in the service's and the adapters' `Deps` | the provider shuts down after stop step 2, flushing within the drain deadline; spans it cannot flush are counted (§10) |
+| tracer | none: the tracing API | the root builds the provider when `tracing.endpoint` is set (§6.3), a no-op provider otherwise | settings | `Tracer`, the tracing API's tracer type, in the `Deps` of every component that opens spans (§6.1): the adapters, the service, the metadata store, the engine and each background pass | the provider shuts down after stop step 2, flushing within the drain deadline; spans it cannot flush are counted (§10) |
 
 ### 8.2 The packages
 
@@ -1211,7 +1222,7 @@ type Source interface {
 
 type Evaluator struct{ /* … */ }
 
-func NewEvaluator(clk clock.Clock, log *slog.Logger, m *metrics.Registry) *Evaluator
+func NewEvaluator(clk clock.Clock, log *slog.Logger, m *metrics.Registry, wd *Watchdog) *Evaluator
 func (e *Evaluator) Add(s Source)
 func (e *Evaluator) Remove(s Source)
 func (e *Evaluator) Start(ctx context.Context) error
@@ -1227,7 +1238,7 @@ func (w *Watchdog) Live() bool // every open loop turned or idle within 60 s (§
 type Loop struct{ /* … */ }
 
 func (l *Loop) Turn()  // a turn completed
-func (l *Loop) Idle()  // waiting, with nothing to do
+func (l *Loop) Idle()  // waiting, with nothing to do; repeated at least every 30 s (§3.5)
 func (l *Loop) Close() // the loop is gone and no longer counts
 ```
 
@@ -1335,9 +1346,9 @@ been removed.
 | [RFC 26 §7](rfc-26-catalog-backups.md#7.%20Observability) | `backup_folder_*` are "per block folder", with the label unnamed | label `location` |
 | [RFC 20 §10.1](rfc-20-adapters.md#10.1%20Metrics) | `adapter_requests_in_flight` spells what `vfs_inflight_calls` and `syncer_inflight_bytes` spell otherwise | `adapter_inflight_requests` (one rename instead of two) |
 | [RFC 20 §10.2](rfc-20-adapters.md#10.2%20Spans) | span names `nfs4 COMPOUND`, `SEQUENCE` | `adapter.nfs4.COMPOUND`, `adapter.nfs4.SEQUENCE` (§6.1) |
+| [RFC 4 §4.12](rfc-4-remote-tier.md#4.12%20What%20a%20store%20makes%20observable) | `remote_request_seconds` by `store` and 16 `op` values is 64 × 16 × 21 = 21,504 series, past §2.5's 10,000 | the histogram's `op` takes the five data calls (`put`, `get`, `delete`, `list`, `health`) and `other` for the rest: 64 × 6 × 21 = 8,064; `remote_requests_total` keeps every `op` |
 
-Tables found to follow §2 as written: [RFC 4](rfc-4-remote-tier.md#4.12%20What%20a%20store%20makes%20observable),
-[RFC 14](rfc-14-open-state.md#14.%20Observability),
+Tables found to follow §2 as written: [RFC 14](rfc-14-open-state.md#14.%20Observability),
 [RFC 15](rfc-15-topology.md#10.%20Observability) and
 [RFC 18](rfc-18-identity.md#10.2%20Metrics), with their histograms to take
 the `request` or `background` set of §2.6.
@@ -1357,7 +1368,7 @@ names, on the composed single-node harness of the [index](rfc-index.md#Test%20ha
 | §3.3 share does not set node | Deny puts on one store under one share of a hundred: assert the share unhealthy naming the store, the node's status unchanged by it, `health_shares{state="unhealthy"}` = 1, readiness and liveness true. | a readiness probe that restarts for a bucket policy |
 | §3.4 never latched | Make a store get-unhealthy, then fix it without touching DittoFS. Assert the condition clears within its owner's bound and the share returns healthy, with no operator action. | a latched condition |
 | §3.5 liveness | Stop the metadata store and the remote, fill the journal's device: assert liveness stays true throughout. Block the request scheduler: assert liveness fails within 60 s. | liveness on a dependency |
-| §3.6 readiness | Assert not ready during recovery, ready in grace, ready while self-fenced, not ready with the metadata store lost and while draining. Drop one listener: assert not ready and `adapter_listener_lost`. Fail a start step: assert `not_ready` and the step named. **(cluster)** Relinquish a shard on a storage node: assert the node stays ready and `shard_relinquished` is raised. | a node unreachable for reclaim; a probe stricter than §3.6 |
+| §3.6 readiness | Assert not ready during recovery, ready in grace, ready while self-fenced, not ready with the metadata store lost and while draining. Drop one listener: assert not ready and `adapter_listener_lost`. Fail a start step: assert `not_ready` and `start_failed` naming the step. **(cluster)** Relinquish a shard on a storage node: assert the node stays ready and `shard_relinquished` is raised. | a node unreachable for reclaim; a probe stricter than §3.6 |
 | §3.9 registry | §3.9's Go table and the RFC table agree, and every `Name` is returned by some `Source` in a test that injects its cause, with the severity the registry's rule gives that cause. | a condition no alert knows |
 | §4.3 never blocks | With the access policy at every decision, stop the writer; run 10⁵ operations. Assert all 10⁵ operations complete, `events_dropped_total{reason="ring_full"}` equal to the events beyond the ring, and, once the writer resumes, one gap record covering exactly those sequence numbers, after every record below them and before every record above. Stop again, drop, and emit nothing more: assert the gap record is written within a second of the writer resuming. | a blocking sink; a silent drop; a gap out of order |
 | §4.4 coalescing | Hammer a full quota with 10⁴ writes in a minute. Assert exactly two hard-refusal records: the first, at once, and one summary carrying the count of the rest. | a quota stream that floods |
