@@ -216,7 +216,7 @@ not guessed.
 - The API writes records; it never calls a component. Every node's runtime
   applies records by their binding class and reports the generation it runs.
 - A resource is addressed by ID. Reads are consistent; lists page by an opaque
-  cursor. Every update and delete carries `If-Match` with the generation read;
+  cursor. Every update and delete carries `If-Match` with the `ETag` read;
   every create and action carries an idempotency key, except the credential
   calls (§4.5).
 - Work longer than one request is an operation: `202`, an operation ID, progress
@@ -350,8 +350,12 @@ drives, so it imports no component's implementation:
 ```go
 package runtime // pkg/controlplane/runtime
 
-// Deps is everything the runtime drives. The root builds each value and starts
-// none; a field is nil where the node lacks the role.
+// Deps is what the runtime drives today. The root builds each value and starts
+// none; a field is nil where the node lacks the role. It is partial: each
+// component §2.1's table gives the runtime but marks pending — namespace
+// metadata and open state, identity, the event sink, the router and the
+// client-address agent, shard placement, the pNFS data server — joins as a
+// field once its owning RFC states its lifecycle (§13, question 5).
 type Deps struct {
 	Records  Records                   // the runtime's store view; not RFC 16's ControlPlane, the API's write view
 	Content  Content                   // storage: the content subsystem as one unit
@@ -365,8 +369,9 @@ type Deps struct {
 	Logger   *slog.Logger
 }
 
-// Records is the desired state and the node's own report.
+// Records is the desired state and the node's own records.
 type Records interface {
+	RegisterNode(ctx context.Context, n Node) error                            // §2.2 step 3: roles and version ranges, refused in the same transaction if an active version lies outside them (RFC 13 §5.5)
 	List(ctx context.Context, kind Kind, after string) iter.Seq2[Record, error] // paged (RFC 16 §3.1)
 	Counters(ctx context.Context) (Counters, error)                            // settings, share list, principals
 	PutNodeStatus(ctx context.Context, s NodeStatus) error                     // §2.4
@@ -499,7 +504,7 @@ The runtime holds two pictures: the **desired** one, read from records, and the
 | a share created | adds the share's context and, on a protocol node, nothing: the share list reaches the filesystem service through `ShareList.Version` ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)) |
 | a share's state changed | moves the share's context to quiescing and back ([RFC 8 §2.3](rfc-8-engine.md#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)); admission reads the state itself on every call ([RFC 17 §4.9](rfc-17-vfs.md#4.9%20Shares%2C%20mounts%20and%20trees)), and a removal's steps run in their owner ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)) |
 | a share's live setting | hands the new value to the context, within RFC 13's live bound |
-| a remote store's live or next-write setting — endpoint, credential reference, storage class, block target, the transform chain but its encrypt stage, as [RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings) classes them | is applied once, to the one store client every context on that store shares ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)), after [RFC 13 §5.2](rfc-13-configuration.md#5.2%20Reaching%20the%20same%20content%20another%20way%20is%20not%20a%20change) has proven a new endpoint or credential. No share context is replaced |
+| a remote store's live or next-write setting — endpoint, credential reference, storage class, block target, the transform chain but its encrypt stage, as [RFC 13 Appendix B](rfc-13-configuration.md#Appendix%20B%20%E2%80%94%20the%20settings) classes them | is applied once per store, to the component that reads it: endpoint, credential reference and storage class to the one store client every context on that store shares ([RFC 4 §4.10](rfc-4-remote-tier.md#4.10%20The%20connection%20pool%20is%20derived%20from%20its%20callers)), after [RFC 13 §5.2](rfc-13-configuration.md#5.2%20Reaching%20the%20same%20content%20another%20way%20is%20not%20a%20change) has proven a new endpoint or credential; the block target to the block assembler ([RFC 2 §5](rfc-2-carver.md#5.%20The%20block%20assembler)) and the transform chain to the engine's codec ([RFC 5 §2.2](rfc-5-transforms.md#2.2%20Where%20it%20runs)), GC's relocation included, for the store's contexts. No share context is replaced |
 | a `Secret`'s new version | the component holding the reference resolves it again within the live bound, and the node reports the version it holds (§2.4, [RFC 13 §7](rfc-13-configuration.md#7.%20Secrets)) |
 | a change [RFC 8 §2.1](rfc-8-engine.md#2.1%20Content%20composition) counts as a change of a share's backends | builds the new context beside the old, switches admission to it, then joins and closes the old one. A new context that fails to build leaves the old one serving and the record refused |
 | an adapter enabled or disabled | starts it, or drains and stops it |
@@ -829,6 +834,7 @@ this table is all of them:
 | `set-password` | user | `operator`; `admin` for an account with a role | no | §3.5, [RFC 18 §8](rfc-18-identity.md#8.%20Management-API%20users) |
 | `drain` | node | `operator` | yes | [RFC 30 §5.3](rfc-30-kubernetes.md#5.3%20Storage%20scale-down%20is%20a%20drain) |
 | `decommission` | node | `admin` | no | [RFC 13 §5.5](rfc-13-configuration.md#5.5%20A%20node%20joins%20only%20where%20its%20versions%20overlap) |
+| `declare-lost` | backup location | `admin` | yes | [RFC 13 §2.5](rfc-13-configuration.md#2.5%20A%20backup%20location%20is%20its%20own%20record), [RFC 26 §4.1](rfc-26-catalog-backups.md#4.1%20Interfaces) |
 | `cancel` | operation | the role that may start its kind | no | §4.6 |
 
 An operation's `Kind` is an `OpKind`, a closed set read from this table and
@@ -997,7 +1003,7 @@ changed. A client **MUST** reuse a key across its own retries of one action and
 
 Work that does not finish in one transaction — a share's removal, a user's
 deletion, a clone, a restore, a backup, a re-home, a move, a credential
-rotation, a signing-key rotation, an index rebuild — is an **operation**. Its call commits the work's
+rotation, a signing-key rotation, an index rebuild, a location's loss — is an **operation**. Its call commits the work's
 first durable step and answers `202 Accepted` with `Location:
 /api/v1/operations/{id}` and the operation's body.
 
@@ -1278,7 +1284,7 @@ The CLI is a client of the management API and of nothing else:
   and the CLI links no package of the metadata store, the block stores or the
   control-plane server;
 - it resolves names to IDs with the list filters (§4.1), reads before it writes
-  and sends the generation it read in `If-Match` (§4.4), generates one
+  and echoes the `ETag` it read, opaque, in `If-Match` (§4.4), generates one
   idempotency key per command and reuses it across that command's retries
   (§4.5), and on `412` shows the difference and stops rather than retrying;
 - for an operation it prints the operation's ID and, with `--wait`, follows it
@@ -1371,7 +1377,7 @@ These rules bind from the single node on, where most of them cost nothing
 | CP2 | The API changes nothing but records; it never calls a component to change it, and a write answers success only after its transaction commits. |
 | CP3 | Every node applies records by their binding class, in counter order, and reports the position it has reconciled through per kind, the records it refused and those awaiting a restart; a record is applied on a node only when that position reaches the record's own and it is in neither set. |
 | CP4 | Stop is the reverse of start; the API outlives the adapters and the store outlives everything. |
-| CP5 | Every `PUT`, `PATCH` and `DELETE` carries `If-Match` — or, for a `PUT` that creates, `If-None-Match: *` — checked inside the write's transaction; a write never commits over a generation, or over a record, its author did not read. |
+| CP5 | Every `PUT`, `PATCH` and `DELETE` carries `If-Match` — or, for a `PUT` that creates, `If-None-Match: *` — checked inside the write's transaction; a write never commits over a tag, or over a record, its author did not read. |
 | CP6 | A request with a recorded idempotency key is answered from the record and applied at most once. |
 | CP7 | Long work is an operation whose progress is the owning component's durable cursor; it survives a crash, and is readable from every API node. |
 | CP8 | Every error reaches the client as the component's own error by name, and every error has a status in the API's table. |
@@ -1536,8 +1542,8 @@ caller of `runtime.New`.
 | §5.1, §5.4 | the bootstrap admin is not a file user | the bootstrap admin is created with uid 0 "for permission bypass" and is added to an `admins` group |
 | §5.2 | `viewer`, `operator`, `admin`, checked against the record | roles `admin`, `operator`, `user`, carried in the token; `operator` can only list adapters |
 | §5.3 | tokens checked against the account each call; installation-wide signing key | the access token is checked for signature and expiry only, so disabling a user or changing a role takes up to 15 min; refresh tokens last 7 days and re-check `Enabled`; the signing secret is per process, from the environment or the host file, and must be copied between nodes by hand (RFC 13 Appendix A, C6); no throttling of sign-in |
-| §5.4 | first password printed once by initialisation; current password always required | the admin is seeded at start from an environment variable, a configured hash, or a random 24-character password printed only when standard output is a terminal; while must-change is set, the password change does not ask for the current password |
 | §5.3, CP11 | no secret is read | store configurations are redacted, identity-provider secrets are write-only, but the settings routes return raw values, and the NETLOGON machine secret is kept as a setting |
+| §5.4 | first password printed once by initialisation; current password always required | the admin is seeded at start from an environment variable, a configured hash, or a random 24-character password printed only when standard output is a terminal; while must-change is set, the password change does not ask for the current password |
 | §6 | an audit record per action, in its transaction | none; nine adapter-settings handlers write an informational log line naming the user |
 | §7 | the CLI only calls the API | `dfsctl` is a REST client over `pkg/apiclient`, with contexts in `~/.config/dfsctl/config.json` (mode 0600, access and refresh tokens); `share mount` and `unmount` run the host's mount tools, which is client-side and allowed; `docs/guide/cli.md` is generated by `cmd/gendocs` from both command trees |
 | §9 | version discovery and schema gate | only the `/api/v1` prefix; no version endpoint, header or client check; `dfsctl version` is local |
