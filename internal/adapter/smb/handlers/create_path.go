@@ -33,7 +33,7 @@ func (h *Handler) shareConnectFilter(sessionID uint64) func(shareName string) bo
 			return false
 		}
 		ctx := NewSMBHandlerContext(context.Background(), "", sessionID, 0, 0)
-		_, _, status := h.admitTreeConnect(ctx, sess, share)
+		_, status := h.admitTreeConnect(ctx, sess, share)
 		return status == types.StatusSuccess
 	}
 }

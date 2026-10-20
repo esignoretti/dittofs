@@ -113,7 +113,7 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 	}
 
 	sess, _ := h.SessionManager.GetSession(ctx.SessionID)
-	permission, generation, status := h.admitTreeConnect(ctx, sess, share)
+	permission, status := h.admitTreeConnect(ctx, sess, share)
 	if status != types.StatusSuccess {
 		return NewErrorResult(status), nil
 	}
@@ -133,30 +133,6 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 		StreamsDisabled:        share.StreamsDisabled,
 		ContinuousAvailability: share.ContinuousAvailability,
 		AllowMFsymlink:         share.AllowMFsymlink,
-	}
-	// Re-check the revocation between resolving access and publishing the tree.
-	// The dispatch gate ran before this handler did, so a re-check sweep that
-	// revoked the session and removed its trees in the meantime would otherwise
-	// find this one published behind it — and a later re-authentication, which
-	// clears the revocation, would leave it standing on the permission resolved
-	// for the user that was retired.
-	if sess != nil && sess.IsExpiredOrRevoked() {
-		logger.Warn("SMB TREE_CONNECT refused: session was revoked while access was being resolved",
-			"share", shareName, "sessionID", ctx.SessionID)
-		return NewErrorResult(types.StatusNetworkSessionExpired), nil
-	}
-	// The permission above was resolved against one identity, and resolving it
-	// takes two store round trips. A re-authentication landing inside that
-	// window re-decides authorization for a principal this answer was not about,
-	// and MS-SMB2 keeps tree connections across one — so publishing here would
-	// pin the previous principal's access onto the new one for the life of the
-	// connection. The client retries the TREE_CONNECT and gets an answer about
-	// the identity it now holds. This is the check the authorization re-check
-	// applies to its own tree updates, on the same generation.
-	if sess != nil && sess.AuthGeneration() != generation {
-		logger.Warn("SMB TREE_CONNECT refused: session re-authenticated while access was being resolved",
-			"share", shareName, "sessionID", ctx.SessionID)
-		return NewErrorResult(types.StatusNetworkSessionExpired), nil
 	}
 	h.StoreTree(tree)
 
@@ -221,10 +197,10 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 // which permission. It is the whole admission rule: TREE_CONNECT applies it,
 // and the srvsvc share list applies it per share so a session is shown only
 // what it could connect to. A second copy of these checks would be one that
-// can drift. It returns the permission capped for a read-only share, the
-// identity generation it was resolved against, and StatusSuccess when the
-// session is admitted or the status TREE_CONNECT answers with when it is not.
-func (h *Handler) admitTreeConnect(ctx *SMBHandlerContext, sess *session.Session, share *runtime.Share) (models.SharePermission, uint64, types.Status) {
+// can drift. It returns the permission capped for a read-only share, and
+// StatusSuccess when the session is admitted or the status TREE_CONNECT
+// answers with when it is not.
+func (h *Handler) admitTreeConnect(ctx *SMBHandlerContext, sess *session.Session, share *runtime.Share) (models.SharePermission, types.Status) {
 	// Refuse TREE_CONNECT on a disabled share. Matches
 	// MS-SMB2 2.2.9 — STATUS_NETWORK_NAME_DELETED is the spec error for a
 	// share that existed but is no longer available. The Enabled flag is
@@ -233,14 +209,14 @@ func (h *Handler) admitTreeConnect(ctx *SMBHandlerContext, sess *session.Session
 	if !share.Enabled {
 		logger.Warn("SMB TREE_CONNECT refused: share disabled",
 			"share", share.Name, "sessionID", ctx.SessionID)
-		return models.PermissionNone, 0, types.StatusNetworkNameDeleted
+		return models.PermissionNone, types.StatusNetworkNameDeleted
 	}
 
 	defaultPerm := models.ParseSharePermission(share.DefaultPermission)
 	permission, user, generation := resolveSharePermission(ctx, sess, share, defaultPerm, h.Registry.GetUserStore())
 	if permission == models.PermissionNone {
 		logger.Debug("Share access denied", "shareName", share.Name, "user", user)
-		return models.PermissionNone, generation, types.StatusAccessDenied
+		return models.PermissionNone, types.StatusAccessDenied
 	}
 
 	logger.Debug("Permission resolved for tree connect",
@@ -256,9 +232,33 @@ func (h *Handler) admitTreeConnect(ctx *SMBHandlerContext, sess *session.Session
 		logger.Info("TREE_CONNECT rejected: encrypted share requires encrypted session",
 			"shareName", share.Name,
 			"encryptionMode", h.EncryptionConfig.Mode)
-		return models.PermissionNone, generation, types.StatusAccessDenied
+		return models.PermissionNone, types.StatusAccessDenied
 	}
-	return permission, generation, types.StatusSuccess
+	// Re-check the revocation between resolving access and acting on it. The
+	// dispatch gate ran before this did, so a re-check sweep that revoked the
+	// session and removed its trees in the meantime would otherwise find a tree
+	// published behind it — and a later re-authentication, which clears the
+	// revocation, would leave it standing on the permission resolved for the
+	// user that was retired.
+	if sess != nil && sess.IsExpiredOrRevoked() {
+		logger.Warn("SMB TREE_CONNECT refused: session was revoked while access was being resolved",
+			"share", share.Name, "sessionID", ctx.SessionID)
+		return models.PermissionNone, types.StatusNetworkSessionExpired
+	}
+	// The permission above was resolved against one identity, and resolving it
+	// takes two store round trips. A re-authentication landing inside that
+	// window re-decides authorization for a principal this answer was not about,
+	// and MS-SMB2 keeps tree connections across one — so admitting here would
+	// pin the previous principal's access onto the new one, as a tree or as a
+	// share the srvsvc list shows. The client retries and gets an answer about
+	// the identity it now holds. This is the check the authorization re-check
+	// applies to its own tree updates, on the same generation.
+	if sess != nil && sess.AuthGeneration() != generation {
+		logger.Warn("SMB TREE_CONNECT refused: session re-authenticated while access was being resolved",
+			"share", share.Name, "sessionID", ctx.SessionID)
+		return models.PermissionNone, types.StatusNetworkSessionExpired
+	}
+	return permission, types.StatusSuccess
 }
 
 // calculateMaximalAccess returns the SMB2 MaximalAccess mask based on share permission.

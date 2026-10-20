@@ -64,6 +64,53 @@ func ndrWideString(s string) []byte {
 	return buf
 }
 
+// openSRVSVCPipe connects IPC$, opens and binds a srvsvc pipe for sessionID,
+// and returns a function issuing one request on it.
+func openSRVSVCPipe(t *testing.T, h *Handler, sessionID uint64) func(opnum uint16, stub []byte) []byte {
+	t.Helper()
+	ipcCtx := newTreeConnectTestContext(sessionID)
+	if res, err := h.TreeConnect(ipcCtx, buildTreeConnectRequestBody(`\\server\IPC$`)); err != nil || res.Status != types.StatusSuccess {
+		t.Fatalf("TREE_CONNECT IPC$ failed: %v %v", res.Status, err)
+	}
+	ipcTree, _ := h.GetTree(ipcCtx.TreeID)
+	createResp, err := h.handlePipeCreate(ipcCtx, &CreateRequest{FileName: "srvsvc"}, ipcTree)
+	if err != nil || createResp.Status != types.StatusSuccess {
+		t.Fatalf("CREATE srvsvc failed: %v %v", createResp.Status, err)
+	}
+	pipe := h.PipeManager.GetPipe(createResp.FileID)
+	if _, err := pipe.Transact(srvsvcBindPDU(1), 65536); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	callID := uint32(2)
+	return func(opnum uint16, stub []byte) []byte {
+		t.Helper()
+		resp, err := pipe.Transact(srvsvcRequestPDU(callID, opnum, stub), 65536)
+		callID++
+		if err != nil || len(resp) < 28 {
+			t.Fatalf("opnum %d: resp len %d err %v", opnum, len(resp), err)
+		}
+		return resp
+	}
+}
+
+// srvsvcEnum issues NetrShareEnum at level.
+func srvsvcEnum(call func(uint16, []byte) []byte, level uint32) []byte {
+	stub := binary.LittleEndian.AppendUint32(nil, 0) // null ServerName
+	stub = binary.LittleEndian.AppendUint32(stub, level)
+	return call(rpc.OpNetrShareEnum, stub)
+}
+
+// srvsvcGetInfo502 issues NetrShareGetInfo for share at level 502.
+func srvsvcGetInfo502(call func(uint16, []byte) []byte, share string) []byte {
+	stub := binary.LittleEndian.AppendUint32(nil, 0) // null ServerName
+	stub = append(stub, ndrWideString(share)...)
+	stub = binary.LittleEndian.AppendUint32(stub, 502)
+	return call(rpc.OpNetrShareGetInfo, stub)
+}
+
+// srvsvcStatus reads the trailing status word of a srvsvc response.
+func srvsvcStatus(resp []byte) uint32 { return binary.LittleEndian.Uint32(resp[len(resp)-4:]) }
+
 // TestSRVSVC_HidesSharesTheSessionCannotConnectTo drives a srvsvc pipe opened
 // over IPC$ by a user holding a grant on /public only. /secret refuses that
 // user at TREE_CONNECT, so the share list must not name it at any level, and
@@ -131,36 +178,11 @@ func TestSRVSVC_HidesSharesTheSessionCannotConnectTo(t *testing.T) {
 		}
 	}
 
-	ipcCtx := newTreeConnectTestContext(sess.SessionID)
-	if res, err := h.TreeConnect(ipcCtx, buildTreeConnectRequestBody(`\\server\IPC$`)); err != nil || res.Status != types.StatusSuccess {
-		t.Fatalf("TREE_CONNECT IPC$ failed: %v %v", res.Status, err)
-	}
-	ipcTree, _ := h.GetTree(ipcCtx.TreeID)
-	createResp, err := h.handlePipeCreate(ipcCtx, &CreateRequest{FileName: "srvsvc"}, ipcTree)
-	if err != nil || createResp.Status != types.StatusSuccess {
-		t.Fatalf("CREATE srvsvc failed: %v %v", createResp.Status, err)
-	}
-	pipe := h.PipeManager.GetPipe(createResp.FileID)
-	if _, err := pipe.Transact(srvsvcBindPDU(1), 65536); err != nil {
-		t.Fatalf("bind: %v", err)
-	}
-
-	callID := uint32(2)
-	call := func(opnum uint16, stub []byte) []byte {
-		t.Helper()
-		resp, err := pipe.Transact(srvsvcRequestPDU(callID, opnum, stub), 65536)
-		callID++
-		if err != nil || len(resp) < 28 {
-			t.Fatalf("opnum %d: resp len %d err %v", opnum, len(resp), err)
-		}
-		return resp
-	}
+	call := openSRVSVCPipe(t, h, sess.SessionID)
 	public, secret := encodeUTF16LE("public"), encodeUTF16LE("secret")
 
 	for _, level := range []uint32{1, 502} {
-		stub := binary.LittleEndian.AppendUint32(nil, 0) // null ServerName
-		stub = binary.LittleEndian.AppendUint32(stub, level)
-		resp := call(rpc.OpNetrShareEnum, stub)
+		resp := srvsvcEnum(call, level)
 		if !bytes.Contains(resp, public) {
 			t.Errorf("NetrShareEnum level %d omits /public, which alice can connect to", level)
 		}
@@ -169,18 +191,54 @@ func TestSRVSVC_HidesSharesTheSessionCannotConnectTo(t *testing.T) {
 		}
 	}
 
-	getInfo := func(share string) []byte {
-		stub := binary.LittleEndian.AppendUint32(nil, 0) // null ServerName
-		stub = append(stub, ndrWideString(share)...)
-		stub = binary.LittleEndian.AppendUint32(stub, 502)
-		return call(rpc.OpNetrShareGetInfo, stub)
-	}
-	status := func(resp []byte) uint32 { return binary.LittleEndian.Uint32(resp[len(resp)-4:]) }
-
+	getInfo := func(share string) []byte { return srvsvcGetInfo502(call, share) }
+	status := srvsvcStatus
 	if resp := getInfo("secret"); status(resp) != rpc.NERR_NetNameNotFound {
 		t.Errorf("NetrShareGetInfo(secret, 502) status = 0x%x, want NERR_NetNameNotFound; a refused session got the share's security descriptor", status(resp))
 	}
 	if resp := getInfo("public"); status(resp) != rpc.NERR_Success {
 		t.Errorf("NetrShareGetInfo(public, 502) status = 0x%x, want NERR_Success", status(resp))
+	}
+}
+
+// TestSRVSVC_ReauthDuringResolveHidesShare pins the generation gate on the
+// share list. The admission answer is resolved against one identity across
+// store round trips; a re-authentication landing inside that window must not
+// let the srvsvc pipe show a share, or hand out its level-502 descriptor, on
+// the previous principal's grants. The re-authentication is injected from
+// inside the record lookup, which is where the window actually is.
+func TestSRVSVC_ReauthDuringResolveHidesShare(t *testing.T) {
+	sessionRecord := userWithGrant(models.PermissionAdmin, 1000, 1000)
+	store := &revalidateUserStore{resolveFromRecord: true, user: sessionRecord}
+
+	h, sessionID, _ := newRevalidateHandler(t, sessionRecord, store, models.PermissionReadWrite, false)
+	sess, ok := h.GetSession(sessionID)
+	if !ok {
+		t.Fatal("fixture is wrong: no session")
+	}
+	call := openSRVSVCPipe(t, h, sessionID)
+	export := encodeUTF16LE("export")
+
+	// Without the interleaving the share is listed, so the assertions below
+	// are about the re-authentication rather than a list that was always empty.
+	if !bytes.Contains(srvsvcEnum(call, 1), export) {
+		t.Fatal("fixture is wrong: /export is not listed before any re-authentication")
+	}
+
+	bobUID := uint32(4242)
+	bob := &models.User{ID: "user-2", Username: "bob", UID: &bobUID, Enabled: true}
+	store.onGetUser = func() {
+		sess.UpdateIdentity(bob.Username, "", bob, false, false, nil, "")
+	}
+
+	for _, level := range []uint32{1, 502} {
+		if bytes.Contains(srvsvcEnum(call, level), export) {
+			t.Errorf("NetrShareEnum level %d listed /export on an answer about alice to a "+
+				"session that re-authenticated as bob mid-resolution", level)
+		}
+	}
+	if st := srvsvcStatus(srvsvcGetInfo502(call, "export")); st != rpc.NERR_NetNameNotFound {
+		t.Errorf("NetrShareGetInfo(export, 502) status = 0x%x, want NERR_NetNameNotFound: the "+
+			"descriptor was returned on an answer about alice after re-authentication as bob", st)
 	}
 }
