@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Sets up a Linux host for night.sh, as root, so a replaced host is ready again in minutes. It can
 # run again at any time; it changes only what is missing or different.
-#   setup.sh                      packages, the run's user, directories, the checkout, the cron file
-#   setup.sh remove               undoes all of that but the packages
+#   setup.sh                      packages, the run's user, directories and the checkout
+#   setup.sh cron                 the cron file that starts the night; after a smoke run passed
+#   setup.sh remove               undoes all of the above but the packages
 #   setup.sh split-drive DEV --yes
 #                                 not part of the setup: takes DEV out of the host's RAID1 mirrors and
 #                                 mounts it alone at /srv/perf/data, so the runs' writes stop
@@ -33,6 +34,9 @@ install() {
     mkdir -p /srv/perf/data /srv/perf/mnt /var/tmp/dittofs-perf
     test -d "$CHECKOUT/.git" ||
         git clone -q --branch "${BRANCH:-develop}" https://github.com/marmos91/dittofs "$CHECKOUT"
+}
+
+cron() {
     cat >"$CRON" <<EOF
 # DittoFS nightly performance run (bench/ditto in $CHECKOUT): as root from 18:45 to its hard stop
 # at 05:45, under the lock of the scenario runs (/var/tmp/dittofs-scenarios), so they never overlap.
@@ -80,7 +84,8 @@ split_drive() {
 test "$(id -u)" -eq 0 || { echo "setup.sh: run it as root" >&2; exit 2; }
 case "${1:-}" in
 "") install ;;
+cron) cron ;;
 remove) remove ;;
 split-drive) split_drive "${2:?setup.sh split-drive DEV --yes}" "${3:-}" ;;
-*) echo "usage: setup.sh [remove | split-drive DEV --yes]" >&2; exit 2 ;;
+*) echo "usage: setup.sh [cron | remove | split-drive DEV --yes]" >&2; exit 2 ;;
 esac

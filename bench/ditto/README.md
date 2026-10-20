@@ -70,8 +70,9 @@ As root, on Linux:
 
 ```sh
 git clone https://github.com/marmos91/dittofs /srv/perf/dittofs
-/srv/perf/dittofs/bench/ditto/setup.sh            # packages, user, directories, cron file
+/srv/perf/dittofs/bench/ditto/setup.sh            # packages, user, directories
 SMOKE=yes /srv/perf/dittofs/bench/ditto/night.sh  # a few minutes, one point of each kind
+/srv/perf/dittofs/bench/ditto/setup.sh cron       # the cron file, in calibration mode
 ```
 
 `setup.sh remove` takes it all away again, apart from the packages. `setup.sh split-drive DEV --yes`
