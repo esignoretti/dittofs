@@ -244,9 +244,9 @@ The source recorded is the one that was lowest. The node **MUST** record it,
 and **MUST** expose *L* and its source (§10). A limit changed while the node runs takes effect at the next
 start; the pools are never resized while serving.
 
-**The runtime is told.** When *L* is not already the runtime's soft limit, the
-node **MUST** set the runtime's soft memory limit to **fifteen sixteenths of
-*L*** before it serves, so the collector works harder as the heap approaches
+**The runtime is told.** Whichever source supplied *L*, the node **MUST** set
+the runtime's soft memory limit to **fifteen sixteenths of *L*** before it
+serves, so the collector works harder as the heap approaches
 *L* rather than letting a burst of garbage pass it, and the sixteenth above it
 is left for memory the runtime does not manage. The node **MUST NOT** change
 the collector's growth target from its default.
@@ -392,10 +392,12 @@ type Budget struct{ /* name, ceiling, waits bool, reserved, per-key DRR queues *
 func NewBudget(name string, ceiling int64, waits bool) *Budget
 // Reserve charges n bytes for key. A waiting budget waits within ctx; a refusing one refuses at once.
 func (b *Budget) Reserve(ctx context.Context, key netip.Addr, n int64) (Reservation, error)
+// Reclaim charges n past the ceiling, refusing only past twice it; a durable one never refuses (§4.6).
+func (b *Budget) Reclaim(n int64, durable bool) (Reservation, error)
 func (b *Budget) Reserved() int64 // for gauges and the leak check (§2.7)
 
-// Reservation is a value; Release is idempotent.
-type Reservation struct{ b *Budget; n int64 }
+// Reservation is a value; Release is idempotent and returns n to key's count too.
+type Reservation struct{ b *Budget; key netip.Addr; n int64 }
 func (r *Reservation) Release()
 
 // Pools is what an adapter is handed (RFC 20 §4.7): the four budgets on the request path.
@@ -405,7 +407,12 @@ type Pools struct{ Receive, Reply, Conn, Hold *Budget }
 - Whether a budget waits or refuses is fixed by its pool's row (§2.3), so one
   `Reserve` serves both. A refusing budget ignores `key`; its callers pass the
   zero `netip.Addr`.
-- `Reservation` is a value, so taking one allocates nothing.
+- `Reservation` is a value, so taking one allocates nothing. It keeps its
+  key, so a release lowers that key's count, which §4.1's cap reads.
+- `Reclaim` is the open-state table's, for a reclaim during grace (§4.6): it
+  never waits, refuses a volatile reclaim only past the reclaim allowance, and
+  never refuses a durable one. Every other create calls `Reserve`, which refuses
+  at the ceiling and so also while restored state holds the pool above it.
 - A reservation is in bytes of memory held, rounded up to the buffer class
   (§3.1) where a pooled buffer backs it.
 - **Charged, not measured.** No pool reads the heap to decide. A charge is
@@ -488,7 +495,7 @@ svc, _ := vfs.New(vfs.Deps{Shares: resources.NewShareCap(pools.Receive, pools.Re
 | `Split` | the root, from `Limit` and roles | the root, a value | recomputed only at the next start |
 | `Pools`: receive, reply, connection state, hold | the root | shared by every adapter's `core` | none; checked at zero after the adapters stop |
 | open-state `Budget` | the root | the open-state table; **(cluster)** also the dedup table | as above |
-| `ShareCap` | the root, over receive and reply | the service's front | entries dropped at zero |
+| `ShareCap` | the root, over receive and reply | the service's admission, in `*vfs.Server` | entries dropped at zero |
 | CPU tokens | the root, from `Split` | shared by background workers | none |
 | sizes: metadata store, index, transfers | the root, from `Split` | the store, each journal, the syncer | handed at construction; the owner sizes itself |
 
@@ -757,17 +764,18 @@ reservation: waiting would keep it, and the memory is what the cap protects.
 **How the service learns a call's bytes.** `core` attaches the call's receive
 and reply charge to the call's context once, before the service is called, as
 it already passes a call's hold bound (`vfs.WithHold`,
-[RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)). The front's admission reads it
-and adds it to the share's count in the same step that checks the cap:
+[RFC 17 §5.9](rfc-17-vfs.md#5.9%20Copy%20and%20clone)). The server's admission reads it
+and adds each half to the share's count for its pool in the same step that
+checks the cap:
 
 ```go
-func WithCharge(ctx context.Context, bytes int64) context.Context
-func ChargeOf(ctx context.Context) int64 // 0 for an internal caller no adapter reserved for
+func WithCharge(ctx context.Context, receive, reply int64) context.Context
+func ChargeOf(ctx context.Context) (receive, reply int64) // 0, 0 for an internal caller no adapter reserved for
 
-// ShareCap is the front's per-share count (§4.2): one per service, built over the
+// ShareCap is the server's per-share count (§4.2): one per service, built over the
 // receive and reply budgets, whose fill it reads. A map entry exists only while a share
 // has a call in flight, so a removed share leaves nothing behind.
-type ShareCap struct{ /* mu; per share: bytes */ }
+type ShareCap struct{ /* mu; per share: receive bytes, reply bytes */ }
 func NewShareCap(receive, reply *Budget) *ShareCap
 func (c *ShareCap) Admit(ctx context.Context, share uint64, exempt bool) (release func(), err error)
 ```
@@ -776,10 +784,11 @@ The share key is a plain integer, because `resources` imports nothing of the
 service's.
 
 > decision: the charge rides in the context because otherwise every `Service`
-> method grows a parameter that only admission reads. It is a number the service
-> reads, not a policy it applies, so it is not the hold-policy hook RFC 17
-> rejected. Make it a field of the call if a second value has to travel the
-> same way.
+> method grows a parameter that only admission reads. It is a pair of counts,
+> receive and reply, kept apart because each is capped against its own pool; the
+> service reads them and applies no policy, so it is not the hold-policy hook
+> RFC 17 rejected. Make it a field of the call if a value other than the charge
+> has to travel the same way.
 
 **A call that releases or reclaims state is not refused by the cap.** A call
 whose operations only end state — a close, an unlock, a lock cancel, a grant or
@@ -919,9 +928,9 @@ created, and released when they end. The costs are proposed at 1 KiB per open
 and 256 bytes per lock range, waiter, grant or reservation, settled by §8's M6.
 
 The open-state table ([RFC 14](rfc-14-open-state.md)) is the pool's one owner:
-it takes the open-state `*Budget` in its `Deps`, charges at each create and
-releases at each end. **(cluster)** The route envelope's dedup table takes the
-same budget in its own `Deps`
+it takes the open-state `*Budget` in its `Deps`, charges at each create — a
+reclaim through `Reclaim` (§2.5) — and releases at each end. **(cluster)** The
+route envelope's dedup table takes the same budget in its own `Deps`
 ([RFC 15 §4.3](rfc-15-topology.md#4.3%20The%20route%20envelope)) and is charged
 per entry.
 
@@ -1209,13 +1218,13 @@ once cannot fill a pool.
 
 | # | Invariant | Test |
 | --- | --- | --- |
-| R1 | The process memory limit is learned once at start, the lowest of the runtime's soft limit, the container's and the host's memory, and the runtime is told fifteen sixteenths of it. | Start in a container limited to 512 MiB with no runtime limit set: assert *L* is 512 MiB, source `container`, and the runtime's soft limit reads 480 MiB, fifteen sixteenths of it. Set the runtime limit to 256 MiB: assert it wins. Set the runtime limit to 1 GiB in a 512 MiB container: assert *L* is 512 MiB, source `container`. |
+| R1 | The process memory limit is learned once at start, the lowest of the runtime's soft limit, the container's and the host's memory, and the runtime is told fifteen sixteenths of it. | Start in a container limited to 512 MiB with no runtime limit set: assert *L* is 512 MiB, source `container`, and the runtime's soft limit reads 480 MiB, fifteen sixteenths of it. Set the runtime limit to 256 MiB: assert it wins, source `runtime`, and the runtime's soft limit reads 240 MiB. Set the runtime limit to 1 GiB in a 512 MiB container: assert *L* is 512 MiB, source `container`. |
 | R2 | The pools' ceilings — each pool's larger of its fraction of *L* and its floor — sum to at most three quarters of *L*, and during grace one sixteenth more (§4.6); where they sum to more, the node raises a health condition naming that sum. | *Daily.* In a 2 GiB container, for an hour: 200 NFS clients writing 1 MiB, the `builds` remote stalled, an SMB share frozen every five minutes, 10⁵ opens, a metadata walk of 10⁷ entries. Assert the process is never killed, resident memory stays under *L*, every pool stays within its ceiling, every request is answered or retried, and the goroutine count stays within §6.1's bounds. Revert the receive pool's reservation to a no-op — 200 clients at 64 requests of 1 MiB is 12.5 GiB against a 2 GiB *L* — and assert the run fails on resident memory. |
 | R3 | Memory held on behalf of a request, a connection, a session, open state or a held call is reserved from its pool before it is held, and released on every path; a size-bounded owner stays within the figure it was handed (§7). | Every pipeline test ends asserting every budget's reserved bytes are zero ([RFC 20 §6.8](rfc-20-adapters.md#6.8%20Buffer%20pools%2C%20in%20code)); a fuzz of the frame stage with random cancellations and panics asserts the same. |
 | R4 | No wait is entered while holding a reservation later in §2.6's order; a refusing pool may be charged anywhere. | Fill the reply pool with replies to a client that stops reading, and the receive pool with writes waiting on a stalled journal: assert both drain once the write deadline closes the stalled client, and no reservation waits past its deadline. |
 | R5 | No queue, wait list or table that grows with load is unbounded; each has a row in §5.1 or in the RFC it cites. | Under constant write load, stop the remote for ten minutes: assert every pool's reserved bytes and every counted queue's length stay within their bound at every sample. Insert an unbounded queue at offload's posting in a test build: assert it is caught by its own length gauge, not by a heap slope. Remove 10⁶ files with the remote stopped: assert the engine's scheduler holds at most its total, `engine_work_items_dropped_total` rises, and every removal completes once the remote returns. |
 | R6 | At the receive ceiling the socket is not read; no request is read that cannot be reserved, and a record in several fragments is reserved at its protocol's largest class before its first fragment is read. | An RPC record in three fragments whose first is 1 KiB: assert the receive pool is charged the transfer class before the first fragment is read, and a fragment past the cap closes the connection with the reservation released. A fuzz over record marks and fragment sequences asserts no reservation leaks and the cap holds. |
-| R7 | No client key is granted bytes of the receive or reply pool that take it past three quarters while another key waits; waiting keys are granted in turns. | A unit property test of `Budget`: for random waiters over N keys, each waiting key is granted at least once in every N grants, and no key past three quarters is granted while another waits. As a smoke test, one address with 16 connections at their caps of 1 MiB writes and 20 other addresses sending `GETATTR`: assert each other address is served, and the busy address is granted nothing further while above three quarters of the receive pool. |
+| R7 | No client key is granted bytes of the receive or reply pool that take it past three quarters while another key waits; waiting keys are granted in turns. | A unit property test of `Budget`: for random waiters of random classes over N keys, with random releases, a visit grants a key no more bytes than its deficit holds; a waiting key below the cap whose head fits the free bytes is granted before any other key is visited twice; and no key past three quarters is granted while another waits. As a smoke test, one address with 16 connections at their caps of 1 MiB writes and 20 other addresses sending `GETATTR`: assert each other address is served, and the busy address is granted nothing further while above three quarters of the receive pool. |
 | R8 | While the receive or reply pool is more than half full, no call is admitted that would take its share past three quarters of it, counting the call's own reservations and checked atomically with their charge; it is refused with `DelayResources` at once. A call that only releases or reclaims state is exempt (§4.2). | `builds`'s remote black-holed, build01 reading cold at depth 64 on four connections, alice-pc writing to `profiles`: assert `builds` holds at most three quarters of the reply pool, build01 is answered `NFS3ERR_JUKEBOX` and `memory_pool_refusals_total{reason="share_cap"}` rises. With `builds` one call below its cap, 64 1 MiB reads on new connections arriving at once: assert `builds` still holds at most three quarters. Close an open and unlock a range on `builds`: assert both succeed. On the reference box, alice-pc's p99 write latency stays within twice its unloaded figure. |
 | R9 | A held call past its connection's floor holds its bytes in the hold pool, not the receive pool, charged its whole receive reservation — buffer class and overhead — never less. | With the receive pool at 64 MiB, freeze `profiles` and hold 300 64 KiB writes on one connection: assert the receive pool holds the floor's 256 and the hold pool the rest. Repeat with 100 KiB writes: assert the hold pool is charged a transfer-class buffer and its overhead per write past the floor. |
 | R10 | No address holds more than a quarter of the connection limit. | One address opening connections in a loop: assert it is held at a quarter of the limit and another address still connects. |
