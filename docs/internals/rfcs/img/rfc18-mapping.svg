@@ -12,13 +12,14 @@
     </style>
   </defs>
   <rect width="900" height="440" fill="#ffffff"/>
-  <text x="16" y="26" class="t">One principal, many spellings: each stored with the record, and as one index row back.</text>
+  <text x="16" y="26" class="t">One principal, many spellings: numbers and SIDs stored with the record and indexed back;</text>
+  <text x="16" y="46" class="t">names derived from the record's name.</text>
 
   <rect x="350" y="180" width="200" height="60" rx="6" class="sv"/>
   <text x="364" y="204" class="m">PrincipalID</text><text x="364" y="224" class="s">minted, never reissued</text>
 
   <rect x="60" y="70" width="220" height="56" rx="5" class="pr"/>
-  <text x="74" y="92" class="m">uid 1500 · gid 1500</text><text x="74" y="112" class="s">AUTH_SYS, NFSv3 attributes</text>
+  <text x="74" y="92" class="m">uid 1500</text><text x="74" y="112" class="s">AUTH_SYS, NFSv3 attributes</text>
   <text x="64" y="144" class="w">allocated, never defaulted</text>
 
   <rect x="620" y="70" width="240" height="56" rx="5" class="pr"/>
