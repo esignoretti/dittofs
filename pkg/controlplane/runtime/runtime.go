@@ -690,9 +690,11 @@ func (r *Runtime) BeginShareRemoval(name string) (end func(), err error) {
 // in its metadata store and its journal directory, which holds its local
 // blocks.
 //
-// It resolves the share's metadata store from the share's row, so it runs
-// after RemoveShare, once the share's block store is closed and nothing writes
-// to what it deletes, and before the row goes. A share created again under the
+// It takes the share's row, already resolved by the caller, and keys every
+// step on the row's name, never on the token the row was looked up by. It
+// resolves the share's metadata store from that row, so it runs after
+// RemoveShare, once the share's block store is closed and nothing writes to
+// what it deletes, and before the row goes. A share created again under the
 // name then starts empty instead of attaching the old root. Each step tolerates
 // what an earlier purge already deleted, so it can be repeated.
 //
@@ -702,11 +704,8 @@ func (r *Runtime) BeginShareRemoval(name string) (end func(), err error) {
 // it, so a share that was alone on its remote, or on its metadata store, leaves
 // its blocks there. Delete them here once a removed share's blocks can be told
 // apart from every other share's.
-func (r *Runtime) PurgeShare(ctx context.Context, name string) error {
-	share, err := r.store.GetShare(ctx, name)
-	if err != nil {
-		return err
-	}
+func (r *Runtime) PurgeShare(ctx context.Context, share *models.Share) error {
+	name := share.Name
 	cfg, err := buildShareConfig(ctx, r.store, share)
 	if err != nil {
 		return err

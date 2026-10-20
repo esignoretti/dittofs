@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -299,4 +300,39 @@ func TestShareRemove_ConcurrentRemovalIsRefused(t *testing.T) {
 		t.Fatalf("the removed share's journal directory is still there: %v", err)
 	}
 	s.create("/team")
+}
+
+// Removing a share by its ID purges that share: the registry, the metadata
+// store and the journal directory are keyed by name, so the ID must be resolved
+// to the share's name before any of them is touched.
+func TestShareRemove_ByIDPurgesTheShare(t *testing.T) {
+	ctx := context.Background()
+	s := newShareServer(t)
+	s.create("/team")
+	s.write("/team", "docs", "old.txt", []byte("old"))
+	row, err := s.cp.GetShare(ctx, "/team")
+	if err != nil {
+		t.Fatalf("GetShare: %v", err)
+	}
+
+	if code := s.remove("/" + row.ID); code != http.StatusNoContent {
+		t.Fatalf("remove by ID = %d, want 204", code)
+	}
+	if _, err := s.rt.GetRootHandle("/team"); err == nil {
+		t.Fatal("the share removed by ID is still served")
+	}
+	if _, err := os.Stat(shares.ShareJournalDir(s.journal, "/team")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the share's journal directory is still there: %v", err)
+	}
+	md, err := s.rt.GetMetadataStore("md")
+	if err != nil {
+		t.Fatalf("GetMetadataStore: %v", err)
+	}
+	names, err := md.ListShares(ctx)
+	if err != nil {
+		t.Fatalf("ListShares: %v", err)
+	}
+	if slices.Contains(names, "/team") {
+		t.Fatalf("the metadata store still holds the share removed by ID: %v", names)
+	}
 }

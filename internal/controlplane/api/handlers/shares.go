@@ -1012,11 +1012,26 @@ func (h *ShareHandler) Update(w http.ResponseWriter, r *http.Request) {
 // Remove handles DELETE /api/v1/shares/{name}.
 // Deletes a share (admin only).
 func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
-	name := metadata.NormalizeShareNameFromURL(chi.URLParam(r, "name"))
-	if name == "/" {
+	token := metadata.NormalizeShareNameFromURL(chi.URLParam(r, "name"))
+	if token == "/" {
 		BadRequest(w, "Share name is required")
 		return
 	}
+
+	// The path names the share by name or by ID. Resolve it once and key
+	// everything after on the share's name: the registry, the metadata store and
+	// the journal directory know a share only by name, so passing an ID on would
+	// miss the share and purge a directory named after the ID instead.
+	share, err := h.store.GetShare(r.Context(), token)
+	if err != nil {
+		if errors.Is(err, models.ErrShareNotFound) {
+			NotFound(w, "Share not found")
+			return
+		}
+		InternalServerError(w, "Failed to delete share")
+		return
+	}
+	name := share.Name
 
 	// Remove from runtime first (if runtime is available)
 	removedFromRuntime := false
@@ -1047,7 +1062,7 @@ func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		// root and serve its files. The cost is that a share on a metadata store
 		// that is not loaded cannot be removed until the store loads. Revisit
 		// once the server records a removal and finishes it on its own.
-		err = h.runtime.PurgeShare(r.Context(), name)
+		err = h.runtime.PurgeShare(r.Context(), share)
 		// decision: the claim is released before the row goes, not after. With
 		// the purge finished nothing of this removal touches the name again,
 		// and the row still standing refuses a create as a duplicate; holding
@@ -1056,10 +1071,6 @@ func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		// not served until a restart.
 		end()
 		if err != nil {
-			if errors.Is(err, models.ErrShareNotFound) {
-				NotFound(w, "Share not found")
-				return
-			}
 			logger.Error("Failed to delete share data; the share is kept so its removal can be repeated",
 				"share", name, "error", err)
 			InternalServerError(w, "Failed to delete share data; repeat the removal")
@@ -1067,7 +1078,8 @@ func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.DeleteShare(r.Context(), name); err != nil {
+	// By ID, so a share created under the name since the lookup keeps its row.
+	if err := h.store.DeleteShare(r.Context(), share.ID); err != nil {
 		if errors.Is(err, models.ErrShareNotFound) {
 			NotFound(w, "Share not found")
 			return
