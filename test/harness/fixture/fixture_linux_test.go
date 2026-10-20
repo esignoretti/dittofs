@@ -72,7 +72,10 @@ func TestRealMount(t *testing.T) {
 			}
 			// A suite's users reach the share through {mount}: the
 			// directory under the mount is private to the user dt runs as.
-			nobody := exec.Command("setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "ls", mount)
+			// setpriv needs root to switch users, so it runs as root the way
+			// the fixture's mount commands do.
+			argv := asRoot("setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "ls", mount)
+			nobody := exec.Command(argv[0], argv[1:]...)
 			if out, err := nobody.CombinedOutput(); err != nil {
 				t.Errorf("a user other than root lists {mount}: %v\n%s", err, out)
 			}
