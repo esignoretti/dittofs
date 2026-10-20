@@ -395,7 +395,7 @@ the health condition of a primary it cannot reach
 principals a first sign-in mints — a create-only `PutUser` or `PutGroup` with
 its `PX` rows, allocated IDs and `PGEN` (RFC 18 §2.4, §5.1) — and a directory
 principal's name refresh, conditional on the generation it read. It **MUST NOT** write a file's,
-a directory's, a shard's or a share's record, nor any control-plane record: each
+a directory's, a shard's or a share's record, nor any other control-plane record — those principal writes are the one exception ([RFC 16 §3](rfc-16-metadata-store.md#3.%20Interfaces%2C%20by%20consumer)): each
 of those is written by a storage node.
 
 **The shard service is the one seam.** The calls §4 serves at a shard's primary,
