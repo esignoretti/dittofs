@@ -279,6 +279,11 @@ func (s *Session) UpdateIdentity(username, domain string, user *models.User, isG
 	s.User = user
 	s.IsGuest = isGuest
 	s.IsNull = isNull
+	// A re-authentication replaces the security context, so the previous
+	// ticket's end-time goes with it: an NTLM one must not keep a Kerberos
+	// session's expiry, or its Kerberos proof. A Kerberos re-authentication
+	// records its own ticket right after.
+	s.ExpiresAt = time.Time{}
 	// Drops the memoized derived identity too: User and PAC may both have
 	// changed, so the next consumer rebuilds from the new fields.
 	s.setPACLocked(pacGroupSIDs, pacUserSID)
@@ -503,10 +508,15 @@ func (s *Session) IsExpired() bool {
 // publishing the new identity, and a request landing between the two would
 // otherwise see the fresh principal beside the previous ticket's end-time and
 // be refused on a session that has just recovered.
+//
+// The ticket is also the session's Kerberos proof (AuthzIdentity.Kerberos), so
+// recording one starts a new identity generation: a decision taken between
+// UpdateIdentity and this call, without the proof, is not applied.
 func (s *Session) SetExpiry(expiresAt time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ExpiresAt = expiresAt
+	s.authGen.Add(1)
 }
 
 // Expiry returns the ticket end-time under the same lock. Zero when the session
@@ -550,7 +560,8 @@ func (s *Session) CurrentUsername() string {
 // AuthzIdentity is one consistent view of every identity field an
 // authorization decision reads off a session: the DittoFS user record, the
 // name and guest flag the local resolver keys on, the Kerberos PAC SIDs the
-// directory resolver keys on, and the generation all four belong to.
+// directory resolver keys on, the proof the share's access policy reads, and
+// the generation they all belong to.
 //
 // It is a single value because a decision that reads them through separate
 // accessors can combine halves of two identities. The local half and the SID
@@ -558,12 +569,15 @@ func (s *Session) CurrentUsername() string {
 // record beside a new principal's group SIDs authorizes a combination that
 // never existed on the session.
 type AuthzIdentity struct {
-	User       *models.User
-	Username   string
-	IsGuest    bool
-	IsNull     bool
-	GroupSIDs  []string
-	UserSID    string
+	User      *models.User
+	Username  string
+	IsGuest   bool
+	IsNull    bool
+	GroupSIDs []string
+	UserSID   string
+	// Kerberos reports that the session holds a Kerberos ticket: only a
+	// Kerberos authentication records a ticket end-time.
+	Kerberos   bool
 	Generation uint64
 }
 
@@ -585,6 +599,7 @@ func (s *Session) AuthzIdentity() AuthzIdentity {
 		IsNull:     s.IsNull,
 		GroupSIDs:  groupSIDs,
 		UserSID:    s.pacUserSID,
+		Kerberos:   !s.ExpiresAt.IsZero(),
 		Generation: s.authGen.Load(),
 	}
 }

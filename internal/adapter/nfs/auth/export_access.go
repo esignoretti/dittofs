@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 
@@ -15,18 +14,19 @@ import (
 // the share's export access-control policy. Every denial wraps it, with the
 // rule that fired in the message, so a caller can map one decision onto its own
 // protocol status (MNT3ERR_ACCES, NFS3ERR_ACCES, NFS4ERR_WRONGSEC) and log why.
-var ErrExportAccessDenied = errors.New("export access denied")
+// It is the shared policy's error, so SMB and NFS refuse with one value.
+var ErrExportAccessDenied = runtime.ErrShareAccessDenied
 
 // NetgroupChecker reports whether a client address is allowed by a share's
-// netgroup allowlist. Passing the lookup in keeps the policy dependent on the
-// one call it needs rather than on the whole control plane;
-// *runtime.Runtime.CheckNetgroupAccess satisfies it.
-type NetgroupChecker func(ctx context.Context, shareName string, clientIP net.IP) (bool, error)
+// netgroup allowlist; *runtime.Runtime.CheckNetgroupAccess satisfies it.
+type NetgroupChecker = runtime.NetgroupChecker
 
-// CheckExportAccess applies a share's export access-control policy to one
-// request: which auth flavors the export accepts, the protection level a
-// Kerberos session must have negotiated, and which client addresses may reach
-// it. It returns nil when the request may proceed and an error wrapping
+// CheckExportAccess applies a share's access policy (runtime.CheckShareAccess)
+// to one NFS request: which auth flavors the export accepts, the protection
+// level a Kerberos session must have negotiated, and which client addresses may
+// reach it. It is the NFS mapping of that policy: AUTH_SYS and AUTH_NONE carry
+// no verified proof, and RPCSEC_GSS carries Kerberos at the service level it
+// negotiated. It returns nil when the request may proceed and an error wrapping
 // ErrExportAccessDenied otherwise. share must not be nil.
 //
 // Both flavor gates test for RPCSEC_GSS rather than against AUTH_UNIX: a share
@@ -54,42 +54,17 @@ func CheckExportAccess(
 	clientIP net.IP,
 	netgroup NetgroupChecker,
 ) error {
-	if authFlavor != rpc.AuthRPCSECGSS {
-		if !share.AllowAuthSys {
-			return fmt.Errorf("%w: share %q accepts only Kerberos auth (flavor %d)",
-				ErrExportAccessDenied, share.Name, authFlavor)
-		}
-		if share.RequireKerberos {
-			return fmt.Errorf("%w: share %q requires Kerberos (flavor %d)",
-				ErrExportAccessDenied, share.Name, authFlavor)
-		}
-	} else {
+	proof, protection := runtime.ProofNone, runtime.ProtectionNone
+	if authFlavor == rpc.AuthRPCSECGSS {
 		si := gss.SessionInfoFromContext(ctx)
 		if si == nil {
 			return fmt.Errorf("%w: RPCSEC_GSS credential for share %q was not verified",
 				ErrExportAccessDenied, share.Name)
 		}
-		if !MeetsMinKerberosLevel(share.MinKerberosLevel, si.Service) {
-			return fmt.Errorf("%w: share %q requires min kerberos level %q (negotiated service %d)",
-				ErrExportAccessDenied, share.Name, share.MinKerberosLevel, si.Service)
-		}
+		proof, protection = runtime.ProofKerberos, gssProtection(si.Service)
 	}
-
-	if netgroup == nil {
-		return nil
-	}
-	if clientIP == nil {
-		return fmt.Errorf("%w: client address for share %q is not an IP, cannot evaluate the netgroup allowlist",
-			ErrExportAccessDenied, share.Name)
-	}
-	allowed, err := netgroup(ctx, share.Name, clientIP)
-	if err != nil {
-		return fmt.Errorf("%w: netgroup check for share %q failed: %w",
-			ErrExportAccessDenied, share.Name, err)
-	}
-	if !allowed {
-		return fmt.Errorf("%w: client %s is not in the netgroup allowed for share %q",
-			ErrExportAccessDenied, clientIP, share.Name)
+	if err := runtime.CheckShareAccess(ctx, share, proof, protection, clientIP, netgroup); err != nil {
+		return fmt.Errorf("auth flavor %d: %w", authFlavor, err)
 	}
 	return nil
 }

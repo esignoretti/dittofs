@@ -1,19 +1,19 @@
 // The share-policy gate, as it actually stands across the protocols.
 //
-// Four things a share's policy can refuse for, and they are not symmetric:
-// only the enabled flag is shared by every protocol. The auth-flavor policy,
-// the minimum Kerberos level and the netgroup allowlist are NFS export policy
-// -- they arrive on the NFS adapter config and are read only under
-// internal/adapter/nfs, so an SMB share has nowhere to set them. Writing the
-// acceptance test as "the same four rejections per protocol" would therefore
-// have asserted three gates SMB cannot have.
+// Four things a share's policy can refuse for, and the gates are not
+// symmetric. The auth-flavor policy, the minimum Kerberos level and the
+// netgroup allowlist are one shared policy (runtime.CheckShareAccess), which
+// each protocol applies at its own points:
 //
 //	rejection            SMB              NFS MOUNT   NFSv3 per-op   NFSv4
 //	enabled flag         TREE_CONNECT     MOUNT       here           PUTFH + junction LOOKUP
 //	                     + revalidation
-//	auth flavor          --               MOUNT       dispatch       auth-context build
-//	min Kerberos level   --               MOUNT       dispatch       auth-context build
-//	netgroup allowlist   --               MOUNT       NOT CHECKED    shareEntryStatus
+//	auth flavor          TREE_CONNECT     MOUNT       dispatch       auth-context build
+//	                     + revalidation
+//	min Kerberos level   TREE_CONNECT     MOUNT       dispatch       auth-context build
+//	                     + revalidation
+//	netgroup allowlist   TREE_CONNECT     MOUNT       NOT CHECKED    shareEntryStatus
+//	                     + revalidation
 //
 // Two of those cells are deliberate and stated where they are decided rather
 // than here: NFSv3's per-operation gate passes no netgroup lookup to

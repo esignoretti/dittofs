@@ -143,6 +143,15 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 
 	permission = capReadOnlyShare(share, permission)
 
+	// The share's access policy. Read after the permission so both answers are
+	// about one identity: a re-authentication after the permission's snapshot
+	// moves the generation the publish check below compares.
+	if err := h.checkSharePolicy(ctx.Context, share, sess, sess.AuthzIdentity(), share.EncryptData, ctx.ClientAddr); err != nil {
+		logger.Info("TREE_CONNECT refused by the share's access policy",
+			"shareName", shareName, "sessionID", ctx.SessionID, "reason", err)
+		return NewErrorResult(types.StatusAccessDenied), nil
+	}
+
 	// Encryption enforcement: in required mode, reject unencrypted sessions
 	// connecting to encrypted shares.
 	if shouldRejectUnencryptedTreeConnect(h.EncryptionConfig.Mode, share, sess) {
@@ -162,6 +171,7 @@ func (h *Handler) TreeConnect(ctx *SMBHandlerContext, body []byte) (*HandlerResu
 		CreatedAt:              time.Now(),
 		Permission:             permission,
 		EncryptData:            share.EncryptData,
+		ClientAddr:             ctx.ClientAddr,
 		AccessBasedEnumeration: share.AccessBasedEnumeration,
 		ChangeNotifyDisabled:   share.ChangeNotifyDisabled,
 		StreamsDisabled:        share.StreamsDisabled,

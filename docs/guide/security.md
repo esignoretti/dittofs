@@ -291,7 +291,8 @@ dfsctl netgroup add-member trusted-net --type ip   --value 192.168.1.50
 dfsctl share nfs-config set /export --netgroup trusted-net
 ```
 
-The netgroup is enforced on both NFS versions, on paths that do not share code:
+The netgroup is enforced on both NFS versions and on SMB, on paths that do not
+share code:
 
 - **NFSv3** — checked at MOUNT and refused with `MNT3ERR_ACCES`. The check runs
   **only** at mount time; the per-operation path re-checks the auth-flavor
@@ -300,6 +301,11 @@ The netgroup is enforced on both NFS versions, on paths that do not share code:
   share handle enters a compound (PUTFH, or a LOOKUP crossing an export
   junction out of the pseudo-fs) and again whenever an operation builds an auth
   context. A client outside the allowlist gets `NFS4ERR_ACCESS`.
+- **SMB**: checked at TREE_CONNECT against the address of the connection that
+  sends it, and refused with `STATUS_ACCESS_DENIED`. Attaching or changing the
+  share's netgroup re-checks the established tree connections; an edit to the
+  netgroup's members applies from the next TREE_CONNECT. See
+  [SMB § Share access policy](smb.md#share-access-policy).
 
 **Consequence for tightening an export.** Because v4 re-checks per request,
 adding or narrowing a netgroup takes effect on a v4 client's next operation,

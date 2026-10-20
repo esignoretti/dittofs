@@ -503,6 +503,24 @@ When authentication fails and guest access is enabled, a session is created with
 privileges. Guest sessions cannot sign or encrypt messages (no session key), so they should be
 limited to read-only public shares.
 
+### Share access policy
+
+A share's access policy, set with `dfsctl share nfs-config set`, applies to SMB
+as well as NFS. It is checked at TREE_CONNECT, and a refusal is
+`STATUS_ACCESS_DENIED`. The defaults admit every session.
+
+| Setting | Over SMB |
+|---------|----------|
+| `require_kerberos` | Refuses NTLM, guest and anonymous sessions. |
+| `allow_auth_sys=false` | Refuses guest and anonymous sessions; NTLM and Kerberos pass. |
+| `min_kerberos_level` | The protection floor for any authenticated session, NTLM included. `krb5i` needs a session that must sign every request (any authenticated SMB 3.1.1 session, or every session when `signing.required` is set). `krb5p` needs every request on the share encrypted, by the session or by the share's `encrypt_data`; a client that cannot encrypt, such as SMB 2.x, is refused. Guest and anonymous sessions answer to `allow_auth_sys` alone. |
+| `netgroup` | The address of the connection that sends TREE_CONNECT must be in the netgroup. |
+
+A policy change re-checks the established tree connections, and a tree the new
+policy refuses is removed. So is a tree whose session re-authenticates with a
+weaker proof, such as NTLM on a Kerberos-only share. An edit to a netgroup's
+members applies from the next TREE_CONNECT.
+
 ### Keytab Configuration and Hot-Reload
 
 ```yaml

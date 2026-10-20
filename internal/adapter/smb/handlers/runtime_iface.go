@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"net"
 
 	"github.com/marmos91/dittofs/internal/adapter/common"
 	"github.com/marmos91/dittofs/pkg/block/engine"
@@ -34,6 +35,10 @@ type smbRuntime interface {
 	GetShare(name string) (*runtime.Share, error)
 	GetRootHandle(shareName string) (metadata.FileHandle, error)
 	ListShares() []string
+
+	// CheckNetgroupAccess applies a share's netgroup allowlist to a client
+	// address, for the share's access policy at TREE_CONNECT.
+	CheckNetgroupAccess(ctx context.Context, shareName string, clientIP net.IP) (bool, error)
 
 	// ShareRootGrantACL returns the allow-only ACL projecting the share's
 	// control-plane grants (user/group/SID + default) into Windows ACE form.

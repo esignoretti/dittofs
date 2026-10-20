@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"testing"
 
 	"github.com/marmos91/dittofs/internal/adapter/smb/types"
@@ -36,7 +37,7 @@ func TestTryReauthUpdate_IdentityMutation(t *testing.T) {
 
 	newUser := &models.User{Username: "bob", Enabled: true}
 	pending := &PendingAuth{SessionID: sessionID, IsReauth: true}
-	if res := h.tryReauthUpdate(pending, "bob", "EXAMPLE", newUser, false); res == nil {
+	if res := h.tryReauthUpdate(context.Background(), pending, "bob", "EXAMPLE", newUser, false); res == nil {
 		t.Fatal("tryReauthUpdate returned nil for an existing session")
 	}
 

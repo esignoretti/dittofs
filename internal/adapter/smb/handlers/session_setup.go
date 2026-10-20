@@ -1349,7 +1349,7 @@ func (h *Handler) completeNTLMAuth(ctx *SMBHandlerContext, securityBuffer []byte
 			if result := h.checkGuestPolicy(); result != nil {
 				return result, nil
 			}
-			if result := h.tryReauthUpdate(pending, "anonymous", "", nil, true); result != nil {
+			if result := h.tryReauthUpdate(ctx.Context, pending, "anonymous", "", nil, true); result != nil {
 				ctx.IsGuest = true
 				return result, nil
 			}
@@ -1517,7 +1517,7 @@ func (h *Handler) completeNTLMAuth(ctx *SMBHandlerContext, securityBuffer []byte
 					// them here makes the SUCCESS response's signature diverge
 					// from what the client computes with the unchanged key
 					// (smb2.session.reauth1-5 reject the response).
-					if result := h.tryReauthUpdate(pending, resolvedUsername, h.sessionDomain(authMsg.Domain), user, false); result != nil {
+					if result := h.tryReauthUpdate(ctx.Context, pending, resolvedUsername, h.sessionDomain(authMsg.Domain), user, false); result != nil {
 						return result, nil
 					}
 					// Fallthrough: session disappeared between negotiate and auth (unlikely)
@@ -2358,7 +2358,7 @@ func (h *Handler) buildAuthenticatedResponse(pending *PendingAuth, exportedSessi
 // SessionBaseKey. The session's tree connects and open files are preserved.
 // Returns a non-nil *HandlerResult if the session was found and updated,
 // or nil if the session no longer exists (caller should fall through).
-func (h *Handler) tryReauthUpdate(pending *PendingAuth, username, domain string, user *models.User, isGuest bool) *HandlerResult {
+func (h *Handler) tryReauthUpdate(ctx context.Context, pending *PendingAuth, username, domain string, user *models.User, isGuest bool) *HandlerResult {
 	existingSess, ok := h.GetSession(pending.SessionID)
 	if !ok {
 		return nil
@@ -2386,6 +2386,7 @@ func (h *Handler) tryReauthUpdate(pending *PendingAuth, username, domain string,
 			"sessionID", existingSess.SessionID, "username", username)
 		return NewErrorResult(types.StatusUserSessionDeleted)
 	}
+	h.recheckTreePolicy(ctx, existingSess)
 
 	logger.Info("Session re-authenticated (identity updated, keys retained)",
 		"sessionID", existingSess.SessionID,

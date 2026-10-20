@@ -257,6 +257,17 @@ func (h *Handler) revalidateTrees(ctx context.Context, userStore models.UserStor
 			return true
 		}
 
+		// The share's access policy, for the same reason: grants never read it,
+		// so a tightened policy would leave every established tree standing.
+		// A netgroup lookup that fails removes the tree too, as it refuses a
+		// TREE_CONNECT: unlike a failed grant lookup, refusing grants nothing.
+		if err := h.checkSharePolicy(ctx, share, sess, survivor.snap, tree.EncryptData, tree.ClientAddr); err != nil {
+			logger.Info("SMB tree refused by the share's access policy",
+				"treeID", tree.TreeID, "share", share.Name, "reason", err)
+			updates = append(updates, treeUpdate{treeID: tree.TreeID, sessionID: tree.SessionID, permission: models.PermissionNone, generation: survivor.snap.Generation})
+			return true
+		}
+
 		permission, _, unresolved := resolveSharePermissionForIdentity(
 			&SMBHandlerContext{Context: ctx},
 			sess,
@@ -302,20 +313,7 @@ func (h *Handler) revalidateTrees(ctx context.Context, userStore models.UserStor
 		// downstream read-only checks read none as "not read-only", so pinning
 		// it would lift the ceiling instead of closing access.
 		if u.permission == models.PermissionNone {
-			// Close the opens first, the way TREE_DISCONNECT does. CLOSE is
-			// itself a tree-scoped command, so a handle left behind on a
-			// removed tree can never be closed by its client, and any byte-range
-			// lock it holds would stand against other users until the
-			// connection dropped.
-			closed := h.CloseAllFilesForTree(ctx, u.treeID, u.sessionID)
-			// A LOCK parked on this tree passed its authorization check before
-			// the grant was withdrawn and is not woken by closing the opens, so
-			// it would otherwise complete against access this sweep just
-			// removed. Drain it through the same helper TREE_DISCONNECT uses.
-			h.cancelPendingLocksForTree(u.treeID)
-			logger.Info("SMB tree removed: share access revoked",
-				"treeID", u.treeID, "filesClosed", closed)
-			h.DeleteTree(u.treeID)
+			h.removeTree(ctx, u.treeID, u.sessionID)
 			continue
 		}
 		tree, ok := h.GetTree(u.treeID)
@@ -342,4 +340,22 @@ func (h *Handler) revalidateTrees(ctx context.Context, userStore models.UserStor
 			"treeID", u.treeID, "share", updated.ShareName,
 			"from", tree.Permission, "to", u.permission)
 	}
+}
+
+// removeTree retires one tree connection the way TREE_DISCONNECT does, for a
+// tree its session no longer has access to.
+func (h *Handler) removeTree(ctx context.Context, treeID uint32, sessionID uint64) {
+	// Close the opens first. CLOSE is itself a tree-scoped command, so a handle
+	// left behind on a removed tree can never be closed by its client, and any
+	// byte-range lock it holds would stand against other users until the
+	// connection dropped.
+	closed := h.CloseAllFilesForTree(ctx, treeID, sessionID)
+	// A LOCK parked on this tree passed its authorization check before access
+	// was withdrawn and is not woken by closing the opens, so it would otherwise
+	// complete against access just removed. Drain it through the same helper
+	// TREE_DISCONNECT uses.
+	h.cancelPendingLocksForTree(treeID)
+	logger.Info("SMB tree removed: share access revoked",
+		"treeID", treeID, "filesClosed", closed)
+	h.DeleteTree(treeID)
 }

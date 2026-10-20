@@ -438,7 +438,7 @@ func TestTryReauthUpdate_ClearsKerberosPACIdentity(t *testing.T) {
 	// Drive an NTLM reauth onto the same session as a different, lower-priv user.
 	ntlmUser := &models.User{Username: "bob", Enabled: true}
 	pending := &PendingAuth{SessionID: sessionID, IsReauth: true}
-	if res := h.tryReauthUpdate(pending, "bob", "DITTOFS", ntlmUser, false); res == nil {
+	if res := h.tryReauthUpdate(context.Background(), pending, "bob", "DITTOFS", ntlmUser, false); res == nil {
 		t.Fatal("tryReauthUpdate returned nil for an existing session")
 	}
 

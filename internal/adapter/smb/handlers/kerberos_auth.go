@@ -243,6 +243,7 @@ func (h *Handler) reauthKerberosSession(
 			"sessionID", sess.SessionID, "username", user.Username)
 		return NewErrorResult(types.StatusUserSessionDeleted), nil
 	}
+	h.recheckTreePolicy(ctx.Context, sess)
 	ctx.PACGroupSIDs = authResult.GroupSIDs
 	ctx.IsGuest = false
 

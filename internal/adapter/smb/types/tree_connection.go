@@ -18,6 +18,10 @@ type TreeConnection struct {
 	CreatedAt   time.Time
 	Permission  models.SharePermission // User's permission level for this share
 	EncryptData bool                   // Share requires all requests to be encrypted
+	// ClientAddr is the address of the connection that carried TREE_CONNECT,
+	// which the share's netgroup allowlist is checked against, then and on
+	// every re-check of the tree.
+	ClientAddr string
 	// AccessBasedEnumeration mirrors the share-level toggle. When true,
 	// QUERY_DIRECTORY filters entries the caller cannot read (refs #532,
 	// MS-SMB2 §2.2.10 SMB2_SHAREFLAG_ACCESS_BASED_DIRECTORY_ENUM).
