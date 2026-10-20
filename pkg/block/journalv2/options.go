@@ -63,8 +63,11 @@ func WithTracer(t Tracer) Option {
 	return Option{func(cfg *core.Config) { cfg.Tracer = t }}
 }
 
-// WithLogger makes the journal log through l. Without it the journal logs
-// nothing.
+// WithLogger makes the journal log through l. Without it, or with a nil l,
+// the journal logs nothing.
 func WithLogger(l *slog.Logger) Option {
+	if l == nil {
+		l = slog.New(slog.DiscardHandler)
+	}
 	return Option{func(cfg *core.Config) { cfg.Logger = l }}
 }

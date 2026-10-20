@@ -10,7 +10,12 @@ func (j *Journal) Inspect() Inspector {
 }
 
 // Inspector reads out a journal's index and segments. Its methods are safe for
-// concurrent use with every other operation on the journal.
+// concurrent use with every other operation on the journal. After the journal
+// closes, File and Verify fail with ErrClosed, and All and Segments return
+// nothing.
+//
+// decision: All and Segments have no error to return, so after Close they
+// return nothing rather than a view of state the journal has released.
 type Inspector struct{}
 
 // File returns the index entries of file id, in offset order.
@@ -47,7 +52,8 @@ const (
 	EntryHeld EntryKind = iota + 1
 
 	// EntryRetained is superseded content kept until its superseding write is
-	// synced, or while a snapshot hold keeps it. A read does not serve it.
+	// synced, or until its successor's existence commits, or while a snapshot
+	// hold keeps it. A read does not serve it.
 	EntryRetained
 
 	// EntryMarker is a removal not yet settled: a truncate, deallocate or
@@ -64,9 +70,9 @@ type IndexEntry struct {
 	// Tag is the tag of the share whose record backs the entry.
 	Tag ShareTag
 
-	// Location is where in local storage the entry's bytes sit.
+	// Location is the record holding the entry's bytes; zero for a marker.
 	//
-	// decision: an entry is one piece of one record (RFC 1 §4.1), so its
+	// decision: an entry is one contiguous piece of one record, so its
 	// location is that record's, the same RecordRef Verify reports.
 	Location RecordRef
 
@@ -95,6 +101,8 @@ type SegmentInfo struct {
 	// Allocated is the storage the segment is accounted at, in bytes.
 	Allocated int64
 
+	// HeldBytes is the bytes of held extents in the segment, and
+	// RetainedBytes the bytes of retained ones; neither includes the other.
 	HeldBytes     int64
 	RetainedBytes int64
 
@@ -117,8 +125,8 @@ type VerifyReport struct {
 	BadFooters []SegmentID
 
 	// FootprintMismatch is the accounted footprint minus the sum of the
-	// segments' sizes, in bytes, when the two differ; nil when they agree.
-	FootprintMismatch *int64
+	// segments' sizes, in bytes; zero when the two agree.
+	FootprintMismatch int64
 }
 
 // UnindexedRecord is a record the index should hold or retain but does not.

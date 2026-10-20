@@ -5,12 +5,13 @@ import "time"
 // Stats returns the journal's statistics: journal-wide, with a per-share
 // breakdown. It is served from counters the journal maintains: it neither
 // walks the placement index or the segment set nor blocks a write, and it is
-// safe to call concurrently with every other operation.
+// safe to call concurrently with every other operation. After Close it
+// returns the zero Stats, since it has no error to return.
 //
 // decision: the stub returns the zero Stats because the signature has no
 // error to carry ErrNotImplemented. A zero Stats reads as an empty journal, so
 // no caller may depend on it until the counters land.
-func (h *Journal) Stats() Stats {
+func (j *Journal) Stats() Stats {
 	return Stats{}
 }
 
@@ -28,13 +29,16 @@ func (h *Journal) Stats() Stats {
 // Each field's comment names its kind: a gauge is a level that rises and
 // falls, a counter only rises and restarts at zero on open, a histogram is a
 // distribution, and a value is reported as it is rather than charted.
+//
+// Every map and slice in a Stats belongs to the caller: Stats returns copies
+// and never keeps them.
 type Stats struct {
 	// MaxBytes is the configured capacity. Kind: gauge.
 	MaxBytes int64
 
 	// UsedBytes is the local storage allocated: the segments, each at its
 	// accounted size. Clean held bytes, dirty bytes and unreclaimed bytes all
-	// count here; it is the measure eviction is triggered on. Kind: gauge.
+	// count here. Kind: gauge.
 	UsedBytes int64
 
 	// ReservedBytes is the record bytes reserved by in-flight writes inside
@@ -48,7 +52,8 @@ type Stats struct {
 	DirtyBytes int64
 
 	// OldestDirty is when the oldest held extent whose offloaded bit is unset
-	// was written: the age of the upload backlog. Kind: value.
+	// was written: the age of the upload backlog. Zero when nothing is dirty.
+	// Kind: value.
 	OldestDirty time.Time
 
 	// Files is the number of files with at least one held extent. Kind: gauge.
@@ -95,8 +100,8 @@ type Stats struct {
 	// SyncDuration is the time per sync. Kind: histogram.
 	SyncDuration Histogram
 
-	// RemovalMarkers is the number of removal markers not yet settled. It
-	// growing is a caller that never settles. Kind: gauge.
+	// RemovalMarkers is the number of removal markers not yet settled. Kind:
+	// gauge.
 	RemovalMarkers int
 
 	// VersionLimit is the version limit, VersionsLeft how many versions remain
@@ -134,10 +139,7 @@ type Stats struct {
 	TagConflicts []TagConflict
 
 	// Shares holds, for every tag that holds a record, attached or not, that
-	// share's statistics.
-	//
-	// Every map and slice in a Stats belongs to the caller: Stats returns copies
-	// and never keeps them. Kind: per share.
+	// share's statistics. Kind: per share.
 	Shares map[ShareTag]ShareStats
 }
 
@@ -165,23 +167,21 @@ type Counters struct {
 	// WrittenBytes is the client bytes accepted by WriteAt.
 	WrittenBytes uint64
 
-	// FilledBytes is the remote bytes placed by Fill. With WrittenBytes, it is
-	// the cold-read share of local writes.
+	// FilledBytes is the remote bytes placed by Fill.
 	FilledBytes uint64
 
 	// FillRefused is the number of fills refused as older than the file.
 	FillRefused uint64
 
 	// OfferedBytes is the bytes offered at offload, and MarkedBytes the bytes
-	// marked offloaded. The lag between them is offload falling behind.
+	// marked offloaded.
 	OfferedBytes, MarkedBytes uint64
 
 	// ReleasedBytes is the bytes released, and FreedBytes the storage actually
 	// returned by unlinking segments.
 	ReleasedBytes, FreedBytes uint64
 
-	// RepackedBytes is the bytes moved by repack: the write amplification
-	// reclamation adds.
+	// RepackedBytes is the bytes moved by repack.
 	RepackedBytes uint64
 
 	// ReservationRefused is the number of writes refused at capacity.
@@ -200,15 +200,14 @@ type Counters struct {
 
 	// CorruptExtentsDataLoss is the number of extents dropped as corrupt with
 	// their offloaded bit unset, and CorruptExtentsRepairable the number with
-	// it set. Any data loss is an alert.
+	// it set.
 	CorruptExtentsDataLoss, CorruptExtentsRepairable uint64
 
 	// StaleExtents is the number of extents dropped as older than offloaded
 	// content.
 	StaleExtents uint64
 
-	// TornTails is the number of torn tails truncated at open. One per crashed
-	// stream is normal.
+	// TornTails is the number of torn tails truncated at open.
 	TornTails uint64
 
 	// ScanResyncs is the number of scans that found a record by
@@ -233,8 +232,8 @@ type Counters struct {
 
 // Histogram is a distribution of durations over fixed buckets.
 //
-// decision: the RFC names the kind but not the shape. Bounds, Counts and Sum
-// are what a metrics exporter needs to publish the distribution.
+// decision: Bounds, Counts and Sum are what a metrics exporter needs to
+// publish the distribution, and nothing more is kept.
 type Histogram struct {
 	// Bounds are the buckets' upper bounds, ascending.
 	Bounds []time.Duration
