@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -35,6 +37,13 @@ type shareServer struct {
 
 func newShareServer(t *testing.T) *shareServer {
 	t.Helper()
+	return newShareServerWith(t, nil)
+}
+
+// newShareServerWith is newShareServer with the metadata store passed through
+// wrap before the runtime sees it, so a test can stand between the two.
+func newShareServerWith(t *testing.T, wrap func(metadata.Store) metadata.Store) *shareServer {
+	t.Helper()
 	ctx := context.Background()
 
 	cp, err := store.New(&store.Config{Type: store.DatabaseTypeSQLite, SQLite: store.SQLiteConfig{Path: ":memory:"}})
@@ -59,7 +68,11 @@ func newShareServer(t *testing.T) *shareServer {
 	if _, err := cp.CreateMetadataStore(ctx, &models.MetadataStoreConfig{Name: "md", Type: "badger"}); err != nil {
 		t.Fatalf("CreateMetadataStore: %v", err)
 	}
-	if err := rt.RegisterMetadataStore("md", md); err != nil {
+	var served metadata.Store = md
+	if wrap != nil {
+		served = wrap(md)
+	}
+	if err := rt.RegisterMetadataStore("md", served); err != nil {
 		t.Fatalf("RegisterMetadataStore: %v", err)
 	}
 	blockID, err := cp.CreateBlockStore(ctx, &models.BlockStoreConfig{Name: "mem", Type: "memory"})
@@ -240,4 +253,50 @@ func TestShareRemove_FailedPurgeKeepsShare(t *testing.T) {
 	if _, err := s.cp.GetShare(ctx, "/stuck"); err != nil {
 		t.Fatalf("the share's row went with a failed purge: %v", err)
 	}
+}
+
+// pausingStore holds the first DeleteShare it receives until resume is closed,
+// so a test can act while a removal is between closing a share and purging it.
+type pausingStore struct {
+	metadata.Store
+	held           atomic.Bool
+	paused, resume chan struct{}
+}
+
+func (p *pausingStore) DeleteShare(ctx context.Context, name string) error {
+	if p.held.CompareAndSwap(false, true) {
+		close(p.paused)
+		<-p.resume
+	}
+	return p.Store.DeleteShare(ctx, name)
+}
+
+// A removal still purging a share keeps its name: a second removal of it is
+// refused rather than purging the same directories alongside the first, and
+// the share can be created again once the first removal is done.
+func TestShareRemove_ConcurrentRemovalIsRefused(t *testing.T) {
+	ps := &pausingStore{paused: make(chan struct{}), resume: make(chan struct{})}
+	s := newShareServerWith(t, func(md metadata.Store) metadata.Store {
+		ps.Store = md
+		return ps
+	})
+	s.create("/team")
+
+	first := make(chan int, 1)
+	go func() { first <- s.remove("/team") }()
+	<-ps.paused
+	resume := sync.OnceFunc(func() { close(ps.resume) })
+	defer resume()
+
+	if code := s.remove("/team"); code != http.StatusConflict {
+		t.Fatalf("a second removal while the first is purging = %d, want 409", code)
+	}
+	resume()
+	if code := <-first; code != http.StatusNoContent {
+		t.Fatalf("the first removal = %d, want 204", code)
+	}
+	if _, err := os.Stat(shares.ShareJournalDir(s.journal, "/team")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the removed share's journal directory is still there: %v", err)
+	}
+	s.create("/team")
 }

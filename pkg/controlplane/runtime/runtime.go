@@ -678,6 +678,14 @@ func (r *Runtime) RemoveShare(name string) error {
 	return rmErr
 }
 
+// BeginShareRemoval claims a share's name for the whole of a removal: RemoveShare,
+// PurgeShare, and whatever the caller does in between. While it is held, adding
+// the share again or beginning a second removal of it fails with
+// shares.ErrShareBusy. The caller must call end once the purge is done.
+func (r *Runtime) BeginShareRemoval(name string) (end func(), err error) {
+	return r.sharesSvc.BeginRemoval(name)
+}
+
 // PurgeShare deletes what a removed share leaves on this server: its records
 // in its metadata store and its journal directory, which holds its local
 // blocks.

@@ -364,10 +364,27 @@ func (s *Service) reserveShareName(name string) error {
 		return fmt.Errorf("share %q already exists", name)
 	}
 	if _, reserved := s.reservations[name]; reserved {
-		return fmt.Errorf("share %q is already being added", name)
+		return fmt.Errorf("share %q: %w", name, ErrShareBusy)
 	}
 	s.reservations[name] = struct{}{}
 	return nil
+}
+
+// BeginRemoval claims a share name for a removal, covering the steps that
+// outlast RemoveShare: the share leaves the registry at once, but its block
+// store is still closing and its data is still to be purged. While the claim is
+// held AddShare and a second BeginRemoval for the name fail with ErrShareBusy,
+// so a share created again under the name cannot open the journal directory
+// the removal is about to delete, and two removals never purge at once. end
+// releases the claim and is idempotent.
+func (s *Service) BeginRemoval(name string) (end func(), err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, reserved := s.reservations[name]; reserved {
+		return nil, fmt.Errorf("share %q: %w", name, ErrShareBusy)
+	}
+	s.reservations[name] = struct{}{}
+	return sync.OnceFunc(func() { s.releaseShareName(name) }), nil
 }
 
 // releaseShareName drops an in-flight AddShare reservation. Idempotent.

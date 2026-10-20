@@ -1021,6 +1021,19 @@ func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	// Remove from runtime first (if runtime is available)
 	removedFromRuntime := false
 	if h.runtime != nil {
+		// The name stays claimed until the purge is done: the share leaves the
+		// registry at once, while its block store is still closing, and a second
+		// removal or a share created again under the name in that window would
+		// race the purge for the same directory.
+		end, err := h.runtime.BeginShareRemoval(name)
+		if err != nil {
+			if errors.Is(err, shares.ErrShareBusy) {
+				Conflict(w, "Share is being added or removed; retry")
+				return
+			}
+			InternalServerError(w, "Failed to delete share")
+			return
+		}
 		// A share absent from the registry is not an error here — the DB row is
 		// authoritative — but whether it was there decides who raises the
 		// invalidation below.
@@ -1034,7 +1047,15 @@ func (h *ShareHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		// root and serve its files. The cost is that a share on a metadata store
 		// that is not loaded cannot be removed until the store loads. Revisit
 		// once the server records a removal and finishes it on its own.
-		if err := h.runtime.PurgeShare(r.Context(), name); err != nil {
+		err = h.runtime.PurgeShare(r.Context(), name)
+		// decision: the claim is released before the row goes, not after. With
+		// the purge finished nothing of this removal touches the name again,
+		// and the row still standing refuses a create as a duplicate; holding
+		// the claim past the row's deletion would instead let a create insert
+		// its row and then be refused by the runtime, leaving a share that is
+		// not served until a restart.
+		end()
+		if err != nil {
 			if errors.Is(err, models.ErrShareNotFound) {
 				NotFound(w, "Share not found")
 				return

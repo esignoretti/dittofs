@@ -295,7 +295,8 @@ type Service struct {
 	// fails early — before it can RegisterStoreForShare and leave a
 	// metadata-store/registry mismatch when it later loses the registry recheck.
 	// A reserved name is NOT yet in registry, so handlers never observe a
-	// half-built share.
+	// half-built share. A removal claims its name here too (BeginRemoval), for
+	// as long as it is still closing and purging what the share left.
 	reservations    map[string]struct{}
 	remoteStores    map[string]*sharedRemote // configID -> shared remote
 	nextCallbackID  int

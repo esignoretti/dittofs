@@ -23,3 +23,7 @@ var ErrShareNotFound = models.ErrShareNotFound
 // next boot to load, so refusing during shutdown is behaviour they are written
 // for.
 var ErrShuttingDown = errors.New("shares service is shutting down")
+
+// ErrShareBusy is returned when a share name is claimed by an add or a removal
+// still in flight, so a second one for the same name cannot overlap it.
+var ErrShareBusy = errors.New("share is being added or removed")
