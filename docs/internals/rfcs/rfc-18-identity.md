@@ -467,15 +467,17 @@ type Minter interface {
 	Rename(ctx context.Context, p metadata.Principal, name string) error // the record's Name and its name index only (§5.1)
 }
 
-// New validates the settings and starts nothing. *Server implements
+// New takes no settings and starts nothing. *Server implements
 // Authenticator, Identities and Resolver; only the composition root holds it.
-func New(d Deps, s config.Identity) (*Server, error)
-func (s *Server) Start(ctx context.Context) error        // loads the keytab's versions; the directory client dials lazily, so a down directory does not fail start
-func (s *Server) Apply(gen uint64, cfg config.Identity) // from the node: a new principals generation, identity settings, the directory record (§7.2)
-func (s *Server) Close() error                         // drops every in-memory table
+func New(d Deps) (*Server, error)
+func (s *Server) Apply(gen uint64, cfg config.Identity) error // from the node, first before Start: a principals generation, identity settings, the directory record (§7.2); refuses an invalid setting and keeps the last applied
+func (s *Server) Start(ctx context.Context) error              // after the first Apply; loads the keytab's versions; the directory client dials lazily, so a down directory does not fail start
+func (s *Server) Close() error                                 // drops every in-memory table
 ```
 
-**Start and stop.** The node starts it in build order, with open state, after
+**Start and stop.** No settings reach `New`. The node reads the records at start
+step 4 and hands identity its first settings and principals generation through
+`Apply`, before `Start`. It starts it in build order, with open state, after
 the metadata store, the engine and GC and before `*vfs.Server`
 ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)). It stops it after `*vfs.Server`, because a drain still
 delivers calls that resolve. A failed start
