@@ -179,8 +179,13 @@ func TestSilentClientExpires(t *testing.T) {
 func TestStartSweepsOnTheClock(t *testing.T) {
 	f := newFixture(t)
 	id := f.connect(t, nfsClient("host-a", 1, principal(1)))
-	f.Start(ctx)
+	if err := f.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
 	defer f.Stop()
+	if err := f.Start(ctx); err == nil {
+		t.Error("a second Start was accepted")
+	}
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		f.clock.advance(sweepEvery)
 		if _, err := f.fs.Store.Clients().Get(ctx, id); err != nil {

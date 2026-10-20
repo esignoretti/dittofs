@@ -2,6 +2,7 @@ package openstate
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -16,8 +17,9 @@ import (
 const sweepEvery = 10 * time.Second
 
 // Start arms the lease timer: a client silent for a whole lease period is
-// expired, and a proposal not confirmed within one is dropped.
-func (t *Table) Start(ctx context.Context) {
+// expired, and a proposal not confirmed within one is dropped. A table already
+// started is refused.
+func (t *Table) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -31,8 +33,14 @@ func (t *Table) Start(ctx context.Context) {
 		}
 	})
 	t.cmu.Lock()
+	defer t.cmu.Unlock()
+	if t.stop != nil {
+		cancel()
+		wg.Wait()
+		return errors.New("openstate: table already started")
+	}
 	t.stop = func() { cancel(); wg.Wait() }
-	t.cmu.Unlock()
+	return nil
 }
 
 // Stop stops the timers Start armed. Open state is left as it is.
