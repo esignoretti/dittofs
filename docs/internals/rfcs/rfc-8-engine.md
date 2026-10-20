@@ -214,11 +214,11 @@ Outcome: alice-pc slows down gradually instead of hitting a wall, and no acknowl
 
 - The engine holds no bytes and no facts. Every byte is the journal's or the
   remote tier's; every fact is block metadata's or the namespace's.
-- It is the content data path, one per node with the storage role, serving every
+- It is the content data path, one per node — every node runs both roles — serving every
   share whose shards that node is primary of. It decides policy through five small policy
   functions, runs three modules — the work queue, the offload pipeline and the
-  speculator — and is the content **interface** the filesystem service calls
-  ([RFC 17](rfc-17-vfs.md)). Adapters never call it.
+  speculator — and is the content **interface** that `*vfs.Server` alone calls
+  ([RFC 17](rfc-17-vfs.md)). Neither the adapters nor the gateway reach it.
 - Offload always carries its chunks. Cross-file deduplication is not in the
   first release; re-adding it is a later RFC's ([§6.5](#6.5%20The%20dedup%20oracle)).
 - The write verifier changes exactly when an acknowledged unstable write may
@@ -316,15 +316,16 @@ The engine **MUST NOT**:
 
 ### 2.1 Content composition
 
-The process's one composition root is [RFC 15](rfc-15-topology.md)'s: it builds a node by role, and
+The process's one composition root is `Build` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)), and
 it alone names concrete component types. This section specifies what it builds
-for content, on a node with the storage role: one **journal per device**, the
+for content, on every node: one **journal per device**, the
 syncer, block metadata's view, and one engine over them with a context per share
 ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)). Everything else holds a concrete type where there is one
-implementation — the filesystem service holds `*engine.Engine`
-([RFC 17 §2.3](rfc-17-vfs.md#2.3%20Dependencies%20and%20wiring)) — and an interface the consumer declares only where
+implementation — `*vfs.Server` holds `*engine.Engine`
+([RFC 17](rfc-17-vfs.md)) — and an interface the consumer declares only where
 [RFC 0 §1.2](rfc-0-data-lifecycle.md#1.2%20Component%20autonomy) requires one: the engine declares one per component it calls, in
-`Deps` ([§2.6](#2.6%20Dependencies%20and%20wiring)). Adapters hold only the filesystem service. [RFC 0 §1.2](rfc-0-data-lifecycle.md#1.2%20Component%20autonomy)'s import rule binds the components composed; the
+`Deps` ([§2.6](#2.6%20Dependencies%20and%20wiring)). Adapters hold only `vfs.Service`, and the gateway behind it never
+reaches the engine. [RFC 0 §1.2](rfc-0-data-lifecycle.md#1.2%20Component%20autonomy)'s import rule binds the components composed; the
 composition code imports them and nothing imports it.
 
 **Every share has a remote block store.** The root **MUST** refuse to add a share
@@ -434,7 +435,7 @@ cold read linear.
 
 ### 2.3 One engine per node; a share is a context
 
-A node with the storage role runs **one engine**, and each share it serves is a
+Every node runs **one engine**, and each share it serves is a
 **share context** in it, not an engine of its own. The context is the engine's
 own, unexported; no caller sees it. It holds the share's ID; its key scope, the
 namespace ID ([§2.1](#2.1%20Content%20composition)); its settings, validated at `SetShare` ([§2.4](#2.4%20Settings%20are%20validated%20once%2C%20and%20refused%20rather%20than%20replaced)); its
@@ -688,8 +689,8 @@ offloaded bit is offered again:
 handover ([RFC 11](rfc-11-ownership.md)) — the new primary settles each file to the sealed or drained
 point ([RFC 10](rfc-10-journal-replication.md)) and runs steps 3, 4 and 6 for it before serving it.
 
-**Stop.** `Close(ctx)` runs these steps in one call, after the filesystem service
-has closed and while the metadata store is still open, so the last group commit
+**Stop.** `Close(ctx)` runs these steps in one call, after `*vfs.Server` has
+stopped and while the metadata store is still open, so the last group commit
 can land.
 
 1. Refuse every call with `ErrUnavailable`.
@@ -709,7 +710,7 @@ can land.
 
 ![Who builds, owns, starts and closes what: the composition root builds and owns the metadata store, the carver, the cut gate, the syncer, the ref-counted remote block stores, the clock and the filesystem service; the runtime starts and stops the engine and sets and stops its shares, the snapshot cut calls PrepareCut and CommitCut, and the filesystem service alone calls the content methods; the root lends the store's views, the carver, the cut gate, the syncer and the clock to the engine through Deps, and the remote block stores are reached only through the syncer's flows; the engine opens and owns the journals, one work queue per journal, the offload passes and a share table whose contexts each own their journal handles and a syncer flow; the engine moves from New, which opens nothing, through Start with its shares, serving with SetShare, StopShare and ForgetShare, to Close, and closes only what it opened](img/rfc8-composition.svg)
 
-The composition root ([RFC 15 §2.4](rfc-15-topology.md#2.4%20Composition%20by%20role)) builds the engine with `New(Deps)`. `New`
+`Build` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20One%20root%20composes%2C%20the%20runtime%20follows)) builds the engine with `New(Deps)`. `New`
 validates the settings and opens nothing; the engine closes only what it opens:
 the journals, their share handles, the flows.
 
@@ -734,30 +735,37 @@ type Deps struct {
 }
 ```
 
-**Build, start and stop.** The root builds, in order: the metadata store; the
-syncer, registering every remote block store, ref-counted per configuration; the
-carver; the engine with `New(Deps)`, which opens nothing; GC; open state; the
-filesystem service. The runtime ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)) starts them in that order —
-the engine's `Start` opening the journals and attaching the shares the records
-say this node serves — and stops them in reverse. The engine closes only the
-journals, handles and flows it opened.
+**Build, start and stop.** `Build` builds, in order: the metadata store; the
+syncer, registering every remote block store, ref-counted per configuration, the
+carver and the engine with `New(Deps)`, which opens nothing; GC; open state and
+identity; `*vfs.Server`; in a cluster, `Serve` and the gateway; the adapters.
+`Node.Start` ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)) starts them in that order — the engine's `Start`
+opening the journals and attaching the shares the records say this node serves
+— and `Node.Stop` stops them in reverse: adapters, gateway, `Serve`, GC's drain,
+`*vfs.Server`, open state and identity, the engine, the metadata store. The
+engine closes only the journals, handles and flows it opened.
 
-| Component | Composed of | Depends on | Injected | Built by → owned by | Lifecycle |
-| --- | --- | --- | --- | --- | --- |
-| engine, `*Engine` | the share table, the journals, a work queue per journal, the passes, the speculator, verifier and fence state, the policy functions | everything in `Deps` | `Deps` | root, `New` → root | `New` opens nothing → `Start(shares)` → serving → `Close`, after the filesystem service and before the syncer and the store |
-| share table | the share contexts, copy-on-write ([§1.1](#1.1%20Neither%20a%20single%20point%20of%20failure%20nor%20a%20bottleneck)) | — | internal | engine → engine | swapped by `SetShare` and `ForgetShare` |
-| share context | its journal handles and flow, settings, budgets, policy state, health, state, the clones and copies admitted into it ([§9.1](#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)) | journal, syncer, metadata store | internal | engine at `Start` or `SetShare` → engine | adding → serving → removing → forgotten ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) |
-| journal, one per device | [RFC 1](rfc-1-journal.md) | its directory, `Clock`, its fault seam | `Deps.Devices`, `Deps.Open` | engine at `Start` step 1, once it has read the floor and identity → engine | closed by `Close` after every handle; never after a failed join ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), stop step 5) |
-| journal handle, one per share per journal | [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | its journal | the journal's `Share` | engine → share context | `Close` then the tag's `Forget` in `ForgetShare`; `Close` alone at node stop |
-| work queue, one per journal | one instance of the shared work scheduler with the engine's source ([§6.1](#6.1%20The%20work%20queue)) | journal statistics, the policy functions | internal | engine at `Start` step 6 → engine | its consumer starts at step 7; it stops dispatching at `Close` |
-| offload pipeline | one state machine per pass ([§6.3](#6.3%20The%20offload%20pipeline)) | the offer, carver, assembler, flow, `Existence`, `Content` | internal | work queue → the pass | joined by `Close`; a pass outlives no component (E13) |
-| speculator | per-open-file frontiers, pre-warm plans ([§7.4](#7.4%20The%20speculator)) | journal statistics, the flow's `Prefetch` | internal | engine → engine | memory only; cancelled by `Close` |
-| carver and block assembler | [RFC 2](rfc-2-carver.md) | — | `Deps.Carver` | root → root | stateless |
-| syncer | [RFC 3](rfc-3-syncer.md), shared pools | the remote block stores | `Deps.Syncer` | root → root | the engine opens one flow per share at attach and closes it in `ForgetShare` or `Close`; the root closes the syncer after the engine |
-| remote block store | [RFC 4](rfc-4-remote-tier.md)'s codec, [RFC 5](rfc-5-transforms.md)'s transforms | — | reached only through the share's flow | root, registered with the syncer, ref-counted per configuration → root | open while any flow names it |
-| metadata store | [RFC 16](rfc-16-metadata-store.md), with [RFC 6](rfc-6-block-metadata.md)'s views | — | `Deps.Existence`, `Deps.Content`, `Deps.Lifecycle`, `Deps.Refs` | root → root | never closed by the engine |
-| cut gate, one per shard | [RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate) | — | `Deps.Gate` | root → root | — |
-| clock, metrics, logger | one per node | — | `Deps` | root → root | — |
+**Only `*vfs.Server` calls the engine.** The adapters hold `vfs.Service`, and in a
+cluster the gateway behind it forwards to the primary's `*vfs.Server`; neither
+holds the engine, so no call reaches it except through the server at the
+primary of the file's shard.
+
+| Component | Composed of | Depends on | Calls | Injected | Built by → owned by | Lifecycle |
+| --- | --- | --- | --- | --- | --- | --- |
+| engine, `*Engine` | the share table, the journals, a work queue per journal, the passes, the speculator, verifier and fence state, the policy functions | everything in `Deps` | the journals and their handles, the carver and assembler, the share flows, `Existence`, `Content`, `Lifecycle`, `Refs`, the cut gate, `Clock` | `Deps` | root, `New` → root | `New` opens nothing → `Start(shares)` → serving → `Close`, after the filesystem service and before the syncer and the store |
+| share table | the share contexts, copy-on-write ([§1.1](#1.1%20Neither%20a%20single%20point%20of%20failure%20nor%20a%20bottleneck)) | — | — | internal | engine → engine | swapped by `SetShare` and `ForgetShare` |
+| share context | its journal handles and flow, settings, budgets, policy state, health, state, the clones and copies admitted into it ([§9.1](#9.1%20Clone%20adopts%20carved%20refs%20and%20copies%20the%20rest%20locally)) | journal, syncer, metadata store | its journal handles and flow | internal | engine at `Start` or `SetShare` → engine | adding → serving → removing → forgotten ([§2.3](#2.3%20One%20engine%20per%20node%3B%20a%20share%20is%20a%20context)) |
+| journal, one per device | [RFC 1](rfc-1-journal.md) | its directory, `Clock`, its fault seam | its directory, `Clock` | `Deps.Devices`, `Deps.Open` | engine at `Start` step 1, once it has read the floor and identity → engine | closed by `Close` after every handle; never after a failed join ([§2.5](#2.5%20Start%20in%20order%2C%20stop%20in%20reverse%2C%20and%20join%20before%20closing), stop step 5) |
+| journal handle, one per share per journal | [RFC 1 §3](rfc-1-journal.md#3.%20Interface) | its journal | — | the journal's `Share` | engine → share context | `Close` then the tag's `Forget` in `ForgetShare`; `Close` alone at node stop |
+| work queue, one per journal | one instance of the shared work scheduler with the engine's source ([§6.1](#6.1%20The%20work%20queue)) | journal statistics, the policy functions | the policy functions, the offload pipeline | internal | engine at `Start` step 6 → engine | its consumer starts at step 7; it stops dispatching at `Close` |
+| offload pipeline | one state machine per pass ([§6.3](#6.3%20The%20offload%20pipeline)) | the offer, carver, assembler, flow, `Existence`, `Content` | the carver, assembler, flow, `Existence`, `Content` | internal | work queue → the pass | joined by `Close`; a pass outlives no component (E13) |
+| speculator | per-open-file frontiers, pre-warm plans ([§7.4](#7.4%20The%20speculator)) | journal statistics, the flow's `Prefetch` | the flow's `Prefetch` | internal | engine → engine | memory only; cancelled by `Close` |
+| carver and block assembler | [RFC 2](rfc-2-carver.md) | — | — | `Deps.Carver` | root → root | stateless |
+| syncer | [RFC 3](rfc-3-syncer.md), shared pools | the remote block stores | the remote block stores | `Deps.Syncer` | root → root | the engine opens one flow per share at attach and closes it in `ForgetShare` or `Close`; the root closes the syncer after the engine |
+| remote block store | [RFC 4](rfc-4-remote-tier.md)'s codec, [RFC 5](rfc-5-transforms.md)'s transforms | — | the remote service | reached only through the share's flow | root, registered with the syncer, ref-counted per configuration → root | open while any flow names it |
+| metadata store | [RFC 16](rfc-16-metadata-store.md), with [RFC 6](rfc-6-block-metadata.md)'s views | — | — | `Deps.Existence`, `Deps.Content`, `Deps.Lifecycle`, `Deps.Refs` | root → root | never closed by the engine |
+| cut gate, one per shard | [RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate) | — | — | `Deps.Gate` | root → root | — |
+| clock, metrics, logger | one per node | — | — | `Deps` | root → root | — |
 
 ### 2.7 The version limit
 
@@ -2509,7 +2517,7 @@ content safe ([§3.2](#3.2%20Policy%20never%20makes%20an%20action%20safe)).
 
 ### 10.5 GC is not scheduled here
 
-GC is one service per remote namespace, partitioned by prefix across storage nodes,
+GC is one service per remote namespace, partitioned by prefix across nodes,
 and it schedules itself: cadence, the trash retention and the space target are
 its own ([RFC 9](rfc-9-gc.md)). Retirement is not GC's to schedule at all: it happens
 inside the block metadata transactions the engine's removals and commits run. It runs its own instance of the shared work scheduler
