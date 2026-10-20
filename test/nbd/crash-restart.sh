@@ -445,6 +445,15 @@ for _ in $(seq 1 100); do
 	[ -b "$device" ] && break
 	sleep 0.1
 done
+# The block NODE appears before the kernel learns the export's capacity. Measured:
+# `[ -b /dev/nbdN ]` goes true while /sys/block/nbdN/size is still 0, so a write at
+# that instant fails ENOSPC on a perfectly healthy export — and the script then
+# blames the adapter identity, which is the wrong diagnosis entirely. Wait for the
+# size, not just the node.
+for _ in $(seq 1 100); do
+	[ "$(cat "/sys/block/$(basename "$device")/size" 2>/dev/null || echo 0)" != 0 ] && break
+	sleep 0.1
+done
 [ -b "$device" ] ||
 	die "nbd-client did not bring up $device. A handshake failure is reported here; check the server is listening on $server:$port, the share grant is read-write (a 'none' grant refuses resolution as 'nbd: unknown export'), and the export name is exactly <share>/<volume>."
 
