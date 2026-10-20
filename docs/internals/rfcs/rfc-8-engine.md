@@ -316,7 +316,7 @@ The engine **MUST NOT**:
 
 ### 2.1 Content composition
 
-The process's one composition root is `runtime.New` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20runtime%20builds%20the%20node)), and
+The process's one composition root is `node.New` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components)), and
 it alone names concrete component types. This section specifies what it builds
 for content, on every node: one **journal per device**, the
 syncer, block metadata's view, and one engine over them with a context per share
@@ -710,7 +710,7 @@ can land.
 
 ![Who builds, owns, starts and closes what: the composition root builds and owns the metadata store, the carver, the cut gate, the syncer, the ref-counted remote block stores, the clock and the filesystem service; the runtime starts and stops the engine and sets and stops its shares, the snapshot cut calls PrepareCut and CommitCut, and the filesystem service alone calls the content methods; the root lends the store's views, the carver, the cut gate, the syncer and the clock to the engine through Deps, and the remote block stores are reached only through the syncer's flows; the engine opens and owns the journals, one work queue per journal, the offload passes and a share table whose contexts each own their journal handles and a syncer flow; the engine moves from New, which opens nothing, through Start with its shares, serving with SetShare, StopShare and ForgetShare, to Close, and closes only what it opened](img/rfc8-composition.svg)
 
-`runtime.New` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20runtime%20builds%20the%20node)) builds the engine with `New(Deps)`. `New`
+`node.New` ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components)) builds the engine with `New(Deps)`. `New`
 validates the settings and opens nothing; the engine closes only what it opens:
 the journals, their share handles, the flows.
 
@@ -735,15 +735,19 @@ type Deps struct {
 }
 ```
 
-**Build, start and stop.** `runtime.New` builds, in order: the metadata store; the
-syncer, registering every remote block store, ref-counted per configuration, the
-carver and the engine with `New(Deps)`, which opens nothing; GC; open state and
-identity; `*vfs.Server`; in a cluster, `Serve` and the gateway; the adapters.
-`Runtime.Start` ([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)) starts them in that order — the engine's `Start`
-opening the journals and attaching the shares the records say this node serves
-— and `Runtime.Stop` stops them in reverse: adapters, gateway, `Serve`, GC's drain,
-`*vfs.Server`, open state and identity, the engine, the metadata store. The
-engine closes only the journals, handles and flows it opened.
+**Build, start and stop.** `node.New` builds, in order: the metadata store; the
+remote block stores, ref-counted per configuration; the journal; the syncer; the
+engine with `New(Deps)`, which opens nothing; GC, a sibling of the engine that is
+never passed into it; open state; identity; `*vfs.Server`; in a cluster,
+`vfs.Serve` and the gateway; the adapters. `Node.Start`
+([RFC 23 §2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)) starts them in that order — the engine's `Start` opening the
+journals and attaching the shares the records say this node serves — and
+`Node.Stop` stops them in reverse, with GC drained before `*vfs.Server` stops.
+The engine closes only the journals, handles and flows it opened.
+
+**The carver is not a component.** It holds no state ([RFC 2](rfc-2-carver.md)): the offload
+pipeline calls its `Cut` at the pass's Carve stage ([§6.3](#6.3%20The%20offload%20pipeline)), and it reaches
+the engine as a value in `Deps`, which the node starts and stops nothing for.
 
 **Only `*vfs.Server` calls the engine.** The adapters hold `vfs.Service`, and in a
 cluster the gateway behind it forwards to the primary's `*vfs.Server`; neither
@@ -760,7 +764,7 @@ primary of the file's shard.
 | work queue, one per journal | one instance of the shared work scheduler with the engine's source ([§6.1](#6.1%20The%20work%20queue)) | journal statistics, the policy functions | the policy functions, the offload pipeline | internal | engine at `Start` step 6 → engine | its consumer starts at step 7; it stops dispatching at `Close` |
 | offload pipeline | one state machine per pass ([§6.3](#6.3%20The%20offload%20pipeline)) | the offer, carver, assembler, flow, `Existence`, `Content` | the carver, assembler, flow, `Existence`, `Content` | internal | work queue → the pass | joined by `Close`; a pass outlives no component (E13) |
 | speculator | per-open-file frontiers, pre-warm plans ([§7.4](#7.4%20The%20speculator)) | journal statistics, the flow's `Prefetch` | the flow's `Prefetch` | internal | engine → engine | memory only; cancelled by `Close` |
-| carver and block assembler | [RFC 2](rfc-2-carver.md) | — | — | `Deps.Carver` | root → root | stateless |
+| carver and block assembler | [RFC 2](rfc-2-carver.md) | — | — | `Deps.Carver` | a value, not a component | stateless; the offload pipeline calls `Cut` |
 | syncer | [RFC 3](rfc-3-syncer.md), shared pools | the remote block stores | the remote block stores | `Deps.Syncer` | root → root | the engine opens one flow per share at attach and closes it in `ForgetShare` or `Close`; the root closes the syncer after the engine |
 | remote block store | [RFC 4](rfc-4-remote-tier.md)'s codec, [RFC 5](rfc-5-transforms.md)'s transforms | — | the remote service | reached only through the share's flow | root, registered with the syncer, ref-counted per configuration → root | open while any flow names it |
 | metadata store | [RFC 16](rfc-16-metadata-store.md), with [RFC 6](rfc-6-block-metadata.md)'s views | — | — | `Deps.Existence`, `Deps.Content`, `Deps.Lifecycle`, `Deps.Refs` | root → root | never closed by the engine |
@@ -2610,7 +2614,7 @@ The engine is one concrete type, `*Engine`; nothing declares it as an
 interface. The filesystem service's per-file part, at the file's primary, is
 the only caller of the content methods ([RFC 17 §2.1](rfc-17-vfs.md#2.1%20What%20runs%20where)); adapters never reach
 the engine. The lifecycle, share and control methods are node-local. Their
-callers are the runtime ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20runtime%20builds%20the%20node), [§2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)), which starts and stops the
+callers are the runtime ([RFC 23 §2.1](rfc-23-control-plane.md#2.1%20The%20node%20builds%20its%20components), [§2.2](rfc-23-control-plane.md#2.2%20Start%20and%20stop)), which starts and stops the
 engine, sets and stops shares and runs pre-warm and the upload drain; a share's
 removal ([RFC 16 §2.3.2](rfc-16-metadata-store.md#2.3.2%20Removing%20a%20share)); and the snapshot cut ([RFC 12 §2.3](rfc-12-snapshots.md#2.3%20The%20cut%20is%20one%20transaction%20behind%20a%20brief%20gate)).
 
