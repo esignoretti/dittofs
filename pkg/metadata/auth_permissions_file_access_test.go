@@ -278,14 +278,12 @@ func TestCheckFileAccess_NilACLOwnerGrantsRequested(t *testing.T) {
 	require.Equal(t, rightReadData|rightWriteData, granted)
 }
 
-// TestCheckFileAccess_NilACLNonOwnerGrantsRequested verifies the open-time
-// gate does NOT deny a non-owner's request when file.ACL == nil — even when
-// the POSIX mode would deny the same operation downstream. This is the WPTS
-// BVT load-bearing case (and smb2.create.multi): CREATE asks for DELETE,
-// WRITE_DAC, or higher-namespace rights that the rwx mapping cannot encode,
-// and the pre-#529 server granted those opens. We must keep granting them at
-// open time; per-op enforcement in read/write/delete catches abuse.
-func TestCheckFileAccess_NilACLNonOwnerGrantsRequested(t *testing.T) {
+// TestCheckFileAccess_NilACLNonOwnerDeniedByMode verifies the open-time gate
+// judges a file with no DACL by its POSIX mode: a non-owner of a 0o600 file is
+// denied write, and the bits the rwx mapping grants only to the owner
+// (DELETE, WRITE_DAC, WRITE_OWNER). The granted rights become the handle's
+// authority downstream, so granting them here would bypass the mode.
+func TestCheckFileAccess_NilACLNonOwnerDeniedByMode(t *testing.T) {
 	f := newTestFixture(t)
 
 	created, _, err := f.service.CreateFile(f.rootContext(), f.rootHandle, "posix_owner_only.txt",
@@ -299,25 +297,22 @@ func TestCheckFileAccess_NilACLNonOwnerGrantsRequested(t *testing.T) {
 
 	authCtx := f.authContext(1001, 1001)
 
-	// Non-owner requesting WRITE_DATA on a 0o600 file. Open succeeds
-	// (no DACL to enforce); the actual WRITE op denies via POSIX mode.
-	granted, err := f.service.CheckFileAccess(created, authCtx, rightWriteData|rightAppendData)
-	require.NoError(t, err)
-	require.Equal(t, rightWriteData|rightAppendData, granted)
+	_, err = f.service.CheckFileAccess(created, authCtx, rightWriteData|rightAppendData)
+	require.Error(t, err)
 
-	// DELETE / WRITE_DAC / WRITE_OWNER — bits the POSIX rwx mapping cannot
-	// encode — must also pass the open gate when there is no DACL.
 	const rightWriteDac uint32 = 0x00040000
 	const rightWriteOwner uint32 = 0x00080000
-	probe := rightDelete | rightWriteDac | rightWriteOwner
-	granted, err = f.service.CheckFileAccess(created, authCtx, probe)
-	require.NoError(t, err)
-	require.Equal(t, probe, granted)
+	for _, bit := range []uint32{rightDelete, rightWriteDac, rightWriteOwner} {
+		_, err = f.service.CheckFileAccess(created, authCtx, bit)
+		require.Error(t, err, "bit 0x%x", bit)
+	}
 }
 
 // TestCheckFileAccess_NilACLMaxAllowedReturnsGenericAll verifies that
-// MAXIMUM_ALLOWED on a no-DACL file returns the full GENERIC_ALL set, mirroring
-// the MxAc reply produced by computeMaximalAccess.
+// MAXIMUM_ALLOWED on a no-DACL file returns the owner's GENERIC_ALL set,
+// mirroring the MxAc reply produced by computeMaximalAccess — less DELETE,
+// which is a right on the parent and so cannot be granted with no parent in
+// scope.
 func TestCheckFileAccess_NilACLMaxAllowedReturnsGenericAll(t *testing.T) {
 	f := newTestFixture(t)
 
@@ -335,8 +330,8 @@ func TestCheckFileAccess_NilACLMaxAllowedReturnsGenericAll(t *testing.T) {
 
 	granted, err := f.service.CheckFileAccess(created, authCtx, rightMaxAllowed)
 	require.NoError(t, err)
-	// GENERIC_ALL = 0x001F01FF
-	require.Equal(t, uint32(0x001F01FF), granted)
+	// GENERIC_ALL = 0x001F01FF, less DELETE (0x00010000).
+	require.Equal(t, uint32(0x001F01FF)&^rightDelete, granted)
 }
 
 // TestCheckFileAccess_ZeroDesiredAccessIsNoop guards against returning
