@@ -23,7 +23,7 @@
   <text x="290" y="84" class="s">generic bits → entry rights</text><text x="566" y="84" class="m">GENERIC_WRITE → 0x00120116</text>
 
   <rect x="24" y="102" width="250" height="30" rx="5" class="sv"/><text x="36" y="122" class="h">2  share ceiling</text>
-  <text x="290" y="122" class="s">widest grant, narrowed by admission</text><text x="566" y="122" class="m">read-write: every entry right</text>
+  <text x="290" y="122" class="s">the caller's grant level, narrowed by admission</text><text x="566" y="122" class="m">read-write: every entry right</text>
 
   <rect x="24" y="140" width="250" height="30" rx="5" class="sv"/><text x="36" y="160" class="h">3  privilege</text>
   <text x="290" y="160" class="s">a privileged caller skips 5 and 6</text><text x="566" y="160" class="m">not privileged</text>
@@ -47,7 +47,7 @@
   <text x="290" y="388" class="s">want within G, the granted set?</text><text x="566" y="388" class="e">no → ErrAccess, STATUS_ACCESS_DENIED</text>
 
   <rect x="24" y="406" width="250" height="30" rx="5" class="am"/><text x="36" y="426" class="h">10  audit selection</text>
-  <text x="290" y="426" class="s">entries that match emit one event</text><text x="566" y="426" class="m">a failed-write entry: one event</text>
+  <text x="290" y="426" class="s">a matching entry selects one event</text><text x="566" y="426" class="m">a failed-write entry: one event</text>
 
   <path d="M14,79 L14,416" class="ln"/>
   <text x="16" y="466" class="s">Privilege skips 5 and 6, and the ceiling still applies at 9, so a privileged caller on a read share stays read-only.</text>
