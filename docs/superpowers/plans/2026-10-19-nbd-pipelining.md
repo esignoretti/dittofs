@@ -290,3 +290,56 @@ next thing to check is the store's internal concurrency rather than this adapter
 6. Benchmarks.
 
 Steps 1–2 are the risky ones for regressions and should be separate commits.
+
+---
+
+## Appendix: the measurements behind this plan
+
+All measured on the development machine (8-core arm64), against the real
+`engine.Store` and the real handler, with throwaway tests that were then deleted.
+Recorded here because the plan's ordering of work depends on them, and because a
+later reader will otherwise re-derive them or, worse, assume the numbers were
+guessed.
+
+**The engine's read path scales, then saturates.** Concurrent `bs.ReadAt` of 4 KiB
+from a warm journal:
+
+| goroutines | aggregate IOPS |
+|---|---|
+| 1 | 53,442 |
+| 2 | 104,004 |
+| 4 | 114,312 |
+| 8 | 93,197 |
+
+Two goroutines nearly double throughput; past that it flattens. So the store path
+is **latency-bound and overlappable**, not CPU-bound — which is the precondition
+for a worker pool helping. (8 goroutines regressing is this 8-core machine
+oversubscribed by the Go runtime plus the fixture's own work, not a store limit.)
+
+**Dispatch itself is cheap.** The real handler over a loopback socket with an
+in-memory store, one connection:
+
+- serial: **17–51 µs per command** (20k–58k IOPS) across runs
+- 4 concurrent connections: **73,126 IOPS aggregate**
+
+So the dispatch code is not the wall. The live server's 1.18 ms per command is
+the store path, and pipelining overlaps it rather than making it cheaper.
+
+**What the live server showed, for comparison** (2-vCPU host, Cubbit S3 remote):
+
+| workload | serial (measured) |
+|---|---|
+| random 4K read, depth 1 | 847 IOPS (1.18 ms) |
+| random 4K read, depth 16 | 14,027 IOPS |
+| sequential read | 46–52 MiB/s (device does 80) |
+| sequential write | 169 MiB/s |
+| fsync per 4K write | 208 IOPS (4.15 ms p99) |
+
+Depth 16 reaching only ~16× depth 1 is exactly what serialization predicts: with
+one command in flight, the client's queue depth becomes a queue of waits.
+
+**The prediction this plan makes, stated so it can be wrong:** at depth 16 with
+`MaxInFlight: 16`, throughput should approach the store's concurrent ceiling
+(measured above at ~114k IOPS in-process) rather than the 14k the serial loop
+reaches — bounded on the real host by its 2 vCPUs and S3 latency, so a 2–4× gain
+is the realistic expectation there, not 8×.
