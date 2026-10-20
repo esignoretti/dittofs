@@ -886,12 +886,17 @@ func (h *Handler) handleNTLMNegotiateBinding(ctx *SMBHandlerContext, sess *sessi
 // for a directory-resolved / NETLOGON pass-through domain user, stamped by
 // synthUserFromResolved onto both the primary session's user and this bind's
 // user. If EITHER identity carries a SID (i.e. is a directory/domain principal),
-// the bind MUST match by SID; the username fallback is reserved for pure-local
-// sessions where NEITHER side has a SID. Allowing the fallback when only one
-// side has a SID would let a SID-less local account named "alice" bind onto
+// the bind MUST match by SID; the fallback is reserved for pure-local sessions
+// where NEITHER side has a SID. Allowing the fallback when only one side has a
+// SID would let a SID-less local account named "alice" bind onto
 // DOMAIN\alice's session and inherit her authorization context (a privilege
-// escalation — control-plane accounts may legitimately have an empty SID). The
-// fallback is case-insensitive, matching Windows username semantics.
+// escalation — control-plane accounts may legitimately have an empty SID).
+//
+// The fallback compares the control-plane record ID, not the username: the user
+// store keeps names case-sensitively, so "alice" and "ALICE" can be two
+// accounts, and a case-folded name match would let either one bind onto, or
+// supersede, the other's session. A SID-less identity with no record ID (a
+// transient user with no local account) matches nothing.
 // It takes the session's user record rather than the session so the caller
 // reads it once, through the locked accessor: SESSION_SETUP re-authentication
 // and the authorization re-check both replace that pointer under the session
@@ -906,7 +911,7 @@ func bindIdentityMatchesSession(sessUser *models.User, authUser *models.User) bo
 		// SID-bearing session (and vice versa).
 		return authUser.SID == sessUser.SID
 	}
-	return strings.EqualFold(authUser.Username, sessUser.Username)
+	return authUser.ID != "" && authUser.ID == sessUser.ID
 }
 
 // completeSessionBind finalizes an SMB2 session bind after NTLM auth proved

@@ -33,7 +33,7 @@ func validNTLMv2Response(password, username, domain string, serverChallenge [8]b
 }
 
 // previousSessionFixture holds alice's established session and a handler
-// whose user store knows alice and bob.
+// whose user store knows alice, bob and a separate case-distinct ALICE.
 type previousSessionFixture struct {
 	h      *Handler
 	prevID uint64
@@ -42,7 +42,7 @@ type previousSessionFixture struct {
 func newPreviousSessionFixture(t *testing.T) *previousSessionFixture {
 	t.Helper()
 	cpStore := newInMemoryStoreForTest(t)
-	for _, name := range []string{"alice", "bob"} {
+	for _, name := range []string{"alice", "bob", "ALICE"} {
 		u := &models.User{Username: name, Enabled: true}
 		u.SetNTHashFromPassword(name + "-pw")
 		if _, err := cpStore.CreateUser(context.Background(), u); err != nil {
@@ -137,6 +137,16 @@ func TestSessionSetup_PreviousSessionID_TeardownNeedsSameUserSignIn(t *testing.T
 		}
 		if f.prevLoggedOff(t) {
 			t.Fatal("previous session logged off by another user's sign-in")
+		}
+	})
+
+	t.Run("case-distinct account's sign-in leaves it", func(t *testing.T) {
+		f := newPreviousSessionFixture(t)
+		if st := f.signIn(t, "ALICE", "ALICE-pw"); st != types.StatusSuccess {
+			t.Fatalf("status = 0x%x, want SUCCESS", st)
+		}
+		if f.prevLoggedOff(t) {
+			t.Fatal("previous session logged off by a different account whose name differs only by case")
 		}
 	})
 
