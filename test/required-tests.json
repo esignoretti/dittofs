@@ -4,13 +4,13 @@
     "here and fails when one is missing, skipped or red.",
     "",
     "A regression test is the only thing standing between a fixed defect and its",
-    "return, and it is deleted by the same edit that reintroduces the defect — so",
+    "return, and it is deleted by the same edit that reintroduces the defect \u2014 so",
     "the suite goes green over the regression and nothing reports it. Listing a",
     "name here moves it out of reach of that edit: removing the test now means",
     "removing it from this file too, which is a line a reviewer sees.",
     "",
     "The list is deliberately short. It is for gates whose removal is silent and",
-    "expensive — authorization, encryption and squashing decisions — not for",
+    "expensive \u2014 authorization, encryption and squashing decisions \u2014 not for",
     "coverage in general, which is what the ordinary unit suite is for.",
     "",
     "Names are top-level Go test functions. A subtest is not addressable here: a",
@@ -40,6 +40,12 @@
       "TestShouldRejectUnencryptedTreeConnect_SMB2DialectRejected",
       "TestShouldRejectUnencryptedTreeConnect_SMB2WithCrypto",
       "TestTreeConnect_RequiredModeRejectsUnencryptedSession"
+    ],
+    "./internal/adapter/nbd": [
+      "TestHandleRead_ChecksReadPermission",
+      "TestIntegration_FlushOnOneConnectionCoversAWriteOnAnother",
+      "TestPipeline_ShutdownDrainsInFlight",
+      "TestPipeline_WritePayloadIsConsumedInOrder"
     ]
   }
 }

@@ -61,6 +61,7 @@ jobs:
               - 'go.sum'
               - 'test/integration/**'
               - 'test/kmip/**'
+              - 'test/nbd/**'
               - '.github/workflows/integration-tests.yml'
 
       # PostgreSQL for the control-plane store's PostgreSQL integration tests.
@@ -208,6 +209,37 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpcbind
           sudo systemctl start rpcbind || sudo rpcbind
+
+      # The NBD differential oracle compares this adapter's wire codec against
+      # qemu-nbd. Without QEMU installed it SKIPS, and a green run that quietly
+      # skipped the only differential check in the repo is worse than no run at
+      # all — run-oracle.sh greps for --- SKIP and exits non-zero for that
+      # reason. Installing qemu-utils is what makes the oracle actually run.
+      #
+      # This is the same shape as the rpcbind step above: a tool the suite needs
+      # is installed here rather than assumed on the runner image.
+      - name: Install QEMU (the NBD oracle needs qemu-nbd)
+        if: github.event_name != 'pull_request' || steps.filter.outputs.go == 'true'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+          qemu-nbd --version
+
+      - name: Run the NBD oracle and the NBD test suite
+        if: github.event_name != 'pull_request' || steps.filter.outputs.go == 'true'
+        run: |
+          # qemu-nbd must be present, or the oracle skips and this step would
+          # pass over nothing. run-oracle.sh already treats a skip as a failure;
+          # this asserts the binary separately so the failure names the cause.
+          command -v qemu-nbd >/dev/null || {
+            echo "qemu-nbd is missing: the NBD oracle would skip" >&2
+            exit 1
+          }
+          ./test/nbd/run-oracle.sh
+          go test -count=1 -timeout=10m ./internal/adapter/nbd/ ./pkg/adapter/nbd/
 
       - name: Run portmap system integration tests
         if: github.event_name != 'pull_request' || steps.filter.outputs.go == 'true'
