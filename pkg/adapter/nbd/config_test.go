@@ -65,22 +65,13 @@ func TestNew_RejectsAnyOtherNegativeCount(t *testing.T) {
 // TestNew_ZeroMaxConnectionsDefaultsToACap pins that 0 is no longer "unlimited".
 // An operator who wants unlimited must say -1, which is a decision written down
 // rather than the accidental meaning of an omitted key.
-//
-// The assertion is deliberately indirect, and the reason is worth recording: the
-// adapter exposes no accessor for its resolved MaxConnections, so the observable
-// property is that a remote bind with an omitted count is accepted while one with
-// -1 is refused. Adding an accessor for this would be a production API added for
-// a test. The pair is the test — this one proves the default is not treated as
-// "unlimited", and TestNew_RefusesAnUncappedRemoteBind proves the refusal path
-// exists at all.
 func TestNew_ZeroMaxConnectionsDefaultsToACap(t *testing.T) {
 	if nbd.DefaultMaxConnections <= 0 {
 		t.Fatalf("DefaultMaxConnections = %d, want a positive cap", nbd.DefaultMaxConnections)
 	}
-	cfg := minimalConfig()
-	cfg.AllowRemoteBind = true // MaxConnections left at 0
-	if a := nbd.New(cfg); a == nil {
-		t.Fatal("New returned nil for a remote bind with the default connection cap")
+	a := nbd.New(minimalConfig()) // MaxConnections left at 0
+	if got := a.ConfigForTest().MaxConnections; got != nbd.DefaultMaxConnections {
+		t.Fatalf("MaxConnections = %d, want DefaultMaxConnections (%d)", got, nbd.DefaultMaxConnections)
 	}
 }
 
@@ -94,5 +85,62 @@ func TestDefaultMaxConnectionsIsLowerThanNFS(t *testing.T) {
 	if nbd.DefaultMaxConnections >= nfsDefaultMaxConnections {
 		t.Fatalf("DefaultMaxConnections = %d; NBD should stay well below NFS's %d because each connection holds a payload buffer",
 			nbd.DefaultMaxConnections, nfsDefaultMaxConnections)
+	}
+}
+
+// TestConfig_UIDZeroIsExpressible pins that "run as root" can be configured.
+//
+// 0 doubled as "unset", so an operator who set uid: 0 silently got 65534 — the
+// one value the field exists to allow or forbid was the one it could not
+// express. The fix is a set-pointer rather than a sentinel: every uint32 is a
+// legal UID, so no in-band value can mean "unset".
+func TestConfig_UIDZeroIsExpressible(t *testing.T) {
+	zero := uint32(0)
+	a := nbd.New(nbd.Config{
+		Enabled: true, Port: 11089, BindAddress: "127.0.0.1",
+		UID: 0, UIDSet: &zero,
+	})
+	if got := a.ConfigForTest().UID; got != 0 {
+		t.Fatalf("UID = %d, want 0", got)
+	}
+}
+
+// TestConfig_GIDZeroIsExpressible is the same for GID, which had the same
+// sentinel bug at config.go:127-130.
+func TestConfig_GIDZeroIsExpressible(t *testing.T) {
+	zero := uint32(0)
+	a := nbd.New(nbd.Config{
+		Enabled: true, Port: 11089, BindAddress: "127.0.0.1",
+		GID: 0, GIDSet: &zero,
+	})
+	if got := a.ConfigForTest().GID; got != 0 {
+		t.Fatalf("GID = %d, want 0", got)
+	}
+}
+
+// TestConfig_UIDUnsetStillDefaults pins that the new pointer did not break the
+// ordinary case: no uid key at all must still give the unprivileged default.
+func TestConfig_UIDUnsetStillDefaults(t *testing.T) {
+	a := nbd.New(nbd.Config{Enabled: true, Port: 11089, BindAddress: "127.0.0.1"})
+	if got := a.ConfigForTest().UID; got != nbd.DefaultUID {
+		t.Fatalf("UID = %d, want DefaultUID (%d)", got, nbd.DefaultUID)
+	}
+}
+
+// TestConfig_UIDSetWinsOverTheBareField pins the precedence rule the two fields
+// create: the *Set pointer is what the config file said, the bare field is the
+// resolved value. An operator who sets only the bare UID to a non-zero value
+// still gets it, because a non-zero bare value is unambiguous; a zero bare value
+// with no pointer means "unset" and gets the default.
+func TestConfig_UIDSetWinsOverTheBareField(t *testing.T) {
+	a := nbd.New(nbd.Config{Enabled: true, Port: 11089, BindAddress: "127.0.0.1", UID: 1234})
+	if got := a.ConfigForTest().UID; got != 1234 {
+		t.Fatalf("UID = %d, want 1234", got)
+	}
+
+	five := uint32(5)
+	b := nbd.New(nbd.Config{Enabled: true, Port: 11089, BindAddress: "127.0.0.1", UID: 1234, UIDSet: &five})
+	if got := b.ConfigForTest().UID; got != 5 {
+		t.Fatalf("UID = %d, want 5 (UIDSet is what the config file said)", got)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -1068,16 +1069,97 @@ func createNBDAdapter(cfg *models.AdapterConfig) (runtime.ProtocolAdapter, error
 	if allowRemote, ok := parsedConfig["allow_remote_bind"].(bool); ok {
 		nbdCfg.AllowRemoteBind = allowRemote
 	}
-	if defaultExport, ok := parsedConfig["default_export"].(string); ok {
-		nbdCfg.DefaultExport = defaultExport
-	}
 	if maxConns, ok := parsedConfig["max_connections"].(float64); ok {
 		nbdCfg.MaxConnections = int(maxConns)
 	} else if maxConns, ok := parsedConfig["max_connections"].(int); ok {
 		nbdCfg.MaxConnections = maxConns
 	}
+	// uid and gid arrive as float64 because the blob is JSON. Both are
+	// security-relevant — the whole adapter runs as this one principal — so they
+	// are range-checked rather than cast: a negative or absurd value would wrap
+	// silently into a different identity than the operator configured, and
+	// "serve as someone else" is not a failure a startup log would reveal.
+	//
+	// The pointer is set alongside the value because 0 is a legal UID and 0 is
+	// also what an unset Config field holds; applyDefaults uses the pointer to
+	// tell "root" from "not configured".
+	if v, ok := parsedConfig["uid"].(float64); ok {
+		u, err := nbdIdentityValue("uid", v)
+		if err != nil {
+			return nil, err
+		}
+		nbdCfg.UID, nbdCfg.UIDSet = u, &u
+	} else if v, ok := parsedConfig["uid"].(int); ok {
+		u, err := nbdIdentityValue("uid", float64(v))
+		if err != nil {
+			return nil, err
+		}
+		nbdCfg.UID, nbdCfg.UIDSet = u, &u
+	}
+	if v, ok := parsedConfig["gid"].(float64); ok {
+		g, err := nbdIdentityValue("gid", v)
+		if err != nil {
+			return nil, err
+		}
+		nbdCfg.GID, nbdCfg.GIDSet = g, &g
+	} else if v, ok := parsedConfig["gid"].(int); ok {
+		g, err := nbdIdentityValue("gid", float64(v))
+		if err != nil {
+			return nil, err
+		}
+		nbdCfg.GID, nbdCfg.GIDSet = g, &g
+	}
+	// The timeouts were never read, so every deployment ran the compiled-in
+	// defaults whatever the config file said. Values arrive as float64 seconds
+	// (a duration in JSON is a number) or as a Go duration string.
+	nbdCfg.Timeouts.Read = nbdDuration(parsedConfig["timeouts.read"], nbdCfg.Timeouts.Read)
+	nbdCfg.Timeouts.Write = nbdDuration(parsedConfig["timeouts.write"], nbdCfg.Timeouts.Write)
+	nbdCfg.Timeouts.Idle = nbdDuration(parsedConfig["timeouts.idle"], nbdCfg.Timeouts.Idle)
+	nbdCfg.Timeouts.Shutdown = nbdDuration(parsedConfig["timeouts.shutdown"], nbdCfg.Timeouts.Shutdown)
+	if nested, ok := parsedConfig["timeouts"].(map[string]any); ok {
+		nbdCfg.Timeouts.Read = nbdDuration(nested["read"], nbdCfg.Timeouts.Read)
+		nbdCfg.Timeouts.Write = nbdDuration(nested["write"], nbdCfg.Timeouts.Write)
+		nbdCfg.Timeouts.Idle = nbdDuration(nested["idle"], nbdCfg.Timeouts.Idle)
+		nbdCfg.Timeouts.Shutdown = nbdDuration(nested["shutdown"], nbdCfg.Timeouts.Shutdown)
+	}
 
 	return nbd.New(nbdCfg), nil
+}
+
+// nbdIdentityValue narrows a JSON number to a Unix id, refusing anything that
+// does not fit rather than wrapping it.
+//
+// The upper bound is uint32's, not int's: the wire identity is a uint32, and a
+// value that only fits an int64 would wrap on assignment.
+func nbdIdentityValue(key string, v float64) (uint32, error) {
+	if v < 0 || v > math.MaxUint32 {
+		return 0, fmt.Errorf("nbd %s %v is out of range: must be 0-%d", key, v, uint64(math.MaxUint32))
+	}
+	if v != math.Trunc(v) {
+		return 0, fmt.Errorf("nbd %s %v is not an integer", key, v)
+	}
+	return uint32(v), nil
+}
+
+// nbdDuration reads one timeout, accepting either a Go duration string
+// ("30s") or a number of seconds, and keeping current when the key is absent or
+// unreadable so a typo degrades to the default rather than to zero — a zero
+// timeout means "no timeout" on Idle, which is the opposite of what an operator
+// who tried to set one asked for.
+func nbdDuration(raw any, current time.Duration) time.Duration {
+	switch v := raw.(type) {
+	case string:
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	case float64:
+		return time.Duration(v * float64(time.Second))
+	case int:
+		return time.Duration(v) * time.Second
+	case int64:
+		return time.Duration(v) * time.Second
+	}
+	return current
 }
 
 // handleFormatMismatch prints the operator directive and reports exit 78 when

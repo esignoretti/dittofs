@@ -12,12 +12,6 @@ import (
 // the protocol itself has no assigned port.
 const DefaultPort = 10809
 
-// DefaultMaxMessageSize is the default cap on a single NBD request payload.
-// The wire layer's maximum block size is 32 MiB (the largest the adapter
-// advertises in its block-size information reply), so anything larger than
-// that is a client that ignored the advertisement.
-const DefaultMaxMessageSize = 32 << 20
-
 // DefaultMaxConnections is the cap applied when the operator configures none.
 //
 // It is deliberately much lower than pkg/adapter/nfs's 1024: an NBD connection
@@ -70,7 +64,6 @@ type TimeoutsConfig struct {
 //   - Timeouts.Write: 30s
 //   - Timeouts.Idle: 5m
 //   - Timeouts.Shutdown: 30s
-//   - MaxMessageSize: 32 MiB
 //   - MaxConnections: 64
 //   - UID/GID: 65534 (nobody/nogroup)
 type Config struct {
@@ -92,10 +85,6 @@ type Config struct {
 	// adapter is one accept loop away from exhausting file descriptors.
 	MaxConnections int `mapstructure:"max_connections"`
 
-	// MaxMessageSize caps a single request payload in bytes. 0 means the
-	// default (32 MiB).
-	MaxMessageSize int `mapstructure:"max_message_size"`
-
 	// Timeouts groups the connection timers.
 	Timeouts TimeoutsConfig `mapstructure:"timeouts"`
 
@@ -105,16 +94,27 @@ type Config struct {
 	// must opt in explicitly.
 	AllowRemoteBind bool `mapstructure:"allow_remote_bind"`
 
-	// DefaultExport is the export name offered to a client that requests none.
-	// An export name is of the form <share>/<volume>.
-	DefaultExport string `mapstructure:"default_export"`
-
-	// UID is the Unix UID every metadata operation runs as. NBD carries no
-	// client identity, so this is the sole principal.
+	// UID is the RESOLVED Unix UID every metadata operation runs as. NBD carries
+	// no client identity, so this is the sole principal.
+	//
+	// Do not set this to 0 to mean "unset": 0 is a legal UID (root) and there is
+	// no in-band value that can mean "not configured". Set UIDSet instead if you
+	// are building a Config in code; a loader that reads a config file sets both.
 	UID uint32 `mapstructure:"uid"`
 
-	// GID is the Unix GID every metadata operation runs as.
+	// UIDSet is what the config file said about UID, or nil when it said
+	// nothing. It exists because 0 doubled as "unset" and silently resolved to
+	// DefaultUID, making the one value the field exists to allow or forbid the
+	// one value it could not express. Every uint32 is a legal UID, so a sentinel
+	// is not available and a pointer is the honest spelling of "absent".
+	UIDSet *uint32 `mapstructure:"-"`
+
+	// GID is the RESOLVED Unix GID every metadata operation runs as. Same
+	// resolved-versus-configured split as UID.
 	GID uint32 `mapstructure:"gid"`
+
+	// GIDSet is what the config file said about GID, or nil.
+	GIDSet *uint32 `mapstructure:"-"`
 }
 
 // applyDefaults fills zero values with the adapter's defaults.
@@ -134,9 +134,6 @@ func (c *Config) applyDefaults() {
 	if c.Timeouts.Shutdown == 0 {
 		c.Timeouts.Shutdown = 30 * time.Second
 	}
-	if c.MaxMessageSize == 0 {
-		c.MaxMessageSize = DefaultMaxMessageSize
-	}
 	// 0 is no longer "unlimited". The zero value of an omitted key used to mean
 	// an uncapped, unauthenticated adapter, and pkg/adapter/base.go:159 only
 	// allocates its semaphore when the value is positive — so the default
@@ -145,10 +142,18 @@ func (c *Config) applyDefaults() {
 	if c.MaxConnections == 0 {
 		c.MaxConnections = DefaultMaxConnections
 	}
-	if c.UID == 0 {
+	// The pointer decides, not the value: UIDSet == nil means the operator said
+	// nothing, and UID 0 with a non-nil pointer means "run as root". A non-zero
+	// bare UID with no pointer is still honoured, because it is unambiguous —
+	// that is the shape an in-code caller naturally writes.
+	if c.UIDSet != nil {
+		c.UID = *c.UIDSet
+	} else if c.UID == 0 {
 		c.UID = DefaultUID
 	}
-	if c.GID == 0 {
+	if c.GIDSet != nil {
+		c.GID = *c.GIDSet
+	} else if c.GID == 0 {
 		c.GID = DefaultGID
 	}
 }
