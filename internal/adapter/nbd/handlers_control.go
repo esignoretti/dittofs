@@ -2,7 +2,6 @@ package nbd
 
 import (
 	"context"
-	"net"
 
 	"github.com/marmos91/dittofs/internal/adapter/common"
 )
@@ -18,7 +17,7 @@ import (
 // A read-only export is not refused. Refusing would make a client error a
 // device that has nothing to flush, and there is nothing to protect: the
 // command carries no data.
-func (h *Handler) handleFlush(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
+func (h *Handler) handleFlush(ctx context.Context, bs BlockStore, exp *Export, req *Request) reply {
 	// FUA is accepted because the spec requires the server to accept it on every
 	// command once SEND_FUA is advertised; no other flag is documented for
 	// FLUSH, so one is a malformed request. This is the same rule handleDiscard
@@ -30,15 +29,15 @@ func (h *Handler) handleFlush(ctx context.Context, bs BlockStore, exp *Export, r
 	// ways is still reported once, and before h.commit so a rejected FLUSH has
 	// not flushed.
 	if req.Flags&^FlagFUA != 0 {
-		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
+		return errorReply(req.Cookie, ErrEINVAL)
 	}
 	if req.Length != 0 || req.Offset != 0 {
-		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
+		return errorReply(req.Cookie, ErrEINVAL)
 	}
 	if err := h.commit(ctx, bs, exp); err != nil {
-		return h.writeReply(conn, req.Cookie, mapError(err), nil)
+		return errorReply(req.Cookie, mapError(err))
 	}
-	return h.writeReply(conn, req.Cookie, 0, nil)
+	return reply{cookie: req.Cookie}
 }
 
 // commit is the durability barrier a FLUSH and a FUA write both need.

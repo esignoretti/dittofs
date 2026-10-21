@@ -3,7 +3,6 @@ package nbd
 import (
 	"context"
 	"math"
-	"net"
 
 	"github.com/marmos91/dittofs/internal/adapter/common"
 )
@@ -14,7 +13,7 @@ import (
 // because a request that is both malformed and out of range must fail on the
 // malformation: the range check reads the request's own fields, so it cannot be
 // trusted until they have been shown to make sense.
-func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
+func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, req *Request) reply {
 	// A client-supplied offset and length can overflow. The check is a
 	// subtraction rather than `req.Offset+uint64(req.Length) > exp.Size`,
 	// because that add wraps and lets a request that is far past the end look
@@ -25,30 +24,21 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	// over an advertised maximum, and the adapter advertises neither. The
 	// request is not out of range; it cannot be interpreted at all.
 	if uint64(req.Length) > math.MaxUint64-req.Offset {
-		if err := h.writeReply(conn, req.Cookie, ErrEIO, nil); err != nil {
-			return err
-		}
-		return nil
+		return errorReply(req.Cookie, ErrEIO)
 	}
 
 	// The spec declines to specify a zero-length read beyond "SHOULD NOT
 	// disconnect". One uniform answer is chosen over a per-command table
 	// because no correct client sends one and the connection stays usable.
 	if req.Length == 0 {
-		if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
-			return err
-		}
-		return nil
+		return errorReply(req.Cookie, ErrEINVAL)
 	}
 
 	// The last byte of the device is addressable, so the range is out of bounds
 	// only when offset+length exceeds the size. A read that ends exactly at the
 	// end is served.
 	if req.Offset+uint64(req.Length) > exp.Size {
-		if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
-			return err
-		}
-		return nil
+		return errorReply(req.Cookie, ErrEINVAL)
 	}
 
 	// Flags are validated before the store is touched, so a malformed request
@@ -61,10 +51,7 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	// nothing, so there is nothing to persist. Every other flag is gated behind
 	// an advertisement the adapter does not make.
 	if req.Flags&^FlagFUA != 0 {
-		if err := h.writeReply(conn, req.Cookie, ErrEINVAL, nil); err != nil {
-			return err
-		}
-		return nil
+		return errorReply(req.Cookie, ErrEINVAL)
 	}
 
 	// A length beyond the maximum advertised in the handshake is refused before
@@ -76,10 +63,7 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	// export in one request — measured: a 256 MiB READ against a 1 GiB export was
 	// accepted despite a 32 MiB advertised maximum.
 	if payloadTooLarge(req.Length) {
-		if err := h.writeReply(conn, req.Cookie, ErrEOVERFLOW, nil); err != nil {
-			return err
-		}
-		return nil
+		return errorReply(req.Cookie, ErrEOVERFLOW)
 	}
 
 	// The metadata read path is the only authorization funnel available to a READ.
@@ -97,10 +81,7 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	// without it.
 	if h.meta != nil {
 		if _, err := h.meta.PrepareRead(h.authContext(ctx, exp), exp.Handle); err != nil {
-			if err := h.writeReply(conn, req.Cookie, mapError(err), nil); err != nil {
-				return err
-			}
-			return nil
+			return errorReply(req.Cookie, mapError(err))
 		}
 	}
 
@@ -119,7 +100,7 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	if err != nil {
 		// No payload on the error path: the reply shape for a failed READ is the
 		// header alone.
-		return h.writeReply(conn, req.Cookie, mapError(err), nil)
+		return errorReply(req.Cookie, mapError(err))
 	}
 
 	// A short read is a store fault, not a short device: the range was already
@@ -128,8 +109,8 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	// success — the one failure mode a filesystem cannot detect, because ext4's
 	// checksums cover metadata rather than file data.
 	if n != len(buf) {
-		return h.writeReply(conn, req.Cookie, ErrEIO, nil)
+		return errorReply(req.Cookie, ErrEIO)
 	}
 
-	return h.writeReply(conn, req.Cookie, 0, buf)
+	return reply{cookie: req.Cookie, payload: buf}
 }

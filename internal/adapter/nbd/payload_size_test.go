@@ -35,7 +35,7 @@ func TestConnection_ReadBeyondAdvertisedMaxIsEOVERFLOW(t *testing.T) {
 		Offset: 0,
 	}
 	done := make(chan struct{})
-	go func() { _ = h.handleRead(t.Context(), f.bs, &exp, req, srv); close(done) }()
+	go func() { _ = h.handleRead(t.Context(), f.bs, &exp, req).write(srv, h); close(done) }()
 
 	rep := readReplyHeader(t, c)
 	if rep.Error != ErrEOVERFLOW {
@@ -62,7 +62,7 @@ func TestConnection_ReadAtAdvertisedMaxIsServed(t *testing.T) {
 	_ = srv.SetDeadline(time.Now().Add(30 * time.Second))
 
 	req := &Request{Type: CmdRead, Cookie: 12, Length: maxBlockSize, Offset: 0}
-	go func() { _ = h.handleRead(t.Context(), f.bs, &exp, req, srv) }()
+	go func() { _ = h.handleRead(t.Context(), f.bs, &exp, req).write(srv, h) }()
 
 	rep := readReplyHeader(t, c)
 	if rep.Error != 0 {
@@ -94,8 +94,22 @@ func TestConnection_WriteBeyondAdvertisedMaxIsEINVALAndDrained(t *testing.T) {
 	// otherwise a correct server blocks in the drain and the test would hang
 	// rather than pass.
 	payload := make([]byte, length)
+	// The split is visible here: validateWrite refuses, the caller writes the
+	// refusal, and the caller drains — because the payload read and the drain
+	// both belong to whoever owns the stream.
 	go func() {
-		_ = h.handleWrite(t.Context(), f.bs, &exp, req, srv)
+		pre, refused := h.validateWrite(&exp, req)
+		if !refused {
+			t.Error("validateWrite accepted a WRITE beyond the advertised maximum")
+			return
+		}
+		if err := pre.write(srv, h); err != nil {
+			return
+		}
+		if err := srv.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return
+		}
+		_ = h.drainWritePayload(srv, req.Length)
 	}()
 
 	go func() { _, _ = c.Write(payload) }()
@@ -112,7 +126,7 @@ func TestConnection_WriteBeyondAdvertisedMaxIsEINVALAndDrained(t *testing.T) {
 	// the connection would desynchronize.
 	next := &Request{Type: CmdRead, Cookie: 14, Length: 4096, Offset: 0}
 	sendRequest(t, c, next)
-	go func() { _ = h.handleRead(t.Context(), f.bs, &exp, next, srv) }()
+	go func() { _ = h.handleRead(t.Context(), f.bs, &exp, next).write(srv, h) }()
 	rep2 := readReplyHeader(t, c)
 	if rep2.Cookie != next.Cookie {
 		t.Fatalf("follow-up reply cookie = %d, want %d: the stream desynchronized",

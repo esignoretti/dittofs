@@ -2,10 +2,7 @@ package nbd
 
 import (
 	"context"
-	"io"
 	"math"
-	"net"
-	"time"
 
 	"github.com/marmos91/dittofs/internal/adapter/common"
 )
@@ -26,31 +23,90 @@ import (
 // path; what it adds over the raw call is deadline wrapping and error
 // normalization, which is two lines here. The commit seam is the one that must
 // stay shared across the adapters, and it is: common.CommitBlockStore.
-func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
+func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, req *Request, data []byte) reply {
+	// data is the payload the caller already read, sized to req.Length. This
+	// function never touches the connection: reading the stream is the
+	// dispatcher's job, because it is the only goroutine allowed to advance it.
+	// A handler that read here would race the reader for the same bytes.
+
+	// Built per command and never cached: it embeds the command's Context, so a
+	// cached one would carry the first command's deadline and cancellation into
+	// every later command on the connection.
+	authCtx := h.authContext(ctx, exp)
+
+	// newSize is offset+length, already shown not to wrap. It is a ceiling
+	// rather than a truncation: the metadata layer applies the maximum of the
+	// old and new sizes, so a write at a lower offset never shrinks the file.
+	intent, err := h.meta.PrepareWrite(authCtx, exp.Handle, req.Offset+uint64(req.Length))
+	if err != nil {
+		return errorReply(req.Cookie, mapError(err))
+	}
+
+	// The returned []block.ChunkRef is discarded: the canonical chunk
+	// projection is produced at Flush time, not once per write
+	// (pkg/block/engine/readwrite.go).
+	writeCtx, cancel := common.WithRequestDeadline(ctx)
+	defer cancel()
+	if _, err := bs.WriteAt(writeCtx, string(intent.PayloadID), nil, data, req.Offset); err != nil {
+		return errorReply(req.Cookie, mapError(err))
+	}
+
+	if _, err := h.meta.CommitWrite(authCtx, intent); err != nil {
+		return errorReply(req.Cookie, mapError(err))
+	}
+
+	// FUA must be durable before the reply: the spec says the server "MUST NOT
+	// send its reply to that command until all write operations ... have been
+	// completed and persisted to non-volatile storage". The commit runs before
+	// the reply is written, never after it, so a client that has seen the reply
+	// has already had the guarantee it asked for.
+	if req.Flags&FlagFUA != 0 {
+		if err := h.commit(ctx, bs, exp); err != nil {
+			return errorReply(req.Cookie, mapError(err))
+		}
+	}
+
+	return reply{cookie: req.Cookie}
+}
+
+// validateWrite runs every check that decides whether a WRITE is served at all,
+// and returns (reply, true) when it is refused.
+//
+// It is split from handleWrite because the payload read has to happen in the
+// dispatcher, and the dispatcher needs to know whether to read a payload before
+// it does. A refused WRITE's payload is still in flight — "The client MUST
+// follow the request header with length number of bytes" holds whatever the
+// server answers — so the caller drains req.Length bytes after writing the
+// refusal. For the zero-length case that drain is a no-op, which is why the
+// single "refused ⇒ drain" rule covers every branch here.
+//
+// The signature carries neither ctx nor bs, unlike the handlers: nothing in this
+// function reaches a store or a context, and threading them in would be two
+// parameters kept alive for the sake of matching a shape.
+func (h *Handler) validateWrite(exp *Export, req *Request) (reply, bool) {
 	// A flag that is not documented for WRITE is a malformed request. FUA is
 	// the exception: it is valid on every command once SEND_FUA is advertised,
 	// and on WRITE it is honoured rather than ignored.
 	if req.Flags&^FlagFUA != 0 {
-		return h.rejectWrite(conn, req, ErrEINVAL)
+		return errorReply(req.Cookie, ErrEINVAL), true
 	}
 
 	// Checked before the length and the range: a read-only export refuses the
 	// write wherever it lands.
 	if exp.ReadOnly {
-		return h.rejectWrite(conn, req, ErrEPERM)
+		return errorReply(req.Cookie, ErrEPERM), true
 	}
 
-	// A zero-length write carries no payload, so it is answered without a
-	// drain. Draining here would consume bytes that were never sent and park
-	// the connection until the read deadline.
+	// A zero-length write carries no payload, so the drain that follows a
+	// refusal consumes nothing: drainWritePayload returns nil for length 0.
 	if req.Length == 0 {
-		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
+		return errorReply(req.Cookie, ErrEINVAL), true
 	}
 
 	// A subtraction rather than offset+length, which wraps: a request far past
 	// the end would otherwise look like it starts inside the export.
 	if req.Offset > math.MaxUint64-uint64(req.Length) {
-		return h.rejectWrite(conn, req, ErrEIO)
+		return errorReply(req.Cookie, ErrEIO), true
 	}
 
 	// A write past the end is NBD_ENOSPC, not NBD_EINVAL: the spec reserves
@@ -62,7 +118,7 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
 	// the size it is checked against can be up to one sizeRefresh stale, which
 	// is the bound Export.Size's doc states.
 	if req.Offset+uint64(req.Length) > exp.Size {
-		return h.rejectWrite(conn, req, ErrENOSPC)
+		return errorReply(req.Cookie, ErrENOSPC), true
 	}
 
 	// A payload beyond the advertised maximum is refused before allocating it.
@@ -75,73 +131,14 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
 	// contract. The asymmetry is deliberate and is the spec's, not an oversight.
 	//
 	// The payload is in flight regardless ("The client MUST follow the request
-	// header with length number of bytes"), so rejectWrite drains it: replying
+	// header with length number of bytes"), so the caller drains it: replying
 	// and returning without draining would parse payload bytes as the next
-	// header.
+	// header. That is why validateWrite returns a bool rather than a bare reply.
 	if payloadTooLarge(req.Length) {
-		return h.rejectWrite(conn, req, ErrEINVAL)
+		return errorReply(req.Cookie, ErrEINVAL), true
 	}
 
-	// Read bounds finishing a request that has already started. The header read
-	// consumed the budget armed in the dispatch loop, and that budget is the
-	// Idle one when the operator has separated the two — so without a fresh arm
-	// here the payload read inherits the wrong timer and Read bounds nothing at
-	// all. The same arm, from the same field, is what makes the split real.
-	if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
-		return err
-	}
-
-	// The payload is read into a buffer sized to the request. LimitReader
-	// bounds the read to the declared length, so a client that sends more than
-	// it declared cannot make the server consume the next request header as
-	// payload.
-	data := make([]byte, req.Length)
-	if _, err := io.ReadFull(io.LimitReader(conn, int64(req.Length)), data); err != nil {
-		// The client stopped mid-payload on a request the server had already
-		// accepted, so the stream position is unknown: returning ends Serve,
-		// which closes the connection. A success reply for bytes the server
-		// never saw is the one answer that must not be sent.
-		return err
-	}
-
-	// Built per command and never cached: it embeds the command's Context, so a
-	// cached one would carry the first command's deadline and cancellation into
-	// every later command on the connection.
-	authCtx := h.authContext(ctx, exp)
-
-	// newSize is offset+length, already shown not to wrap. It is a ceiling
-	// rather than a truncation: the metadata layer applies the maximum of the
-	// old and new sizes, so a write at a lower offset never shrinks the file.
-	intent, err := h.meta.PrepareWrite(authCtx, exp.Handle, req.Offset+uint64(req.Length))
-	if err != nil {
-		return h.writeReply(conn, req.Cookie, mapError(err), nil)
-	}
-
-	// The returned []block.ChunkRef is discarded: the canonical chunk
-	// projection is produced at Flush time, not once per write
-	// (pkg/block/engine/readwrite.go).
-	writeCtx, cancel := common.WithRequestDeadline(ctx)
-	defer cancel()
-	if _, err := bs.WriteAt(writeCtx, string(intent.PayloadID), nil, data, req.Offset); err != nil {
-		return h.writeReply(conn, req.Cookie, mapError(err), nil)
-	}
-
-	if _, err := h.meta.CommitWrite(authCtx, intent); err != nil {
-		return h.writeReply(conn, req.Cookie, mapError(err), nil)
-	}
-
-	// FUA must be durable before the reply: the spec says the server "MUST NOT
-	// send its reply to that command until all write operations ... have been
-	// completed and persisted to non-volatile storage". The commit runs before
-	// the reply write, never after it, so a client that has seen the reply has
-	// already had the guarantee it asked for.
-	if req.Flags&FlagFUA != 0 {
-		if err := h.commit(ctx, bs, exp); err != nil {
-			return h.writeReply(conn, req.Cookie, mapError(err), nil)
-		}
-	}
-
-	return h.writeReply(conn, req.Cookie, 0, nil)
+	return reply{}, false
 }
 
 // handleTrim serves one NBD_CMD_TRIM.
@@ -154,8 +151,8 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
 // deterministic one. The alternative, a cheaper discard that leaves reads
 // non-deterministic, is the far worse property: the zero chunks dedup to a
 // single CAS object, so the over-delivery costs almost nothing in aggregate.
-func (h *Handler) handleTrim(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
-	return h.handleDiscard(ctx, bs, exp, req, conn, FlagFUA, ErrEINVAL)
+func (h *Handler) handleTrim(ctx context.Context, bs BlockStore, exp *Export, req *Request) reply {
+	return h.handleDiscard(ctx, bs, exp, req, FlagFUA, ErrEINVAL)
 }
 
 // handleWriteZeroes serves one NBD_CMD_WRITE_ZEROES.
@@ -173,8 +170,8 @@ func (h *Handler) handleTrim(ctx context.Context, bs BlockStore, exp *Export, re
 // sparse, and PunchHole already zero-overwrites rather than leaving a hole, so
 // honouring it takes no extra work. Refusing it would break a MUST on the
 // strength of the rule that makes NO_HOLE invalid on WRITE.
-func (h *Handler) handleWriteZeroes(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
-	return h.handleDiscard(ctx, bs, exp, req, conn, FlagFUA|FlagNoHole, ErrENOSPC)
+func (h *Handler) handleWriteZeroes(ctx context.Context, bs BlockStore, exp *Export, req *Request) reply {
+	return h.handleDiscard(ctx, bs, exp, req, FlagFUA|FlagNoHole, ErrENOSPC)
 }
 
 // handleDiscard is the shared body of TRIM and WRITE_ZEROES: the two commands
@@ -186,13 +183,13 @@ func (h *Handler) handleWriteZeroes(ctx context.Context, bs BlockStore, exp *Exp
 // the end, then the store — the same order handleWrite uses and for the same
 // reason: the range check reads the request's own fields, so it cannot be
 // trusted until they have been shown to make sense.
-func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn, allowed CommandFlags, outOfRange NBDError) error {
+func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export, req *Request, allowed CommandFlags, outOfRange NBDError) reply {
 	// A flag that is not documented for this command is a malformed request.
 	// FUA is accepted on both, because the spec requires the server to accept it
 	// on every command once SEND_FUA is advertised. NO_HOLE is accepted on
 	// WRITE_ZEROES only.
 	if req.Flags&^allowed != 0 {
-		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
+		return errorReply(req.Cookie, ErrEINVAL)
 	}
 
 	// Checked before the length and the range: a read-only export refuses the
@@ -203,21 +200,21 @@ func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export,
 	// SHOULD return NBD_EPERM if it receives a write or trim request on a
 	// read-only export".
 	if exp.ReadOnly {
-		return h.writeReply(conn, req.Cookie, ErrEPERM, nil)
+		return errorReply(req.Cookie, ErrEPERM)
 	}
 
 	// Neither command carries a payload, so a rejection is answered without a
 	// drain: there are no bytes in flight to consume, and draining here would
 	// read the next request header as payload.
 	if req.Length == 0 {
-		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
+		return errorReply(req.Cookie, ErrEINVAL)
 	}
 
 	// A subtraction rather than offset+length, which wraps: a request far past
 	// the end would otherwise look like it starts inside the export. The same
 	// guard handleRead uses, for the same reason.
 	if req.Offset > math.MaxUint64-uint64(req.Length) {
-		return h.writeReply(conn, req.Cookie, ErrEIO, nil)
+		return errorReply(req.Cookie, ErrEIO)
 	}
 
 	// Out of range is refused, never clamped, and these two checks are what make
@@ -233,13 +230,13 @@ func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export,
 	// zeroes request including one or more sectors beyond the size of the
 	// device". outOfRange carries the caller's code.
 	if req.Offset >= exp.Size {
-		return h.writeReply(conn, req.Cookie, outOfRange, nil)
+		return errorReply(req.Cookie, outOfRange)
 	}
 
 	// The last byte of the export is addressable, so a range that ends exactly
 	// at the end is served.
 	if req.Offset+uint64(req.Length) > exp.Size {
-		return h.writeReply(conn, req.Cookie, outOfRange, nil)
+		return errorReply(req.Cookie, outOfRange)
 	}
 
 	// The metadata punch is not optional, and it is not only about reclaim.
@@ -263,7 +260,7 @@ func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export,
 	authCtx := h.authContext(ctx, exp)
 	res, err := h.meta.PunchHole(authCtx, exp.Handle, req.Offset, uint64(req.Length))
 	if err != nil {
-		return h.writeReply(conn, req.Cookie, mapError(err), nil)
+		return errorReply(req.Cookie, mapError(err))
 	}
 
 	// The deadline wrapper is applied per command, not per connection, and it is
@@ -275,7 +272,7 @@ func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export,
 	punchCtx, cancel := common.WithRequestDeadline(ctx)
 	defer cancel()
 	if _, err := bs.PunchHole(punchCtx, string(res.PayloadID), res.PreOpBlocks, req.Offset, uint64(req.Length)); err != nil {
-		return h.writeReply(conn, req.Cookie, mapError(err), nil)
+		return errorReply(req.Cookie, mapError(err))
 	}
 
 	// FUA must be durable before the reply, exactly as WRITE does: the spec says
@@ -283,65 +280,10 @@ func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export,
 	// operations ... have been completed and persisted to non-volatile storage".
 	if req.Flags&FlagFUA != 0 {
 		if err := h.commit(ctx, bs, exp); err != nil {
-			return h.writeReply(conn, req.Cookie, mapError(err), nil)
+			return errorReply(req.Cookie, mapError(err))
 		}
 	}
 
 	// Neither command has a reply payload.
-	return h.writeReply(conn, req.Cookie, 0, nil)
-}
-
-// rejectWrite answers a write that failed a check and then consumes the payload
-// the client has already sent.
-//
-// The spec requires the client to follow the request header with length bytes
-// unconditionally, so a rejection that returns without consuming them leaves
-// the next request header to be read out of payload bytes. The connection then
-// desynchronizes into garbage, and the symptom appears on an unrelated command
-// minutes later.
-//
-// decision: the reply is written before the drain. The reply travels
-// server→client and the payload client→server, so neither orders the other,
-// and replying first is what lets a client that declared a huge length and
-// stalled learn the reason instead of seeing only a closed socket. The drain is
-// still required, and unchanged by when the reply goes out: its whole job is to
-// put the next header at the right offset.
-func (h *Handler) rejectWrite(conn net.Conn, req *Request, nbdErr NBDError) error {
-	if err := h.writeReply(conn, req.Cookie, nbdErr, nil); err != nil {
-		return err
-	}
-
-	// Re-armed from the request budget rather than left to the deadline set
-	// before ReadRequest: that read consumed part of the budget, and the drain
-	// is where a hostile or stalled client parks.
-	if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
-		return err
-	}
-	return h.drainWritePayload(conn, req.Length)
-}
-
-// drainWritePayload consumes length bytes of a WRITE payload the client has
-// already sent, so that the next request header is read from the right offset.
-//
-// It arms no deadline of its own, and that is the point of the split: the caller
-// owns the choice. rejectWrite arms the Read budget because the connection is
-// otherwise idle and a stalled client would park in the drain; the draining path
-// deliberately does not, because the shutdown path has already put a short
-// deadline on the connection and replacing it would hold the drain open (see the
-// call site in serve).
-//
-// io.CopyN rather than a buffer of length bytes, so a client that declares a
-// gigabyte costs a bounded buffer instead of an allocation.
-func (h *Handler) drainWritePayload(conn net.Conn, length uint32) error {
-	if length == 0 {
-		return nil
-	}
-	if _, err := io.CopyN(io.Discard, conn, int64(length)); err != nil {
-		// The stream position is unknown now, so the connection cannot be
-		// reused for another command: returning ends Serve, which closes it.
-		return err
-	}
-	// Drained: the next header is read from the right offset, so the loop
-	// continues and the connection stays usable.
-	return nil
+	return reply{cookie: req.Cookie}
 }

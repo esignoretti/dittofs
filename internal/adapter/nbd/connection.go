@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"runtime/debug"
 	"sync/atomic"
@@ -345,27 +346,58 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 
 		switch req.Type {
 		case CmdRead:
-			if err := h.handleRead(ctx, bs, exp, req, conn); err != nil {
+			if err := h.handleRead(ctx, bs, exp, req).write(conn, h); err != nil {
 				return err
 			}
 
 		case CmdWrite:
-			if err := h.handleWrite(ctx, bs, exp, req, conn); err != nil {
+			// The payload read lives here, in the loop, because this is the only
+			// goroutine allowed to advance the stream. handleWrite keeps the
+			// store calls and gains the already-read bytes; a handler that read
+			// here would race the reader for the same bytes.
+			//
+			// A refused WRITE still has its payload in flight — "The client MUST
+			// follow the request header with length number of bytes" holds
+			// whatever the server answers — so the drain stays here too.
+			// Replying and moving on without draining would parse payload bytes
+			// as the next header.
+			//
+			// The drain re-arms the Read budget, unlike the draining path below:
+			// that path has already had a short shutdown deadline put on the
+			// connection, while this one is an ordinary command and the drain is
+			// where a hostile or stalled client parks.
+			if pre, refused := h.validateWrite(exp, req); refused {
+				if err := pre.write(conn, h); err != nil {
+					return err
+				}
+				if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
+					return err
+				}
+				if err := h.drainWritePayload(conn, req.Length); err != nil {
+					return err
+				}
+				continue
+			}
+			data, err := h.readWritePayload(conn, req)
+			if err != nil {
+				return err
+			}
+			if err := h.handleWrite(ctx, bs, exp, req, data).write(conn, h); err != nil {
 				return err
 			}
 
 		case CmdFlush:
-			if err := h.handleFlush(ctx, bs, exp, req, conn); err != nil {
+			if err := h.handleFlush(ctx, bs, exp, req).write(conn, h); err != nil {
 				return err
 			}
 
 		case CmdTrim:
-			if err := h.handleTrim(ctx, bs, exp, req, conn); err != nil {
+			if err := h.handleTrim(ctx, bs, exp, req).write(conn, h); err != nil {
 				return err
 			}
 
 		case CmdWriteZeroes:
-			if err := h.handleWriteZeroes(ctx, bs, exp, req, conn); err != nil {
+			if err := h.handleWriteZeroes(ctx, bs, exp, req).write(conn, h); err != nil {
 				return err
 			}
 
@@ -381,23 +413,14 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 	}
 }
 
-// writeReply writes one simple reply header, followed by the payload when there
-// is one.
+// writeReply writes one simple reply, header then payload.
 //
-// The write deadline is armed here, before every reply write, so a client that
-// stops reading cannot hold the connection past the configured budget.
+// It is now a wrapper over reply.write, not a second implementation: the loop's
+// own refusals (a malformed command, a draining connection, an unknown type) are
+// replies like any other, and two writers would be two places to get the write
+// deadline and the header-before-payload order wrong.
 func (h *Handler) writeReply(conn net.Conn, cookie uint64, nbdErr NBDError, payload []byte) error {
-	if err := conn.SetWriteDeadline(time.Now().Add(h.timeouts.Write)); err != nil {
-		return err
-	}
-	if err := writeSimpleReply(conn, cookie, nbdErr); err != nil {
-		return err
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	_, err := conn.Write(payload)
-	return err
+	return reply{cookie: cookie, nbdErr: nbdErr, payload: payload}.write(conn, h)
 }
 
 // mapError translates a block-store error to the transmission-phase value the
@@ -466,4 +489,57 @@ func mapError(err error) NBDError {
 	// definition, so it is the one class logged at Error.
 	logger.Error("nbd: unmapped block store error", "error", err)
 	return ErrEIO
+}
+
+// readWritePayload reads exactly req.Length bytes of WRITE payload.
+//
+// It arms the read deadline first, and that is why this cannot be a bare
+// io.ReadFull at the call site: the header read consumed the budget armed in the
+// dispatch loop, and that budget is the Idle one when the operator has separated
+// the two — so without a fresh arm the payload read inherits the wrong timer and
+// Read bounds nothing at all.
+func (h *Handler) readWritePayload(conn net.Conn, req *Request) ([]byte, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(h.timeouts.Read)); err != nil {
+		return nil, err
+	}
+
+	// The payload is read into a buffer sized to the request. LimitReader bounds
+	// the read to the declared length, so a client that sends more than it
+	// declared cannot make the server consume the next request header as
+	// payload.
+	data := make([]byte, req.Length)
+	if _, err := io.ReadFull(io.LimitReader(conn, int64(req.Length)), data); err != nil {
+		// The client stopped mid-payload on a request the server had already
+		// accepted, so the stream position is unknown: returning ends Serve,
+		// which closes the connection. A success reply for bytes the server
+		// never saw is the one answer that must not be sent.
+		return nil, err
+	}
+	return data, nil
+}
+
+// drainWritePayload consumes length bytes of a WRITE payload the client has
+// already sent, so that the next request header is read from the right offset.
+//
+// It arms no deadline of its own, and that is the point of the split: the caller
+// owns the choice. rejectWrite arms the Read budget because the connection is
+// otherwise idle and a stalled client would park in the drain; the draining path
+// deliberately does not, because the shutdown path has already put a short
+// deadline on the connection and replacing it would hold the drain open (see the
+// call site in serve).
+//
+// io.CopyN rather than a buffer of length bytes, so a client that declares a
+// gigabyte costs a bounded buffer instead of an allocation.
+func (h *Handler) drainWritePayload(conn net.Conn, length uint32) error {
+	if length == 0 {
+		return nil
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(length)); err != nil {
+		// The stream position is unknown now, so the connection cannot be
+		// reused for another command: returning ends Serve, which closes it.
+		return err
+	}
+	// Drained: the next header is read from the right offset, so the loop
+	// continues and the connection stays usable.
+	return nil
 }
