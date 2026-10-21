@@ -186,6 +186,15 @@ func TestOracle_DifferentialAgainstQemuNBD(t *testing.T) {
 // (SEND_CACHE, SEND_FAST_ZERO) that this adapter deliberately does not, so
 // equality would be wrong; what must hold is ours ⊆ theirs, because the flags we
 // DO advertise are the ones a client acts on without verifying.
+//
+// qemu-nbd is started with --shared=0, and that is load-bearing rather than
+// incidental. Its --shared default is 1, i.e. one client at a time, and it
+// withholds NBD_FLAG_CAN_MULTI_CONN in that mode (blockdev-nbd.c:
+// `if (nbd_server_max_connections() != 1) exp->nbdflags |= NBD_FLAG_CAN_MULTI_CONN`).
+// Measured: --shared=1 gives 0x0c6d and --shared=0 gives 0x0d6d, so the only
+// difference is the bit under test. Comparing against the default would assert
+// that this adapter behaves like a single-client server, which is precisely the
+// behaviour the flag removes.
 func TestOracle_TransmissionFlagsMatchQemuNBD(t *testing.T) {
 	oracleRequireBinary(t, "qemu-nbd")
 
@@ -416,6 +425,11 @@ func oracleStartQemuNBD(t *testing.T, qemuNBD, scratch string) {
 		"-b", "127.0.0.1",
 		"--persistent",
 		"--discard=unmap",
+		// --shared=0 is unlimited sharing, which is the configuration in which
+		// qemu-nbd advertises NBD_FLAG_CAN_MULTI_CONN. Its default is 1
+		// (single client), where it withholds the flag; see
+		// TestOracle_TransmissionFlagsMatchQemuNBD.
+		"--shared=0",
 		"-x", oracleExportName,
 		scratch,
 	)

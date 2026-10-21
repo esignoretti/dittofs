@@ -52,12 +52,28 @@ const (
 	FlagFastZero CommandFlags = 1 << 4
 )
 
+// CmdResize is deliberately absent.
+//
+// NBD_CMD_RESIZE (8) is defined only by the experimental RESIZE extension, and
+// no mainline client ships it: the Linux kernel's request-type switch has no
+// case for it (drivers/block/nbd.c handles READ, WRITE, DISC, FLUSH, TRIM and
+// WRITE_ZEROES only), and QEMU's include/block/nbd.h stops its request enum at
+// NBD_CMD_BLOCK_STATUS even though the same header defines the flag bit. So the
+// adapter does not advertise NBD_FLAG_SEND_RESIZE, and an NBD_CMD_RESIZE falls
+// to the dispatcher's default arm and is refused with EINVAL — which is what a
+// server must answer for a command it does not support.
+//
+// The command is also not merely unimplemented but unwanted here: a volume is
+// an ordinary metadata file, so resizing it is a metadata operation with a
+// truncate's data-loss semantics, not a block-protocol operation. See
+// docs/BENCHMARKS.md and the design spec §11.
 // TransmissionFlags is the flag word the server hands the client at the end of
 // the handshake. A client acts on these bits without verifying them.
 type TransmissionFlags uint16
 
-// Transmission flag bits. Bit 4 (rotational) and bits 7 and above are
-// deliberately absent: the adapter does not advertise them.
+// Transmission flag bits. Bit 4 (rotational), bit 7 (SEND_DF), bit 9
+// (SEND_RESIZE) and bits 10 and above are deliberately absent: the adapter does
+// not advertise them.
 const (
 	FlagHASFlags        TransmissionFlags = 1 << 0
 	FlagReadOnly        TransmissionFlags = 1 << 1
@@ -65,6 +81,13 @@ const (
 	FlagSendFUA         TransmissionFlags = 1 << 3
 	FlagSendTrim        TransmissionFlags = 1 << 5
 	FlagSendWriteZeroes TransmissionFlags = 1 << 6
+	// FlagCanMultiConn tells the client it may multiplex commands over several
+	// connections to this export and rely on server-side coherence: the effects
+	// of FLUSH and FUA become visible across all connections. It is advertised
+	// only when the export's backing store satisfies that (see
+	// Export.canShareCache), because the flag is a promise the client acts on
+	// without verifying.
+	FlagCanMultiConn TransmissionFlags = 1 << 8
 )
 
 // NBDError is a transmission-phase error value, carried in a simple reply.

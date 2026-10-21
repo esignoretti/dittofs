@@ -200,8 +200,8 @@ func TestHandshake_GoReturnsExportInfoThenAck(t *testing.T) {
 	if flags&FlagHASFlags == 0 {
 		t.Error("NBD_FLAG_HAS_FLAGS not advertised")
 	}
-	if flags&(1<<8) != 0 {
-		t.Error("NBD_FLAG_CAN_MULTI_CONN advertised: two connections on one volume is a corruption path")
+	if flags&(1<<8) == 0 {
+		t.Error("NBD_FLAG_CAN_MULTI_CONN not advertised: a client that does not see it keeps to one connection, which is the single-connection throughput ceiling")
 	}
 
 	exp := <-got
@@ -422,10 +422,29 @@ func TestExport_TransmissionFlagsIncludeReadOnlyOnlyWhenSet(t *testing.T) {
 	if ro.TransmissionFlags()&FlagReadOnly == 0 {
 		t.Error("read-only export did not advertise NBD_FLAG_READ_ONLY")
 	}
-	// The omissions are the load-bearing part.
-	for _, f := range []TransmissionFlags{1 << 8, 1 << 7, 1 << 9, 1 << 10, 1 << 11, 1 << 12, 1 << 4} {
+	// The omissions are the load-bearing part. Bit 8 is deliberately absent
+	// from this list: it is advertised, and TestExport_TransmissionFlagsAdvertiseCanMultiConn
+	// asserts that it is.
+	for _, f := range []TransmissionFlags{1 << 7, 1 << 9, 1 << 10, 1 << 11, 1 << 12, 1 << 4} {
 		if ro.TransmissionFlags()&f != 0 {
 			t.Errorf("export advertised flag bit %d, which the design excludes", f)
+		}
+	}
+}
+
+// TestExport_TransmissionFlagsAdvertiseCanMultiConn pins the flag that decides
+// how many connections a client opens, and pins it for the read-only case too:
+// the guarantee is about cache coherence and flush visibility, which a read-only
+// export needs just as much (two readers must not disagree, and a FLUSH on one
+// must be a barrier over a write another connection made before the export went
+// read-only).
+func TestExport_TransmissionFlagsAdvertiseCanMultiConn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exp  *Export
+	}{{"writable", &Export{Size: 1 << 20}}, {"read-only", &Export{Size: 1 << 20, ReadOnly: true}}} {
+		if tc.exp.TransmissionFlags()&FlagCanMultiConn == 0 {
+			t.Errorf("%s export did not advertise NBD_FLAG_CAN_MULTI_CONN", tc.name)
 		}
 	}
 }

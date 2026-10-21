@@ -622,3 +622,97 @@ func TestIntegration_WriteZeroesDoesNotMaterializeChunks(t *testing.T) {
 		t.Fatal("READ of the zeroed range did not return zeros")
 	}
 }
+
+// TestIntegration_OneBlockStorePerShare is the invariant NBD_FLAG_CAN_MULTI_CONN
+// rests on, asserted rather than assumed.
+//
+// The flag tells a client it may multiplex commands over several connections and
+// rely on FLUSH and FUA being visible across all of them. That is only true if
+// every connection to one export reaches the same store instance: two
+// *engine.Store values over one payload would each keep their own journal and
+// their own dirty intervals, and a FLUSH on one would be a barrier over nothing
+// the other wrote. The adapter never caches a store per connection — Handler is
+// shared and Stateless, and the resolver wraps common.ResolveForWrite — so the
+// property under test is the one the shares service provides: resolution is keyed
+// by share, not by caller.
+//
+// The two resolutions below stand in for two connections: they are made through
+// the same path the production resolver uses, with different exports and from
+// different goroutines, which is how a second connection would reach it.
+func TestIntegration_OneBlockStorePerShare(t *testing.T) {
+	rt, name, bs := newIntegrationFixture(t)
+
+	resolve := func() *engine.Store {
+		exp, err := NewRuntimeExporter(rt, integrationIdentity).Resolve(context.Background(), name)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", name, err)
+		}
+		st, err := common.ResolveForWrite(context.Background(), rt, exp.Handle)
+		if err != nil {
+			t.Fatalf("resolve the block store for %s: %v", name, err)
+		}
+		return st
+	}
+
+	// Resolved concurrently, because that is the case the flag admits: two
+	// connections arriving at once must not race into two store instances.
+	got := make([]*engine.Store, 8)
+	done := make(chan int, len(got))
+	for i := range got {
+		go func() {
+			got[i] = resolve()
+			done <- i
+		}()
+	}
+	for range got {
+		<-done
+	}
+	for i, st := range got {
+		if st != bs {
+			t.Fatalf("resolution %d returned %p, want the share's single store %p: two connections would hold two journals over one payload", i, st, bs)
+		}
+	}
+}
+
+// TestIntegration_FlushOnOneConnectionCoversAWriteOnAnother is the behaviour the
+// flag promises, driven end to end: bytes written through one connection are made
+// durable by a FLUSH issued on a second one.
+//
+// This is the observable half of TestIntegration_OneBlockStorePerShare. The
+// assertion is on the store's own durable state rather than on the reply, because
+// the reply only says the barrier ran; what the client is promised is that the
+// other connection's bytes are covered by it.
+func TestIntegration_FlushOnOneConnectionCoversAWriteOnAnother(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	h := f.newHandler(t, f.bs)
+
+	// Connection one writes. No FUA, so nothing is committed by the write itself.
+	writerServer, writer := pipe(t)
+	serveConn(h, writerServer)
+	completeHandshake(t, writer, integrationExportName)
+
+	payload := bytes.Repeat([]byte{0x5a}, 4096)
+	if rep := writeThroughClient(t, writer, 0, payload, 0); rep.Error != 0 {
+		t.Fatalf("WRITE reply error = %d, want 0", rep.Error)
+	}
+
+	// Connection two flushes the same export. It is a separate socket and a
+	// separate handshake, so it shares nothing with the writer but the handler.
+	flusherServer, flusher := pipe(t)
+	serveConn(h, flusherServer)
+	completeHandshake(t, flusher, integrationExportName)
+	if rep := flushThroughClient(t, flusher); rep.Error != 0 {
+		t.Fatalf("FLUSH on the second connection returned error %d, want 0", rep.Error)
+	}
+
+	// The barrier is over the shared store, so the writer's bytes must be
+	// readable through the second connection. A per-connection store would leave
+	// them visible only to the writer.
+	rep, got := readReplyAndPayload(t, flusher, &Request{Type: CmdRead, Cookie: 0x91, Offset: 0, Length: 4096})
+	if rep.Error != 0 {
+		t.Fatalf("READ on the flushing connection returned error %d, want 0", rep.Error)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the second connection did not observe the first connection's write: the export is not coherent across connections, so NBD_FLAG_CAN_MULTI_CONN must not be advertised")
+	}
+}
