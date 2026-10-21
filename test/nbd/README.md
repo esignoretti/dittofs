@@ -1,12 +1,14 @@
 # NBD adapter test rigs
 
-Two rigs, two different questions. Neither substitutes for the other.
+Three rigs and one fixture. Each answers a different question; none substitutes for
+another.
 
 | Rig | Question it answers | Needs |
 | --- | --- | --- |
 | `run-oracle.sh` | Does the adapter's **wire codec and handshake** agree with a known-good NBD server? | QEMU. Tier B also a running server. |
 | `boot-qemu.sh` | Does a **real kernel client boot** off an NBD export? | QEMU with `kvm` (Linux) or `hvf` (macOS), an aarch64 kernel + initramfs, a provisioned share. |
 | `crash-restart.sh` | Does client I/O **pause and resume** across a server SIGKILL inside the dead-connection window? | **Linux + root**, a `master`-built `nbd-client`, init netns. |
+| `fixture/` | What does a crash rig kill? | Nothing beyond Go — it is the server those rigs need. |
 
 The oracle can be green while the boot path is broken, and the boot path can
 work while the codec disagrees on an edge the kernel never hits. Run all three.
@@ -14,6 +16,44 @@ work while the codec disagrees on an edge the kernel never hits. Run all three.
 **Neither boot nor crash can run in CI on macOS.** `boot-qemu.sh` runs on macOS
 via `hvf`, but `crash-restart.sh` needs the Linux block layer, root, netlink and a
 `master`-built `nbd-client`; it refuses cleanly on Darwin rather than half-running.
+
+## `fixture/` — the server a crash rig kills
+
+`crash-restart.sh` needs a server that can be SIGKILLed, and the production `dfs`
+server cannot be: it needs a provisioned volume, and creating one needs a share
+mount, which needs root. `fixture/` builds the same runtime the integration tests
+build — real control plane, real `engine.Store`, real `pkg/adapter/nbd` — from an
+ordinary program, and then holds still.
+
+```
+GOOS=linux GOARCH=amd64 go build -o /tmp/nbd-fixture ./test/nbd/fixture
+/tmp/nbd-fixture -port 10950 -size 2147483648 -journal /tmp/fx-j -meta /tmp/fx-m
+# then point the crash rig at it
+sudo ./test/nbd/crash-restart.sh --server 127.0.0.1 --port 10950 \
+    --export export/boot --device /dev/nbd7 --expect-size 2147483648 \
+    --cmd-timeout 5 --dead-timeout 40 --restart-cmd '<restart the fixture>'
+```
+
+`--expect-size` is required here: the fixture's metadata lives on disk but there is
+no NFS share mount to stat, so the crash rig cannot derive the export size from a
+file.
+
+Two properties of the fixture are load-bearing, and both were learned by getting
+them wrong:
+
+- **The metadata store is on disk.** An in-memory store loses the file's size and
+  chunk manifest when the process dies, so after a restart every read returns
+  zeros — which a verifying client reports as `err=84` (EILSEQ), i.e. exactly as a
+  corruption bug in the adapter. The first version of this test did that and the
+  investigation started in the wrong place.
+- **Provisioning is idempotent.** A crash test restarts the server by definition; a
+  fixture that re-created its volume on every start would erase the data it is
+  meant to have survived. Every step is create-or-look-up.
+
+It also refuses to print `READY` until something actually accepts a connection on
+its port. A fixture that announced readiness after `Serve` had already died on
+"address already in use" let an older server on the same port answer the clients,
+so a run silently measured the wrong process.
 
 ## Prerequisites
 
