@@ -98,11 +98,16 @@ func newIntegrationFixtureAs(t *testing.T, id Identity) (*runtime.Runtime, strin
 }
 
 // newIntegrationFixtureAsSized is newIntegrationFixtureAs with an explicit
-// export size. The size is fixed at creation and the handler bounds-checks
-// against it, so a test whose command sequence reaches past the export's end
-// needs its own: a WRITE past the end is NBD_ENOSPC and a READ or TRIM past it
-// is NBD_EINVAL, and those are indistinguishable from a real codec bug when
-// they show up as a transcript divergence.
+// export size. The handler bounds-checks against the size it last resolved, so
+// a test whose command sequence reaches past the export's end needs its own: a
+// WRITE past the end is NBD_ENOSPC and a READ or TRIM past it is NBD_EINVAL,
+// and those are indistinguishable from a real codec bug when they show up as a
+// transcript divergence.
+//
+// The size is set here rather than being fixed forever: a volume is an ordinary
+// regular file, and the connection loop re-resolves it at most once per
+// Handler.sizeRefresh. Tests that change it mid-connection set sizeRefresh to 0
+// to make the refresh happen before every command.
 func newIntegrationFixtureAsSized(t *testing.T, id Identity, size uint64) (*runtime.Runtime, string, *engine.Store) {
 	t.Helper()
 	rt, bsID := testruntime.NewWithShareStore(t)
@@ -148,8 +153,8 @@ func newIntegrationFixtureAsSized(t *testing.T, id Identity, size uint64) (*runt
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Creation zeroes the size, so the export size is set explicitly: it is
-	// fixed at creation and the handler bounds-checks against it.
+	// Creation zeroes the size, so the export size is set explicitly here. It is
+	// not fixed from this point on — see the doc comment above.
 	if _, err := metaSvc.SetFileAttributes(authCtx, createdHandle, &metadata.SetAttrs{Size: ptr(size)}); err != nil {
 		t.Fatal(err)
 	}

@@ -56,8 +56,11 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
 	// A write past the end is NBD_ENOSPC, not NBD_EINVAL: the spec reserves
 	// EINVAL for a read or trim past the end, because a write past the end
 	// means the client's view of the device is too large while a read or trim
-	// past the end is a malformed request. The export size is fixed at volume
-	// creation, so a write never grows it.
+	// past the end is a malformed request. NBD has no command that grows an
+	// export (NBD_CMD_RESIZE exists only in an experimental extension no
+	// mainline client implements, see protocol.go), so a write never grows it —
+	// the size it is checked against can be up to one sizeRefresh stale, which
+	// is the bound Export.Size's doc states.
 	if req.Offset+uint64(req.Length) > exp.Size {
 		return h.rejectWrite(conn, req, ErrENOSPC)
 	}

@@ -54,11 +54,16 @@ func NewRuntimeExporter(rt *runtime.Runtime, id Identity) *RuntimeExporter {
 // client-supplied, and the server must not tell a client which part of its
 // guess was wrong.
 //
-// decision: the export is resolved here, once, and never on the hot path. Its
-// size is fixed at volume creation, so a later resolve could only re-read a
-// value that cannot change, and holding the file's handle for the life of the
-// connection is what lets the write path address the payload without
-// re-resolving a name the client could have renamed out from under it.
+// decision: the export is resolved here, and the handle is held for the life of
+// the connection, which is what lets the write path address the payload without
+// re-resolving a name the client could have renamed out from under it. The SIZE
+// is not held the same way: a volume is an ordinary regular file, so its size
+// changes when another protocol writes to it or when the operator truncates it,
+// and this comment used to claim the opposite ("its size is fixed at volume
+// creation, so a later resolve could only re-read a value that cannot change").
+// The connection loop re-resolves on a bounded interval instead — see
+// Handler.sizeRefresh — because re-resolving per command would take a registry
+// lock and decode a handle on every 4 KiB read.
 func (r *RuntimeExporter) Resolve(ctx context.Context, name string) (*Export, error) {
 	// An exporter with no runtime can resolve nothing. It is reported as an
 	// unknown export rather than as an internal error because the handshake

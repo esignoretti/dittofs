@@ -86,12 +86,20 @@ type Export struct {
 	//
 	// It is a snapshot, not a fixed property: a volume is an ordinary regular
 	// file, so its size can change under the connection when another protocol
-	// writes to it, or when the operator grows or shrinks it. The transmission
-	// phase enforces the range it holds, so a stale value is a range check
-	// against a size the client was told at handshake time. NBD cannot tell an
-	// established client about a new size — that would need NBD_CMD_RESIZE,
-	// which no mainline client implements (see protocol.go) — so a resize takes
-	// effect for clients that connect afterwards.
+	// writes to it, or when the operator grows or shrinks it.
+	//
+	// The transmission phase re-resolves the export at most once per
+	// Handler.sizeRefresh (one second by default), so this field is up to that
+	// stale — not always current, and no longer "fixed at volume creation" as
+	// this comment used to claim. A refresh that fails keeps the previous
+	// export, because the value was valid a moment ago and a transient registry
+	// error should not error the client's device.
+	//
+	// Staleness is a range check, not a size the client can act on: NBD cannot
+	// tell an established client about a new size — that would need
+	// NBD_CMD_RESIZE, which no mainline client implements (see protocol.go) — so
+	// a grown export stays unreachable past the old end until the client
+	// reconnects, and a shrunk one is refused within a second.
 	Size uint64
 	// PayloadID addresses the volume's bytes in the block store.
 	PayloadID metadata.PayloadID

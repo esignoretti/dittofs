@@ -83,6 +83,22 @@ type Handler struct {
 	// consumes the count (see TakeDegraded), so it is "since the last probe"
 	// rather than a running total.
 	degraded atomic.Int64
+
+	// sizeRefresh bounds how stale Export.Size can be.
+	//
+	// A volume is an ordinary regular file in a share, so its size is mutable
+	// over NFS and SMB while an NBD connection is live — the handshake's
+	// snapshot is not "fixed at volume creation" as the Resolve doc comment used
+	// to claim. Per-command re-resolution would take a registry lock and decode
+	// a handle on every 4 KiB read, which is the exact cost the handshake's
+	// one-time resolve exists to avoid, so a bounded interval is the compromise.
+	// The residual staleness is stated in Export.Size's own doc comment.
+	//
+	// Zero means "re-read before every command": it falls out of the
+	// `time.Since(lastResolve) >= h.sizeRefresh` comparison with no extra
+	// branch, and it is what makes the truncate test deterministic instead of a
+	// race against the window.
+	sizeRefresh time.Duration
 }
 
 // NewHandler returns a handler for one adapter's connections.
@@ -98,6 +114,8 @@ func NewHandler(exporter Exporter, stores StoreResolver, meta *metadata.Service,
 		id:       id,
 		timeouts: timeouts,
 		draining: draining,
+
+		sizeRefresh: time.Second,
 	}
 }
 
@@ -216,6 +234,17 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 		return fmt.Errorf("nbd: resolving the block store for export %q: %w", exp.Name, err)
 	}
 
+	// lastResolve is when exp was last read from the metadata layer, so the
+	// refresh below can bound how stale it gets. It is declared next to exp
+	// because the two move together.
+	//
+	// For Task 9: this refresh must move into the pipeline's reader goroutine,
+	// not stay in the dispatch switch. It reassigns exp, so exp cannot become a
+	// plain field the workers read — that is a data race the moment the worker
+	// count exceeds one. The reader owns the current export and stamps each
+	// command with it (command.exp); a worker never reads shared mutable state.
+	lastResolve := time.Now()
+
 	for {
 		// The read deadline is armed before the read, and deliberately not
 		// while draining. initiateShutdown sets a 100 ms deadline on every
@@ -245,6 +274,20 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 			if err := conn.SetReadDeadline(time.Now().Add(budget)); err != nil {
 				return err
 			}
+		}
+
+		// See sizeRefresh. Cheap enough to keep the size honest within a second,
+		// rare enough that the 4 KiB read path never pays for it.
+		//
+		// A failed refresh keeps the previous export rather than failing the
+		// command: the export was valid a second ago, and a transient registry
+		// error should not error the client's device. The bound that buys is "up
+		// to one second stale", which is what Export.Size's doc states.
+		if time.Since(lastResolve) >= h.sizeRefresh {
+			if refreshed, err := h.exporter.Resolve(ctx, exp.Name); err == nil {
+				exp = refreshed
+			}
+			lastResolve = time.Now()
 		}
 
 		req, err := ReadRequest(conn)
