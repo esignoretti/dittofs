@@ -262,7 +262,16 @@ func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export,
 	if err != nil {
 		return h.writeReply(conn, req.Cookie, mapError(err), nil)
 	}
-	if _, err := bs.PunchHole(ctx, string(res.PayloadID), res.PreOpBlocks, req.Offset, uint64(req.Length)); err != nil {
+
+	// The deadline wrapper is applied per command, not per connection, and it is
+	// a no-op when the context already carries one. The metadata call above is
+	// bounded by its own service timeout; the block-store call is not, so this is
+	// the only thing standing between a stalled remote tier and a connection
+	// goroutine held open indefinitely. Same wrapper, same reason, as
+	// handlers_read.go:93 and handlers_write.go:120.
+	punchCtx, cancel := common.WithRequestDeadline(ctx)
+	defer cancel()
+	if _, err := bs.PunchHole(punchCtx, string(res.PayloadID), res.PreOpBlocks, req.Offset, uint64(req.Length)); err != nil {
 		return h.writeReply(conn, req.Cookie, mapError(err), nil)
 	}
 
