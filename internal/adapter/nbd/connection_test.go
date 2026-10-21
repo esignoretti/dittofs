@@ -54,6 +54,11 @@ type storeFake struct {
 	// map, a slice bounds error, a bad type assertion on an engine-returned
 	// store).
 	panicOnRead bool
+
+	// panicOnWrite does the same for WriteAt. It exists for the worker-panic
+	// test: before the pipeline, a panic anywhere in dispatch was caught by
+	// Conn.Serve, which covers the loop but not a worker goroutine.
+	panicOnWrite bool
 }
 
 func newStoreFake() *storeFake {
@@ -88,6 +93,9 @@ func (s *storeFake) ReadAt(_ context.Context, id string, buf []byte, off uint64)
 
 func (s *storeFake) WriteAt(_ context.Context, id string, currentBlocks []block.ChunkRef, data []byte, off uint64) ([]block.ChunkRef, error) {
 	s.writes++
+	if s.panicOnWrite {
+		panic("storeFake: WriteAt panicked on purpose")
+	}
 	if s.writeErr != nil {
 		return currentBlocks, s.writeErr
 	}
@@ -427,9 +435,9 @@ func TestConnection_DiscClosesWithoutReply(t *testing.T) {
 }
 
 // The base adapter's accept loop has no recover (pkg/adapter/base.go:373 runs
-// the handler on a bare goroutine), so a panic that escapes here does not kill
-// the connection — it kills the process, and with it every NFS and SMB
-// connection. Both sibling adapters recover for this reason: NFS at
+// the handler on a bare goroutine), so a panic that escapes does not kill the
+// connection — it kills the process, and with it every NFS and SMB connection.
+// Both sibling adapters recover for this reason: NFS at
 // pkg/adapter/nfs/connection.go:420, SMB at pkg/adapter/smb/connection.go:474.
 //
 // The assertion is "it came back", and that is sufficient: if the recover is
@@ -437,6 +445,16 @@ func TestConnection_DiscClosesWithoutReply(t *testing.T) {
 // failure mode is a crashed package rather than a failed assertion. The test
 // deliberately does not wrap the call in its own recover — that would make it
 // pass whether or not Conn.Serve has one.
+//
+// The panic now arrives from a worker goroutine, where Conn.Serve's recover
+// cannot see it: a recover only covers the frame it was deferred in, and the
+// handler call moved out of that frame when dispatch became a pool. Containment
+// therefore lives in the worker (pipeline.serve), and the observable difference
+// is that the connection now SURVIVES — the client gets NBD_EIO for the one
+// command and keeps using the connection. This test asserts that, which is the
+// stronger property, and TestPipeline_WorkerPanicRepliesEIO asserts the reply
+// that comes back. Conn.Serve's own recover is still the backstop for a panic in
+// the handshake or the reader, neither of which this can drive.
 func TestConn_PanicInHandlerDoesNotKillTheProcess(t *testing.T) {
 	st := newStoreFake()
 	st.panicOnRead = true
@@ -453,10 +471,17 @@ func TestConn_PanicInHandlerDoesNotKillTheProcess(t *testing.T) {
 	completeHandshake(t, client, testExportName)
 	sendRequest(t, client, &Request{Type: CmdRead, Cookie: 1, Offset: 0, Length: 4096})
 
+	// The one command that panicked is answered, not dropped.
+	if rep := readReplyHeader(t, client); rep.Error != ErrEIO {
+		t.Fatalf("panicking READ reply error = %d, want ErrEIO (%d)", rep.Error, uint32(ErrEIO))
+	}
+
+	// And the connection is still alive: Conn.Serve has not returned. If the
+	// containment were missing, the process would already have died.
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Conn.Serve did not return after the handler panicked")
+		t.Fatal("Conn.Serve returned after the handler panicked; the connection should have survived a contained panic")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
