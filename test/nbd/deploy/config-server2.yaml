@@ -1,4 +1,4 @@
-# DittoFS on demo-host.example (demo-es-2), serving 4 GiB VM boot disks over NBD.
+# DittoFS on a demo host, serving 4 GiB VM boot disks over NBD.
 #
 # Data disk: /dev/sdc (23GB spare) mounted at /var/lib/dittofs.
 # /dev/sdb is deliberately NOT used: it is /data/agent00, backing a live Cubbit
@@ -46,6 +46,8 @@ controlplane:
   host: "127.0.0.1"
   port: 18080
   jwt:
+    # Redacted: the real deployment used a generated secret. Set your own
+    # here (>=32 chars) before running this config.
     secret: "CHANGE-ME-before-running-this-config"
 
 blockstore:
