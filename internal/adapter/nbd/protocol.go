@@ -36,7 +36,6 @@ const (
 	CmdTrim        Command = 4
 	CmdCache       Command = 5
 	CmdWriteZeroes Command = 6
-	CmdBlockStatus Command = 7
 )
 
 // CommandFlags is the per-request flag word.
@@ -128,8 +127,6 @@ const (
 	OptInfo            Option = 6
 	OptGO              Option = 7
 	OptStructuredReply Option = 8
-	OptListMetaContext Option = 9
-	OptSetMetaContext  Option = 10
 )
 
 // OptionReplyType is the type field of an option reply header. Values below
@@ -138,20 +135,13 @@ type OptionReplyType uint32
 
 // Option reply types.
 const (
-	RepAck              OptionReplyType = 1
-	RepServer           OptionReplyType = 2
-	RepInfo             OptionReplyType = 3
-	RepMetaContext      OptionReplyType = 4
-	RepErrUnsup         OptionReplyType = 0x80000001
-	RepErrPolicy        OptionReplyType = 0x80000002
-	RepErrInvalid       OptionReplyType = 0x80000003
-	RepErrPlatform      OptionReplyType = 0x80000004
-	RepErrTLSReqd       OptionReplyType = 0x80000005
-	RepErrUnknown       OptionReplyType = 0x80000006
-	RepErrShutdown      OptionReplyType = 0x80000007
-	RepErrBlockSizeReqd OptionReplyType = 0x80000008
-	RepErrTooBig        OptionReplyType = 0x80000009
-	RepErrExtHeaderReqd OptionReplyType = 0x8000000A
+	RepAck        OptionReplyType = 1
+	RepServer     OptionReplyType = 2
+	RepInfo       OptionReplyType = 3
+	RepErrUnsup   OptionReplyType = 0x80000001
+	RepErrInvalid OptionReplyType = 0x80000003
+	RepErrUnknown OptionReplyType = 0x80000006
+	RepErrTooBig  OptionReplyType = 0x80000009
 )
 
 // ErrBadMagic reports a header whose leading magic value did not match the
@@ -296,21 +286,4 @@ func (o *OptionReplyHeader) Encode(w io.Writer) error {
 	binary.BigEndian.PutUint32(buf[16:20], o.Length)
 	_, err := w.Write(buf[:])
 	return err
-}
-
-// ReadOptionReplyHeader reads and decodes an option reply header.
-//
-// The server never reads one: it only writes them. This decoder exists so tests
-// can assert on what the server sent without hand-parsing bytes.
-func ReadOptionReplyHeader(r io.Reader) (*OptionReplyHeader, error) {
-	var buf [optionReplyHeaderLen]byte
-	if _, err := io.ReadFull(r, buf[:]); err != nil {
-		return nil, err
-	}
-	return &OptionReplyHeader{
-		Magic:  binary.BigEndian.Uint64(buf[0:8]),
-		Option: Option(binary.BigEndian.Uint32(buf[8:12])),
-		Type:   OptionReplyType(binary.BigEndian.Uint32(buf[12:16])),
-		Length: binary.BigEndian.Uint32(buf[16:20]),
-	}, nil
 }
