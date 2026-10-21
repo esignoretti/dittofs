@@ -358,13 +358,13 @@ pause; the script refuses on Darwin naming exactly that.
 
 ```
 sudo ./test/nbd/crash-restart.sh --restart-cmd 'systemctl start dittofs' \
-    --dead-timeout 60 --export export/boot
+    --cmd-timeout 5 --dead-timeout 60 --export export/boot
 ```
 
 ### The ordering is the whole test
 
 ```
-1. connect WITH BOTH -persist -T 60, then write a pattern and FLUSH it
+1. connect WITH ALL THREE of -persist -t 5 -T 60, then write a pattern and FLUSH it
 2. SIGKILL the server FIRST, before issuing the read
 3. THEN issue the read — it must PAUSE, not fail
 4. restart the server inside the window
@@ -378,6 +378,41 @@ lands on an idle device. **A pass without a nonzero pause AND a completed read
 after the restart has tested the page cache, not the adapter** — the script fails
 in that case rather than reporting a pass.
 
+### Three timeouts, and why `-t` is not optional
+
+This is the bug that made the first version of this script unable to pass, and it
+was found by running it, not by reading it.
+
+| flag | kernel attribute | what it does |
+|---|---|---|
+| `-t SECS` | `NBD_ATTR_TIMEOUT` | the **block-layer request timeout** (`nbd_set_cmd_timeout`, `nbd.c:1464`) — makes the kernel notice an in-flight request is stuck |
+| `-T SECS` | `NBD_ATTR_DEAD_CONN_TIMEOUT` | how long the kernel then waits for a new socket before failing the I/O |
+| `-p` | (client-side) | the monitor that actually performs the reconnect |
+
+Without `-t`, `nbd_xmit_timeout` (`nbd.c:413`) takes the wrong branch when there
+is a single connection:
+
+```c
+if (config->num_connections > 1 ||
+    (config->num_connections == 1 && nbd->tag_set.timeout))   // nbd.c:435
+        ... nbd_requeue_cmd(cmd); return BLK_EH_DONE;         // :462
+
+if (!nbd->tag_set.timeout)                                   // :469
+        "Possible stuck request ..." return BLK_EH_RESET_TIMER; // :477,:491
+```
+
+With one connection and no `-t` the second branch wins: the timer is reset
+forever, the request is **never requeued**, and it never reaches
+`wait_for_reconnect` at all. The read then hangs past the entire window instead of
+failing at it — which is exactly what the first measured run did: `-T 20`, no
+`-t`, dmesg printed `Possible stuck request ... Runtime 30 seconds`, and the read
+was still blocked at t=41s.
+
+So the **worst-case pause is `-t` + `-T`**, and the script computes its windows
+from that sum. The default `-t` is 5s, well under `-T`; the script refuses a
+`--cmd-timeout` of 0 (which disables the timeout and reintroduces the hang) or one
+at or above `--dead-timeout`.
+
 ### The `dead_conn_timeout` value
 
 Default **60s**, set explicitly with `-T 60` and printed. It is kept under ~120s
@@ -387,19 +422,54 @@ safe is not a configured one, and the script must not depend on `-p` being what
 supplied the window. `dead_conn_timeout` has **no sysfs read-back**
 (`drivers/block/nbd.c` creates only `pid_attr` and `backend_attr`), so the window
 is asserted **behaviourally and in both directions**: the I/O must *block* (that
-is `-T`) and must *resume* (that is `-p`). Blocking alone passes with a broken
-`-p`. `--keep-dead` runs the negative control: no restart, and the read must
-*fail* at the window.
+is `-t` and `-T`) and must *resume* (that is `-p`). Blocking alone passes with a
+broken `-p`. `--keep-dead` runs the negative control: no restart, and the read
+must *fail* at the window.
 
 ### Reading the verdict
 
-Measured against a real DittoFS on this host: the read was still blocked at
-t=4s, t=8s and t=12s, the server returned at t=16s, and the read completed
-`exit=0 elapsed=14s` with `PRE-CRASH-PATTERN-AAAA`; the persist daemon logged
-`Received link dead notification for device 0` → `Our device, triggering
-reconnect` → three refused attempts → `Successfully reconnected after 4
-attempts`. The script fails if the pause is absent, if the read does not resume,
-if the restart happened outside the window, or if the bytes do not match.
+Measured on a Linux host against a DittoFS fixture serving a 2 GiB export
+(`--cmd-timeout 5 --dead-timeout 40`, killed at t=0, restarted at t=5s):
+
+```
+=== issue the read — it must PAUSE, not fail
+  read still blocked at t=2s
+  read still blocked at t=4s
+=== restart the server inside the window (at t=4s, window 40s)
+  restart command returned at t=5s
+
+VERDICT: read paused (blocked for >=2s), server restarted at t=5s inside the 45s
+window (-t 5s + -T 40s), read completed status=0 elapsed=7s with
+PRE-CRASH-PATTERN-AAAA.
+Client logged the link-dead notification, so the kernel multicast reached it and
+-p reconnected.
+```
+
+The matching negative control (`--keep-dead`, `--cmd-timeout 5 --dead-timeout 20`)
+failed at t=27s with no server running — that is `-t` making the kernel notice the
+stuck request and `-T` bounding the wait.
+
+Independently of the paused client, the bytes were then read back through a
+**fresh** client after the restart (`qemu-io -c "read -v 0 22"`) and returned
+`PRE-CRASH-PATTERN-AAAA`, so the resumed read had genuinely reached the restarted
+server rather than a cache.
+
+The script fails if the pause is absent, if the read does not resume, if the
+restart happened outside the window, or if the bytes do not match.
+
+### The size cross-check (a bug this rig produced)
+
+Pre-flight describes the **file** at `<volume-path>/volumes/<volume>`; it cannot
+describe the **server** on the port. Measuring a fixture on port 10950 while
+`--volume-path` pointed at a production share printed the production size and then
+killed a different server — and both runs looked identical until the numbers were
+compared.
+
+So after connecting, the script reads `/sys/block/<dev>/size`, multiplies by 512,
+and **refuses** if it does not equal the expected export size. For a server with
+no on-disk share mount (an in-memory metadata store) there is no file to stat, so
+`--expect-size BYTES` states it explicitly; that flag wins over the file when both
+are present.
 
 ### Harness details worth knowing
 

@@ -32,8 +32,14 @@
 # `live_connections` is incremented only by userspace netlink operations
 # (nbd_add_socket :1339, nbd_genl_reconfigure :1401). The kernel notices the dead
 # link, multicasts NBD_CMD_LINK_DEAD, and waits for a client to hand it a new
-# socket. So the two settings do different jobs and BOTH are needed:
+# socket. So the settings do different jobs and ALL THREE are needed:
 #
+#   -t <seconds> / --cmd-timeout   sets the BLOCK-LAYER request timeout
+#                                  (nbd_set_cmd_timeout, nbd.c:1464-1466:
+#                                  `nbd->tag_set.timeout = timeout * HZ`). This is
+#                                  what makes the kernel notice that an in-flight
+#                                  request is stuck at all. WITHOUT IT NOTHING EVER
+#                                  REQUeues — see the measured note below.
 #   -T <seconds> / --dead-timeout  sets the kernel's patience before failing
 #                                  in-flight I/O. NOT documented in the man page
 #                                  (grep -i dead man/nbd-client.8 finds only
@@ -45,8 +51,32 @@
 #                                  default window (nbd-client.c:188), which -T
 #                                  overrides.
 #
-# -T alone pauses the I/O for the full window and then returns BLK_STS_IOERR,
-# which reads exactly like a DittoFS failure and is not one.
+# WHY -t IS NOT OPTIONAL (measured on this rig, and the reason the first version
+# of this script could never pass). nbd_xmit_timeout (nbd.c:413) takes two
+# different paths when there is a single connection:
+#
+#   if (config->num_connections > 1 ||
+#       (config->num_connections == 1 && nbd->tag_set.timeout))   <- :435-436
+#           ... nbd_requeue_cmd(cmd); return BLK_EH_DONE;         <- :462
+#
+#   if (!nbd->tag_set.timeout)                                   <- :469
+#           "Possible stuck request ..." return BLK_EH_RESET_TIMER; <- :477,:491
+#
+# With ONE connection and NO -t the second branch wins: the timer is reset
+# forever, the request is NEVER requeued, so it never re-enters nbd_handle_cmd and
+# never reaches wait_for_reconnect at all. The read then hangs past the whole
+# window instead of failing at it. Measured with -T 20 and no -t: dmesg printed
+# "Possible stuck request ... Runtime 30 seconds" and the read was still blocked
+# at t=41s. With -t 5 -T 20 the same run failed at t=21s; with -t 5 -T 30 and a
+# restart at t=8s the read resumed with the pre-crash bytes.
+#
+# So the worst-case pause is cmd_timeout + dead_timeout: -t seconds before the
+# kernel notices, then up to -T waiting for the new socket. The window assertions
+# below are computed from that sum, not from -T alone.
+#
+# -T alone does NOT pause for the full window and then return BLK_STS_IOERR: with
+# no -t it hangs indefinitely (measured above). With -t it pauses and then returns
+# BLK_STS_IOERR, which reads exactly like a DittoFS failure and is not one.
 #
 # -T reaches the kernel ONLY through netlink, as NBD_ATTR_DEAD_CONN_TIMEOUT
 # (nbd-client.c:185-186). On the ioctl path it is parsed, stored, and never read.
@@ -85,10 +115,12 @@
 # releases. The requirement is a build from master (after eac55e0b06fe,
 # 2026-08-30), and that is what the refusal names.
 #
-# A working measured verdict to reproduce: read still blocked at t=4s/8s/12s,
-# server back at t=16s, read completed exit=0 elapsed=14s with
-# PRE-CRASH-PATTERN-AAAA, and the persist daemon logged "Successfully reconnected
-# after 4 attempts". Blocking proves -T; resuming proves -p; both in one run.
+# A working measured verdict to reproduce (fixture server, -t 5 -T 30, killed at
+# t=0, restarted at t=8s): the read stayed blocked, dmesg printed "Connection
+# timed out, retrying (0/1 alive)" at t~6s, the read completed exit=0 at t~11s
+# with PRE-CRASH-PATTERN-AAAA, and the persist daemon logged "Received link dead
+# notification for device 5" then "Successfully reconnected after 4 attempts".
+# Blocking proves -t and -T; resuming proves -p; all three in one run.
 
 set -euo pipefail
 
@@ -109,6 +141,12 @@ Options:
   --server ADDR        Server address (default 127.0.0.1).
   --device DEV         NBD device (default /dev/nbd0). Not a partition: the
                        export is a single file served whole.
+  --cmd-timeout SECS   Block-layer request timeout, passed as -t (default
+                       $NBD_CMD_TIMEOUT, else 5). NOT optional: with one
+                       connection and no -t the kernel resets the stuck-request
+                       timer forever instead of requeueing, so the read hangs
+                       past the window rather than failing at it. Keep it well
+                       under --dead-timeout; the worst-case pause is their sum.
   --dead-timeout SECS  Kernel dead_conn_timeout, passed as -T (default
                        $NBD_DEAD_TIMEOUT, else 60). Kept under ~120s: over that
                        the hung-task detector trips.
@@ -120,7 +158,13 @@ Options:
   --volume-path DIR    Host path where the share is mounted over NFS/SMB
                        (default $DITTOFS_VOLUME_PATH, else /mnt/dittofs/export).
                        Used to print the export size and adapter identity before
-                       the run.
+                       the run, and to cross-check the size the server actually
+                       serves.
+  --expect-size BYTES  Expected export size, for a server whose metadata store is
+                       in memory and therefore has no file at
+                       <volume-path>/volumes/<volume> to stat. Without it that
+                       path is a refusal, because an unverified size means the
+                       run cannot tell whether it crashed the server it printed.
   --pattern STR        Pattern written and flushed before the kill
                        (default PRE-CRASH-PATTERN-AAAA).
   --keep-dead          Do not restart; expect the I/O to FAIL at the window.
@@ -161,11 +205,13 @@ export_name=${DITTOFS_NBD_EXPORT:-export/boot}
 port=${DITTOFS_NBD_PORT:-10809}
 server=${NBD_SERVER:-127.0.0.1}
 device=${NBD_DEVICE:-/dev/nbd0}
+cmd_timeout=${NBD_CMD_TIMEOUT:-5}
 dead_timeout=${NBD_DEAD_TIMEOUT:-60}
 dfs_pid=${DITTOFS_DFS_PID:-}
 dfs_pattern=${DITTOFS_DFS_PATTERN:-dfs}
 restart_cmd=${DITTOFS_RESTART_CMD:-}
 volume_path=${DITTOFS_VOLUME_PATH:-/mnt/dittofs/export}
+expected_bytes=${DITTOFS_EXPECT_SIZE:-}
 pattern=${NBD_PATTERN:-PRE-CRASH-PATTERN-AAAA}
 nbd_client=${NBD_CLIENT:-nbd-client}
 keep_dead=0
@@ -192,6 +238,11 @@ while [ $# -gt 0 ]; do
 		device=$2
 		shift 2
 		;;
+	--cmd-timeout)
+		[ $# -ge 2 ] || die "--cmd-timeout needs seconds"
+		cmd_timeout=$2
+		shift 2
+		;;
 	--dead-timeout)
 		[ $# -ge 2 ] || die "--dead-timeout needs seconds"
 		dead_timeout=$2
@@ -215,6 +266,11 @@ while [ $# -gt 0 ]; do
 	--volume-path)
 		[ $# -ge 2 ] || die "--volume-path needs a directory"
 		volume_path=$2
+		shift 2
+		;;
+	--expect-size)
+		[ $# -ge 2 ] || die "--expect-size needs a byte count"
+		expected_bytes=$2
 		shift 2
 		;;
 	--pattern)
@@ -348,6 +404,17 @@ share_name=${export_name%%/*}
 	die "export name '$export_name' must have a non-empty share and volume (e.g. export/boot)"
 
 # Numeric sanity, and the hung-task bound.
+case $cmd_timeout in
+'' | *[!0-9]*) die "--cmd-timeout must be a positive integer of seconds, got '$cmd_timeout'" ;;
+esac
+[ "$cmd_timeout" -ge 1 ] ||
+	die "--cmd-timeout $cmd_timeout is zero, which DISABLES the block-layer timeout: nbd_xmit_timeout then resets the stuck-request timer forever and the read hangs instead of pausing and failing. Use at least 1 (5 is the recommended value)."
+[ "$cmd_timeout" -lt "$dead_timeout" ] ||
+	die "--cmd-timeout $cmd_timeout must be smaller than --dead-timeout $dead_timeout. -t makes the kernel notice the stuck request; -T is how long it then waits for a new socket. The worst-case pause is their sum, so a -t at or above -T puts the requeue outside the window it is meant to open."
+case $expected_bytes in
+'' ) ;;
+*[!0-9]*) die "--expect-size must be a whole number of bytes, got '$expected_bytes'" ;;
+esac
 case $dead_timeout in
 '' | *[!0-9]*) die "--dead-timeout must be a positive integer of seconds, got '$dead_timeout'" ;;
 esac
@@ -386,17 +453,32 @@ printf '  server           : %s:%s\n' "$server" "$port"
 printf '  device           : %s\n' "$device"
 printf '  nbd-client       : %s (%s)\n' "$nbd_client" "${client_version:-version unknown}"
 printf '  netns            : %s (init: %s) — OK\n' "$self_netns" "$init_netns"
+printf '  cmd_timeout      : %ss, set with -t/--cmd-timeout (without it nothing requeues)\n' "$cmd_timeout"
 printf '  dead_conn_timeout: %ss, set with -T/--dead-timeout AND -p/--persist\n' "$dead_timeout"
+printf '  worst-case pause : %ss (-t + -T)\n' "$((cmd_timeout + dead_timeout))"
 printf '  adapter identity : UID/GID 65534 (not configurable; applyDefaults rewrites UID 0)\n'
 printf '  share mount      : %s\n' "$volume_path"
-if [ -e "$volume_path/volumes/$volume_name" ]; then
+# --expect-size wins when given: an operator who states the size is asserting what
+# the SERVER serves, which is the fact this run has to verify. The file on disk is
+# only a fallback for when nothing was stated, and on a fixture server it is not
+# even the same volume.
+if [ -n "$expected_bytes" ]; then
+	vol_bytes=$expected_bytes
+	if [ -e "$volume_path/volumes/$volume_name" ]; then
+		printf '  export size      : %s bytes (from --expect-size; %s/volumes/%s is %s bytes)\n' \
+			"$vol_bytes" "$volume_path" "$volume_name" "$(wc -c <"$volume_path/volumes/$volume_name" | tr -d ' ')"
+	else
+		printf '  export size      : %s bytes (from --expect-size; %s/volumes/%s does not exist)\n' \
+			"$vol_bytes" "$volume_path" "$volume_name"
+	fi
+elif [ -e "$volume_path/volumes/$volume_name" ]; then
 	vol_bytes=$(wc -c <"$volume_path/volumes/$volume_name" | tr -d ' ')
 	printf '  export size      : %s bytes (%s)\n' "$vol_bytes" "$volume_path/volumes/$volume_name"
 	[ "$vol_bytes" -gt 0 ] 2>/dev/null ||
 		die "volume '$volume_name' is $vol_bytes bytes. CreateFile with a size does NOT produce a file of that size (ApplyCreateDefaults, pkg/metadata/validation.go:492, sets Size = 0 for every non-symlink), so the size must be set afterwards. A zero-length export fails the handshake."
 else
 	printf '  export size      : UNKNOWN — %s/volumes/%s not found\n' "$volume_path" "$volume_name"
-	die "volume '$volume_name' not found at '$volume_path/volumes/$volume_name'. Provision it through the share as the adapter's identity (UID/GID 65534) and set its size after creating it. If the guest then fails the handshake with 'nbd: unknown export', that names neither the volume nor the identity — and the same message also means a share grant of 'none' (the resolution itself is refused) or an omitted -N."
+	die "volume '$volume_name' not found at '$volume_path/volumes/$volume_name'. Provision it through the share as the adapter's identity (UID/GID 65534) and set its size after creating it. If the guest then fails the handshake with 'nbd: unknown export', that names neither the volume nor the identity — and the same message also means a share grant of 'none' (the resolution itself is refused) or an omitted -N. For a server with no on-disk share mount (an in-memory metadata store), pass --expect-size BYTES instead."
 fi
 
 # ------------------------------------------------------------------ connect
@@ -428,7 +510,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "connect: $nbd_client -N $export_name -p -T $dead_timeout $server $port $device"
+step "connect: $nbd_client -N $export_name -p -t $cmd_timeout -T $dead_timeout $server $port $device"
 # -p does NOT daemonize (the persist branch returns before daemon(0,0),
 # nbd-client.c:1571 vs :1580), so it must be backgrounded here too. Both flags are
 # passed and both are printed: -T sets the window, -p performs the reconnect.
@@ -439,7 +521,7 @@ step "connect: $nbd_client -N $export_name -p -T $dead_timeout $server $port $de
 # fails open in a container (see the note there). The success path asserts on
 # this line.
 client_log=$(mktemp "${TMPDIR:-/tmp}/nbd-client.XXXXXX")
-"$nbd_client" -N "$export_name" -p -T "$dead_timeout" "$server" "$port" "$device" >"$client_log" 2>&1 &
+"$nbd_client" -N "$export_name" -p -t "$cmd_timeout" -T "$dead_timeout" "$server" "$port" "$device" >"$client_log" 2>&1 &
 client_pid=$!
 for _ in $(seq 1 100); do
 	[ -b "$device" ] && break
@@ -456,6 +538,18 @@ for _ in $(seq 1 100); do
 done
 [ -b "$device" ] ||
 	die "nbd-client did not bring up $device. A handshake failure is reported here; check the server is listening on $server:$port, the share grant is read-write (a 'none' grant refuses resolution as 'nbd: unknown export'), and the export name is exactly <share>/<volume>."
+
+# Cross-check that the server this run actually attached to is serving the volume
+# the pre-flight printed. This is not pedantry: measuring a fixture on port 10950
+# while --volume-path pointed at a production share printed the production size in
+# pre-flight and then crashed a different server entirely. Both runs looked
+# identical in the output until the numbers were compared.
+#
+# The kernel reports capacity in 512-byte sectors, so compare bytes.
+kernel_bytes=$(( $(cat "/sys/block/$(basename "$device")/size" 2>/dev/null || echo 0) * 512 ))
+printf '  kernel capacity  : %s bytes (from /sys/block/%s/size)\n' "$kernel_bytes" "$(basename "$device")"
+[ "$kernel_bytes" -eq "$vol_bytes" ] ||
+	die "the server on $server:$port serves a $kernel_bytes-byte export, but '$volume_path/volumes/$volume_name' is $vol_bytes bytes. These must be the same volume. Most likely --port or --volume-path names a different server or share than the one you meant to crash — the pre-flight identity lines describe the FILE, not the running server, so a mismatch here means the run would kill and measure something other than what it printed."
 
 step "write pattern and FLUSH it (the flush is what makes the bytes the server's problem)"
 printf '%s' "$pattern" | dd of="$device" bs=1 count="${#pattern}" conv=fsync status=none ||
@@ -506,11 +600,14 @@ read_pid=$!
 
 blocked_samples=0
 pause_seen=0
-deadline=$((dead_timeout + 20))
+# The pause can last cmd_timeout + dead_timeout: -t seconds before the kernel
+# notices the stuck request, then up to -T waiting for a new socket. Timing out
+# against dead_timeout alone would declare a working run broken.
+deadline=$((cmd_timeout + dead_timeout + 20))
 while kill -0 "$read_pid" 2>/dev/null; do
 	elapsed=$((SECONDS - read_start))
 	if [ "$elapsed" -gt "$deadline" ]; then
-		die "the read is still blocked at ${elapsed}s, past the ${dead_timeout}s window + 20s slack. The server was never restarted, or -p cannot reconnect (a release nbd-client). No verdict: this run would only time out."
+		die "the read is still blocked at ${elapsed}s, past the ${cmd_timeout}s + ${dead_timeout}s window + 20s slack. The server was never restarted, or -p cannot reconnect (a release nbd-client). If the kernel log shows 'Possible stuck request', -t did not reach the block layer. No verdict: this run would only time out."
 	fi
 	if [ "$blocked_samples" -gt 0 ] || [ "$elapsed" -ge 1 ]; then
 		if [ "$pause_seen" = 0 ] && [ "$elapsed" -ge 2 ]; then
@@ -557,7 +654,7 @@ if [ "$keep_dead" = 1 ]; then
 	# is what proves -T reached the kernel even when nothing reconnects it.
 	[ "$read_status" -ne 0 ] ||
 		die "--keep-dead: the read SUCCEEDED with no server running. That can only mean it was served from the page cache, so this run tested nothing (the flush or the kill ordering is wrong)."
-	printf '\nVERDICT (negative control): the read failed with status %s after %ss with no server running — that is -T reaching the kernel.\n' "$read_status" "$read_elapsed"
+	printf '\nVERDICT (negative control): the read failed with status %s after %ss with no server running — that is -t making the kernel notice the stuck request and -T bounding how long it waited.\n' "$read_status" "$read_elapsed"
 	exit 0
 fi
 
@@ -569,16 +666,16 @@ fi
 	die "the read failed with status $read_status after ${read_elapsed}s. It blocked (so -T reached the kernel) but never resumed — -p did not hand the kernel a new socket. Check that nbd-client is a master build (no release can reconnect), that the persist daemon is running, and that it logged 'Received link dead notification for device 0'. Do not read this as a DittoFS failure."
 [ "${restarted:-0}" = 1 ] ||
 	die "the read completed but the server was never restarted by this script; the completion cannot be attributed to a reconnect. Nothing is proven."
-[ "$restart_at" -lt "$dead_timeout" ] ||
-	die "the server was restarted at t=${restart_at}s, outside the ${dead_timeout}s window; the I/O may have been failed and re-issued rather than paused. Increase --dead-timeout or fix the restart latency. Not a pass."
+[ "$restart_at" -lt "$((cmd_timeout + dead_timeout))" ] ||
+	die "the server was restarted at t=${restart_at}s, outside the $((cmd_timeout + dead_timeout))s window (-t ${cmd_timeout}s + -T ${dead_timeout}s); the I/O may have been failed and re-issued rather than paused. Increase --dead-timeout or fix the restart latency. Not a pass."
 
 read_bytes=$(cat "$read_out")
 [ "$read_bytes" = "$pattern" ] ||
 	die "the read resumed but returned '${read_bytes}', not the pre-crash '${pattern}'. The bytes did not survive the crash — that is a real durability finding, not a harness problem."
 
-printf '\nVERDICT: read paused (blocked for >=2s), server restarted at t=%ss inside the %ss window, read completed status=0 elapsed=%ss with %s.\n' \
-	"$restart_at" "$dead_timeout" "$read_elapsed" "$read_bytes"
-printf 'Blocking proves -T; resuming proves -p. Both are present in this run.\n'
+printf '\nVERDICT: read paused (blocked for >=2s), server restarted at t=%ss inside the %ss window (-t %ss + -T %ss), read completed status=0 elapsed=%ss with %s.\n' \
+	"$restart_at" "$((cmd_timeout + dead_timeout))" "$cmd_timeout" "$dead_timeout" "$read_elapsed" "$read_bytes"
+printf 'Blocking proves -t reached the block layer and -T bounded the wait; resuming proves -p. All three are present in this run.\n'
 
 # The positive assertion for the mechanism itself. The netns gate earlier is a
 # PROXY and it fails open: inside a container /proc/1 is the container's init, so
