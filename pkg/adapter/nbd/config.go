@@ -23,6 +23,22 @@ const DefaultPort = 10809
 // authentication at all.
 const DefaultMaxConnections = 64
 
+// DefaultMaxInFlight is how many commands one connection may have in flight.
+// Four is where the measured plateau begins (docs/nbd-benchmarks.md: 7,686 IOPS
+// at depth 1 against 13,000-16,900 from depth 4 on, flat above it), so a larger
+// default buys latency under load and costs memory, not throughput.
+const DefaultMaxInFlight = 4
+
+// MaxMaxInFlight clamps the configured value. 64 concurrent 32 MiB payloads is
+// already 2 GiB on one connection, well past the point where the byte budget is
+// the binding limit rather than the worker count.
+const MaxMaxInFlight = 64
+
+// DefaultMaxInFlightBytes is two maximum-size payloads (the advertised block
+// maximum is 32 MiB), so one large request cannot be starved by its neighbours.
+// It is per connection, so the adapter-wide ceiling is MaxConnections times this.
+const DefaultMaxInFlightBytes int64 = 64 << 20
+
 // DefaultUID and DefaultGID are the unprivileged identity the adapter runs
 // metadata operations as when the operator configures none: nobody/nogroup.
 // NBD carries no user identity at all, so every operation runs as this one
@@ -94,6 +110,22 @@ type Config struct {
 	// must opt in explicitly.
 	AllowRemoteBind bool `mapstructure:"allow_remote_bind"`
 
+	// MaxInFlight is how many commands one connection may have in flight.
+	//
+	// 0 takes the default (4), and the value is clamped to 64. Four is where the
+	// measured plateau begins: the depth sweep in docs/nbd-benchmarks.md shows
+	// 7,686 IOPS at depth 1 against 13,000-16,900 from depth 4 on, and nothing
+	// above it. More buys latency under load, not throughput.
+	MaxInFlight int `mapstructure:"max_in_flight"`
+
+	// MaxInFlightBytes bounds the payload memory one connection may hold at
+	// once, in both directions.
+	//
+	// 0 takes the default (64 MiB, i.e. two maximum-size payloads). It is per
+	// connection, so the adapter-wide ceiling is MaxConnections times this —
+	// which is why the connection cap defaults to 64 rather than NFS's 1024.
+	MaxInFlightBytes int64 `mapstructure:"max_in_flight_bytes"`
+
 	// UID is the RESOLVED Unix UID every metadata operation runs as. NBD carries
 	// no client identity, so this is the sole principal.
 	//
@@ -156,6 +188,19 @@ func (c *Config) applyDefaults() {
 	} else if c.GID == 0 {
 		c.GID = DefaultGID
 	}
+	// Zero means "not configured" for both, and both are clamped rather than
+	// refused: an operator who asks for 1000 workers gets the maximum the adapter
+	// will honour, with the resolved value visible through ConfigForTest. A
+	// negative value is a typo and is refused in validate.
+	if c.MaxInFlight == 0 {
+		c.MaxInFlight = DefaultMaxInFlight
+	}
+	if c.MaxInFlight > MaxMaxInFlight {
+		c.MaxInFlight = MaxMaxInFlight
+	}
+	if c.MaxInFlightBytes == 0 {
+		c.MaxInFlightBytes = DefaultMaxInFlightBytes
+	}
 }
 
 // validate reports whether the configuration describes an adapter that can be
@@ -178,6 +223,14 @@ func (c *Config) validate() error {
 	// port, so it does not catch this first — this is the gate.
 	if c.AllowRemoteBind && c.MaxConnections < 0 {
 		return fmt.Errorf("allow_remote_bind requires a connection limit: set max_connections to a positive value")
+	}
+	// Negative pipelining values are typos: 0 means "take the default" for both,
+	// so there is no in-band way to spell "negative on purpose".
+	if c.MaxInFlight < 0 {
+		return fmt.Errorf("invalid max_in_flight %d: must be positive, or 0 for the default", c.MaxInFlight)
+	}
+	if c.MaxInFlightBytes < 0 {
+		return fmt.Errorf("invalid max_in_flight_bytes %d: must be positive, or 0 for the default", c.MaxInFlightBytes)
 	}
 	// Any other negative value is a typo, not a policy.
 	if c.MaxConnections < -1 {

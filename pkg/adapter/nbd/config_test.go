@@ -144,3 +144,47 @@ func TestConfig_UIDSetWinsOverTheBareField(t *testing.T) {
 		t.Fatalf("UID = %d, want 5 (UIDSet is what the config file said)", got)
 	}
 }
+
+// TestNew_ClampsAndDefaultsPipelining pins the two pipelining knobs.
+//
+// Both are per connection, so their product with MaxConnections is the
+// adapter-wide memory ceiling — 64 connections x 64 MiB of payload budget is
+// already 4 GiB, which is why MaxConnections defaults to 64 rather than NFS's
+// 1024. Getting the clamp wrong is therefore a memory bug, not a tuning one.
+func TestNew_ClampsAndDefaultsPipelining(t *testing.T) {
+	cfg := minimalConfig()
+	if got := nbd.New(cfg).ConfigForTest().MaxInFlight; got != nbd.DefaultMaxInFlight {
+		t.Fatalf("MaxInFlight = %d, want DefaultMaxInFlight (%d)", got, nbd.DefaultMaxInFlight)
+	}
+	if got := nbd.New(cfg).ConfigForTest().MaxInFlightBytes; got != nbd.DefaultMaxInFlightBytes {
+		t.Fatalf("MaxInFlightBytes = %d, want DefaultMaxInFlightBytes (%d)", got, nbd.DefaultMaxInFlightBytes)
+	}
+
+	// A value past the clamp is clamped, not refused: the operator asked for more
+	// concurrency than the adapter will honour, and the resolved value is
+	// observable through ConfigForTest.
+	cfg.MaxInFlight = 10_000
+	if got := nbd.New(cfg).ConfigForTest().MaxInFlight; got != nbd.MaxMaxInFlight {
+		t.Fatalf("MaxInFlight = %d, want the clamp (%d)", got, nbd.MaxMaxInFlight)
+	}
+
+	// A negative value is a typo and panics, like every other invalid config.
+	for _, bad := range []struct {
+		name string
+		set  func(*nbd.Config)
+	}{
+		{"negative max_in_flight", func(c *nbd.Config) { c.MaxInFlight = -1 }},
+		{"negative max_in_flight_bytes", func(c *nbd.Config) { c.MaxInFlightBytes = -1 }},
+	} {
+		t.Run(bad.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("New accepted %s", bad.name)
+				}
+			}()
+			c := minimalConfig()
+			bad.set(&c)
+			nbd.New(c)
+		})
+	}
+}

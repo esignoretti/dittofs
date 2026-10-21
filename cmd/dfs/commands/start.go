@@ -1074,6 +1074,21 @@ func createNBDAdapter(cfg *models.AdapterConfig) (runtime.ProtocolAdapter, error
 	} else if maxConns, ok := parsedConfig["max_connections"].(int); ok {
 		nbdCfg.MaxConnections = maxConns
 	}
+	if v, ok := parsedConfig["max_in_flight"].(float64); ok {
+		nbdCfg.MaxInFlight = int(v)
+	} else if v, ok := parsedConfig["max_in_flight"].(int); ok {
+		nbdCfg.MaxInFlight = v
+	}
+	// float64 again, and this one is bytes: a value past 2^53 would lose
+	// precision in JSON, which is far beyond any sane budget and so not worth
+	// guarding separately from the negative check validate already does.
+	if v, ok := parsedConfig["max_in_flight_bytes"].(float64); ok {
+		nbdCfg.MaxInFlightBytes = int64(v)
+	} else if v, ok := parsedConfig["max_in_flight_bytes"].(int64); ok {
+		nbdCfg.MaxInFlightBytes = v
+	} else if v, ok := parsedConfig["max_in_flight_bytes"].(int); ok {
+		nbdCfg.MaxInFlightBytes = int64(v)
+	}
 	// uid and gid arrive as float64 because the blob is JSON. Both are
 	// security-relevant — the whole adapter runs as this one principal — so they
 	// are range-checked rather than cast: a negative or absurd value would wrap

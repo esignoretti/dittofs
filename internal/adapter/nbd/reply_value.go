@@ -20,6 +20,17 @@ type reply struct {
 	cookie  uint64
 	nbdErr  NBDError
 	payload []byte
+
+	// release is how many bytes of in-flight payload budget this reply's command
+	// held, and the writer gives them back once the reply is on the wire.
+	//
+	// It is carried here rather than derived from len(payload) because the two
+	// are not the same number in either direction: a WRITE acquires req.Length
+	// and replies with no payload at all, while a READ acquires req.Length and
+	// replies with exactly that. Deriving it from the payload would leak the
+	// whole budget for every WRITE — which is not a slow connection, it is one
+	// that wedges at zero bytes once the leak reaches the limit.
+	release int64
 }
 
 // write sends the reply: header first, then payload when there is one.

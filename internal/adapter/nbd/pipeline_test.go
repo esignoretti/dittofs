@@ -149,3 +149,167 @@ func TestPipeline_WorkerPanicRepliesEIO(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+// TestPipeline_BackpressureBoundsMemory pins the property that makes a pool safe
+// on a small host.
+//
+// Each in-flight WRITE holds req.Length bytes and each in-flight READ allocates
+// req.Length bytes on a worker, and the advertised maximum is 32 MiB — so an
+// unbounded pool turns a fast client into an OOM. Commands block when the budget
+// is exhausted rather than being refused: a refused write is a data-loss bug,
+// a delayed one is just slow.
+//
+// The budget here is 64 KiB against 32 KiB commands, so exactly two fit. The
+// assertion is on the pipeline's own peak accounting rather than on the Go heap,
+// because the heap is not attributable to this connection.
+func TestPipeline_BackpressureBoundsMemory(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	st.data[string(f.exp.PayloadID)] = make([]byte, 1<<20)
+	h := f.newHandler(t, st)
+	// Set on the handler, not on a pipeline: serve builds the pipeline, and a
+	// second pipeline on the same connection would have two readers racing for
+	// the stream — which is the very thing the design forbids.
+	h.maxInFlight = 8
+	h.maxInFlightBytes = 64 << 10
+	client, done := serveHandler(t, h, f.exp.Name)
+
+	const cmdBytes = 32 << 10
+	const n = 8
+
+	// Submitted all at once and only then read back, which is the whole point:
+	// writeThroughClient waits for each reply, so a loop of it would never have
+	// more than one command in flight and the peak would be one command's bytes
+	// whether or not a budget existed. That version of this test passed with the
+	// budget removed.
+	//
+	// 64 KiB of budget against 32 KiB commands means exactly two fit at once, so
+	// the peak is asserted at the budget rather than at 8 x 32 KiB.
+	for i := range n {
+		sendRequest(t, client, &Request{
+			Type: CmdWrite, Cookie: uint64(i), Offset: uint64(i * cmdBytes), Length: cmdBytes,
+		})
+		if _, err := client.Write(bytes.Repeat([]byte{byte(i)}, cmdBytes)); err != nil {
+			t.Fatalf("WRITE %d payload: %v", i, err)
+		}
+	}
+
+	// Every command completes: the budget delays, it does not refuse.
+	seen := map[uint64]bool{}
+	for range n {
+		rep := readReplyHeader(t, client)
+		if rep.Error != 0 {
+			t.Fatalf("WRITE cookie %d reply error = %d", rep.Cookie, rep.Error)
+		}
+		seen[rep.Cookie] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("saw %d distinct reply cookies, want %d", len(seen), n)
+	}
+
+	if peak := h.PeakInFlightBytes(); peak > h.maxInFlightBytes {
+		t.Fatalf("peak buffered bytes = %d, want <= %d; the byte budget did not bound the pool",
+			peak, h.maxInFlightBytes)
+	} else if peak == 0 {
+		t.Fatal("peak buffered bytes = 0; the budget was never exercised, so this test proves nothing")
+	}
+
+	// Still serving.
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned %v; the connection should still be open", err)
+	default:
+	}
+
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the client closed")
+	}
+}
+
+// TestPipeline_ConcurrentReadsAreConsistent pins that out-of-order completion
+// does not mispair a reply with a cookie.
+//
+// NBD simple replies are matched by cookie, not by position, so a worker pool
+// legitimately returns them out of order — which means a single swapped cookie
+// corrupts a filesystem silently, with no protocol error to notice it by. Each
+// READ here targets a range whose contents are derived from the cookie, so a
+// swap is detectable rather than merely unlikely.
+//
+// With one worker this passes trivially, because replies are inherently in
+// order. It becomes meaningful when the pool is widened, and it is written now so
+// that widening the pool cannot quietly break it.
+func TestPipeline_ConcurrentReadsAreConsistent(t *testing.T) {
+	const blockSize = 512
+
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	data := make([]byte, 32*blockSize)
+	for i := range 32 {
+		for j := range blockSize {
+			data[i*blockSize+j] = byte(i)
+		}
+	}
+	st.data[string(f.exp.PayloadID)] = data
+	h := f.newHandler(t, st)
+	client, _ := serveHandler(t, h, f.exp.Name)
+
+	for i := range 32 {
+		rep, got := readReplyAndPayload(t, client, &Request{
+			Type: CmdRead, Cookie: uint64(i), Offset: uint64(i * blockSize), Length: blockSize,
+		})
+		if rep.Error != 0 {
+			t.Fatalf("READ %d reply error = %d", i, rep.Error)
+		}
+		if rep.Cookie != uint64(i) {
+			t.Fatalf("reply cookie = %d, want %d", rep.Cookie, i)
+		}
+		for _, b := range got {
+			if b != byte(i) {
+				t.Fatalf("READ at offset %d (cookie %d) returned %#x, want %#x: a reply was paired with the wrong cookie",
+					i*blockSize, i, b, byte(i))
+			}
+		}
+	}
+}
+
+// TestHandler_SetPipelining pins that the configured values reach the handler.
+//
+// It exists because they did not. Handler's fields were read by serve and
+// written by nobody: pkg/adapter/nbd/adapter.go built the handler without them,
+// so every configured value was silently replaced by the handler's own default.
+// A benchmark A/B against that build measured the default against the default and
+// reported that pipelining changed nothing — which was true of the binary, and
+// false of the code.
+//
+// Zero means "keep the current value" so a caller can set one knob alone; that is
+// asserted too, because a caller that sets only the byte budget must not
+// accidentally zero the worker count and fall back to 1.
+func TestHandler_SetPipelining(t *testing.T) {
+	h := newTestHandler(newStoreFake(), testExport(8192), testTimeouts())
+	if h.maxInFlight != DefaultMaxInFlight {
+		t.Fatalf("new handler maxInFlight = %d, want %d", h.maxInFlight, DefaultMaxInFlight)
+	}
+	if h.maxInFlightBytes != DefaultMaxInFlightBytes {
+		t.Fatalf("new handler maxInFlightBytes = %d, want %d", h.maxInFlightBytes, DefaultMaxInFlightBytes)
+	}
+
+	h.SetPipelining(8, 1<<20)
+	if h.maxInFlight != 8 {
+		t.Fatalf("maxInFlight = %d, want 8", h.maxInFlight)
+	}
+	if h.maxInFlightBytes != 1<<20 {
+		t.Fatalf("maxInFlightBytes = %d, want %d", h.maxInFlightBytes, 1<<20)
+	}
+
+	// Zero leaves the value alone, so one knob can be set without the other.
+	h.SetPipelining(0, 2<<20)
+	if h.maxInFlight != 8 {
+		t.Fatalf("maxInFlight = %d after SetPipelining(0, ...), want it unchanged at 8", h.maxInFlight)
+	}
+	if h.maxInFlightBytes != 2<<20 {
+		t.Fatalf("maxInFlightBytes = %d, want %d", h.maxInFlightBytes, 2<<20)
+	}
+}

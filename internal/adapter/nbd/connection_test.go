@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +31,14 @@ import (
 // store with a durable remote and no strict enforcement), so a commit takes the
 // localDurable fast path. A test that needs the strict path sets them itself.
 type storeFake struct {
+	// mu guards everything below.
+	//
+	// It is not paranoia: before the pipeline, dispatch was serialized, so a
+	// counter could be a plain int and a test could read st.writes after a reply
+	// and know nothing else was running. With maxInFlight > 1 several workers
+	// reach the same fake at once, and -race finds it immediately. The counters
+	// stay readable through the accessors at the bottom of this file.
+	mu       sync.Mutex
 	data     map[string][]byte
 	readErr  error
 	writeErr error
@@ -70,10 +79,15 @@ func newStoreFake() *storeFake {
 }
 
 func (s *storeFake) ReadAt(_ context.Context, id string, buf []byte, off uint64) (int, error) {
+	s.mu.Lock()
 	s.reads++
-	if s.panicOnRead {
+	panicOnRead := s.panicOnRead
+	s.mu.Unlock()
+	if panicOnRead {
 		panic("storeFake: ReadAt panicked on purpose")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.readErr != nil {
 		return 0, s.readErr
 	}
@@ -92,10 +106,15 @@ func (s *storeFake) ReadAt(_ context.Context, id string, buf []byte, off uint64)
 }
 
 func (s *storeFake) WriteAt(_ context.Context, id string, currentBlocks []block.ChunkRef, data []byte, off uint64) ([]block.ChunkRef, error) {
+	s.mu.Lock()
 	s.writes++
-	if s.panicOnWrite {
+	panicOnWrite := s.panicOnWrite
+	s.mu.Unlock()
+	if panicOnWrite {
 		panic("storeFake: WriteAt panicked on purpose")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.writeErr != nil {
 		return currentBlocks, s.writeErr
 	}
@@ -113,6 +132,8 @@ func (s *storeFake) WriteAt(_ context.Context, id string, currentBlocks []block.
 }
 
 func (s *storeFake) PunchHole(_ context.Context, id string, currentBlocks []block.ChunkRef, off, length uint64) ([]block.ChunkRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.punches++
 	if s.punchErr != nil {
 		return currentBlocks, s.punchErr
@@ -125,12 +146,18 @@ func (s *storeFake) PunchHole(_ context.Context, id string, currentBlocks []bloc
 }
 
 func (s *storeFake) Flush(_ context.Context, _ string) (*block.FlushResult, error) {
+	s.mu.Lock()
 	s.flushes++
-	if s.onFlush != nil {
-		s.onFlush()
+	onFlush := s.onFlush
+	flushErr := s.flushErr
+	s.mu.Unlock()
+	// Called without the lock: onFlush is a test hook that inspects the store, so
+	// holding mu here would deadlock the moment it reads a counter.
+	if onFlush != nil {
+		onFlush()
 	}
-	if s.flushErr != nil {
-		return nil, s.flushErr
+	if flushErr != nil {
+		return nil, flushErr
 	}
 	return &block.FlushResult{}, nil
 }

@@ -45,7 +45,23 @@ type pipeline struct {
 
 	ctx         context.Context
 	maxInFlight int
-	barrier     *barrier
+
+	// maxInFlightBytes bounds the payload memory the connection may hold at
+	// once, in both directions. Zero means unbounded, which is only ever right
+	// for a test that is asserting something else.
+	//
+	// It is a separate limit from maxInFlight because the two fail differently:
+	// too many workers is a latency problem, too many bytes is an OOM. A pool of
+	// 4 holding 32 MiB reads is 128 MiB per connection, and the default
+	// connection cap is 64.
+	maxInFlightBytes int64
+
+	barrier *barrier
+
+	// bytes is the in-flight payload budget, and peakBytes the high-water mark a
+	// test reads to prove the budget held.
+	bytes     *byteBudget
+	peakBytes int64
 }
 
 func newPipeline(h *Handler, conn net.Conn, bs BlockStore, exp *Export, ctx context.Context, maxInFlight int) *pipeline {
@@ -53,13 +69,15 @@ func newPipeline(h *Handler, conn net.Conn, bs BlockStore, exp *Export, ctx cont
 		maxInFlight = 1
 	}
 	return &pipeline{
-		h:           h,
-		conn:        conn,
-		bs:          bs,
-		exp:         exp,
-		ctx:         ctx,
-		maxInFlight: maxInFlight,
-		barrier:     newBarrier(),
+		h:                h,
+		conn:             conn,
+		bs:               bs,
+		exp:              exp,
+		ctx:              ctx,
+		maxInFlight:      maxInFlight,
+		maxInFlightBytes: h.maxInFlightBytes,
+		barrier:          newBarrier(),
+		bytes:            newByteBudget(h.maxInFlightBytes),
 	}
 }
 
@@ -83,6 +101,11 @@ type command struct {
 	exp  *Export
 	data []byte
 	pre  *reply
+
+	// bytes is the in-flight payload budget this command holds, released by the
+	// writer once the reply is sent. See reply.release for why it is carried
+	// rather than derived.
+	bytes int64
 }
 
 // barrier is the FLUSH ordering guarantee.
@@ -146,6 +169,117 @@ func (b *barrier) wait() {
 		b.cond.Wait()
 	}
 	b.mu.Unlock()
+}
+
+// byteBudget bounds the payload memory in flight on one connection.
+//
+// A mutex and a condition variable rather than a channel: a channel of empty
+// structs cannot express "N bytes held", and a channel of int64 would have to be
+// refilled on every release. The pattern is the same as barrier's, deliberately.
+//
+// Acquiring blocks instead of failing. A refused WRITE is a data-loss bug; a
+// delayed one is only slow, and the client is already applying backpressure of
+// its own by not sending the next request until this one is answered.
+type byteBudget struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	held  int64
+	limit int64 // 0 means unbounded
+	peak  int64
+}
+
+func newByteBudget(limit int64) *byteBudget {
+	b := &byteBudget{limit: limit}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+// acquire blocks until n bytes fit, then holds them.
+//
+// It must be called BEFORE the bytes are allocated or read, never after: the
+// point of the budget is to bound what the reader has already committed to
+// buffering, and a gate consulted after the allocation bounds nothing.
+//
+// ctx is polled by a goroutine rather than selected on, because sync.Cond has no
+// context support. The goroutine is created only when the acquire actually has
+// to wait, so the common uncontended case costs one mutex and no goroutine.
+func (b *byteBudget) acquire(ctx context.Context, n int64) error {
+	if b == nil || b.limit <= 0 || n <= 0 {
+		return nil
+	}
+
+	b.mu.Lock()
+	if b.held+n <= b.limit {
+		b.take(n)
+		b.mu.Unlock()
+		return nil
+	}
+	b.mu.Unlock()
+
+	// Slow path: wait, but stay cancellable. Without this a cancelled connection
+	// with a full budget would park the reader forever, because nothing will
+	// release bytes it is not going to write.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			b.mu.Lock()
+			b.cond.Broadcast()
+			b.mu.Unlock()
+		case <-stop:
+		}
+	}()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if b.held+n <= b.limit {
+			b.take(n)
+			return nil
+		}
+		b.cond.Wait()
+	}
+}
+
+// take records n bytes as held. The caller holds b.mu.
+func (b *byteBudget) take(n int64) {
+	b.held += n
+	if b.held > b.peak {
+		b.peak = b.held
+	}
+}
+
+// release gives n bytes back and wakes anyone waiting.
+//
+// Every acquire needs a release on every path, including the ones that never
+// reach the writer — a reader error, a drained refusal, a contained panic. A
+// leaked budget is not a slow connection: it is a connection that wedges at zero
+// bytes the moment the leak reaches the limit.
+func (b *byteBudget) release(n int64) {
+	if b == nil || b.limit <= 0 || n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.held -= n
+	if b.held < 0 {
+		b.held = 0
+	}
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
+
+// highWater returns the peak bytes held, for a test asserting the budget held.
+func (b *byteBudget) highWater() int64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.peak
 }
 
 // run reads commands, dispatches them, and writes replies until the client
@@ -351,11 +485,36 @@ func (p *pipeline) readLoop(ctx context.Context, work chan<- command, cancel con
 			// The payload read stays on the reader: this is the only goroutine
 			// allowed to advance the stream, and a handler reading here would race
 			// it for the same bytes.
-			data, err := p.h.readWritePayload(p.conn, req)
-			if err != nil {
+			// Acquired BEFORE the read, never after: the budget bounds what the
+			// reader has already committed to buffering, and a gate consulted
+			// after the allocation bounds nothing.
+			if err := p.bytes.acquire(ctx, int64(req.Length)); err != nil {
 				return err
 			}
-			if err := p.submitWrite(work, command{req: req, exp: p.exp, data: data}); err != nil {
+			data, err := p.h.readWritePayload(p.conn, req)
+			if err != nil {
+				// Never queued, so the writer will never release this budget.
+				p.bytes.release(int64(req.Length))
+				return err
+			}
+			if err := p.submitWrite(work, command{req: req, exp: p.exp, data: data, bytes: int64(req.Length)}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// READ allocates too, so it takes the budget as well. handleRead does
+		// buf := make([]byte, req.Length) on the worker, so a WRITE-only budget
+		// would leave maxInFlight concurrent READs free to allocate
+		// maxInFlight x 32 MiB with the counter untouched — the same OOM the
+		// budget exists to prevent, on the direction a boot disk spends most of
+		// its time in.
+		if req.Type == CmdRead {
+			if err := p.bytes.acquire(ctx, int64(req.Length)); err != nil {
+				return err
+			}
+			if err := p.submit(work, command{req: req, exp: p.exp, bytes: int64(req.Length)}); err != nil {
+				p.bytes.release(int64(req.Length))
 				return err
 			}
 			continue
@@ -378,6 +537,46 @@ func (p *pipeline) readLoop(ctx context.Context, work chan<- command, cancel con
 		}
 	}
 }
+
+// recordPeak publishes this pipeline's high-water mark to the handler, so a test
+// can assert the budget held after the connection has closed. The atomic max is
+// a compare-and-swap loop rather than a plain store: several pipelines may exist
+// for one handler over the connection's life, and the largest peak is the one
+// that matters.
+func (p *pipeline) recordPeak() {
+	peak := p.bytes.highWater()
+	for {
+		cur := p.h.peakInFlightBytes.Load()
+		if peak <= cur || p.h.peakInFlightBytes.CompareAndSwap(cur, peak) {
+			return
+		}
+	}
+}
+
+// SetPipelining sets how many commands one connection may have in flight and
+// how many payload bytes they may hold at once.
+//
+// It is a method rather than two more NewHandler parameters because the handler
+// is built in one place in production and ten in tests, and every test wants the
+// defaults. Zero means "keep the current value", so a caller can set one knob
+// without having to know the other's default.
+//
+// Call it before the adapter starts serving: serve reads these fields on each
+// new connection, and a handler is built once per adapter.
+func (h *Handler) SetPipelining(maxInFlight int, maxInFlightBytes int64) {
+	if maxInFlight > 0 {
+		h.maxInFlight = maxInFlight
+	}
+	if maxInFlightBytes > 0 {
+		h.maxInFlightBytes = maxInFlightBytes
+	}
+}
+
+// PeakInFlightBytes returns the highest payload memory this handler's pipelines
+// held at once. It exists for the backpressure test: the pipeline itself is gone
+// by the time serve returns, so the observation has to be recorded somewhere the
+// test still holds.
+func (h *Handler) PeakInFlightBytes() int64 { return h.peakInFlightBytes.Load() }
 
 // submit queues a command, returning the error that should end the connection.
 //
@@ -450,8 +649,10 @@ func (p *pipeline) serve(ctx context.Context, cmd command, replies chan<- reply)
 			// exactly the state a panic tends to arrive in — and a goroutine
 			// parked in a deferred send never reaches its WaitGroup.Done, so
 			// shutdown hangs instead of failing.
+			panicReply := errorReply(cmd.req.Cookie, ErrEIO)
+			panicReply.release = cmd.bytes
 			select {
-			case replies <- errorReply(cmd.req.Cookie, ErrEIO):
+			case replies <- panicReply:
 				keepGoing = true
 			case <-ctx.Done():
 				keepGoing = false
@@ -460,6 +661,9 @@ func (p *pipeline) serve(ctx context.Context, cmd command, replies chan<- reply)
 	}()
 
 	rep := p.dispatch(ctx, cmd)
+	// Set here rather than inside dispatch so every path carries it: a handler
+	// that returns an error reply still spent the budget its command acquired.
+	rep.release = cmd.bytes
 	select {
 	case replies <- rep:
 		return true
@@ -525,10 +729,24 @@ func (p *pipeline) dispatch(ctx context.Context, cmd command) reply {
 // client with more than one command in flight has already accepted that. At
 // maxInFlight == 1 they arrive in submission order regardless.
 func (p *pipeline) writeLoop(replies <-chan reply) error {
+	// The release happens here, after the reply is written, because that is when
+	// the payload buffer's ownership ends: the reader filled it and the writer
+	// has now sent it, so nothing else can be holding a reference.
+	//
+	// It is deferred so a write error still releases: a connection that fails
+	// mid-reply has already spent the budget, and the pipeline is about to unwind
+	// anyway — but the defer keeps the accounting true rather than merely
+	// irrelevant.
+	defer p.recordPeak()
 	for rep := range replies {
 		if err := rep.write(p.conn, p.h); err != nil {
 			return err
 		}
+		p.bytes.release(rep.release)
+		// Published as each reply retires, not only at the end: the test reads
+		// the peak while the connection is still open, and a peak published only
+		// on shutdown would be invisible to it.
+		p.recordPeak()
 	}
 	return nil
 }
@@ -543,3 +761,21 @@ func (p *pipeline) writeLoop(replies <-chan reply) error {
 func isWriteLike(t Command) bool {
 	return t == CmdWrite || t == CmdTrim || t == CmdWriteZeroes
 }
+
+// DefaultMaxInFlight is how many commands one connection may have in flight.
+//
+// Four, not the dozens a filesystem server might use, because the measured
+// plateau is at depth 4: the depth sweep in docs/nbd-benchmarks.md shows
+// 7,686 IOPS at depth 1 against 13,000-16,900 from depth 4 on, and nothing above
+// it. More workers buy latency under load and cost memory; they do not raise the
+// ceiling, which is the block store's.
+const DefaultMaxInFlight = 4
+
+// DefaultMaxInFlightBytes bounds the payload memory one connection may hold.
+//
+// 64 MiB is two maximum-size payloads (the advertised block maximum is 32 MiB),
+// so a single large request cannot be starved by its own neighbours. It is per
+// connection, and the default connection cap is 64, so the adapter-wide ceiling
+// is 4 GiB of payload buffers — which is why MaxConnections defaults to 64 rather
+// than NFS's 1024.
+const DefaultMaxInFlightBytes int64 = 64 << 20

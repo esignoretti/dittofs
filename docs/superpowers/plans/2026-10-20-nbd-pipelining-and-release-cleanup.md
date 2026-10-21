@@ -19,8 +19,8 @@
 - **Go 1.26.x** — CI matrix floor (`.github/workflows/unit-tests.yml`), not the local toolchain.
 - **No new module dependencies.** Everything needed is in the standard library.
 - **Scope is `internal/adapter/nbd/` and `pkg/adapter/nbd/`.** No engine, metadata, control-plane, or `cmd/` changes except where a task names one.
-- **`NBD_FLAG_CAN_MULTI_CONN` stays OFF.** Pipelining is one connection with several commands in flight; it is not multi-connection cache coherence.
-- **`BLOCK_STATUS` and structured replies stay unimplemented.** Spec §7's residency-truth gate has not moved.
+- **`NBD_FLAG_CAN_MULTI_CONN` is now ON** (`c03a908b`), which changes one premise this plan was written against. Pipelining is still one connection with several commands in flight — it is not multi-connection cache coherence — but a client that sees the flag may now open several connections, so the depth plateau is a per-connection ceiling rather than a per-export one. Two consequences for the tasks below: `TestIntegration_OneBlockStorePerShare` and `TestIntegration_FlushOnOneConnectionCoversAWriteOnAnother` pin the coherence the flag promises and must keep passing, and the oracle's expected flag word is `0x016d` (it was `0x006d` when this plan was written) because `oracleStartQemuNBD` now passes `--shared=0`.
+- **`BLOCK_STATUS` and structured replies stay unimplemented.** Spec §7's residency-truth gate has not moved. [`docs/nbd-block-status.md`](../../nbd-block-status.md) states the gate's cost and the checklist to lift it.
 - **`maxBlockSize` is 32 MiB** (`internal/adapter/nbd/payload_size.go`) and is the per-request payload ceiling. It does not change.
 - **Existing suite must pass unchanged.** That is the primary regression gate for the pipelining tasks; any test that must change is named in the task that changes it.
 - **Every test that pins a fixed defect must be shown to fail before the fix.** Record the failing output in the commit message.
@@ -996,7 +996,7 @@ The places that keep the socket are `drainWritePayload` (a read) and the `CmdDis
 - [ ] **Step 5: Run the full package and the oracle**
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/ && go test -run Oracle ./internal/adapter/nbd/ -v`
-Expected: both `ok`; the oracle's transmission-flag words unchanged (`DittoFS = 0x006d`).
+Expected: both `ok`; the oracle's transmission-flag words unchanged (`DittoFS = 0x016d`, `qemu-nbd = 0x0d6d`, `ours-only = 0x0000`).
 
 - [ ] **Step 6: Commit**
 

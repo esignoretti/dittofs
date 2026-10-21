@@ -75,8 +75,17 @@ func handleKey(handle FileHandle) string {
 }
 
 // RecordWrite records a pending write for deferred commit.
-// Returns the current pending state (with max size across all writes).
-func (t *PendingWritesTracker) RecordWrite(handle FileHandle, intent *WriteOperation, clearSetuid bool) *PendingWriteState {
+// Returns a COPY of the current pending state (with max size across all writes).
+//
+// The copy is load-bearing, not defensive. The state lives in t.pending and is
+// mutated under t.mu by later writes, so returning the stored pointer hands the
+// caller a value that can change underneath it: deferredCommitWrite reads
+// state.MaxSize/LastMtime/ClearSetuidSetgid after the lock is released, and two
+// concurrent writes to one file race there. That was unreachable while every
+// protocol adapter dispatched one command at a time per file — which is why it
+// was never observed — but NBD's pipelining makes it ordinary: several workers
+// reach this function for the same handle at once.
+func (t *PendingWritesTracker) RecordWrite(handle FileHandle, intent *WriteOperation, clearSetuid bool) PendingWriteState {
 	key := pendingWriteKey(handle)
 
 	t.mu.Lock()
@@ -130,7 +139,9 @@ func (t *PendingWritesTracker) RecordWrite(handle FileHandle, intent *WriteOpera
 		}
 	}
 
-	return state
+	// Copied while t.mu is still held, which is the only moment the fields are
+	// stable.
+	return *state
 }
 
 // GetPendingSize returns the pending size for a file, if any.

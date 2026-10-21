@@ -100,6 +100,21 @@ type Handler struct {
 	// branch, and it is what makes the truncate test deterministic instead of a
 	// race against the window.
 	sizeRefresh time.Duration
+
+	// maxInFlight is how many commands a connection may have in flight, and
+	// maxInFlightBytes bounds the payload memory they may hold at once.
+	//
+	// Both are per connection, not per adapter: one client's backlog must not
+	// starve another's, and the adapter's MaxConnections cap already bounds the
+	// total.
+	maxInFlight      int
+	maxInFlightBytes int64
+
+	// peakInFlightBytes records the highest payload memory this handler's
+	// pipelines held at once, for the backpressure test. It is an atomic because
+	// it is updated from the pipeline's reader while a test reads it after the
+	// connection closes.
+	peakInFlightBytes atomic.Int64
 }
 
 // NewHandler returns a handler for one adapter's connections.
@@ -117,6 +132,9 @@ func NewHandler(exporter Exporter, stores StoreResolver, meta *metadata.Service,
 		draining: draining,
 
 		sizeRefresh: time.Second,
+
+		maxInFlight:      DefaultMaxInFlight,
+		maxInFlightBytes: DefaultMaxInFlightBytes,
 	}
 }
 
@@ -243,7 +261,7 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 	// Task 11 raises that number. Nothing else about this call changes when it
 	// does, because the three roles are already separated: a worker never touches
 	// the connection, and the reader is the only goroutine that advances it.
-	return newPipeline(h, conn, bs, exp, ctx, 1).run()
+	return newPipeline(h, conn, bs, exp, ctx, h.maxInFlight).run()
 }
 
 // writeReply writes one simple reply, header then payload.

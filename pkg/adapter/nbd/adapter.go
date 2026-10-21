@@ -134,8 +134,14 @@ func (a *Adapter) Serve(ctx context.Context) error {
 			return false
 		}
 	}
-	a.handler.Store(nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
-		id, a.config.timeouts(), draining))
+	handler := nbd.NewHandler(exporter, resolver, a.runtime.GetMetadataService(),
+		id, a.config.timeouts(), draining)
+	// applyDefaults has already resolved both of these (4 and 64 MiB), so the
+	// handler's own defaults would agree — but only by coincidence, and a
+	// configured value would be silently ignored. This is the one place they are
+	// connected.
+	handler.SetPipelining(a.config.MaxInFlight, a.config.MaxInFlightBytes)
+	a.handler.Store(handler)
 
 	return a.ServeWithFactory(ctx, a, nil, nil)
 }
