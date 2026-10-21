@@ -19,6 +19,19 @@ import (
 // device that has nothing to flush, and there is nothing to protect: the
 // command carries no data.
 func (h *Handler) handleFlush(ctx context.Context, bs BlockStore, exp *Export, req *Request, conn net.Conn) error {
+	// FUA is accepted because the spec requires the server to accept it on every
+	// command once SEND_FUA is advertised; no other flag is documented for
+	// FLUSH, so one is a malformed request. This is the same rule handleDiscard
+	// applies (handlers_write.go:191) and it was missing here only because FLUSH
+	// is the one command whose payload is nothing at all — there was no length
+	// check to hang it on.
+	//
+	// Checked before the length/offset check so a request that is wrong in both
+	// ways is still reported once, and before h.commit so a rejected FLUSH has
+	// not flushed.
+	if req.Flags&^FlagFUA != 0 {
+		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
+	}
 	if req.Length != 0 || req.Offset != 0 {
 		return h.writeReply(conn, req.Cookie, ErrEINVAL, nil)
 	}
