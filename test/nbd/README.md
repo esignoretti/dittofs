@@ -497,6 +497,26 @@ server rather than a cache.
 The script fails if the pause is absent, if the read does not resume, if the
 restart happened outside the window, or if the bytes do not match.
 
+### Verifying more than one byte range, without fooling yourself
+
+`crash-restart.sh` proves one 22-byte pattern survives. To check a whole region after a
+crash, use `fio --verify=crc32c`, and avoid three traps that each produce a green run
+that means nothing:
+
+- **Verify sequentially, not with random reads.** `--rw=randread --number_ios=600` over
+  16 MiB reads 600 of 4 096 blocks, so a corrupted block is very likely never visited.
+  This was caught by zeroing a known block and watching the "verify" still return
+  `err=0`. `--rw=read` is deterministic.
+- **Prove the verifier bites before trusting it.** Seed with `--do_verify=0`, verify
+  clean (`err=0`), corrupt one block, verify again (`err=84`, EILSEQ). Without that
+  sequence `err=0` is unfalsifiable.
+- **Do not count kernel log lines.** `Connection timed out, retrying` is emitted with
+  `dev_err_ratelimited`, so identical runs logged 8, 3 and 1 lines for 8 in-flight
+  requests. Use `/sys/block/nbdN/inflight` for the queue depth at the kill.
+
+A pipelined crash run measured this way: 8 commands outstanding at the kill, `err=0`,
+and a sequential verify of all 4 096 blocks afterwards crc32c-clean.
+
 ### The size cross-check (a bug this rig produced)
 
 Pre-flight describes the **file** at `<volume-path>/volumes/<volume>`; it cannot
