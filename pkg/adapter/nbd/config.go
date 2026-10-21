@@ -18,6 +18,17 @@ const DefaultPort = 10809
 // that is a client that ignored the advertisement.
 const DefaultMaxMessageSize = 32 << 20
 
+// DefaultMaxConnections is the cap applied when the operator configures none.
+//
+// It is deliberately much lower than pkg/adapter/nfs's 1024: an NBD connection
+// holds a block-store handle and can be holding up to a 32 MiB read buffer,
+// where an NFS connection holds neither. The NFS precedent's reasoning applies
+// unchanged, though — "a sane default cap so the accept loop's connSemaphore is
+// always built. Leaving this at 0 (unlimited) lets unauthenticated clients
+// exhaust memory/goroutines" — and it applies harder here, because NBD has no
+// authentication at all.
+const DefaultMaxConnections = 64
+
 // DefaultUID and DefaultGID are the unprivileged identity the adapter runs
 // metadata operations as when the operator configures none: nobody/nogroup.
 // NBD carries no user identity at all, so every operation runs as this one
@@ -60,6 +71,7 @@ type TimeoutsConfig struct {
 //   - Timeouts.Idle: 5m
 //   - Timeouts.Shutdown: 30s
 //   - MaxMessageSize: 32 MiB
+//   - MaxConnections: 64
 //   - UID/GID: 65534 (nobody/nogroup)
 type Config struct {
 	// Enabled controls whether the adapter is active. When false the adapter
@@ -74,7 +86,10 @@ type Config struct {
 	// AllowRemoteBind.
 	BindAddress string `mapstructure:"bind_address"`
 
-	// MaxConnections limits concurrent client connections. 0 means unlimited.
+	// MaxConnections limits concurrent client connections. 0 means the default
+	// (64); -1 means unlimited, which validate refuses together with
+	// AllowRemoteBind because an uncapped, unauthenticated, remotely reachable
+	// adapter is one accept loop away from exhausting file descriptors.
 	MaxConnections int `mapstructure:"max_connections"`
 
 	// MaxMessageSize caps a single request payload in bytes. 0 means the
@@ -122,6 +137,14 @@ func (c *Config) applyDefaults() {
 	if c.MaxMessageSize == 0 {
 		c.MaxMessageSize = DefaultMaxMessageSize
 	}
+	// 0 is no longer "unlimited". The zero value of an omitted key used to mean
+	// an uncapped, unauthenticated adapter, and pkg/adapter/base.go:159 only
+	// allocates its semaphore when the value is positive — so the default
+	// configuration had no limit at all. -1 is the explicit spelling for
+	// unlimited, which makes it a decision an operator writes down.
+	if c.MaxConnections == 0 {
+		c.MaxConnections = DefaultMaxConnections
+	}
 	if c.UID == 0 {
 		c.UID = DefaultUID
 	}
@@ -138,6 +161,22 @@ func (c *Config) applyDefaults() {
 func (c *Config) validate() error {
 	if c.Port > 65535 {
 		return fmt.Errorf("invalid port %d: must be 0-65535", c.Port)
+	}
+	// A remote bind with no cap is the one combination worth refusing rather
+	// than defaulting, because the operator asked for both halves explicitly:
+	// -1 is the deliberate spelling of "unlimited", and pairing it with a
+	// reachable interface is a decision the adapter should not make silently.
+	//
+	// This reaches the operator as a panic from New, which is the same path every
+	// other invalid config takes. models.AdapterConfig.Validate
+	// (pkg/controlplane/models/adapter.go:55-77) checks only the type and the
+	// port, so it does not catch this first — this is the gate.
+	if c.AllowRemoteBind && c.MaxConnections < 0 {
+		return fmt.Errorf("allow_remote_bind requires a connection limit: set max_connections to a positive value")
+	}
+	// Any other negative value is a typo, not a policy.
+	if c.MaxConnections < -1 {
+		return fmt.Errorf("invalid max_connections %d: use 0 for the default, -1 for unlimited, or a positive limit", c.MaxConnections)
 	}
 	return nil
 }
