@@ -49,7 +49,7 @@ Five conditions the spec implies but no existing test exercises, each of which a
 - Consumes: `common.WithRequestDeadline(ctx context.Context) (context.Context, context.CancelFunc)` — already used at `handlers_write.go:120` and `handlers_read.go:93`.
 - Produces: nothing new.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The test must observe that the context handed to `bs.PunchHole` carries a deadline. A fake `BlockStore` records the context it receives.
 
@@ -109,12 +109,12 @@ Two details that decide whether this test is honest:
 - **`storeFake` is embedded by pointer, and the override delegates.** `newStoreFake()` returns `*storeFake` (`connection_test.go:59`). Embedding the value instead of the pointer would leave the recording store with its own zero-valued counters, so `st.punches` would read 0 regardless and the second assertion would be meaningless.
 - **The offset/length are inside the export.** `newWriteVolumeFixture` creates a 1 MiB volume (`newIntegrationFixtureAs` → `newIntegrationFixtureAsSized(t, id, 1<<20)`), and `handleDiscard` bounds-checks against `exp.Size` before touching the store — a 4096-byte WRITE_ZEROES at offset 0 passes, while one at offset 0 with length 1 MiB+1 would be answered `NBD_ENOSPC` and the store would never be called.
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [x] **Step 2: Run it and confirm it fails**
 
 Run: `go test ./internal/adapter/nbd/ -run TestHandleDiscard_PunchHoleCarriesRequestDeadline -v`
 Expected: `FAIL` — `PunchHole was called without a request deadline on its context`.
 
-- [ ] **Step 3: Apply the deadline**
+- [x] **Step 3: Apply the deadline**
 
 In `handleDiscard`, wrap the context before the engine call, mirroring `handlers_read.go:93`:
 
@@ -129,12 +129,12 @@ In `handleDiscard`, wrap the context before the engine call, mirroring `handlers
 	if _, err := bs.PunchHole(punchCtx, string(res.PayloadID), res.PreOpBlocks, req.Offset, uint64(req.Length)); err != nil {
 ```
 
-- [ ] **Step 4: Run the test and the package**
+- [x] **Step 4: Run the test and the package**
 
 Run: `go test ./internal/adapter/nbd/ -run TestHandleDiscard_PunchHoleCarriesRequestDeadline -v && go test -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/`
 Expected: both `ok`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/handlers_write.go internal/adapter/nbd/handlers_write_deadline_test.go
@@ -153,7 +153,7 @@ git commit -m "fix(nbd): bound the block-store punch with a request deadline"
 - Consumes: `FlagFUA` (`protocol.go`), the `req.Flags&^allowed != 0` idiom from `handleDiscard` (`handlers_write.go:191`).
 - Produces: nothing new.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 // internal/adapter/nbd/handlers_control_test.go
@@ -197,12 +197,12 @@ func TestHandleFlush_AcceptsFUA(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run both and confirm the first fails**
+- [x] **Step 2: Run both and confirm the first fails**
 
 Run: `go test ./internal/adapter/nbd/ -run 'TestHandleFlush_' -v`
 Expected: `TestHandleFlush_RejectsUndocumentedFlags` FAILS (reply error is 0, not EINVAL); `TestHandleFlush_AcceptsFUA` passes.
 
-- [ ] **Step 3: Add the check**
+- [x] **Step 3: Add the check**
 
 Insert before the length/offset check in `handleFlush`:
 
@@ -217,12 +217,12 @@ Insert before the length/offset check in `handleFlush`:
 	}
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test ./internal/adapter/nbd/ -run 'TestHandleFlush_' -v`
 Expected: both PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/handlers_control.go internal/adapter/nbd/handlers_control_test.go
@@ -242,7 +242,7 @@ git commit -m "fix(nbd): reject undocumented flags on FLUSH"
 - Consumes: `(*metadata.Service).PrepareRead(ctx *metadata.AuthContext, handle metadata.FileHandle) (*metadata.ReadMetadata, error)` at `pkg/metadata/io.go:602` — it validates the file is regular and calls `checkReadPermission` (`pkg/metadata/auth_permissions.go:601`). `(*Handler).authContext(ctx context.Context, exp *Export) *metadata.AuthContext` at `connection.go:118`.
 - Produces: nothing new. `handleRead` gains a permission check and returns `ErrEPERM` on denial, matching the write path's mapping.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Two tests. The first pins the authorization gap; the second pins the discarded return value in the same function, because Task 3 rewrites that call anyway and a short read reported as success is the one failure a filesystem cannot detect.
 
@@ -338,12 +338,12 @@ func (s *shortReadStore) ReadAt(ctx context.Context, id string, buf []byte, off 
 }
 ```
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [x] **Step 2: Run it and confirm it fails**
 
 Run: `go test ./internal/adapter/nbd/ -run 'TestHandleRead_' -v`
 Expected: `TestHandleRead_ChecksReadPermission` FAILS — reply error is 0 and the payload is present, because no check runs. `TestHandleRead_ShortReadIsEIO` FAILS — reply error is 0 because `n` is discarded.
 
-- [ ] **Step 3: Add the check**
+- [x] **Step 3: Add the check**
 
 In `handleRead`, after the flags and payload-size checks and **before** `buf := make([]byte, req.Length)`, insert:
 
@@ -387,17 +387,17 @@ Then, while the function is open, fix the short read. Today the return value is 
 
 A short read is a store fault, not a short device: the range was already checked against `exp.Size`, so the bytes exist. `TestHandleRead_ShortReadIsEIO` from step 1 pins it.
 
-- [ ] **Step 4: Confirm `mapError` maps the denial to EPERM**
+- [x] **Step 4: Confirm `mapError` maps the denial to EPERM**
 
 Run: `grep -n "ErrAccessDenied" internal/adapter/nbd/connection.go`
 Expected: `case merrs.ErrPermissionDenied, merrs.ErrAccessDenied:` at `connection.go:402`, returning `ErrEPERM`. Confirmed present — no change needed. `mapError` normalizes through `common.NormalizeBlockStoreError`, which walks the wrap chain with `errors.As`, so a metadata `*merrs.StoreError{Code: ErrAccessDenied}` from `PrepareRead` reaches the same arm as a block-store denial. That is what makes the test's expectation of `ErrEPERM` correct rather than hopeful.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/`
 Expected: both `ok`. If an existing dispatch test now fails, it is because that test drives a READ with `nil` meta — which the `h.meta != nil` guard covers. Any other failure is a real regression; investigate before continuing.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/adapter/nbd/handlers_read.go internal/adapter/nbd/connection.go internal/adapter/nbd/handlers_read_test.go
@@ -419,12 +419,12 @@ git commit -m "fix(nbd): authorize READ and reject a short read as EIO"
 - Consumes: `Exporter` (`handshake.go:109`), `RuntimeExporter.Resolve` (`volume.go`).
 - Produces: `(*Export).Size` becomes documented as a snapshot, and `Handler` gains a way to refresh it. Two options; the task picks one and records why.
 
-- [ ] **Step 1: Establish what the current comment claims**
+- [x] **Step 1: Establish what the current comment claims**
 
 Run: `sed -n '120,150p' internal/adapter/nbd/volume.go`
 Expected: a comment asserting the size "cannot change" because it is "fixed at volume creation". That is false — a volume is an ordinary regular file in a share, mutable over NFS/SMB. The exact claim to find and delete is the `Resolve` doc's "its size is fixed at volume creation, so a later resolve could only re-read a value that cannot change".
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 ```go
 // TestExport_SizeIsReReadAfterATruncate pins that a live connection sees a
@@ -487,12 +487,12 @@ Two things about the truncate that decide whether this test is honest:
 - **The identity has to be the file's owner.** `SetFileAttributes` resolves ownership at `pkg/metadata/file_modify.go:421` (`isOwner := identity != nil && identity.UID != nil && *identity.UID == file.UID`) and only an owner or root clears the ownership gate at `:560-565`. The fixture creates the volume as `integrationIdentity` (`newWriteVolumeFixture` → `newIntegrationFixtureAs(t, integrationIdentity)`), so an auth context built from `integrationIdentity` is the owner. Any other identity would fail the chmod with a permission error and the test would fail for the wrong reason.
 - **A size change is not a mode change.** `onlySettingSize` (`pkg/metadata/file_modify.go:465`) is a distinct branch, so this does not depend on the chmod path Task 3's test uses. Both are legitimate, they just take different routes through the same function.
 
-- [ ] **Step 3: Run it and confirm it fails**
+- [x] **Step 3: Run it and confirm it fails**
 
 Run: `go test ./internal/adapter/nbd/ -run TestExport_SizeIsReReadAfterATruncate -v`
 Expected: `FAIL` — size is still 1 MiB, so the READ at offset 4096 succeeds.
 
-- [ ] **Step 4: Implement the refresh**
+- [x] **Step 4: Implement the refresh**
 
 Re-resolving the export per command is not affordable — it takes a registry lock and decodes a handle on every 4 KiB read, which is the exact cost the handshake's one-time resolve exists to avoid. So: re-resolve on a bounded interval, and document the residual staleness as a limit rather than leaving it as a surprise.
 
@@ -535,12 +535,12 @@ Rewrite the false comment at `volume.go:146` and the `Export.Size` doc at `hands
 
 **And note for Task 9 the harder half of the same point:** the refresh *reassigns* `exp`, so `exp` cannot become a plain `pipeline` field that workers read — that is a data race the moment the worker count exceeds one, and `go test -race` in Task 11 would catch it as a flake rather than a design error. The reader goroutine owns the current export and stamps each `command` with it (`command.exp`), so a worker never reads shared mutable state. Task 9's `command` type must therefore carry `exp *Export`, not rely on `p.exp`.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/`
 Expected: both `ok`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/adapter/nbd/volume.go internal/adapter/nbd/handshake.go internal/adapter/nbd/connection.go internal/adapter/nbd/volume_test.go
@@ -561,7 +561,7 @@ git commit -m "fix(nbd): stop treating the export size as immutable"
 
 **The test file is `package nbd_test`, not `package nbd`.** Both existing test files in `pkg/adapter/nbd/` are external (`adapter_test.go:1`, `healthcheck_test.go:1`). That means `applyDefaults` and `validate` — both unexported — are **not reachable** from it. Do not export them just for a test, and do not switch the package. Assert through `New` instead, which is what actually runs them (`adapter.go:55-60`) and which is already how the package's other validation test works (`TestNew_PanicsOnOutOfRangePort`, `adapter_test.go:30`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 // TestNew_RefusesAnUncappedRemoteBind pins the combination the adapter must not
@@ -610,12 +610,12 @@ func TestNew_ZeroMaxConnectionsDefaultsToACap(t *testing.T) {
 
 The second test is deliberately weak, and it is honest about why: `Adapter.config` is unexported and there is no accessor for `MaxConnections` (the only exported accessors are `Port`, `Protocol`, and the base adapter's). A stronger assertion would need a new accessor, which is a production API added for a test. The property that matters — that 0 no longer means unlimited — is enforced by `applyDefaults` and observed by the fact that a remote bind with 0 is *not* refused while one with -1 is. That pair is the test.
 
-- [ ] **Step 2: Run both and confirm they fail**
+- [x] **Step 2: Run both and confirm they fail**
 
 Run: `go test ./pkg/adapter/nbd/ -run 'TestNew_' -v`
 Expected: `TestNew_RefusesAnUncappedRemoteBind` FAILS — `New accepted a remote bind with an explicitly unlimited connection count`. `TestNew_ZeroMaxConnectionsDefaultsToACap` passes already (`DefaultMaxConnections` does not exist yet, so this step does not compile until step 3 adds the constant — add the constant first if you want the failing run to be about behaviour rather than about a missing symbol).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `applyDefaults`, before the UID/GID block:
 
@@ -657,12 +657,12 @@ Two things to know about where this lands:
 - **`New` panics on a validation failure.** `pkg/adapter/nbd/adapter.go:55-60` runs `applyDefaults()` then `validate()` and panics with `"invalid NBD config: %v"`. That is the established contract (the values come from the operator's file and the control-plane row), so this task does not change it — but it does mean the new error is a startup panic, not a log line. Say so in the doc comment. Note that `models.AdapterConfig.Validate` (`pkg/controlplane/models/adapter.go:55-77`) checks only the type and the port; it does **not** check `max_connections`, so the earlier gate an operator hits is this one, not the control-plane one. An earlier draft of this task claimed otherwise.
 - **`DefaultMaxConnections` does not collide.** `pkg/adapter/nfs/adapter.go:46` already defines `DefaultMaxConnections = 1024`, in a different package. NBD's 64 is lower on purpose: an NBD connection holds a block-store handle and up to 32 MiB of read buffer, where an NFS connection is cheaper. Note the divergence so the next reader does not "fix" it to match. The NFS precedent at `pkg/adapter/nfs/adapter.go:472-477` is worth copying for the comment's reasoning: *"A sane default cap so the accept loop's connSemaphore is always built. Leaving this at 0 (unlimited) lets unauthenticated clients exhaust memory/goroutines."*
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test -race -count=1 ./pkg/adapter/nbd/`
 Expected: `ok`. Also confirm nothing else builds a `Config` with a negative count: `grep -rn 'MaxConnections' --include=*.go pkg/adapter/nbd/ cmd/dfs/commands/start.go` — the only writer should be `createNBDAdapter`'s `parsedConfig["max_connections"]` read.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add pkg/adapter/nbd/config.go pkg/adapter/nbd/config_test.go
@@ -698,7 +698,7 @@ func (a *Adapter) ConfigForTest() Config { return a.config }
 
 Go allows a `package nbd` file and `package nbd_test` files in one directory as long as only the former is `_test.go`-suffixed... which it is, and that is the point: `nbd_test` sees `ConfigForTest`, and `ConfigForTest` sees `a.config`. State this reasoning in the accessor's comment, because the next reader will otherwise ask why one directory has two packages.
 
-- [ ] **Step 1: Write the failing test for UID 0**
+- [x] **Step 1: Write the failing test for UID 0**
 
 ```go
 // TestConfig_UIDZeroIsExpressible pins that "run as root" can be configured.
@@ -739,12 +739,12 @@ func TestConfig_UIDUnsetStillDefaults(t *testing.T) {
 
 A test that documents its own weakness is better than one that pretends, but a test that can be made strong should be.
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [x] **Step 2: Run it and confirm it fails**
 
 Run: `go test ./pkg/adapter/nbd/ -run 'TestConfig_UID' -v`
 Expected: FAIL — `UID = 65534, want 0` (`UIDSet` does not exist yet, so add the field first if you want the failure to be about behaviour rather than about a missing symbol).
 
-- [ ] **Step 3: Implement the sentinel, then wire or delete the dead keys**
+- [x] **Step 3: Implement the sentinel, then wire or delete the dead keys**
 
 Add `UIDSet *uint32` / `GIDSet *uint32` alongside `UID`/`GID` (set by `createNBDAdapter` when the key is present), and change `applyDefaults` to test the pointer rather than the value. Document on `UID`/`GID` that the bare fields are the *resolved* values and the `*Set` pointers are what the config file said, or the next reader will set `UID: 0` and wonder why it became 65534.
 
@@ -765,19 +765,19 @@ Then decide each dead key and record the decision in a comment:
 - `default_export` — **delete it.** `RuntimeExporter.Resolve` has no fallback path and `ServeHandshake` always requires a name: `OptGO` carries one in its payload, `OptExportName`'s payload *is* the name, and a client that asks for none gets `RepErrUnsup`. A config key with no consumer is a promise the adapter does not keep.
 - `uid`/`gid`/`timeouts.*` — **wire them** in `createNBDAdapter`, which currently reads only four keys. `a.config.UID`/`GID` are read at `adapter.go:118` and `timeouts()` at `config.go:150`, so the values are consumed once something sets them; `start.go` just never does.
 
-- [ ] **Step 4: Verify the wiring by construction**
+- [x] **Step 4: Verify the wiring by construction**
 
 There is no unit test for `createNBDAdapter` (it needs a control-plane `models.AdapterConfig`). Prove the wiring instead:
 
 Run: `grep -n 'parsedConfig\[' cmd/dfs/commands/start.go`
 Then compare against the mapstructure keys on `Config` (`grep -n 'mapstructure:' pkg/adapter/nbd/config.go`) and record both lists in the commit message. A key on `Config` with no `parsedConfig[...]` read is the defect being fixed; a `parsedConfig[...]` read with no `Config` field is a key that does nothing, which is the other half of the same defect. After this task the only `Config` keys without a `parsedConfig` read should be `enabled` (set by `createNBDAdapter` itself, `nbdCfg := nbd.Config{Enabled: true, Port: port}`) and `port` (taken from the row, not the blob).
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `go build ./... && go test -race -count=1 ./pkg/adapter/nbd/ ./cmd/...`
 Expected: build OK, tests `ok`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add pkg/adapter/nbd/config.go cmd/dfs/commands/start.go pkg/adapter/nbd/config_test.go pkg/adapter/nbd/export_test.go
@@ -796,7 +796,7 @@ git commit -m "fix(nbd): make uid/gid 0 expressible, wire the dead keys, delete 
 - Consumes: nothing.
 - Produces: nothing. Pure deletion.
 
-- [ ] **Step 1: Confirm each symbol is unused in production**
+- [x] **Step 1: Confirm each symbol is unused in production**
 
 The audit found two distinct classes. Verify both with one script rather than a grep, because the naive `grep -v protocol.go` counts the declaration in no file but does count test references — which is exactly the distinction that matters here.
 
@@ -831,11 +831,11 @@ Any other symbol in that output is a symbol the audit missed; stop and report it
 
 Verified against HEAD: 48 typed constants are declared in `protocol.go`; the script above classifies exactly the ten DEAD and six TEST-ONLY names in the table, and the other 32 are live. Run it before editing — if the split differs, the file has changed since this plan was written.
 
-- [ ] **Step 2: Delete the dead ten**
+- [x] **Step 2: Delete the dead ten**
 
 Remove the ten `DEAD` constants from `protocol.go`. **Keep the six test-only ones**: they pin wire values in `protocol_test.go`, and a test that asserts `FlagDF == 1<<2` is the only thing keeping the constants file honest against the spec. Deleting them would delete their tests too, for no gain.
 
-- [ ] **Step 3: Delete the one fully dead codec function**
+- [x] **Step 3: Delete the one fully dead codec function**
 
 The audit distinguished three classes here, and only one is removable without also deleting a test:
 
@@ -851,12 +851,12 @@ Delete only `ReadOptionReplyHeader`. The test-only ones are the codec's own roun
 
 Note: `writeSimpleReply` (`reply.go:37`) is **live** — `writeReply` calls it at `connection.go:350`. An earlier ledger entry called it dead code; that entry is wrong.
 
-- [ ] **Step 4: Run the full package**
+- [x] **Step 4: Run the full package**
 
 Run: `go build ./... && go test -race -count=1 ./internal/adapter/nbd/`
 Expected: `ok`. A build failure means a symbol was live after all — restore it.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/protocol.go internal/adapter/nbd/protocol_test.go
@@ -902,11 +902,11 @@ git commit -m "refactor(nbd): remove protocol constants and codecs nothing uses"
 - Every handler **writes** through `h.writeReply(conn, …)`. That is what moves to `reply`.
 - `rejectWrite` (`handlers_write.go:297-316`) both writes a reply and drains a payload. It splits in two: the reply becomes a `reply` value, and the drain becomes `func (h *Handler) drainWritePayload(conn net.Conn, length uint32) error`, which already exists and already does exactly that. `drainWritePayload` stays with the reader, which owns the socket.
 
-- [ ] **Step 1: Add the type**
+- [x] **Step 1: Add the type**
 
 Create `reply_value.go` with the type above and a `func (r reply) write(conn net.Conn, h *Handler) error` that arms the write deadline and writes header then payload — the body currently in `Handler.writeReply` (`connection.go:341-356`).
 
-- [ ] **Step 2: Convert one handler and keep the loop serial**
+- [x] **Step 2: Convert one handler and keep the loop serial**
 
 Convert `handleRead` only — it neither reads nor drains, so it is the clean case. In `serve`, replace its call site with:
 
@@ -920,7 +920,7 @@ Convert `handleRead` only — it neither reads nor drains, so it is the clean ca
 Run: `go test -race -count=1 ./internal/adapter/nbd/`
 Expected: `ok`, unchanged. This is the proof that the extraction is behaviour-preserving for one handler.
 
-- [ ] **Step 3: Move the WRITE payload read into the reader**
+- [x] **Step 3: Move the WRITE payload read into the reader**
 
 This is the step the pipelining depends on, and the one an earlier draft omitted. `handleWrite`'s payload read has to leave the handler **before** Task 9 exists, or the reader and the handler both read the same socket.
 
@@ -987,18 +987,18 @@ Expected: both `ok`, no test changed. This step is the riskiest in the task — 
 
 **Note for Task 9:** the `pre.write` + `drain` pair above is exactly what becomes `command.pre` — the reader refuses, drains, and hands the pipeline a command carrying the ready reply instead of writing it inline. Do not design a second mechanism there; move this one.
 
-- [ ] **Step 4: Convert the rest**
+- [x] **Step 4: Convert the rest**
 
 Do `handleFlush`, `handleTrim`, `handleWriteZeroes`, `handleDiscard` the same way. Every `return h.writeReply(conn, req.Cookie, X, nil)` becomes `return reply{cookie: req.Cookie, nbdErr: X}`; every `return h.writeReply(conn, req.Cookie, 0, buf)` becomes `return reply{cookie: req.Cookie, payload: buf}`.
 
 The places that keep the socket are `drainWritePayload` (a read) and the `CmdDisc`/draining branches in `serve`. Keep them and say why in a comment.
 
-- [ ] **Step 5: Run the full package and the oracle**
+- [x] **Step 5: Run the full package and the oracle**
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/ && go test -run Oracle ./internal/adapter/nbd/ -v`
 Expected: both `ok`; the oracle's transmission-flag words unchanged (`DittoFS = 0x016d`, `qemu-nbd = 0x0d6d`, `ours-only = 0x0000`).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/adapter/nbd/reply_value.go internal/adapter/nbd/handlers_*.go internal/adapter/nbd/connection.go
@@ -1072,7 +1072,7 @@ git commit -m "refactor(nbd): handlers return a reply instead of writing to the 
   func (b *barrier) wait()
   ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 // TestPipeline_WritePayloadIsConsumedInOrder pins the property the whole design
@@ -1086,12 +1086,12 @@ func TestPipeline_WritePayloadIsConsumedInOrder(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [x] **Step 2: Run it and confirm it fails**
 
 Run: `go test ./internal/adapter/nbd/ -run TestPipeline_WritePayloadIsConsumedInOrder -v`
 Expected: FAIL — `pipeline` is undefined.
 
-- [ ] **Step 3: Implement `barrier` and `pipeline` with `maxInFlight: 1`**
+- [x] **Step 3: Implement `barrier` and `pipeline` with `maxInFlight: 1`**
 
 Reader goroutine: loop reading a header, run the `CmdDisc` and draining branches **verbatim from `serve`**, then — for a WRITE that passed validation — read the payload (Task 8 step 3's `readWritePayload`, now living here), and hand a `command` to the pool. Worker: `switch req.Type` calling the converted handlers **with `cmd.exp`**, then hand the `reply` to the writer channel. Writer: single goroutine, `reply.write(conn, h)`.
 
@@ -1110,7 +1110,7 @@ Use buffered channels sized `maxInFlight` so the reader blocks when the pool is 
 
 Errors: a reader error closes the work channel and is returned from `run` after the writer drains; a writer error cancels a `context.WithCancel` derived from `p.ctx` so workers stop.
 
-- [ ] **Step 4: Point `serve` at the pipeline with `maxInFlight: 1`**
+- [x] **Step 4: Point `serve` at the pipeline with `maxInFlight: 1`**
 
 Replace everything from the `for {` loop onward with `return newPipeline(h, conn, bs, exp, ctx, 1).run()`, keeping the handshake and the store resolution above it. The connection's `SetDeadline`/`SetReadDeadline` arming moves into the pipeline's reader, which is the only thing that reads.
 
@@ -1124,7 +1124,7 @@ grep -n 'CmdDisc\|draining()\|SetReadDeadline' internal/adapter/nbd/connection.g
 ```
 Expected: only the handshake's `SetDeadline` and the `draining` closure's definition. A `CmdDisc` or `draining()` hit inside `serve` means a branch was copied rather than moved.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/pipeline.go internal/adapter/nbd/connection.go internal/adapter/nbd/pipeline_test.go
@@ -1144,7 +1144,7 @@ git commit -m "refactor(nbd): dispatch through a pipeline with one worker"
 - Consumes: `barrier` from Task 9.
 - Produces: `pipeline.run` calls `p.barrier.wait()` on the reader goroutine before queueing a `CmdFlush`; for the three mutating commands — `CmdWrite`, `CmdTrim`, `CmdWriteZeroes` — it calls `submitted()` before dispatch and `committed()` after the store call returns. `handleFlush` itself is unchanged apart from deleting its "serialized" comment — it still just commits.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 // TestPipeline_FlushIsABarrier is the load-bearing test of this whole plan. It
@@ -1162,12 +1162,12 @@ func TestPipeline_FlushIsABarrier(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [x] **Step 2: Run it and confirm it fails**
 
 Run: `go test ./internal/adapter/nbd/ -run TestPipeline_FlushIsABarrier -v`
 Expected: FAIL — the FLUSH reply arrives while the write is still blocked.
 
-- [ ] **Step 3: Wire the barrier**
+- [x] **Step 3: Wire the barrier**
 
 In `pipeline.run`'s dispatch, for `CmdWrite`, `CmdTrim` and `CmdWriteZeroes`: `p.barrier.submitted()` before handing the command to the pool, `p.barrier.committed()` after the handler returns and **before** the reply is queued.
 
@@ -1194,12 +1194,12 @@ An earlier draft of this plan put `p.barrier.wait()` inside `handleFlush`; that 
 
 Delete the "correct without tracking which writes are outstanding because dispatch is serialized" paragraph in `handlers_control.go` and replace it with a pointer to `barrier`.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/`
 Expected: `ok`, and `TestPipeline_FlushIsABarrier` passes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/pipeline.go internal/adapter/nbd/handlers_control.go internal/adapter/nbd/pipeline_test.go
@@ -1218,7 +1218,7 @@ git commit -m "fix(nbd): make FLUSH a real barrier instead of relying on seriali
 - Consumes: `pipeline` from Task 9.
 - Produces: `Config.MaxInFlight int` (`mapstructure:"max_in_flight"`, default 4, max 64) and `Config.MaxInFlightBytes int64` (`mapstructure:"max_in_flight_bytes"`, default 64 MiB). `pipeline` gains a byte budget — a `sync.Mutex` + `sync.Cond` counter in the same style as `barrier`, **not** a `chan struct{}`: a channel of empty structs cannot express "N bytes held", and a channel of `int64` would have to be re-filled on every release.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Two tests, because the worker count introduces two distinct hazards: memory (below) and reply-to-cookie correspondence.
 
@@ -1247,12 +1247,12 @@ func TestPipeline_ConcurrentReadsAreConsistent(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run both and confirm they fail**
+- [x] **Step 2: Run both and confirm they fail**
 
 Run: `go test ./internal/adapter/nbd/ -run 'TestPipeline_(Backpressure|ConcurrentReads)' -v`
 Expected: `BackpressureBoundsMemory` FAILS — all 8 are buffered at once. `ConcurrentReadsAreConsistent` may pass by luck before the pool is widened (with one worker, replies are inherently in order); confirm it still passes after step 4, where it becomes meaningful.
 
-- [ ] **Step 3: Implement the semaphore and the config**
+- [x] **Step 3: Implement the semaphore and the config**
 
 A weighted semaphore over a channel of `int64` is awkward; use a small `sync.Mutex` + `sync.Cond` counter in the same style as `barrier`, since the pattern is already established in this file. Release the budget in the writer, after the reply is written — that is when the payload buffer's ownership ends.
 
@@ -1264,14 +1264,14 @@ Two hazards, both of which hang the connection rather than failing a test cleanl
 
 `Config.applyDefaults`: `MaxInFlight` 0 → 4, clamp to 64; `MaxInFlightBytes` 0 → 64 MiB. `validate`: reject negative values. Wire both in `createNBDAdapter`.
 
-- [ ] **Step 4: Raise the default**
+- [x] **Step 4: Raise the default**
 
 Change `serve`'s `newPipeline(..., 1)` to `newPipeline(..., h.maxInFlight)`.
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/`
 Expected: both `ok`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/pipeline.go internal/adapter/nbd/connection.go pkg/adapter/nbd/config.go cmd/dfs/commands/start.go internal/adapter/nbd/pipeline_test.go pkg/adapter/nbd/config_test.go
@@ -1290,7 +1290,7 @@ git commit -m "feat(nbd): allow several commands in flight, bounded in bytes"
 - Consumes: `pipeline`.
 - Produces: nothing new on the wire.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 // TestPipeline_WorkerPanicRepliesEIO pins that a panic in one command does not
@@ -1304,12 +1304,12 @@ func TestPipeline_WorkerPanicRepliesEIO(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [x] **Step 2: Run it and confirm it fails**
 
 Run: `go test ./internal/adapter/nbd/ -run TestPipeline_WorkerPanicRepliesEIO -v`
 Expected: FAIL — the process panics out of the test.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Wrap the handler call in the worker:
 
@@ -1335,12 +1335,12 @@ The `select` is not decoration. A bare `replies <-` in a deferred recover blocks
 
 Keep `Conn.Serve`'s existing recover as the outer backstop; do not delete it.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/`
 Expected: `ok`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/pipeline.go internal/adapter/nbd/pipeline_test.go
@@ -1359,7 +1359,7 @@ git commit -m "fix(nbd): contain a worker panic to its own command"
 - Consumes: `pipeline`, `Handler.draining`, the base adapter's 100 ms read deadline (`pkg/adapter/base.go:452`).
 - Produces: nothing new.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```go
 // TestPipeline_ShutdownDrainsInFlight pins that a command already being served
@@ -1379,12 +1379,12 @@ func TestPipeline_ShutdownDrainsInFlight(t *testing.T) {
 
 The trigger has to be context cancellation with the connection alive. Cancelling *and* closing the socket would pass against today's code, because today's loop returns as soon as the read fails and the client only notices the hangup — the test would then be asserting the wrong thing.
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [x] **Step 2: Run it and confirm it fails**
 
 Run: `go test ./internal/adapter/nbd/ -run TestPipeline_ShutdownDrainsInFlight -v`
 Expected: FAIL — the reply never arrives, because `run` returns on `ctx.Done()` without waiting for the worker.
 
-- [ ] **Step 3: Implement the shutdown ordering**
+- [x] **Step 3: Implement the shutdown ordering**
 
 On cancellation, `run` must go through three phases and only then return:
 
@@ -1399,12 +1399,12 @@ Two ordering traps to write down in the code:
 
 The `NBD_ESHUTDOWN` answers that the serial loop gave to commands arriving during shutdown are **unchanged and stay in the reader's copy of the drain branch** (Task 9 step 3 moved it there). What this task adds is only that a command already *in* the pipeline is finished rather than abandoned. Note the interaction with `pkg/adapter/base.go:452`: `interruptBlockingReads` arms a 100 ms read deadline on every active connection at shutdown, so the reader's blocking read fails within ~100 ms regardless. Do not arm a longer deadline here to "give the drain more time" — that would hold the connection open past the base adapter's budget, and it is why the drain branch must not overwrite the shutdown deadline (the same reasoning as the P0 fix at `connection.go:276-296`).
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/`
 Expected: both `ok`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/nbd/pipeline.go internal/adapter/nbd/pipeline_test.go
@@ -1424,7 +1424,7 @@ git commit -m "fix(nbd): finish in-flight commands before closing a draining con
 - Consumes: `fio` on the client host; the same `nbd-client`/`qemu-nbd` rig the other scripts use.
 - Produces: `test/nbd/bench-fio.sh` — the script the pipelining plan has cited since it was written and which does not exist.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 It must reproduce the baseline table in the pipelining plan exactly: random 4 KiB read at depth 1/8/16/32/64, sequential read 64 MiB, sequential write 64 MiB, fsync-per-4 KiB. Follow `run-oracle.sh`'s structure for argument handling, `set -euo pipefail`, and its refusal to run without the binaries it needs.
 
@@ -1436,7 +1436,7 @@ Usage: bench-fio.sh <host> <port> <export> [--depth N] [--runtime SECONDS]
 
 Defaults: every depth in `1 8 16 32 64`, 20 seconds per run. It prints one `depth<TAB>iops` line per depth plus the three sequential numbers, so two runs can be diffed with `paste`. Refuse to run if `fio` is absent, matching `oracleRequireBinary`'s message style.
 
-- [ ] **Step 2: Establish the baseline**
+- [x] **Step 2: Establish the baseline**
 
 Run it against the **pre-pipelining** adapter — check out the commit before Task 11's worker-count change, or run against the source worktree at `nbd-on-036` — on the same host the plan's numbers came from:
 
@@ -1446,7 +1446,7 @@ bash test/nbd/bench-fio.sh <host> 10809 <share>/<volume> | tee /tmp/bench-before
 
 Expected: within noise of 5,328 / 8,880 / 8,955 / 9,245 / 8,918. If it is not, the environment differs (different host, different backing tier, different chunk size) and the comparison in step 3 is invalid — say so in the results instead of comparing across environments.
 
-- [ ] **Step 3: Measure the pipelined adapter**
+- [x] **Step 3: Measure the pipelined adapter**
 
 ```bash
 bash test/nbd/bench-fio.sh <host> 10809 <share>/<volume> | tee /tmp/bench-after.txt
@@ -1455,11 +1455,11 @@ paste /tmp/bench-before.txt /tmp/bench-after.txt
 
 The falsifiable prediction: **depth 32 must exceed depth 8 by a wide margin**, and **depth 1 must barely move** — a serialized connection at depth 1 has one command in flight either way, so a material depth-1 gain means the change is doing something other than what it claims. If depth 32 does not move, the 1.18 ms is CPU-bound inside the store rather than latency-bound, the plan's premise was wrong, and that is the finding to report.
 
-- [ ] **Step 4: Record the result in both documents**
+- [x] **Step 4: Record the result in both documents**
 
 Append a results section to the pipelining plan with both tables and the verdict. Update `test/nbd/README.md` with the command and what it measures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add test/nbd/bench-fio.sh test/nbd/README.md docs/superpowers/plans/2026-10-19-nbd-pipelining.md
@@ -1480,7 +1480,7 @@ git commit -m "test(nbd): add the fio benchmark the pipelining plan cites, and m
 - Consumes: `test/required-tests.sh`, which reads `test/required-tests.json` and is run in CI as part of the `lint-go` suite (`test/suites.yaml:31`, `job: Go Checks`, `tier: pr`) via `.github/workflows/lint.yml:84` (`"$RUNNER_TEMP/dt" run lint-go --tier "$TIER" --ci`).
 - Produces: the NBD packages' load-bearing tests listed in `required-tests.json`; a decision, recorded in `test/nbd/README.md`, on whether the oracle runs in CI.
 
-- [ ] **Step 1: Establish what CI already runs**
+- [x] **Step 1: Establish what CI already runs**
 
 Two separate facts, and the earlier draft of this task got both wrong:
 
@@ -1498,7 +1498,7 @@ Two things worth checking rather than assuming:
 
 So the gap is narrower than "no CI coverage" and narrower than "the pin runner is not in CI": the runner runs, but **no NBD test is listed in it** (`test/required-tests.json` pins exactly three packages: `./internal/adapter/nfs/auth`, `./internal/adapter/smb`, `./internal/adapter/smb/handlers`), so the NBD gates can be hollowed out while the suite stays green. That is the defect this task fixes.
 
-- [ ] **Step 2: Add the pinned names**
+- [x] **Step 2: Add the pinned names**
 
 Add to `test/required-tests.json` under `packages`, following the file's own guidance — it says the list is for gates "whose removal is silent and expensive — authorization, encryption and squashing decisions":
 
@@ -1526,7 +1526,7 @@ done
 
 Note that `TestHandleRead_ChecksReadPermission`, `TestPipeline_FlushIsABarrier` and `TestHandleDiscard_PunchHoleCarriesRequestDeadline` are created by Tasks 1, 3 and 10 — so this task must run **after** them. That is why it is second-to-last.
 
-- [ ] **Step 3: Decide on the oracle**
+- [x] **Step 3: Decide on the oracle**
 
 `TestOracle_DifferentialAgainstQemuNBD` calls `oracleRequireBinary(t, "qemu-nbd")` (`oracle_test.go:104`), which `t.Skipf`s when the binary is absent. No workflow installs `qemu-nbd`: the only `qemu` hits in `.github/workflows/` are `docker/setup-qemu-action` in `release.yml`, which is QEMU user-mode emulation for cross-building container images and has nothing to do with the NBD server. So in CI the oracle skips silently and proves nothing.
 
@@ -1553,7 +1553,7 @@ Do **not** reach for a `dt` suite cell here, which an earlier draft of this task
 
 Whichever is chosen, `test/nbd/README.md` must say which, because a reader who assumes the oracle runs in CI will trust a green build more than it deserves.
 
-- [ ] **Step 4: Verify locally what CI will do**
+- [x] **Step 4: Verify locally what CI will do**
 
 Run: `go test -count=1 -v -run '^(TestHandleRead_ChecksReadPermission|TestPipeline_FlushIsABarrier|TestConnection_DrainingWriteDrainsPayload|TestConnection_HandshakeIsBounded|TestHandleDiscard_PunchHoleCarriesRequestDeadline)$' ./internal/adapter/nbd/`
 Expected: five `--- PASS:` lines at column 0. This is the exact invocation `required-tests.sh` performs (minus its `-v`-independent grep), so a name that passes here cannot fail the pin.
@@ -1572,7 +1572,7 @@ go test -short -race -count=1 ./internal/adapter/nbd/ ./pkg/adapter/nbd/
 ```
 Expected: both `ok`. `-short` is in the command because it is in CI's; it changes nothing here, which is the point of the check above.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add test/required-tests.json test/nbd/README.md .github/workflows/integration-tests.yml
@@ -1595,13 +1595,13 @@ Drop `.github/workflows/integration-tests.yml` from the `git add` if option 1 or
 - Consumes: the results of Tasks 1–15.
 - Produces: nothing.
 
-- [ ] **Step 1: Fix the three factual errors**
+- [x] **Step 1: Fix the three factual errors**
 
 1. **"29 deferred minors"** (`README.md:100`) — the ledger enumerates 14 (`grep -c 'minor (deferred)' docs/sdd/progress.md` → `14`). Write the real number, or say "the deferred minors" without a count. A count that is wrong is worse than no count: it tells a reader the list was checked.
 2. **"No CI coverage"** — appears **twice**, in the status line at `README.md:5` ("there is no CI coverage") and in open work item 4 at `README.md:96` ("`nbd` appears in no GitHub workflow and is not in `test/required-tests.json`"). Both are wrong: `unit-tests.yml:93-96` runs `./internal/...` and `./pkg/...`, so both NBD packages compile and all 97 tests run on every pull request. Replace with what Task 15 established: the packages run, but no NBD test was pinned in `test/required-tests.json` until now, and the differential oracle skips in CI because nothing installs `qemu-nbd`. That is the honest version, and it is still a real gap.
 3. **"feature-complete"** — already softened to "a working prototype"; confirm it still reads that way after this work, and update the status line to say pipelining is implemented once Task 13 lands (the status line at `README.md:5` currently says "pipelining is planned and unstarted", which stops being true at Task 9 and is fully true of the code only at Task 13).
 
-- [ ] **Step 2: Move every fixed issue out of the known-issues table**
+- [x] **Step 2: Move every fixed issue out of the known-issues table**
 
 The README's table lists ten issues. Map each to its fate, then delete the row:
 
@@ -1620,7 +1620,7 @@ The README's table lists ten issues. Map each to its fate, then delete the row:
 
 Record each fixed one in `docs/sdd/progress.md` with the commit that fixed it. A row left in the table that the code has since fixed is the same failure as a row missing that it has not.
 
-- [ ] **Step 3: Verify no claim survives that the code contradicts**
+- [x] **Step 3: Verify no claim survives that the code contradicts**
 
 Run:
 ```bash
@@ -1628,7 +1628,7 @@ grep -n "deferred\|CI coverage\|feature-complete\|known minor" README.md
 ```
 For each hit, confirm against the code. A README that overstates is the failure mode this task exists to prevent — the previous audit found three.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md docs/sdd/progress.md
