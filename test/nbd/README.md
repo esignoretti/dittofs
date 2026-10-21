@@ -417,6 +417,53 @@ if the restart happened outside the window, or if the bytes do not match.
   command to run — against the volume read as a file over NFS, never from inside
   the guest.
 
+## `bench-fio.sh` — measure the export under load
+
+The pipelining work cites this script, so it now exists.
+
+```bash
+./bench-fio.sh 127.0.0.1 10809 export/boot                    # fio's nbd engine
+./bench-fio.sh --device /dev/nbd0 export/boot                 # an attached device
+./bench-fio.sh 127.0.0.1 10809 export/boot --depth "1 2 4 8 16 32 64" --runtime 30
+```
+
+It prints one `key<TAB>value` line per measurement — `depth1`, `depth8`, …,
+`seqread_kib_s`, `seqwrite_kib_s`, `fsync4k_iops`, `fsync4k_clat_mean_ns` — so
+two runs can be compared with `paste`:
+
+```bash
+paste /tmp/bench-before.txt /tmp/bench-after.txt
+```
+
+### What the depth sweep is for
+
+A server that serves one command at a time reports the **same** IOPS at depth 8,
+16, 32 and 64, because the client's queue is only a queue of waits. A server that
+can have several commands in flight keeps climbing with depth until it reaches the
+block store's own ceiling. That shape — not any single number — is what separates
+a serialized dispatcher from a pipelined one.
+
+### Three ways to reach the export, and why the script supports two
+
+`fio` can speak NBD only through its `nbd` engine, which is compiled only when
+`libnbd` was present at build time. Most packaged builds omit it — the Homebrew
+build on this machine has no `nbd` engine at all — so the script does not assume
+it. It accepts an already-attached block device (`--device`, needs `nbd-client`
+run by you, because attaching needs root and a device name), or falls back with an
+explanation rather than a confusing `engine 'nbd' not loadable`.
+
+The third route, and the one the recorded numbers use, is `qemu-img bench`, which
+speaks the NBD protocol directly and needs neither root nor `libnbd`. It reports
+elapsed time rather than IOPS:
+
+```bash
+qemu-img bench -f raw -c 10000 -s 4096 -S 4096 -t none -d 8 \
+  nbd://127.0.0.1:10809/export/boot
+```
+
+`-S 4096` matters: `qemu-img bench`'s default step equals the block size, so it
+re-reads the same offsets in order and measures the cache instead of the export.
+
 ## Results recorded on this host
 
 Honest accounting of what the two new rigs have and have not proven. The
@@ -429,6 +476,9 @@ development machine is macOS arm64 (Apple silicon).
 | `boot-qemu.sh` durability verdict | **PROVEN on this host, 2026-10-14** | `--mkfs` writes `hello.txt`, `--no-mkfs` reads it back in a fresh VM: both exit 0 `PASS` in ~3s. The negative control — `--expect-file not-there.txt` — exits 1 `FAIL` in ~6s |
 | `fetch-artifacts.sh` | **PROVEN on this host, 2026-10-14** | fetched Alpine `linux-virt` 6.6.142 + busybox from a clean directory, and the resulting tree booted the export end to end with nothing from a hand-built `/tmp` |
 | `crash-restart.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses on Darwin naming the missing Linux block layer, and refuses without a `master` `nbd-client`, root, netlink, init netns, or a provisioned volume |
+| `bench-fio.sh` syntax + refusal paths | **verified** | `bash -n` clean; refuses cleanly with no arguments, with a non-block `--device`, and with `fio` built without the `nbd` engine, naming the three alternatives |
+| `bench-fio.sh` JSON parsing | **verified on real fio output** | both extraction bugs it had are recorded in the script: a `note:` line before the JSON, and selecting the read section for a write job (which read as `0.000000`). Confirmed against `fio-3.43` on a local file: `read iops 11778.110945`, `read bw 47112`, `read clat 84496.605567` |
+| `bench-fio.sh` against a live NBD export | **not run here** | needs `libnbd` (absent from the Homebrew `fio` build) or a root-attached device. The pipelining numbers below were measured with `qemu-img bench`, which reaches the same server over the same protocol |
 | `crash-restart.sh` crash/reconnect verdict | **the mechanism was PROVEN manually, not by this script** | the recipe was run by hand inside a Linux container (`--network=host`, Docker Desktop's kernel has `CONFIG_BLK_DEV_NBD=y`) against a live DittoFS: with `-persist -T 60` a read stayed blocked at t=4s/8s/12s, the server returned at t=16s, and the read completed `exit=0 elapsed=14s` returning the pre-crash bytes with `Successfully reconnected after 4 attempts` in the client log. The **script** has not been run end to end; it needs a Linux host with root and a `master`-built `nbd-client` |
 | Host-side `fsck` after the crash | **not run here** | follows the crash run; needs the Linux host |
 

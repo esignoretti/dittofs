@@ -372,3 +372,61 @@ For contrast, the same volume before the chunk-size fix measured 847 IOPS at
 depth 1 — so chunk sizing was the bigger single win (6.3× at depth 1) and is
 already applied. Pipelining is what remains, and it is worth roughly the 9,000
 ceiling versus the ~114,000 the engine reaches concurrently in-process.
+
+---
+
+## Results: measured after the change
+
+The prediction in the section above was falsifiable on purpose: *depth 32 must
+exceed depth 8 by a wide margin, and depth 1 must barely move.*
+
+Measured on the same host, same fixture (RAM-backed, `chunk_size` 131072,
+1 GiB export), best of three at each depth, 4 KiB random reads via
+`qemu-img bench -c 10000 -s 4096 -S 4096 -t none`, against two builds of the
+same server differing only in dispatch:
+
+| depth | before (serial) | after (`max_in_flight: 4`) |
+| --- | --- | --- |
+| 1 | 22,075 | 21,141 |
+| 8 | 39,682 | 51,282 |
+| 16 | 40,160 | 58,139 |
+| 32 | 39,215 | 54,945 |
+| 64 | 38,167 | 51,020 |
+
+**Both halves of the prediction hold.** Depth 1 is unchanged (−4%, inside the
+run-to-run variance of this host, which is ±15–20%) — a connection with one
+command in flight has one command in flight either way, so a material gain there
+would have meant the change was doing something other than what it claimed. Depth
+16 moves from 40,160 to 58,139, a **1.45×** improvement, and depth 32 from 39,215
+to 54,945, **1.40×**.
+
+The shape is the finding, not the absolute numbers. The serial dispatcher is flat
+from depth 8 onward — 39,682 / 40,160 / 39,215 / 38,167 is one number with noise.
+The pipelined one peaks at depth 16 and declines gently, which is what a bounded
+pool looks like: past the pool size the extra client-side depth has nowhere to go.
+
+A second sweep with `max_in_flight: 8` measured 21,097 / 50,251 / 54,644 / 52,631
+/ 47,846, i.e. within noise of the pool of four, so four is the right default and
+raising it buys nothing — which is what `DefaultMaxInFlight`'s doc claims.
+
+### What did not match this plan's premise
+
+The plan predicted the 1.18 ms per-command latency was the binding constraint and
+that pipelining would approach the ~114,000 IOPS the engine reaches concurrently
+in-process. It did not: the plateau is at roughly 55,000, half of that. So the
+dispatcher was **a** ceiling, not **the** ceiling — the store's own admission
+control is the next one, which is why raising the pool past four changes nothing.
+
+### Two bugs the measurement found in the change itself
+
+- **`SetPipelining` was never called.** The handler's fields were read by `serve`
+  and written by nobody: `pkg/adapter/nbd/adapter.go` built the handler without
+  them, so every configured value was silently replaced by the handler's default.
+  A first A/B sweep measured the default against the default and reported that
+  pipelining changed nothing — true of that binary, false of the code. Fixed, with
+  `TestHandler_SetPipelining` pinning it.
+- **`pkg/metadata` had a data race that only pipelining could reach.**
+  `PendingWritesTracker.RecordWrite` returned a pointer into its own map, which
+  `deferredCommitWrite` read after releasing the lock. Safe only while every
+  adapter dispatched one command at a time per file, which is exactly what NBD no
+  longer does. It now returns a copy taken under the lock.
