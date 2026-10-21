@@ -2,8 +2,12 @@ package nbd
 
 import (
 	"bytes"
+	"context"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/marmos91/dittofs/pkg/block"
 )
 
 // TestPipeline_WritePayloadIsConsumedInOrder pins the property the whole design
@@ -312,4 +316,88 @@ func TestHandler_SetPipelining(t *testing.T) {
 	if h.maxInFlightBytes != 2<<20 {
 		t.Fatalf("maxInFlightBytes = %d, want %d", h.maxInFlightBytes, 2<<20)
 	}
+}
+
+// TestPipeline_ShutdownDrainsInFlight pins that a command already being served
+// when shutdown begins still gets its reply.
+//
+// A client that has sent a write and is waiting for the answer must not see a
+// closed socket: that is the difference between a paused device and an errored
+// one, which is the whole point of answering NBD_ESHUTDOWN rather than hanging up.
+//
+// The trigger is context cancellation with the connection still open. Closing the
+// socket instead would pass against a loop that abandons everything, because the
+// client would only notice the hangup — the test would then be asserting the
+// wrong thing.
+func TestPipeline_ShutdownDrainsInFlight(t *testing.T) {
+	f := newWriteVolumeFixture(t)
+
+	// A store that blocks inside WriteAt until the test lets it go, so the worker
+	// is demonstrably mid-command when the context is cancelled.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	st := &blockingWriteStore{
+		storeFake: newStoreFake(),
+		onWrite: func() {
+			once.Do(func() { close(entered) })
+			<-release
+		},
+	}
+	st.data[string(f.exp.PayloadID)] = make([]byte, 1<<20)
+
+	h := f.newHandler(t, st)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server, client := pipe(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		NewConn(h, server).Serve(ctx)
+	}()
+	completeHandshake(t, client, f.exp.Name)
+
+	// Send the WRITE and wait until the worker is inside the store.
+	sendRequest(t, client, &Request{Type: CmdWrite, Cookie: 7, Offset: 0, Length: 512})
+	if _, err := client.Write(bytes.Repeat([]byte{0xaa}, 512)); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never reached the store")
+	}
+
+	// Shutdown begins now, while that write is in flight.
+	cancel()
+
+	// The reply must still arrive, and arrive cleanly.
+	close(release)
+	rep := readReplyHeader(t, client)
+	if rep.Error != 0 {
+		t.Fatalf("in-flight WRITE reply error = %d, want 0: shutdown abandoned it instead of draining it", rep.Error)
+	}
+	if rep.Cookie != 7 {
+		t.Fatalf("reply cookie = %d, want 7", rep.Cookie)
+	}
+
+	// And serve returns: the drain is bounded, not a hang.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after cancellation; the reader is still blocked on the socket")
+	}
+}
+
+// blockingWriteStore blocks inside WriteAt until its hook returns.
+type blockingWriteStore struct {
+	*storeFake
+	onWrite func()
+}
+
+func (s *blockingWriteStore) WriteAt(ctx context.Context, id string, currentBlocks []block.ChunkRef, data []byte, off uint64) ([]block.ChunkRef, error) {
+	s.onWrite()
+	return s.storeFake.WriteAt(ctx, id, currentBlocks, data, off)
 }

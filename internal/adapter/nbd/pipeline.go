@@ -316,6 +316,33 @@ func (p *pipeline) run() error {
 	writeDone := make(chan error, 1)
 	go func() { writeDone <- p.writeLoop(replies) }()
 
+	// Cancellation has to reach a reader parked in ReadRequest, and the only way
+	// to interrupt a blocking read on a live socket is the deadline: cancelling a
+	// context does not touch the syscall.
+	//
+	// This is the piece whose absence hung shutdown for the full idle timeout
+	// (5 minutes by default). The base adapter's interruptBlockingReads
+	// (pkg/adapter/base.go:452) does the same thing on the shutdown path, so
+	// production rarely hit it — but a cancelled context with the socket still
+	// open did, and that is exactly what a caller of Serve sees when it shuts
+	// down by cancelling rather than by closing.
+	//
+	// The deadline is set to now, not to a budget: this is an unblock, not a
+	// grace period. Giving it a budget would hold the connection open past the
+	// shutdown window, which is the mistake the draining branch's payload drain
+	// is careful not to make. The commands already in flight are unaffected — a
+	// read deadline does not touch writes — so they still get their replies,
+	// which is the whole point of draining rather than abandoning.
+	unblock := make(chan struct{})
+	defer close(unblock)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = p.conn.SetReadDeadline(time.Now())
+		case <-unblock:
+		}
+	}()
+
 	readErr := p.readLoop(ctx, work, cancel)
 
 	// Orderly shutdown: stop accepting, let queued work finish, then close the
@@ -651,11 +678,11 @@ func (p *pipeline) serve(ctx context.Context, cmd command, replies chan<- reply)
 			// shutdown hangs instead of failing.
 			panicReply := errorReply(cmd.req.Cookie, ErrEIO)
 			panicReply.release = cmd.bytes
-			select {
-			case replies <- panicReply:
-				keepGoing = true
-			case <-ctx.Done():
-				keepGoing = false
+			keepGoing = p.post(ctx, cmd, panicReply, replies)
+			if !keepGoing && isWriteLike(cmd.req.Type) && cmd.pre == nil {
+				// Released here because serve's caller never reaches its own
+				// release on this path.
+				p.barrier.committed()
 			}
 		}
 	}()
@@ -664,16 +691,37 @@ func (p *pipeline) serve(ctx context.Context, cmd command, replies chan<- reply)
 	// Set here rather than inside dispatch so every path carries it: a handler
 	// that returns an error reply still spent the budget its command acquired.
 	rep.release = cmd.bytes
+	if p.post(ctx, cmd, rep, replies) {
+		return true
+	}
+	// The writer is gone, so nobody will read this reply. Returning is the only
+	// way to stop; the barrier must still be released or a FLUSH on another
+	// goroutine would wait forever.
+	if isWriteLike(cmd.req.Type) && cmd.pre == nil {
+		p.barrier.committed()
+	}
+	return false
+}
+
+// post hands a reply to the writer, reporting whether it was delivered.
+//
+// The non-blocking attempt first is not an optimization. A plain select over both
+// cases picks RANDOMLY when both are ready, and during a drain both always are:
+// the context is cancelled and the reply channel has buffer room. So half the
+// replies of a draining connection were dropped by their own escape hatch — the
+// client got EOF where it should have got its answer, which is precisely the
+// failure draining exists to prevent. Trying the send unconditionally first makes
+// the escape hatch reachable only when the send would actually block.
+func (p *pipeline) post(ctx context.Context, cmd command, rep reply, replies chan<- reply) bool {
+	select {
+	case replies <- rep:
+		return true
+	default:
+	}
 	select {
 	case replies <- rep:
 		return true
 	case <-ctx.Done():
-		// The writer is gone, so nobody will read this reply. Returning is the
-		// only way to stop; the barrier must still be released or a FLUSH on
-		// another goroutine would wait forever.
-		if isWriteLike(cmd.req.Type) && cmd.pre == nil {
-			p.barrier.committed()
-		}
 		return false
 	}
 }
