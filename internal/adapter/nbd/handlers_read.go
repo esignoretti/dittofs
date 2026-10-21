@@ -82,6 +82,28 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 		return nil
 	}
 
+	// The metadata read path is the only authorization funnel available to a READ.
+	// The write path gets one from PrepareWrite; nothing equivalent was called
+	// here, so a file whose mode forbids reads was still served in full. NBD
+	// carries no client identity, so the identity is the adapter's single
+	// synthetic one — but its group and the file's mode are the operator's
+	// configuration, and honouring it is not optional.
+	//
+	// Placed before the allocation for the same reason the bounds checks are: a
+	// denied 32 MiB read should cost nothing.
+	//
+	// The nil guard is not defensive noise: newTestHandler in connection_test.go
+	// passes nil for meta, and every store-fault dispatch test would panic
+	// without it.
+	if h.meta != nil {
+		if _, err := h.meta.PrepareRead(h.authContext(ctx, exp), exp.Handle); err != nil {
+			if err := h.writeReply(conn, req.Cookie, mapError(err), nil); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+
 	// Allocated only after the bounds checks: a client that sends
 	// Length: 0xffffffff against a small export gets NBD_EINVAL without a
 	// multi-gigabyte allocation.
@@ -93,10 +115,20 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	readCtx, cancel := common.WithRequestDeadline(ctx)
 	defer cancel()
 
-	if _, err := bs.ReadAt(readCtx, string(exp.PayloadID), buf, req.Offset); err != nil {
+	n, err := bs.ReadAt(readCtx, string(exp.PayloadID), buf, req.Offset)
+	if err != nil {
 		// No payload on the error path: the reply shape for a failed READ is the
 		// header alone.
 		return h.writeReply(conn, req.Cookie, mapError(err), nil)
+	}
+
+	// A short read is a store fault, not a short device: the range was already
+	// checked against exp.Size, so the bytes exist. Replying with a partially
+	// filled buffer would hand the client zeros in place of its data and report
+	// success — the one failure mode a filesystem cannot detect, because ext4's
+	// checksums cover metadata rather than file data.
+	if n != len(buf) {
+		return h.writeReply(conn, req.Cookie, ErrEIO, nil)
 	}
 
 	return h.writeReply(conn, req.Cookie, 0, buf)
