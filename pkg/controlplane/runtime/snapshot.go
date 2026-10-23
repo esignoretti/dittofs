@@ -1985,6 +1985,20 @@ func (r *Runtime) DeleteSnapshot(ctx context.Context, share, snapID string) (err
 			snapID, share, models.ErrSnapshotInFlight)
 	}
 
+	// Fence against an open export. An NBD snapshot export holds the
+	// registration for the whole time it reads the snapshot's manifest, so
+	// without this a delete would wipe the directory mid-boot and the client
+	// would see a corrupt snapshot rather than a refused delete. Refusal is
+	// scoped to this one snapshot, so pruning can still delete another.
+	//
+	// Checked under the already-held delete lock, which is what makes the
+	// answer stable: a holder registers BEFORE it reads anything, so one that
+	// arrives after this check reads a directory already being removed, and
+	// one that registered before it is visible here.
+	if err := r.refuseIfSnapshotOpen(share, snapID); err != nil {
+		return err
+	}
+
 	// Fence against the per-share restore marker. While a restore is in
 	// flight (or crash-interrupted and awaiting startup rollback), the marker
 	// names the pre-restore safety snapshot — the SOLE rollback primitive —

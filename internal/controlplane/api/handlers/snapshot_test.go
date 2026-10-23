@@ -455,6 +455,7 @@ func TestMapSnapshotError_SentinelTable(t *testing.T) {
 		{"StateConflict", models.ErrSnapshotStateConflict, http.StatusConflict},
 		{"InFlight", models.ErrSnapshotInFlight, http.StatusConflict},
 		{"MarkerProtected", models.ErrSnapshotMarkerProtected, http.StatusConflict},
+		{"Open", models.ErrSnapshotOpen, http.StatusConflict},
 		{"DrainTimeout", models.ErrSnapshotDrainTimeout, http.StatusGatewayTimeout},
 		{"MetadataDumpMissing", models.ErrSnapshotMetadataDumpMissing, http.StatusInternalServerError},
 		{"MetadataStoreNotResetable", models.ErrMetadataStoreNotResetable, http.StatusInternalServerError},

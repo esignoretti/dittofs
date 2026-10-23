@@ -63,6 +63,16 @@ var (
 	// and clears its marker.
 	ErrSnapshotMarkerProtected = errors.New("snapshot is protected by an in-progress restore and cannot be deleted")
 
+	// ErrSnapshotOpen is returned when a delete is attempted on a snapshot that
+	// is currently exported or being restored by an NBD snapshot export. The
+	// open registration is process-local and counts holders, so a delete is
+	// refused rather than blocked: blocking would let a long boot stall
+	// retention pruning for its whole duration, and on a per-share RWMutex it
+	// would also block a second snapshot from opening. Scoped to the one
+	// snapshot, so deleting snapshot B while snapshot A is open still proceeds.
+	// Mapped to 409, and the count lets the operator see why.
+	ErrSnapshotOpen = errors.New("snapshot is open by an active export and cannot be deleted")
+
 	// ErrSnapshotLocalStoreUnsupported is returned when a snapshot is
 	// requested on a share whose local block store has no on-disk root
 	// (the in-memory backend), so the metadata.dump + manifest.hashes

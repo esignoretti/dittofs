@@ -328,6 +328,12 @@ func mapSnapshotError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, models.ErrSnapshotMarkerProtected):
 		Conflict(w, "snapshot is protected by an in-progress restore; retry once it completes")
 		return true
+	case errors.Is(err, models.ErrSnapshotOpen):
+		// A snapshot held open by an export cannot be deleted: a boot reads its
+		// manifest for minutes. Name the state rather than the snapshot so the
+		// operator knows to stop the export, not to retry.
+		Conflict(w, "snapshot is open by an active export; close the export before deleting it")
+		return true
 	case errors.Is(err, models.ErrSnapshotStateConflict):
 		Conflict(w, "snapshot is not in a state that allows this operation")
 		return true

@@ -177,6 +177,14 @@ type Runtime struct {
 	// provider instance.
 	snapDeleteLocks keyedMutex[sync.RWMutex]
 
+	// openSnapshots counts the holders of each snapshot so a delete is refused
+	// while one is being read. See snapshot_open.go: an NBD snapshot export
+	// reads a snapshot's manifest for the whole duration of a boot, and a
+	// delete that raced it would surface as a corrupt snapshot rather than as
+	// a refused delete. Process-local by design — after a crash nothing is
+	// reading, so nothing should be refused.
+	openSnapshots openSnapshotRegistry
+
 	// restoreLocks serializes RestoreSnapshot per share. Restore requires
 	// the share be disabled, but two concurrent restore calls both observe
 	// "disabled" and would otherwise interleave their destructive metadata
