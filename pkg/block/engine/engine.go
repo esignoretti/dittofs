@@ -145,6 +145,14 @@ type Store struct {
 	// Atomic because an operator can retighten the promise on a share that is
 	// already serving: the write lands while commit-path readers are running.
 	requireDurableCommit atomic.Bool
+
+	// evictionAllowed is a caller's standing assertion that every byte this
+	// store's local tier holds is remote-durable by construction, so eviction
+	// may run without the carver gate CanEvict applies. Set only through
+	// SetEvictionAllowed; the health callback consults it so a remote blip
+	// suspends eviction and the recovery re-enables it, rather than leaving
+	// eviction off for the life of the store.
+	evictionAllowed atomic.Bool
 }
 
 // New creates a new Store from the given configuration.
@@ -216,7 +224,7 @@ func (bs *Store) Start(ctx context.Context) error {
 		// wired to it. Saying "re-enabled" while eviction stays off would leave a
 		// log that disagrees with the store, which is the hazard this gate exists
 		// to remove.
-		canEvict := bs.syncer.CanEvict()
+		canEvict := bs.evictionPermitted()
 		bs.local.SetEvictionEnabled(canEvict)
 		switch {
 		case canEvict:
@@ -245,7 +253,7 @@ func (bs *Store) Start(ctx context.Context) error {
 	// where the initial probe settled health without driving a transition
 	// callback (e.g. it started unhealthy with no prior state to transition
 	// from).
-	bs.local.SetEvictionEnabled(bs.syncer.CanEvict())
+	bs.local.SetEvictionEnabled(bs.evictionPermitted())
 
 	// Wire the Cache in Start so the loadByHash closure captures bs and
 	// NewCache spawns workers immediately. A single Cache type replaces

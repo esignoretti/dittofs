@@ -103,3 +103,61 @@ func (bs *Store) HasRemoteStore() bool {
 func (bs *Store) SetEvictionPinned(pinned bool) {
 	bs.local.SetEvictionPinned(pinned)
 }
+
+// SetEvictionAllowed lets a caller enable eviction on a store whose syncer
+// cannot justify it itself, and returns whether eviction is now allowed.
+//
+// Every other caller should not use this. Start and the health callback set
+// eviction from evictionPermitted, which on an ordinary share is
+// syncer.CanEvict() — requiring BOTH a healthy remote AND a wired carver
+// (carveActive), because on a normal share, evicting local bytes that were
+// never uploaded loses them. This method exists for the one store shape where
+// that requirement does not apply: a read-only shadow whose local tier holds
+// only bytes hydrated from a remote that is the sole source of truth. There,
+// everything evictable is remote-durable by construction, so a missing carver
+// (a read-only store never writes, so it never carves) is not a reason to
+// withhold eviction.
+//
+// The assertion is standing, not one-shot: it is remembered so the health
+// callback keeps honouring it. A shadow that allowed eviction and then had its
+// remote blip would otherwise have eviction switched off by the callback's
+// CanEvict and never switched back on, because a read-only store's carver never
+// activates — turning a transient outage into a store that can no longer evict
+// and so dies with ErrLocalStoreFull on the next full local tier.
+//
+// It still refuses when the remote is unhealthy or absent, because those are
+// the only conditions under which eviction would strand a byte: the health
+// callback suspends eviction during an outage and this method's permission
+// resumes it on recovery.
+//
+// The returned bool reports what was decided rather than what was asked, so a
+// caller can log a refusal instead of assuming the store will evict.
+func (bs *Store) SetEvictionAllowed(allowed bool) bool {
+	bs.evictionAllowed.Store(allowed)
+	canEvict := bs.evictionPermitted()
+	bs.local.SetEvictionEnabled(canEvict)
+	return canEvict
+}
+
+// evictionPermitted is the single decision every eviction gate goes through: a
+// caller's standing assertion that the local tier's bytes are all
+// remote-durable, or the syncer's own carve-and-health gate. Both require a
+// remote to re-fetch an evicted byte from.
+//
+// Remote presence and health are read from the syncer, not from bs.remote: the
+// syncer is what every other remote-dependent decision consults (readahead,
+// the carve recompute), and a store can be built with a real remote on its
+// syncer and a nil bs.remote — the retention-pin and cold-read fixtures do
+// exactly that. Gating on bs.remote would refuse eviction on those stores,
+// which is the failure this method exists to avoid.
+func (bs *Store) evictionPermitted() bool {
+	if !bs.syncer.hasRemote.Load() {
+		// Nothing to re-fetch an evicted byte from, so no assertion can make
+		// eviction safe.
+		return false
+	}
+	if !bs.syncer.IsRemoteHealthy() {
+		return false
+	}
+	return bs.evictionAllowed.Load() || bs.syncer.CanEvict()
+}
