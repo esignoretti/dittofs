@@ -245,14 +245,40 @@ honoured by every write path — `validateWrite` refuses with `ErrEPERM` at
 `FlagReadOnly` is advertised by `Export.TransmissionFlags` at
 `internal/adapter/nbd/handshake.go:152`.
 
-Promotion is an operator action on an open snapshot export:
+Promotion is an operator action, and it is **not** a flag flip. Two facts in
+the current code force the shape:
+
+- **NBD transmission flags are one-shot.** `Export.TransmissionFlags`
+  (`internal/adapter/nbd/handshake.go:149`) is serialized to the wire exactly
+  once, in the handshake at `:370` and `:392`. A client that saw
+  `NBD_FLAG_READ_ONLY` will not send a write whatever the server does
+  afterwards. Promotion therefore requires the client to **reconnect** — the
+  operator promotes, then the VM re-attaches. That is the operational story and
+  it must be documented as such, not hidden behind "flip a switch".
+- **`Export` is not a place to store mutable state.**
+  `RuntimeExporter.Resolve` (`internal/adapter/nbd/volume.go:149-155`) builds a
+  fresh `&Export{...}` on every call and nothing caches it; `serve`
+  (`internal/adapter/nbd/connection.go:226`) keeps the one copy the handshake
+  returned and `pipeline` holds that pointer (`internal/adapter/nbd/pipeline.go:44`).
+  Mutating `exp.ReadOnly` would change one connection's view and nothing else.
+
+The read-only decision must therefore live in a **snapshot registry that
+`Resolve` consults**, not in the `Export` value. The adapter also has no
+live-connection registry today — `pkg/adapter/nbd/adapter.go` exposes only
+`Serve` and `Stop`, and connection tracking is `BaseAdapter`'s `connSemaphore` —
+so nothing can force a disconnect; the reconnect is the operator's step.
+
+So promotion is:
 
 1. Refuse unless the operator explicitly confirms production is gone. This is
    the split-brain gate and it must be a deliberate, separate act — never
    implied by opening the export.
-2. Flip `Export.ReadOnly` to false and clear `FlagReadOnly` from the advertised
-   flags.
-3. Writes now proceed through the shadow store.
+2. Mark the snapshot promoted **in the registry**. This is the durable record;
+   it survives a server restart, which a struct field would not.
+3. The client disconnects and re-attaches. `Resolve` now builds the export with
+   `ReadOnly: false`, so the new handshake omits `NBD_FLAG_READ_ONLY` and the
+   client is willing to write.
+4. Writes proceed through the shadow store.
 
 **Why writes are safe without a copy.** Chunks are immutable and
 content-addressed: a write mints new chunks and never overwrites a chunk the
@@ -264,13 +290,21 @@ blocks are shared. That is exactly Ceph's protected-snapshot clone and ZFS's
 (`pkg/block/engine/readwrite.go:89`) appends into the local journal and returns
 early — it touches no coordinator and no refcount, so a shadow store built
 without a `Coordinator` accepts writes as-is. The coordinator is only consulted
-on the reap paths (`Truncate`, `Delete`, `CopyPayload`), each of which already
-nil-checks it. So promotion needs no new engine plumbing; what it needs is
-durability (next paragraph).
+on the reap paths (`Truncate` at `:236` and `:323`, `Delete` at `:437`,
+`CopyPayload` at `:596` and `:632`), each of which already nil-checks it. So
+promotion needs no new engine plumbing; what it needs is durability (below).
 
 **What promotion must not do:** it must not write into the snapshot's own
 `metadata.dump` or `manifest.hashes`. Those files are the immutable record of
 the backup. The shadow store's divergence lives in its own metadata store.
+
+**Promotion must not release the GC hold.** The snapshot keeps protecting its
+chunks after promotion. The promoted export's *new* chunks are referenced by the
+shadow's metadata, which the mark phase enumerates through
+`EnumerateFileChunks` (`pkg/block/gc/gc.go:543`); the snapshot's *original*
+chunks stay reachable only through `HeldHashes` (`:555`). Dropping the hold at
+promotion would let GC reclaim the base blocks the promoted export is still
+reading from — the precise silent corruption this design exists to prevent.
 
 **Durability on promotion.** A promoted export's writes need somewhere durable
 to land. The shadow's journal is a hydration cache whose contents are already
@@ -303,9 +337,6 @@ These are implementation calls that do not change what gets built:
 - Whether the shadow metadata store lives on disk (restartable) or in memory
   (simpler, lost on restart). A boot that outlives a server restart argues for
   disk; the per-snapshot directory already exists as a natural home.
-- How the open-snapshot registry is keyed and where it lives (runtime, shares
-  service, or the NBD adapter). The routing section states the constraint, not
-  the location.
 - Whether the snapshot export shares the production NBD adapter's port (routed
   by export name) or gets its own. The export name already distinguishes them;
   a separate port is a security convenience, not a requirement.
@@ -314,6 +345,13 @@ These are implementation calls that do not change what gets built:
   `/api/v1/shares/{share}/snapshots/{id}/` mirrors it.
 - Whether promotion is a separate endpoint or a flag on the open call. Separate
   is safer given the split-brain gate.
+
+One thing that is **not** left to the builder: the registry that `Resolve`
+consults must be the source of truth for read-only, and its promoted flag must
+be durable. Putting the flag on the `Export` value, or in a per-connection
+struct, cannot work — see the promotion section. Where the registry *lives*
+(runtime, shares service, or the adapter) is still open; that it exists and is
+consulted at resolve time is not.
 
 ## Verification
 
@@ -326,6 +364,8 @@ anti-goal maps to a check:
 | Booting a snapshot does not affect production | Run the production write path under load while a snapshot export is read; assert production throughput and correctness are unchanged. |
 | GC cannot reclaim a snapshot's chunks | Create a snapshot, overwrite the volume, run GC, boot from the snapshot. The `SnapshotHoldProvider` test suite already covers the hold; this covers the integration. |
 | A promoted snapshot shares no mutable state with production | Promote, write to the promoted export, assert the snapshot's own manifest and production's manifest both still describe their original bytes. |
+| Promotion needs a reconnect, and the promoted state survives a restart | Promote, assert the still-connected client's writes are refused `ErrEPERM`; reconnect; assert writes now succeed. Then restart the server and assert the reconnected export is still writable. |
+| Promotion does not release the GC hold | Promote, overwrite every block the snapshot named, run GC, then read the promoted export's untouched ranges. If the hold were dropped, those reads fail. |
 | A snapshot export cannot be reached without the bind gate | The existing `TestServe_RefusesNonLoopbackBindWithoutOptIn` covers the adapter; assert the snapshot export is not exempt. |
 | The snapshot's bytes equal production's at capture time | Boot a real kernel from a snapshot export taken from a booted VM, and confirm the guest's filesystem replays and mounts. This is the end-to-end proof and it needs the existing `test/nbd/boot-qemu.sh` rig, extended to point at a snapshot export. |
 
