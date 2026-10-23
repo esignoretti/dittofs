@@ -114,21 +114,24 @@ These would each mean the design failed even if a VM boots:
 
 Serve each snapshot from a **second block store instance** whose local tier is
 empty and whose metadata is the snapshot's, pointing at the **same remote
-blocks**.
+blocks**, driven by a **private metadata service** that nothing else shares.
 
 ```
-production (unchanged)                    snapshot export
-┌──────────────────────┐                 ┌──────────────────────┐
-│ meta store (live)    │                 │ meta store (replayed │
-│  f:, fm: rows        │                 │  from metadata.dump) │
-├──────────────────────┤                 ├──────────────────────┤
-│ engine.Store         │                 │ engine.Store         │
-│  local journal ──────┼──► disk         │  local journal ──────┼──► disk
-│  manifest: live      │                 │  manifest: SNAPSHOT  │
-└──────────┬───────────┘                 └──────────┬───────────┘
-           │                                        │
-           └──────────► remote (S3), shared, ◄──────┘
-                        immutable chunks
+production (unchanged)                  snapshot export
+┌──────────────────────┐               ┌──────────────────────┐
+│ metadata.Service     │               │ metadata.Service     │
+│  registry: /export   │               │  (fresh, one share)  │
+├──────────────────────┤               ├──────────────────────┤
+│ meta store (live)    │               │ meta store (replayed │
+│  f:, fm: rows        │               │  from metadata.dump) │
+├──────────────────────┤               ├──────────────────────┤
+│ engine.Store         │               │ engine.Store         │
+│  local journal ──────┼──► disk       │  local journal ──────┼──► disk
+│  manifest: live      │               │  manifest: SNAPSHOT  │
+└──────────┬───────────┘               └──────────┬───────────┘
+           │                                      │
+           └────────► remote (S3), shared, ◄──────┘
+                      immutable chunks
 ```
 
 **Why this works, mechanically.** `engine.Store.ReadAt` calls
@@ -163,7 +166,7 @@ returns `ErrRestoreDestinationNotEmpty` unless the target holds no `s:` key
 the only thing that satisfies it, and it is also the only thing that keeps the
 snapshot's rows from colliding with production's.
 
-### Routing: how a client names a snapshot
+### Routing: a private metadata service per open snapshot
 
 The NBD handler resolves an export name to an `*Export`, which carries a
 `Handle` and a `PayloadID`. Reads then call
@@ -171,38 +174,85 @@ The NBD handler resolves an export name to an `*Export`, which carries a
 decodes the **share name out of the handle** to pick a store
 (`pkg/metadata/service.go:252`).
 
-That is the seam. Register each snapshot's shadow metadata store under a
-distinct synthetic share name:
+The obvious routing trick — register the replayed store under a synthetic share
+name and let `storeForHandle` (`pkg/metadata/service.go:252`) decode it out of
+the handle — **does not work**, for two independent reasons found while
+implementing.
+
+**The name does not fit in a handle.** A handle is `"<shareName>:<uuid>"` and
+`MaxFileHandleSize` is 64 (`pkg/metadata/types.go:48`), with a 36-byte UUID and
+a one-byte separator, so `MaxShareNameLen` is 27. Snapshot IDs are
+`uuid.NewString()` (`pkg/controlplane/runtime/snapshot.go:188`) — 36 characters:
 
 ```
-production:  /export              → live metadata store
-snapshot:    /export@snap-abc123  → replayed snapshot store
+/export@e3b0c442-98fc-11ef-9c4d-0242ac120002   shareName=44  handle=81  TOO LONG
 ```
 
-A handle whose share name is `/export@snap-abc123` routes to the snapshot's
-store with no change to `metadata.Service`. The **payload ID inside stays
-`export/<uuid>`**, because it is not derived from the handle — so the shadow
-store's `fm:` rows match the dumped `f:` rows without a rewrite.
+Every operation on such an export would fail at handle mint. Shortening the
+name to fit is possible but pointless, because of the second reason.
 
-Export names follow the same shape the existing exporter already accepts
-`<share>/<volume>`, so a snapshot of volume `boot` on share `/export` is:
+**A second registration would fork state that must not fork.** `metadata.Service`
+is not just a store map. `shareRegistry` holds, per share, a lock manager, a
+directory-change notifier, a unified view, a quota row and a writeback flag
+(`pkg/metadata/service.go:1016, 1075, 1097, 1102`). Registering the snapshot
+under a different name creates a *second* lock manager and a *second* quota row
+for what is physically the same set of files — two lock namespaces over one
+namespace, which is a correctness bug, not an inefficiency. And it does not
+even fix the data: the dump carries `File.ShareName = "/export"` inside every
+record (`pkg/metadata/store/badger/encoding.go:327,437`), so the registry key
+and the records would disagree, and the paths that compare them
+(`badger/shares.go:195`) would be comparing different names.
+
+So a snapshot gets its **own `metadata.Service` instance**, built fresh with
+`metadata.New()`, holding only the replayed store registered under the
+**production share name**. Nothing else is in it, so there is nothing to
+collide with, and `File.ShareName` already matches the key.
 
 ```
-NBD export name:  export@snap-abc123/boot
+production                        snapshot (per open snapshot)
+┌─────────────────────┐           ┌──────────────────────────┐
+│ metadata.Service    │           │ metadata.Service (new)   │
+│  registry: /export  │           │  registry: /export only  │
+│   → live store      │           │   → replayed store       │
+│   → lock manager    │           │   → its own lock manager │
+└─────────┬───────────┘           └────────────┬─────────────┘
+          │                                    │
+          └──────────► remote (S3) ◄───────────┘
+                   shared, immutable chunks
 ```
 
-**This routing choice is mine, not the user's.** The alternative — one NBD
-adapter instance per open snapshot, each on its own port with its own handler —
-is simpler to reason about but burns a port per snapshot and duplicates the
-adapter lifecycle. The synthetic-share-name approach reuses one adapter and one
-`metadata.Service`; its cost is that `common.ResolveForWrite` would decode
-`/export@snap-abc123` and ask the shares service for a block store that has no
-share row, so the snapshot path needs its own `StoreResolver` that checks the
-snapshot registry first and falls through to production otherwise.
-`StoreResolver` is already a function type for exactly this kind of injection
-(`internal/adapter/nbd/connection.go:59`). If this proves awkward in
-implementation, switching to an adapter instance per snapshot is a contained
-change that touches no other part of the design.
+`Handler` already takes a `meta *metadata.Service` and every handler method
+receives it as `h.meta` (`handlers_read.go:16`, `handlers_write.go:26`), so a
+snapshot handler is the same `Handler` type over a different service. The
+`*Export` it serves is built by the snapshot exporter with the replayed
+store's handle.
+
+The `Export.Handle` must therefore be minted **from the replayed store's own
+records**, not copied from production: it is `<shareName>:<fileUUID>`, and while
+the UUID survives the dump, encoding it against the replayed file is what makes
+the handle belong to the shadow. Production's handle would work by accident
+(same UUID, same share name) and would silently point at production's service if
+the two were ever swapped, so the exporter encodes it explicitly.
+
+Export names follow the shape the existing exporter already accepts, with the
+snapshot named explicitly:
+
+```
+NBD export name:  export/snapshots/e3b0c442-98fc-11ef-9c4d-0242ac120002/boot
+```
+
+A leading `snapshots/` segment after the share is what distinguishes it. That
+segment can never collide with a real volume, because `volumes/` is the only
+directory the production exporter reads and a volume name cannot contain `/`.
+
+**What this costs.** A `metadata.Service` per open snapshot. It is a struct with
+a registry and a handful of trackers — small next to the Badger instance it
+wraps — and the number of concurrently open snapshots is expected to be one or
+two. It also means the snapshot path cannot reuse
+`common.ResolveForWrite` (which asks the runtime's shares service for a block
+store by handle); the snapshot's `StoreResolver` returns the shadow
+`engine.Store` directly, which is why `StoreResolver` is a function type
+(`internal/adapter/nbd/connection.go:59`) rather than an interface.
 
 ### Lifecycle of an open snapshot
 
@@ -211,31 +261,45 @@ change that touches no other part of the design.
    snapshot has no dump yet, and a `failed` one may have a partial manifest.
    Refuse a `degraded` one unless the caller explicitly opts in — it restores,
    but its manifest is short by `DegradedEntries` rows.
-3. Create a fresh metadata store (Badger, on disk under a per-snapshot directory
-   so a restart can find it again, or in memory if the design prefers
-   simplicity — see "what's left to the builder").
-4. Replay `metadata.dump` into it via `RestoreSnapshot`.
-5. Register it under `/export@<snapID>` in the metadata service.
-6. Acquire the shared remote store (reference-counted).
-7. Build an `engine.Store` with that metadata store as its `FileChunkStore`, an
-   empty journal directory, and the shared remote.
-8. Serve reads. All reads are cold and hydrate on demand.
-9. On close: deregister, release the remote reference, close the shadow store,
-   remove the shadow journal directory.
+3. Take the **shared** side of the per-share snapshot lock, so a concurrent
+   delete cannot remove the dump or manifest mid-boot (see below).
+4. Create a fresh Badger metadata store at
+   `<journalRoot>/<share>/snapshots/<snapID>/shadow-meta`.
+5. Replay `metadata.dump` into it via `RestoreSnapshot`
+   (`pkg/metadata/snapshotable.go:52`). The store must be empty; that is
+   exactly what a new directory gives.
+6. Build a fresh `metadata.New()` and `RegisterStoreForShare(shareName, store)`
+   under the **production** share name.
+7. Acquire the shared remote store (reference-counted).
+8. Open an empty journal directory at
+   `<journalRoot>/<share>/snapshots/<snapID>/shadow-journal`, and build an
+   `engine.Store` with the replayed metadata store as its `FileChunkStore` and
+   that journal as its local tier. **`RemoteSync` must be constructed with the
+   replayed store too** — `NewRemoteSync` panics on a nil `fileChunkStore`
+   (`pkg/block/engine/syncer.go:182`), and it is the object that resolves a cold
+   read to a manifest, so pointing it at production's store would hydrate
+   production's bytes into a snapshot export.
+9. Build the snapshot `Handler` over the new `metadata.Service` and register the
+   export in the open-snapshot registry.
+10. Serve reads. All reads are cold and hydrate on demand.
+11. On close: deregister, release the remote reference, close the engine, close
+    and remove the shadow journal and metadata directories, release the shared
+    lock.
 
 **The snapshot must be held against deletion for the life of the open export.**
-`SnapshotHoldProvider` already owns the mutual exclusion for this: `HeldHashes`
-takes the **read** side of a per-share `sync.RWMutex`
+`SnapshotHoldProvider` already owns this mutual exclusion: `HeldHashes` takes
+the **read** side of a per-share `sync.RWMutex`
 (`pkg/controlplane/runtime/snapshot_hold.go:53,274`) and the delete path takes
 the **write** side through `AcquireDeleteLock` (`:238`).
 
-An open snapshot export needs the same read side, and **that accessor does not
-exist yet** — `AcquireDeleteLock` is the exclusive side and using it would block
-GC's mark phase for the whole life of the export. A shared-side accessor
+An open export needs the same read side, and **that accessor does not exist
+yet** — `AcquireDeleteLock` is the exclusive side and using it would block GC's
+mark phase for the whole life of the export. A shared-side accessor
 (`AcquireHoldLock`, returning `RLock`/`RUnlock`) must be added alongside it,
 borrowing the same `snapshotDeleteLock(shareName)` pointer so it excludes
 deletion exactly as `HeldHashes` does. Without it, an operator removing the
 snapshot mid-boot deletes the manifest out from under a running VM.
+
 
 ## Promotion to read-write
 
@@ -334,9 +398,6 @@ guarantee the promoted export does not keep.
 
 These are implementation calls that do not change what gets built:
 
-- Whether the shadow metadata store lives on disk (restartable) or in memory
-  (simpler, lost on restart). A boot that outlives a server restart argues for
-  disk; the per-snapshot directory already exists as a natural home.
 - Whether the snapshot export shares the production NBD adapter's port (routed
   by export name) or gets its own. The export name already distinguishes them;
   a separate port is a security convenience, not a requirement.
@@ -345,13 +406,25 @@ These are implementation calls that do not change what gets built:
   `/api/v1/shares/{share}/snapshots/{id}/` mirrors it.
 - Whether promotion is a separate endpoint or a flag on the open call. Separate
   is safer given the split-brain gate.
+- Whether the shadow metadata store is kept after close (so a re-open is fast)
+  or removed with the shadow journal. Keeping it costs disk per snapshot and
+  buys nothing on a first boot, so removal is the simpler default.
 
-One thing that is **not** left to the builder: the registry that `Resolve`
-consults must be the source of truth for read-only, and its promoted flag must
-be durable. Putting the flag on the `Export` value, or in a per-connection
-struct, cannot work — see the promotion section. Where the registry *lives*
-(runtime, shares service, or the adapter) is still open; that it exists and is
-consulted at resolve time is not.
+Three things that are **not** left to the builder:
+
+- **The shadow gets its own `metadata.Service`.** Registering the replayed store
+  in the production service under a synthetic name forks the lock manager and
+  the quota row for one namespace, and the name does not fit a file handle
+  anyway. See the routing section.
+- **`RemoteSync` is built with the replayed store as its `fileChunkStore`.**
+  Pointing it at production's store would hydrate production's bytes into a
+  snapshot export. `NewRemoteSync` panics on nil, so this cannot be silently
+  skipped (`pkg/block/engine/syncer.go:182`).
+- **The registry that `Resolve` consults is the source of truth for read-only,
+  and its promoted flag is durable.** Putting the flag on the `Export` value, or
+  in a per-connection struct, cannot work — see the promotion section. Where the
+  registry *lives* is still open; that it exists, is consulted at resolve time,
+  and survives a restart is not.
 
 ## Verification
 
@@ -367,6 +440,9 @@ anti-goal maps to a check:
 | Promotion needs a reconnect, and the promoted state survives a restart | Promote, assert the still-connected client's writes are refused `ErrEPERM`; reconnect; assert writes now succeed. Then restart the server and assert the reconnected export is still writable. |
 | Promotion does not release the GC hold | Promote, overwrite every block the snapshot named, run GC, then read the promoted export's untouched ranges. If the hold were dropped, those reads fail. |
 | A snapshot export cannot be reached without the bind gate | The existing `TestServe_RefusesNonLoopbackBindWithoutOptIn` covers the adapter; assert the snapshot export is not exempt. |
+| A snapshot cannot be deleted while it is open | Open a snapshot export, attempt `DeleteSnapshot`, assert it blocks or is refused; close the export, assert the delete then succeeds. This is the shared-lock test. |
+| A snapshot export reads the snapshot's manifest, not production's | Open a snapshot, write a distinct pattern to production, read the same range through the snapshot, assert the pre-write bytes. Then assert the shadow's `FileChunkStore` is the replayed store and not production's — the wrong wiring is silent, so a behaviour test is required, not a wiring assertion. |
+| A snapshot of a non-ready snapshot is refused | Open against a `creating` and a `failed` row; assert both are refused and a `degraded` one is refused without the opt-in. |
 | The snapshot's bytes equal production's at capture time | Boot a real kernel from a snapshot export taken from a booted VM, and confirm the guest's filesystem replays and mounts. This is the end-to-end proof and it needs the existing `test/nbd/boot-qemu.sh` rig, extended to point at a snapshot export. |
 
 The last one is the one that matters. Everything else is a component test; that
