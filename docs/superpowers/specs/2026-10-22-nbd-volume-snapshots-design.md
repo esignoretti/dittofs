@@ -16,6 +16,13 @@ what makes the image usable, exactly as after a power cut. That is the right
 trade at a few-minute cadence, where a guest-side freeze every interval would
 cost more than it buys.
 
+Two properties keep the design small:
+
+- **A snapshot is always read-only.** It never accepts a write, so it needs no
+  durability story, no refcount discipline, and no divergence handling.
+- **Getting a writable copy is a separate, explicit operation** — rehydrate —
+  which materialises an ordinary volume and leaves the snapshot untouched.
+
 ## The finding that shapes everything
 
 **DittoFS already has snapshots.** `pkg/controlplane/runtime/snapshot.go` is a
@@ -26,7 +33,7 @@ and crash recovery via a durable restore marker. `dfsctl share snapshot` and
 `dfsctl share snapshot-policy` expose all of it today.
 
 So this is not "add snapshots". It is "give an existing snapshot an address on
-the read path".
+the read path", plus one operation that turns a snapshot into a volume.
 
 A snapshot on disk is two files under `<shareDataDir>/snapshots/<id>/`:
 
@@ -51,6 +58,14 @@ needed: the dump is taken inside a single Badger MVCC view, so all `f:` and
 against a real store while a background writer hammers it, and asserts the
 result is never half-captured. This is the crash-consistent guarantee, tested.
 
+**What the guarantee is not.** `CreateSnapshot` drains uploads
+(`snapshot.go:563`) so the manifest is complete, but it does not stop production
+writes, and nothing between the drain and the dump holds them off. The image is
+therefore "the state at the instant the dump was written", not "a clean point in
+time". A guest that is shut down cleanly, or that has just issued a FLUSH, gives
+a clean snapshot, because that FLUSH is drained by Step 0. That is the operator's
+lever and it is worth documenting rather than engineering around.
+
 ## What is missing
 
 The only consumer of a snapshot today is `RestoreSnapshot`, and it is
@@ -70,27 +85,33 @@ share, not a snapshot into a new addressable volume.
   scheduler.**
 - Boot a VM from any ready snapshot while the production volume keeps serving
   reads and writes.
-- Promote a snapshot to a writable export when the operator decides the
-  production volume is gone, and keep running on it.
+- Turn a snapshot into a new, writable volume when the operator wants to move on
+  from the original.
+- Remove old snapshots and know what that frees.
 - Leave production completely unaffected: no lock it must wait on, no change to
   its cache, no risk of its writes landing in the snapshot.
 
 ## Non-goals
 
-- **Automatic failover.** The operator decides when to promote. A promotion
-  while production is alive creates two writers on a shared base — split brain —
-  and detecting that needs a witness (lease, heartbeat, quorum) that does not
-  exist. Not building the witness is the point of this decision, not an
-  oversight.
+- **In-place promotion.** A snapshot never becomes writable. Turning one into a
+  writable volume is rehydration, which produces a *new* volume and leaves the
+  snapshot immutable. This is the decision that removes most of the complexity
+  in this document.
+- **Automatic failover.** The operator decides. Rehydrating while production is
+  alive creates two volumes with independent metadata over a shared base, which
+  is a deliberate clone, not a split brain — but it is still an operator
+  decision, not something the server infers.
 - **Application-consistent snapshots.** No guest freeze, no VSS, no fsfreeze
   orchestration. The guest filesystem replays its own journal.
-- **Single-file recovery from a snapshot.** Restore is whole-volume: connect and
-  boot. Reading a file out of an image is what mounting it as NFS/SMB is for.
+- **Single-file recovery from a snapshot.** Recovery is whole-volume: boot it, or
+  rehydrate it. Reading one file out of an image is what mounting it as NFS/SMB
+  is for.
 - **Incremental or differential backup streams.** A snapshot is a reference set,
   not a transfer format. Shipping one off-box is a separate concern.
 - **Snapshotting a local-only share.** A shadow store hydrates from a remote
-  tier; a local-only share has none. Same gap `RestoreSnapshot` already has
-  (upstream #1718).
+  tier; a local-only share has none, so its snapshot would read as zeros. Same
+  gap `RestoreSnapshot` already has (upstream #1718). Refused explicitly, see
+  below.
 - **NBD-level snapshot semantics.** No `NBD_CMD_BLOCK_STATUS`, no
   `NBD_FLAG_SEND_RESIZE`. The snapshot is a separate export, not a feature of
   the export it came from.
@@ -105,12 +126,15 @@ These would each mean the design failed even if a VM boots:
   is not taking production down.
 - GC reclaims a chunk a snapshot needs. Silent corruption discovered at restore,
   which is the worst possible time.
-- Promotion produces a volume that silently shares mutable state with
-  production.
+- A rehydrated volume silently shares *mutable* state with production.
 - A snapshot export is reachable without authentication. NBD has no
   authentication of its own; the existing bind gate is the only control.
+- Deleting a snapshot silently succeeds while something is reading it, and the
+  reader then fails halfway through a boot.
 
-## The design: a shadow store over the same blocks
+---
+
+## Part 1 — Booting from a snapshot
 
 Serve each snapshot from a **second block store instance** whose local tier is
 empty and whose metadata is the snapshot's, pointing at the **same remote
@@ -146,13 +170,27 @@ snapshot's. So the bytes are the snapshot's. **No seeding step is needed**: an
 empty journal naturally reports holes, and a hole on a remote-backed share
 hydrates from the manifest.
 
+**A seeding step would change nothing, and this is worth stating so nobody adds
+one.** `SeedColdBatch` / `SeedColdFromManifest`
+(`pkg/controlplane/runtime/shares/lifecycle.go:767`, called from
+`seedColdIfNeeded` for a share whose local tier has no record of a manifest
+seed) mark a payload's manifest ranges remote-durable-but-not-local. That is a
+state change for residency accounting only: `reconcile` is
+`st.Cold || (st.Hole && HasRemoteStore())`, so a seeded range and a hole take
+the *same* path on a read. `SeedColdRefs` says so in its own doc — "It changes
+no read: a hole on a remote-backed share already reconciles against the manifest
+and hydrates exactly as a cold range does" (`pkg/block/engine/flush.go:659-667`).
+Seeding would only make the shadow's remote-only byte count and
+`OfflineReadiness` describe ranges nobody asked about.
+
 **Why production is untouched.** Separate journal directory, separate metadata
 store, separate `engine.Store` instance, shared remote. Nothing the shadow does
 takes a lock production holds, and nothing production does changes the shadow's
 manifest. The only shared object is the remote store, which is already
 reference-counted per config UUID (`acquireRemoteStore`/`releaseRemoteStore` in
-`pkg/controlplane/runtime/shares/blockstore_config.go:649,796`) so two shares
-pointing at one remote share a single instance safely.
+`pkg/controlplane/runtime/shares/blockstore_config.go:649,796`), wrapped for the
+engine in `nonClosingRemote` (`:311`) so `engine.Close` does not close it out
+from under production.
 
 **Why the payload IDs line up.** `PayloadID` is `shareName/uuid`
 (`pkg/metadata/file_helpers.go:23`) and the dump preserves it verbatim. Replaying
@@ -160,11 +198,25 @@ the dump into a fresh store reproduces the same `fm:<payloadID>/<offset>` rows
 the `f:` records' `FileAttr.Blocks` point at. Nothing is rewritten, which is
 what makes this a replay rather than a migration.
 
-**Why a fresh store is required, not optional.** `BadgerMetadataStore.RestoreSnapshot`
-returns `ErrRestoreDestinationNotEmpty` unless the target holds no `s:` key
+**Why a fresh store is required, not optional.**
+`BadgerMetadataStore.RestoreSnapshot` returns `ErrRestoreDestinationNotEmpty`
+unless the target holds no `s:` key
 (`pkg/metadata/store/badger/snapshot_store.go:256-264`). A brand-new store is
 the only thing that satisfies it, and it is also the only thing that keeps the
 snapshot's rows from colliding with production's.
+
+**Why the shadow never needs to be visible to GC.** A read-only export mints no
+chunks: every write path refuses before it reaches the block store. So the
+shadow's metadata is never a source of *new* references, and the snapshot's own
+hashes are already held by `HeldHashes` from the manifest on disk. The shadow
+store therefore needs no entry in `sharesSvc.registry` and no seam in
+`DistinctRemoteStores` — which is exactly why read-only is the cheap case.
+
+**Why hydration does not write to the metadata store.** `journal.Store.Hydrate`
+(`pkg/block/journal/store.go:541`) appends to the *journal index* with
+`synced=true` (`:550`) and touches no manifest row. The replayed Badger store is
+never written after the replay, so the shadow needs no write path to it, no
+rollback, and no cleanup beyond closing it.
 
 ### Routing: a private metadata service per open snapshot
 
@@ -175,9 +227,7 @@ decodes the **share name out of the handle** to pick a store
 (`pkg/metadata/service.go:252`).
 
 The obvious routing trick — register the replayed store under a synthetic share
-name and let `storeForHandle` (`pkg/metadata/service.go:252`) decode it out of
-the handle — **does not work**, for two independent reasons found while
-implementing.
+name — **does not work**, for two independent reasons.
 
 **The name does not fit in a handle.** A handle is `"<shareName>:<uuid>"` and
 `MaxFileHandleSize` is 64 (`pkg/metadata/types.go:48`), with a 36-byte UUID and
@@ -223,227 +273,377 @@ production                        snapshot (per open snapshot)
 
 `Handler` already takes a `meta *metadata.Service` and every handler method
 receives it as `h.meta` (`handlers_read.go:16`, `handlers_write.go:26`), so a
-snapshot handler is the same `Handler` type over a different service. The
-`*Export` it serves is built by the snapshot exporter with the replayed
-store's handle.
+snapshot handler is the same `Handler` type over a different service.
 
-The `Export.Handle` must therefore be minted **from the replayed store's own
-records**, not copied from production: it is `<shareName>:<fileUUID>`, and while
-the UUID survives the dump, encoding it against the replayed file is what makes
-the handle belong to the shadow. Production's handle would work by accident
-(same UUID, same share name) and would silently point at production's service if
-the two were ever swapped, so the exporter encodes it explicitly.
+The `Export.Handle` must be minted **from the replayed store's own records**,
+not copied from production: it is `<shareName>:<fileUUID>`, and while the UUID
+survives the dump, encoding it against the replayed file is what makes the
+handle belong to the shadow. Production's handle would work by accident (same
+UUID, same share name) and would silently point at production's service if the
+two were ever swapped, so the exporter encodes it explicitly.
 
-Export names follow the shape the existing exporter already accepts, with the
-snapshot named explicitly:
+**Export names.** The existing exporter splits on the *last* slash
+(`sep := strings.LastIndexByte(name, '/')`, `internal/adapter/nbd/volume.go:79`),
+so for `export/snapshots/<id>/boot` it would take `share =
+/export/snapshots/<id>` and `volume = boot` — a share that does not exist, so it
+returns `ErrUnknownExport` rather than mis-routing. The snapshot exporter
+therefore does not need to *pre-empt* it: it must only be consulted at all. It
+claims any name whose second segment is `snapshots`, and any name it does not
+claim falls through unchanged, so production's resolver is untouched either way.
 
 ```
-NBD export name:  export/snapshots/e3b0c442-98fc-11ef-9c4d-0242ac120002/boot
+export/snapshots/e3b0c442-98fc-11ef-9c4d-0242ac120002/boot
+└────┬─┘└───┬────┘└──────────────┬──────────────┘└─┬─┘
+   share   marker              snapID          volume
 ```
 
-A leading `snapshots/` segment after the share is what distinguishes it. That
-segment can never collide with a real volume, because `volumes/` is the only
-directory the production exporter reads and a volume name cannot contain `/`.
-
-**What this costs.** A `metadata.Service` per open snapshot. It is a struct with
-a registry and a handful of trackers — small next to the Badger instance it
-wraps — and the number of concurrently open snapshots is expected to be one or
-two. It also means the snapshot path cannot reuse
-`common.ResolveForWrite` (which asks the runtime's shares service for a block
-store by handle); the snapshot's `StoreResolver` returns the shadow
-`engine.Store` directly, which is why `StoreResolver` is a function type
-(`internal/adapter/nbd/connection.go:59`) rather than an interface.
+`snapshots/` can never collide with a real volume, because `volumes/` is the
+only directory the production exporter reads and a volume name cannot contain
+`/`.
 
 ### Lifecycle of an open snapshot
 
 1. Operator (or the boot rig) requests a snapshot export by name.
-2. Resolve the snapshot row; refuse unless `State == StateReady`. A `creating`
-   snapshot has no dump yet, and a `failed` one may have a partial manifest.
-   Refuse a `degraded` one unless the caller explicitly opts in — it restores,
-   but its manifest is short by `DegradedEntries` rows.
-3. Take the **shared** side of the per-share snapshot lock, so a concurrent
-   delete cannot remove the dump or manifest mid-boot (see below).
-4. Create a fresh Badger metadata store at
-   `<journalRoot>/<share>/snapshots/<snapID>/shadow-meta`.
-5. Replay `metadata.dump` into it via `RestoreSnapshot`
-   (`pkg/metadata/snapshotable.go:52`). The store must be empty; that is
-   exactly what a new directory gives.
-6. Build a fresh `metadata.New()` and `RegisterStoreForShare(shareName, store)`
+2. **Check the preconditions, all before creating anything.** Refuse unless
+   `State == StateReady`; refuse `degraded` unless the caller opted in (its
+   manifest is short by `DegradedEntries` rows); refuse a share with no remote
+   store, because there is nothing to hydrate from and every read would return
+   zeros. Failing here costs nothing to unwind.
+3. Register the snapshot as open (Part 3) so a concurrent delete is refused
+   rather than racing the boot.
+4. Replay. Create a fresh Badger metadata store at
+   `<journalRoot>/<share>/snapshots/<snapID>/shadow-meta` and replay
+   `metadata.dump` into it via `RestoreSnapshot` (`pkg/metadata/snapshotable.go:52`).
+   This is the expensive step and the only one that can fail slowly.
+5. Build a fresh `metadata.New()` and `RegisterStoreForShare(shareName, store)`
    under the **production** share name.
-7. Acquire the shared remote store (reference-counted).
-8. Open an empty journal directory at
-   `<journalRoot>/<share>/snapshots/<snapID>/shadow-journal`, and build an
-   `engine.Store` with the replayed metadata store as its `FileChunkStore` and
-   that journal as its local tier. **`RemoteSync` must be constructed with the
-   replayed store too** — `NewRemoteSync` panics on a nil `fileChunkStore`
-   (`pkg/block/engine/syncer.go:182`), and it is the object that resolves a cold
-   read to a manifest, so pointing it at production's store would hydrate
-   production's bytes into a snapshot export.
-9. Build the snapshot `Handler` over the new `metadata.Service` and register the
-   export in the open-snapshot registry.
-10. Serve reads. All reads are cold and hydrate on demand.
-11. On close: deregister, release the remote reference, close the engine, close
-    and remove the shadow journal and metadata directories, release the shared
-    lock.
+6. Build the shadow `engine.Store`: acquire the shared remote store
+   (reference-counted) wrapped in `nonClosingRemote`, open an empty journal at
+   `<journalRoot>/<share>/snapshots/<snapID>/shadow-journal`, and pass the
+   replayed store as **both** `FileChunkStore` and `RemoteSync`'s
+   `fileChunkStore`. This is not optional: `NewRemoteSync` panics on nil
+   (`pkg/block/engine/syncer.go:180-182`), and pointing it at production's store
+   would hydrate production's bytes into a snapshot export.
+7. `Start`, then **cap the shadow journal and allow it to evict** (see below).
+8. Build the snapshot `Handler` over the new `metadata.Service` and register the
+   export. Only now is the export reachable.
+9. Serve reads. All reads are cold and hydrate on demand.
+10. On close: deregister, release the remote reference, close the engine, remove
+    the shadow journal and metadata directories, release the open registration.
 
-**The snapshot must be held against deletion for the life of the open export.**
-`SnapshotHoldProvider` already owns this mutual exclusion: `HeldHashes` takes
-the **read** side of a per-share `sync.RWMutex`
-(`pkg/controlplane/runtime/snapshot_hold.go:53,274`) and the delete path takes
-the **write** side through `AcquireDeleteLock` (`:238`).
+**Failure unwinds in reverse and is allowed to be slow.** Every step after 4
+holds a resource, so the open path must be written as an ordered list of
+acquired resources with one deferred teardown, not as a function that returns
+early. A replay that fails at 90% leaves a partial Badger directory behind, so
+the directory is created fresh per attempt (`shadow-meta` is removed on failure,
+not reused) — `ErrRestoreDestinationNotEmpty` is exactly the guard that would
+otherwise make the second attempt fail for a different reason than the first.
 
-An open export needs the same read side, and **that accessor does not exist
-yet** — `AcquireDeleteLock` is the exclusive side and using it would block GC's
-mark phase for the whole life of the export. A shared-side accessor
-(`AcquireHoldLock`, returning `RLock`/`RUnlock`) must be added alongside it,
-borrowing the same `snapshotDeleteLock(shareName)` pointer so it excludes
-deletion exactly as `HeldHashes` does. Without it, an operator removing the
-snapshot mid-boot deletes the manifest out from under a running VM.
+**The shadow journal must evict, and this needs one small engine change.**
+`CanEvict()` is `carveActive && IsRemoteHealthy()`
+(`pkg/block/engine/sync_health.go:218`), and `carveActive` is true only once the
+carve substrate is wired — `SetRemoteBlockStore` plus a block committer derived
+from the metadata store (`pkg/block/engine/syncer.go:155`). A read-only shadow
+wires neither, so `engine.Start` computes `CanEvict() == false` and calls
+`local.SetEvictionEnabled(false)` (`pkg/block/engine/engine.go:248`).
 
+That is fatal to a capped shadow. With eviction held, `evict()` returns
+`{Held: true}` immediately (`pkg/block/journal/evict.go:64-65`), and
+`ensureSpace` (`pkg/block/journal/evict.go:504`) has nothing evictable, no
+drain progress (`unsynced` never moves), so it stalls for `EvictMaxWait` and
+then returns `ErrLocalStoreFull` — a boot that dies mid-flight. And the cap
+cannot simply be left unset: then the shadow journal grows without bound next to
+the volume production writes to.
 
-## Promotion to read-write
+Hydrated records are written `synced=true` (`Hydrate` →
+`appendRecord(..., true, ...)`, `pkg/block/journal/store.go:550`), so every byte
+in a shadow journal is recoverable from remote and is genuinely safe to evict.
+The fix is one exported method on `engine.Store`:
 
-Today's snapshot export is read-only: the `Export.ReadOnly` flag is already
-honoured by every write path — `validateWrite` refuses with `ErrEPERM` at
-`internal/adapter/nbd/handlers_write.go:96` and `handleDiscard` at `:202` — and
-`FlagReadOnly` is advertised by `Export.TransmissionFlags` at
-`internal/adapter/nbd/handshake.go:152`.
+```go
+// SetEvictionAllowed forces the local tier's eviction gate, for a store whose
+// every byte is recoverable from the remote — a read-only shadow whose journal
+// is a pure hydration cache. A normal store must not use this: its journal
+// holds bytes that exist nowhere else, which is why the gate is normally
+// derived from carve health.
+func (bs *Store) SetEvictionAllowed(allowed bool) { bs.local.SetEvictionEnabled(allowed) }
+```
 
-Promotion is an operator action, and it is **not** a flag flip. Two facts in
-the current code force the shape:
+Called with `true` right after `Start`, together with a `MaxLocalBytes` cap. Two
+caveats the builder must respect:
 
-- **NBD transmission flags are one-shot.** `Export.TransmissionFlags`
-  (`internal/adapter/nbd/handshake.go:149`) is serialized to the wire exactly
-  once, in the handshake at `:370` and `:392`. A client that saw
-  `NBD_FLAG_READ_ONLY` will not send a write whatever the server does
-  afterwards. Promotion therefore requires the client to **reconnect** — the
-  operator promotes, then the VM re-attaches. That is the operational story and
-  it must be documented as such, not hidden behind "flip a switch".
-- **`Export` is not a place to store mutable state.**
-  `RuntimeExporter.Resolve` (`internal/adapter/nbd/volume.go:149-155`) builds a
-  fresh `&Export{...}` on every call and nothing caches it; `serve`
-  (`internal/adapter/nbd/connection.go:226`) keeps the one copy the handshake
-  returned and `pipeline` holds that pointer (`internal/adapter/nbd/pipeline.go:44`).
-  Mutating `exp.ReadOnly` would change one connection's view and nothing else.
+- The health callback installed in `Start` (`engine.go:215-231`) re-derives the
+gate on every remote-health transition, so a transition after the override
+silently turns eviction back off. For a shadow that is tolerable — the shadow
+never *needs* to upload, so carving is not an option to wire — but the override
+must be reapplied in the callback, or documented as "eviction may be suspended
+while the remote is unhealthy", which is also correct.
+- The cap comes from the share's `LocalStoreDefaults.MaxSize`, the same field
+production's journal uses (`pkg/controlplane/runtime/shares/journal_open.go:51`).
+It is per-store, so the shadow's cap is independent of production's — but it is
+the same *number* unless the shadow overrides it, which the builder should do
+with a dedicated fraction rather than inheriting a multi-gigabyte share size for
+a boot cache.
 
-The read-only decision must therefore live in a **snapshot registry that
-`Resolve` consults**, not in the `Export` value. The adapter also has no
-live-connection registry today — `pkg/adapter/nbd/adapter.go` exposes only
-`Serve` and `Stop`, and connection tracking is `BaseAdapter`'s `connSemaphore` —
-so nothing can force a disconnect; the reconnect is the operator's step.
+---
 
-So promotion is:
+## Part 2 — Rehydrating a snapshot into a new volume
 
-1. Refuse unless the operator explicitly confirms production is gone. This is
-   the split-brain gate and it must be a deliberate, separate act — never
-   implied by opening the export.
-2. Mark the snapshot promoted **in the registry**. This is the durable record;
-   it survives a server restart, which a struct field would not.
-3. The client disconnects and re-attaches. `Resolve` now builds the export with
-   `ReadOnly: false`, so the new handshake omits `NBD_FLAG_READ_ONLY` and the
-   client is willing to write.
-4. Writes proceed through the shadow store.
+A snapshot is never promoted. Turning one into a writable volume is
+**rehydration**: a job that creates a *new* volume whose chunks are shared with
+the snapshot and whose metadata is its own. The snapshot stays read-only and
+stays bootable.
 
-**Why writes are safe without a copy.** Chunks are immutable and
-content-addressed: a write mints new chunks and never overwrites a chunk the
-snapshot references. The shadow's metadata diverges from the snapshot's; the
-blocks are shared. That is exactly Ceph's protected-snapshot clone and ZFS's
-`clone`. The snapshot itself stays valid and stays bootable.
+**Rehydration reads no bytes.** It needs the snapshot's *manifest*, not its
+contents, because `CopyPayload` reflinks by hash. So the rehydrate path never
+builds a shadow `engine.Store` — no journal, no remote, no hydration. It replays
+the dump, reads `FileAttr.Blocks`, and hands it to production's store.
 
-**What a promoted write actually needs.** `engine.Store.WriteAt`
-(`pkg/block/engine/readwrite.go:89`) appends into the local journal and returns
-early — it touches no coordinator and no refcount, so a shadow store built
-without a `Coordinator` accepts writes as-is. The coordinator is only consulted
-on the reap paths (`Truncate` at `:236` and `:323`, `Delete` at `:437`,
-`CopyPayload` at `:596` and `:632`), each of which already nil-checks it. So
-promotion needs no new engine plumbing; what it needs is durability (below).
+### Why the result is independent
 
-**What promotion must not do:** it must not write into the snapshot's own
-`metadata.dump` or `manifest.hashes`. Those files are the immutable record of
-the backup. The shadow store's divergence lives in its own metadata store.
+Chunks are immutable and content-addressed. `CopyPayload`
+(`pkg/block/engine/readwrite.go:536`) creates the destination's per-file
+`FileChunk` rows keyed by the **same** offset, hash and size, pointing at the
+same CAS objects — O(blocks) metadata puts and zero data movement. A write to
+the new volume mints new chunks and never touches one the snapshot references.
+That is exactly a reflink, and exactly Ceph's protected-snapshot clone.
 
-**Promotion must not release the GC hold.** The snapshot keeps protecting its
-chunks after promotion. The promoted export's *new* chunks are referenced by the
-shadow's metadata, which the mark phase enumerates through
-`EnumerateFileChunks` (`pkg/block/gc/gc.go:543`); the snapshot's *original*
-chunks stay reachable only through `HeldHashes` (`:555`). Dropping the hold at
-promotion would let GC reclaim the base blocks the promoted export is still
-reading from — the precise silent corruption this design exists to prevent.
+**It must run against production's store, not a shadow.** `CopyPayload` returns
+`ErrMetadataCoordinatorNotWired` when the source has blocks and the store has no
+coordinator (`readwrite.go:596-598`), and it persists the destination's rows
+through that coordinator. Production's store has one; a shadow does not. This is
+also the right direction: the new volume lives in production.
 
-**Durability on promotion.** A promoted export's writes need somewhere durable
-to land. The shadow's journal is a hydration cache whose contents are already
-recoverable from remote; once writes start arriving, its journal holds bytes
-that exist nowhere else. The promotion step must therefore either flush to
-remote on FUA/FLUSH as production does (the same `common.FlushStableWrite` path
-the production handlers already use) or refuse to advertise `FlagSendFUA` until
-its journal is durable-backed. Leaving this as-is would advertise a durability
-guarantee the promoted export does not keep.
+### The job
+
+1. Validate: target share exists, is not read-only, points at the **same remote
+   store config** as the snapshot's share (chunks are addressed by hash inside
+   one remote; a different remote would resolve to nothing). Same share is the
+   simple and default case; a different share is allowed only under that
+   precondition.
+2. Register the snapshot as open (Part 3) for the duration, so a delete cannot
+   remove the dump mid-job.
+3. Replay the dump into a temporary Badger store and read the snapshot volume's
+   `FileAttr.Blocks`. This is the only use of the replayed store, and it is
+   removed when the job finishes.
+4. Create the destination volume file in the target share — an ordinary regular
+   file, created the same way the NBD volume path creates one. **The
+   destination's payload ID is the new file's, never the snapshot's**:
+   `PayloadID` is `shareName/uuid`, so reusing the source's would address the
+   source's chunks and leave the new file with no manifest of its own.
+5. `productionBS.CopyPayload(ctx, srcPayloadID, dstPayloadID, srcBlocks)` →
+   `[]block.ChunkRef`. Note the argument order — **source first, destination
+   second** — which reads the other way round from the name.
+6. Persist the returned refs as the new volume's `FileAttr.Blocks` in the same
+   metadata transaction, then `productionBS.SeedColdRefs(ctx, dstPayloadID, refs)`
+   after the commit, so the local index describes the ranges the manifest
+   places. Binding the txn in `ctx` (`metadata.TxFromContext`) is what
+   `CopyPayload` expects from its clone callers: the per-file rows and the
+   `Blocks` write then commit or roll back together
+   (`pkg/block/engine/readwrite.go:660-672`).
+7. Report the new volume's name. The volume is immediately writable.
+
+**Order matters: replay before create.** Step 3 must succeed before step 4
+leaves a file behind, otherwise a dump that fails to replay leaves an empty
+volume the operator has to clean up.
+
+**Failure is a rollback, not a repair.** If any step fails, delete the
+destination volume and its rows. There is no partial state worth keeping: the
+snapshot is untouched throughout, so the operator simply retries.
+
+**What makes the new volume a real GC reference.** `EnumerateFileChunks`
+(`pkg/metadata/store/badger/objects.go:876-890`) runs **two** passes over the
+share — the `fb:` FileChunk rows, then the `f:` `File.Blocks` manifests — so a
+chunk the copy names is marked twice over. `CopyPayload` writes the rows, which
+is the pass the read path also resolves through
+("The cold-read path resolves bytes via `ListFileChunks(dstPayloadID)`, not
+`FileAttr.Blocks`", `pkg/block/engine/readwrite.go:655-657`). The `Blocks` write
+in step 6 is therefore belt-and-braces, not the load-bearing part — but it is
+still required, because a file whose `Blocks` disagree with its rows is a
+correctness bug the next `Truncate` or copy would act on.
+
+**It must be a normal file in a normal share.** Nothing about it is
+special-cased for having been rehydrated, so every existing invariant — the
+quota, the lock manager, the GC enumeration, the read path — applies to it
+unchanged. That is the whole reason rehydration materialises a volume instead
+of inventing a second kind of thing.
+
+**Why a job and not a synchronous call.** Step 3 replays a metadata dump and
+step 5 writes one row per block. For a large volume that is seconds to minutes,
+and the caller wants progress and a status to poll. The existing block-GC job
+machinery (`pkg/controlplane/runtime/blockgc_job.go`) is the shape to copy:
+submit, poll, terminal state, one durable record.
+
+### What rehydration is not
+
+- It is **not** a restore. `RestoreSnapshot` overwrites the production volume in
+  place and needs the share disabled. Rehydration never touches the source.
+- It is **not** a move. The snapshot keeps its chunks and its GC hold; the new
+  volume's chunks are additionally referenced by the new volume's own metadata,
+  which GC sees because it is a real file in a real share.
+
+---
+
+## Part 3 — Removing snapshots and knowing what that frees
+
+Deletion already exists at three levels, so this part adds almost no mechanism —
+it closes one race and adds the visibility that is missing.
+
+### What exists
+
+| Layer | Mechanism |
+|---|---|
+| Manual | `dfsctl share snapshot remove <share> <id>` (`cmd/dfsctl/commands/share/snapshot/remove.go:13`) |
+| Retention | `snapshotsched.Service.prune` (`pkg/controlplane/runtime/snapshotsched/service.go:282`) runs after every scheduled snapshot and deletes scheduler-created ready snapshots outside `KeepLast` (count) or `TTL` (age). Both zero disables pruning. Manual snapshots are never pruned. |
+| Space | `DeleteSnapshot` (`pkg/controlplane/runtime/snapshot.go:1953`) removes the snapshot dir (`metadata.dump` + `manifest.hashes`) and the DB row, then `recomputePinVersion`. The *chunks* are reclaimed by the next GC run, once the grace period (default 1h) expires and no remaining manifest holds them. Auto-GC runs every 15 minutes (`StartScheduledGC`, `pkg/controlplane/runtime/blockgc_scheduler.go:22`). |
+
+So "remove old snapshots to free space" is already: delete the row, then let GC
+reclaim. Nothing new is needed to make that work.
+
+### The race to close: delete while open
+
+`DeleteSnapshot` takes the per-share `snapshotDeleteLock` write side
+(`snapshot.go:1974`) and wipes the directory. Nothing stops it running while a
+snapshot export is being read — the reader would fail partway through a boot
+with a missing manifest.
+
+The wrong fix is to have the open export hold the shared side of that lock for
+its lifetime. `DeleteSnapshot` would then **block** for the duration of a boot —
+not refuse, block, with no context and no timeout — and because Go's `RWMutex`
+blocks new readers once a writer is pending, a second snapshot open on the same
+share would hang too. That is worse than the race.
+
+The right fix is a **per-snapshot open registry with refusal**, which is ~30
+lines and no new lock type:
+
+```go
+// pkg/controlplane/runtime — one map guarded by one mutex
+openSnapshots map[snapshotKey]int   // key: {share, snapID} → refcount
+```
+
+- `OpenSnapshot(ctx, share, snapID) (release func(), err error)` — increments.
+  Called by the boot path and the rehydrate job.
+- `DeleteSnapshot` checks the count for `{share, snapID}` and returns a new
+  sentinel `models.ErrSnapshotOpen` when non-zero. The REST layer maps it to
+  `409 Conflict` with the holders' count, so the operator sees *why*.
+- Refusal, not blocking, and **scoped to the one snapshot**. Deleting snapshot B
+  while snapshot A is open proceeds normally — which is the whole point, since
+  retention pruning is exactly the case of deleting a snapshot while another is
+  in use.
+
+The `snapshotDeleteLock` keeps its current job — excluding the GC mark phase
+from a delete — and gains no new caller.
+
+### The gap: no way to see what a snapshot costs
+
+`dfsctl store block gc-status` shows GC state; `dfsctl share snapshot show`
+shows one snapshot's metadata. There is no "how much of the retained set does
+this one snapshot actually pin" and no "these 40 snapshots hold 4.8M chunks,
+0.3M of them unique to one snapshot."
+
+That falls out of a single pass over the manifests, which `HeldHashes` already
+performs — it unions every snapshot's manifest, deduplicating across snapshots
+because hourly snapshots of a slowly-changing tree re-reference the same hashes
+(`snapshot_hold.go:99-127`). The same walk, counting per-snapshot membership
+instead of unioning, answers both questions in one pass.
+
+| Report | Computation |
+|---|---|
+| Per snapshot | `unique` = hashes in this manifest and no other; `shared` = the rest |
+| Per share | `total` = union size; `reclaimable_if_deleted(id)` = that snapshot's `unique`; `reclaimable_now` = hashes no live manifest and no live file references |
+
+**Counts, not bytes, and that is a deliberate limit.** A manifest line is a
+hash and nothing else — `snapshot.ReadManifest` parses `block.ContentHash` per
+line (`pkg/snapshot/manifest.go:83-96`). Byte sizes live in the remote objects,
+not in the manifest, which is why GC's own `BytesFreed` is documented as coming
+from the reclaimer rather than the index (`pkg/block/gc/sweep_index.go:37-39`).
+Reporting chunk counts is exact and needs no remote calls; converting to bytes
+would mean a remote HEAD per distinct hash. So the report gives counts, and the
+operator who wants bytes reads `bytes_freed` from the next `gc-status` after a
+real delete. Adding a byte estimate later is a `BlockReclaimer` dry-run, not a
+new index.
+
+Exposed as `dfsctl share snapshot usage <share> [--id <id>]`. Read-only, no new
+storage, one manifest walk, no remote traffic.
+
+---
 
 ## Costs, stated honestly
 
 - **Cold reads.** A boot off a snapshot hydrates every chunk it touches. On the
   S3-backed host a single cold 4 KiB read costs 13.75 ms (measured), so a boot
   is slow until the shadow's journal warms. This is inherent to reading from a
-  remote tier and is the same cost a production cold read already pays.
-- **Disk for the shadow journal.** It is a second hydration cache. It must be
-  size-capped so opening a snapshot cannot fill the disk production writes to.
+  remote tier and is the same cost a production cold read already pays. It has
+  not been measured end to end for a full boot, and should be before promising a
+  number.
+- **Disk for the shadow journal.** It is a second hydration cache on the same
+  volume production writes to. It must be capped *and* allowed to evict — the
+  cap alone would turn a large boot into `ErrLocalStoreFull`.
+- **Replay cost per open.** `metadata.dump` is replayed row by row into a fresh
+  Badger instance on **every** open and every rehydrate. For a large volume that
+  is a real delay before the first byte is served. Not cached between opens,
+  deliberately: a cache would need invalidation on delete and would pin memory
+  for snapshots nobody is booting.
 - **Memory for the replayed metadata store.** A Badger instance per open
-  snapshot. Capped by the number of concurrently open snapshots, which is
-  expected to be one or two, not by the number of snapshots retained.
-- **Snapshot retention is the operator's lever, not space.** Because chunks are
-  shared, N snapshots of a slowly-changing volume cost little more than one.
-  Retention still matters: `KeepLast`/`TTL` on the policy is what bounds it.
+  snapshot, bounded by concurrently open snapshots (expected: one or two), not
+  by snapshots retained.
+- **Retention is the operator's lever, not space.** Because chunks are shared, N
+  snapshots of a slowly-changing volume cost little more than one. `KeepLast`
+  and `TTL` are what bound it; the usage report is what makes the trade visible.
 
 ## What is left to the builder
 
-These are implementation calls that do not change what gets built:
+Calls that do not change what gets built:
 
 - Whether the snapshot export shares the production NBD adapter's port (routed
-  by export name) or gets its own. The export name already distinguishes them;
-  a separate port is a security convenience, not a requirement.
-- The exact CLI/API surface. `dfsctl share snapshot` already exists; a `boot` or
-  `open` subcommand is the natural shape, and a REST endpoint under
-  `/api/v1/shares/{share}/snapshots/{id}/` mirrors it.
-- Whether promotion is a separate endpoint or a flag on the open call. Separate
-  is safer given the split-brain gate.
-- Whether the shadow metadata store is kept after close (so a re-open is fast)
-  or removed with the shadow journal. Keeping it costs disk per snapshot and
-  buys nothing on a first boot, so removal is the simpler default.
+  by export name) or gets its own. The export name already distinguishes them; a
+  separate port is a security convenience, not a requirement.
+- The exact CLI/API surface. `dfsctl share snapshot` already exists; `open`,
+  `rehydrate` and `usage` subcommands are the natural shape, and REST endpoints
+  under `/api/v1/shares/{share}/snapshots/{id}/` mirror them.
+- Whether the shadow metadata and journal directories are kept after close (fast
+  re-open) or removed. Removal is the simpler default and costs only the replay.
+- Where the open-snapshot refcount map lives: runtime or shares service.
 
-Three things that are **not** left to the builder:
+Five things that are **not** left to the builder:
 
-- **The shadow gets its own `metadata.Service`.** Registering the replayed store
-  in the production service under a synthetic name forks the lock manager and
-  the quota row for one namespace, and the name does not fit a file handle
-  anyway. See the routing section.
-- **`RemoteSync` is built with the replayed store as its `fileChunkStore`.**
-  Pointing it at production's store would hydrate production's bytes into a
-  snapshot export. `NewRemoteSync` panics on nil, so this cannot be silently
-  skipped (`pkg/block/engine/syncer.go:182`).
-- **The registry that `Resolve` consults is the source of truth for read-only,
-  and its promoted flag is durable.** Putting the flag on the `Export` value, or
-  in a per-connection struct, cannot work — see the promotion section. Where the
-  registry *lives* is still open; that it exists, is consulted at resolve time,
-  and survives a restart is not.
+1. **The shadow gets its own `metadata.Service`.** Registering the replayed store
+   in the production service under a synthetic name forks the lock manager and
+   the quota row for one namespace, and the name does not fit a file handle
+   anyway.
+2. **`RemoteSync` is built with the replayed store as its `fileChunkStore`.**
+   Pointing it at production's store would hydrate production's bytes into a
+   snapshot export, and `NewRemoteSync` panics on nil so it cannot be skipped by
+   accident.
+3. **The shadow journal evicts.** `SetEvictionAllowed(true)` plus a cap. Without
+   the former the latter turns a boot into `ErrLocalStoreFull`.
+4. **Delete is refused, never blocked, while a snapshot is open** — and the
+   refusal is per snapshot, not per share.
+5. **A snapshot is never writable.** No code path sets `ReadOnly: false` on a
+   snapshot export, and `TransmissionFlags` therefore always advertises
+   `FlagReadOnly` for one. Note the one asymmetry that is intentional: `handleFlush`
+   (`internal/adapter/nbd/handlers_control.go:20`) does not refuse a read-only
+   export, because FLUSH carries no data — a snapshot export answers FLUSH
+   successfully as a no-op. Only WRITE, WRITE_ZEROES, TRIM and DISCARD are
+   refused, all through `validateWrite`'s `exp.ReadOnly` check.
 
 ## Verification
 
-A design is only worth building if its failure modes are testable. Each
-anti-goal maps to a check:
+Each anti-goal maps to a check. The last one is the claim that matters.
 
 | Claim | How to prove it |
 |---|---|
 | A snapshot read never sees a post-snapshot write | Write a pattern, snapshot, overwrite with a different pattern, read through the snapshot export, assert the first pattern. Then read through production and assert the second. |
 | Booting a snapshot does not affect production | Run the production write path under load while a snapshot export is read; assert production throughput and correctness are unchanged. |
-| GC cannot reclaim a snapshot's chunks | Create a snapshot, overwrite the volume, run GC, boot from the snapshot. The `SnapshotHoldProvider` test suite already covers the hold; this covers the integration. |
-| A promoted snapshot shares no mutable state with production | Promote, write to the promoted export, assert the snapshot's own manifest and production's manifest both still describe their original bytes. |
-| Promotion needs a reconnect, and the promoted state survives a restart | Promote, assert the still-connected client's writes are refused `ErrEPERM`; reconnect; assert writes now succeed. Then restart the server and assert the reconnected export is still writable. |
-| Promotion does not release the GC hold | Promote, overwrite every block the snapshot named, run GC, then read the promoted export's untouched ranges. If the hold were dropped, those reads fail. |
-| A snapshot export cannot be reached without the bind gate | The existing `TestServe_RefusesNonLoopbackBindWithoutOptIn` covers the adapter; assert the snapshot export is not exempt. |
-| A snapshot cannot be deleted while it is open | Open a snapshot export, attempt `DeleteSnapshot`, assert it blocks or is refused; close the export, assert the delete then succeeds. This is the shared-lock test. |
-| A snapshot export reads the snapshot's manifest, not production's | Open a snapshot, write a distinct pattern to production, read the same range through the snapshot, assert the pre-write bytes. Then assert the shadow's `FileChunkStore` is the replayed store and not production's — the wrong wiring is silent, so a behaviour test is required, not a wiring assertion. |
-| A snapshot of a non-ready snapshot is refused | Open against a `creating` and a `failed` row; assert both are refused and a `degraded` one is refused without the opt-in. |
-| The snapshot's bytes equal production's at capture time | Boot a real kernel from a snapshot export taken from a booted VM, and confirm the guest's filesystem replays and mounts. This is the end-to-end proof and it needs the existing `test/nbd/boot-qemu.sh` rig, extended to point at a snapshot export. |
-
-The last one is the one that matters. Everything else is a component test; that
-one is the claim the user actually cares about — a VM boots from the backup.
+| GC cannot reclaim a snapshot's chunks | Create a snapshot, overwrite the volume, run GC, boot from the snapshot. `SnapshotHoldProvider`'s suite covers the hold; this covers the integration. |
+| A snapshot export reads the snapshot's manifest, not production's | Open a snapshot, write a distinct pattern to production, read the same range through the snapshot, assert the pre-write bytes. A behaviour test, not a wiring assertion — the wrong wiring is silent. |
+| A snapshot export is never writable | Attempt WRITE, WRITE_ZEROES, TRIM and DISCARD through a snapshot export; assert `ErrEPERM` on each. Assert the handshake advertises `FlagReadOnly`. FLUSH is deliberately *not* in this list: it is not a data write, and `validateWrite` lets it through because the shadow has nothing to flush — a FLUSH on a snapshot export succeeds as a no-op, which is correct. |
+| A snapshot of a local-only share is refused, not served as zeros | Create a snapshot on a share with no remote; assert the open fails with a clear error and no export is registered. |
+| A snapshot cannot be deleted while it is open | Open a snapshot export, attempt `DeleteSnapshot`, assert `ErrSnapshotOpen` (409) and that the export still reads correctly; close, assert the delete then succeeds. |
+| Deleting one snapshot does not affect another that is open | Open A, delete B, assert B is deleted and A still reads correctly. This is the per-snapshot scoping test. |
+| A rehydrated volume is independent of its snapshot | Rehydrate, write a distinct pattern to the new volume, then read the same range through the snapshot and assert the original bytes. Assert the snapshot is still openable and still read-only. |
+| A rehydrated volume survives the snapshot being deleted | Rehydrate, delete the snapshot, run GC, read the new volume's full range and assert correctness. This proves the rehydrated metadata is a real GC reference and not a borrowed hold. |
+| Rehydration refuses a different remote | Attempt a cross-share rehydrate where the two shares point at different remote configs; assert it is refused before any volume is created. |
+| Rehydration rollback leaves nothing behind | Fail the job after the volume is created; assert the volume, its rows and its chunks-references are gone and the snapshot is untouched. |
+| The usage report matches reality | Create three snapshots with known overlap; assert `unique` and `shared` chunk counts per snapshot and the share total against hand-computed values. |
+| The snapshot's bytes equal production's at capture time | Boot a real kernel from a snapshot export taken from a booted VM, and confirm the guest's filesystem replays and mounts. Extend `test/nbd/boot-qemu.sh` to point at a snapshot export. |
