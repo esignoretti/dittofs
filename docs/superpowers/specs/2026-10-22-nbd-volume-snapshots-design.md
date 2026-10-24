@@ -638,6 +638,22 @@ Five things that are **not** left to the builder:
    successfully as a no-op. Only WRITE, WRITE_ZEROES, TRIM and DISCARD are
    refused, all through `validateWrite`'s `exp.ReadOnly` check.
 
+   Two honest notes on how that guarantee is enforced, both verified while
+   building it. First, the read-only decision is made in three independent
+   places — `validateWrite` and `handleWriteZeroes`/`handleDiscard` check
+   `exp.ReadOnly` directly, and `authContext` passes the same field down as
+   `AuthContext.ShareReadOnly`, which the metadata layer enforces for the NFS and
+   SMB paths as well. That redundancy is wanted, but it means an over-the-wire
+   test of "a write is refused" passes with any one layer removed; the test in
+   `internal/adapter/nbd/snapshot_test.go` therefore carries a positive control
+   (the same identity writing successfully to the production export), because
+   without it a refusal caused by ordinary ownership permissions looks identical
+   to one caused by read-only. Second, the shadow `engine.Store` is not itself
+   write-refusing: a direct `WriteAt` on it succeeds. Nothing reaches it that way
+   today — the only caller is the handler, and every write command is refused
+   before the store is touched — but the guarantee lives in the handler, not in
+   the store, and that is the layer to re-check if a future caller is added.
+
 ## Verification
 
 Each anti-goal maps to a check. The last one is the claim that matters.
