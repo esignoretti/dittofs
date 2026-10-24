@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/marmos91/dittofs/internal/logger"
@@ -66,7 +67,14 @@ type OpenSnapshotExport struct {
 	metaStore metadata.Store
 	metaDir   string
 	jrnlDir   string
-	closed    bool
+
+	// closeOnce guards every field Close reads and clears. Close is reachable
+	// from two places that do not coordinate — the connection's deferred release
+	// and the caller that opened the export — so "idempotent" is not enough:
+	// without this both run, both see closed == false, and they race on the
+	// fields they clear. The race detector reports it, and in a real run it would
+	// double-close the block store.
+	closeOnce sync.Once
 	closeErr  error
 }
 
@@ -387,11 +395,15 @@ func (e *OpenSnapshotExport) BlockStore() *engine.Store { return e.bs }
 // store and metadata store are closed, something could still read the snapshot
 // directory, and releasing early would let a delete race that read.
 func (e *OpenSnapshotExport) Close() error {
-	if e == nil || e.closed {
-		return e.closeErr
+	if e == nil {
+		return nil
 	}
-	e.closed = true
+	e.closeOnce.Do(e.close)
+	return e.closeErr
+}
 
+// close does the work, once.
+func (e *OpenSnapshotExport) close() {
 	var errs []error
 	if e.bs != nil {
 		if err := e.bs.Close(); err != nil {
@@ -427,5 +439,4 @@ func (e *OpenSnapshotExport) Close() error {
 	}
 
 	e.closeErr = errors.Join(errs...)
-	return e.closeErr
 }

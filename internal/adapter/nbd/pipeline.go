@@ -416,7 +416,15 @@ func (p *pipeline) readLoop(ctx context.Context, work chan<- command, cancel con
 		//
 		// p.exp is reassigned here and only here, which is why the reader stamps
 		// commands with it and workers never read it.
-		if time.Since(lastResolve) >= p.h.sizeRefresh {
+		//
+		// A snapshot export is never refreshed. Re-resolving it would open the
+		// snapshot again — a fresh replay, a fresh metadata service, a fresh
+		// block store and a fresh open registration — once a second, and the
+		// previous registration would be released only by the connection's
+		// deferred close. The leak would make the snapshot undeletable while the
+		// connection lived. It is also pointless: a snapshot's size cannot
+		// change, because nothing can write to it.
+		if p.exp.closeFn == nil && time.Since(lastResolve) >= p.h.sizeRefresh {
 			if refreshed, err := p.h.exporter.Resolve(ctx, p.exp.Name); err == nil {
 				p.exp = refreshed
 			}

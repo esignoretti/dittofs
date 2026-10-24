@@ -62,5 +62,5 @@ func (h *Handler) handleFlush(ctx context.Context, bs BlockStore, exp *Export, r
 // commands, that stops being true and this barrier needs explicit tracking of
 // in-flight writes.
 func (h *Handler) commit(ctx context.Context, bs BlockStore, exp *Export) error {
-	return common.FlushStableWrite(h.authContext(ctx, exp), h.meta, bs, exp.Handle, exp.PayloadID, true)
+	return common.FlushStableWrite(h.authContext(ctx, exp), h.metaFor(exp), bs, exp.Handle, exp.PayloadID, true)
 }

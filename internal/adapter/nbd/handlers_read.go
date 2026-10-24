@@ -79,8 +79,8 @@ func (h *Handler) handleRead(ctx context.Context, bs BlockStore, exp *Export, re
 	// The nil guard is not defensive noise: newTestHandler in connection_test.go
 	// passes nil for meta, and every store-fault dispatch test would panic
 	// without it.
-	if h.meta != nil {
-		if _, err := h.meta.PrepareRead(h.authContext(ctx, exp), exp.Handle); err != nil {
+	if h.metaFor(exp) != nil {
+		if _, err := h.metaFor(exp).PrepareRead(h.authContext(ctx, exp), exp.Handle); err != nil {
 			return errorReply(req.Cookie, mapError(err))
 		}
 	}

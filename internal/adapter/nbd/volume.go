@@ -73,6 +73,14 @@ func (r *RuntimeExporter) Resolve(ctx context.Context, name string) (*Export, er
 		return nil, ErrUnknownExport
 	}
 
+	// A snapshot export is a different shape with a different owner: it is
+	// opened through the runtime and carries its own metadata service and block
+	// store. It is claimed first, and anything not of that shape falls through
+	// to the volume resolution below unchanged.
+	if share, snapID, volume, ok := parseSnapshotExportName(name); ok {
+		return r.resolveSnapshot(ctx, name, share, snapID, volume)
+	}
+
 	// The volume is the last path element; everything before it names the
 	// share. A share name may itself contain slashes, so the split is from the
 	// right.

@@ -37,7 +37,7 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
 	// newSize is offset+length, already shown not to wrap. It is a ceiling
 	// rather than a truncation: the metadata layer applies the maximum of the
 	// old and new sizes, so a write at a lower offset never shrinks the file.
-	intent, err := h.meta.PrepareWrite(authCtx, exp.Handle, req.Offset+uint64(req.Length))
+	intent, err := h.metaFor(exp).PrepareWrite(authCtx, exp.Handle, req.Offset+uint64(req.Length))
 	if err != nil {
 		return errorReply(req.Cookie, mapError(err))
 	}
@@ -51,7 +51,7 @@ func (h *Handler) handleWrite(ctx context.Context, bs BlockStore, exp *Export, r
 		return errorReply(req.Cookie, mapError(err))
 	}
 
-	if _, err := h.meta.CommitWrite(authCtx, intent); err != nil {
+	if _, err := h.metaFor(exp).CommitWrite(authCtx, intent); err != nil {
 		return errorReply(req.Cookie, mapError(err))
 	}
 
@@ -258,7 +258,7 @@ func (h *Handler) handleDiscard(ctx context.Context, bs BlockStore, exp *Export,
 	// Built per command and never cached, for the same reason handleWrite builds
 	// its own: it embeds the command's Context.
 	authCtx := h.authContext(ctx, exp)
-	res, err := h.meta.PunchHole(authCtx, exp.Handle, req.Offset, uint64(req.Length))
+	res, err := h.metaFor(exp).PunchHole(authCtx, exp.Handle, req.Offset, uint64(req.Length))
 	if err != nil {
 		return errorReply(req.Cookie, mapError(err))
 	}

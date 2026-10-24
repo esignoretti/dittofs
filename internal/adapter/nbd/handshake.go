@@ -109,6 +109,29 @@ type Export struct {
 	Handle metadata.FileHandle
 	// ReadOnly reports whether the share that holds the volume is read-only.
 	ReadOnly bool
+
+	// Meta is the metadata service this export's handles belong to. Nil means
+	// the handler's own service, which is the production case: every export a
+	// RuntimeExporter resolves out of a share addresses the same service.
+	//
+	// A snapshot export sets it, because a snapshot is served from its own
+	// metadata service over a replayed store (see runtime.OpenSnapshotAsExport).
+	// It travels on the export rather than on the Handler because the Handler is
+	// shared by every connection while the service is per export — and the
+	// export is the one thing the handshake returns per connection.
+	Meta *metadata.Service
+
+	// store is the block store this export reads through, when it is not the
+	// share's own. Set for a snapshot export, whose store is a private
+	// hydration cache over the shared remote; nil means "resolve it from the
+	// handle", which is what common.ResolveForWrite does for a volume.
+	store BlockStore
+
+	// closeFn releases whatever the resolution acquired, and is called once when
+	// the connection that resolved this export ends. Nil for a volume, which
+	// acquires nothing: its store and service belong to the runtime and outlive
+	// every connection.
+	closeFn func() error
 }
 
 // TransmissionFlags returns the flag word the client is handed for this

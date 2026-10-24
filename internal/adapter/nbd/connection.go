@@ -152,6 +152,24 @@ func (h *Handler) TakeDegraded() int64 { return h.degraded.Swap(0) }
 // every later command on the connection. ShareReadOnly is the client-facing
 // ceiling and is applied here, not during the handshake's export resolution,
 // which deliberately resolves an export the operator already configured.
+// metaFor returns the metadata service an export's handles belong to.
+//
+// Production resolves every export out of the one service the runtime holds, so
+// this is h.meta for all of them. A snapshot export carries its own service over
+// a replayed store, and using h.meta for it would resolve its handles against
+// the live volume's metadata — the reads would return production's bytes while
+// the connection believed it was serving a snapshot.
+//
+// The nil check is not defensive habit: tests build handlers with a nil service
+// on purpose (newTestHandler passes nil for meta), and those tests exercise the
+// store path without a metadata layer.
+func (h *Handler) metaFor(exp *Export) *metadata.Service {
+	if exp != nil && exp.Meta != nil {
+		return exp.Meta
+	}
+	return h.meta
+}
+
 func (h *Handler) authContext(ctx context.Context, exp *Export) *metadata.AuthContext {
 	uid, gid := h.id.UID, h.id.GID
 	return &metadata.AuthContext{
@@ -241,10 +259,25 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 		return err
 	}
 
+	// A snapshot export acquired an open registration and two private stores, so
+	// the connection that resolved it is what releases them. Deferred here rather
+	// than in Serve so it runs for a connection that fails to resolve its store
+	// too — the export was already opened by then, and a leaked registration
+	// makes the snapshot undeletable for the process lifetime.
+	if exp.closeFn != nil {
+		defer func() {
+			if cerr := exp.closeFn(); cerr != nil {
+				logger.Warn("NBD snapshot export did not close cleanly",
+					"export", exp.Name, "error", cerr)
+			}
+		}()
+	}
+
 	// Resolved once, not per command: the handle is fixed for the connection's
 	// life, so a per-command resolve would decode a handle and take a lock on
-	// every 4 KiB read.
-	bs, err := h.stores(ctx, exp)
+	// every 4 KiB read. An export that brought its own store (a snapshot) skips
+	// resolution entirely: its store is private to it and already open.
+	bs, err := h.storeFor(ctx, exp)
 	if err != nil {
 		// Not a wire error: the connection ends, because every subsequent
 		// command would fail the same way. It is counted so a probe can report
@@ -262,6 +295,21 @@ func (h *Handler) serve(ctx context.Context, conn net.Conn) error {
 	// does, because the three roles are already separated: a worker never touches
 	// the connection, and the reader is the only goroutine that advances it.
 	return newPipeline(h, conn, bs, exp, ctx, h.maxInFlight).run()
+}
+
+// storeFor returns the block store an export reads through.
+//
+// A volume has none of its own: its store belongs to the share, and
+// common.ResolveForWrite finds it from the handle, so two connections to one
+// export reach the same journal and the same flush locks (which is what
+// NBD_FLAG_CAN_MULTI_CONN rests on). A snapshot carries its own, because its
+// bytes must come from its replayed manifest over the shared remote and not from
+// the volume the snapshot was taken of.
+func (h *Handler) storeFor(ctx context.Context, exp *Export) (BlockStore, error) {
+	if exp.store != nil {
+		return exp.store, nil
+	}
+	return h.stores(ctx, exp)
 }
 
 // writeReply writes one simple reply, header then payload.
