@@ -306,9 +306,20 @@ only directory the production exporter reads and a volume name cannot contain
 1. Operator (or the boot rig) requests a snapshot export by name.
 2. **Check the preconditions, all before creating anything.** Refuse unless
    `State == StateReady`; refuse `degraded` unless the caller opted in (its
-   manifest is short by `DegradedEntries` rows); refuse a share with no remote
-   store, because there is nothing to hydrate from and every read would return
-   zeros. Failing here costs nothing to unwind.
+   manifest is short by `DegradedEntries` rows); refuse a share whose block
+   store has no remote, because there is nothing to hydrate from and every read
+   would return zeros. Failing here costs nothing to unwind.
+
+   The no-remote refusal is a guard, not a reachable production state: every
+   share must reference a block store, and both store types this release can
+   build (`fs` and `memory`) wire a remote — a share configured with no remote
+   is refused at `AddShare` ("failed to create remote store"). It is kept
+   because the shadow store's correctness depends on it: a share that somehow
+   had no remote would produce an export that reads as a blank disk with no
+   error, which is the one failure mode worth a cheap precondition even when
+   nothing today can reach it. It is therefore tested by unit assertion on the
+   guard rather than by an end-to-end fixture, which cannot construct the
+   state.
 3. Register the snapshot as open (Part 3) so a concurrent delete is refused
    rather than racing the boot.
 4. Replay. Create a fresh Badger metadata store at
@@ -638,7 +649,7 @@ Each anti-goal maps to a check. The last one is the claim that matters.
 | GC cannot reclaim a snapshot's chunks | Create a snapshot, overwrite the volume, run GC, boot from the snapshot. `SnapshotHoldProvider`'s suite covers the hold; this covers the integration. |
 | A snapshot export reads the snapshot's manifest, not production's | Open a snapshot, write a distinct pattern to production, read the same range through the snapshot, assert the pre-write bytes. A behaviour test, not a wiring assertion — the wrong wiring is silent. |
 | A snapshot export is never writable | Attempt WRITE, WRITE_ZEROES, TRIM and DISCARD through a snapshot export; assert `ErrEPERM` on each. Assert the handshake advertises `FlagReadOnly`. FLUSH is deliberately *not* in this list: it is not a data write, and `validateWrite` lets it through because the shadow has nothing to flush — a FLUSH on a snapshot export succeeds as a no-op, which is correct. |
-| A snapshot of a local-only share is refused, not served as zeros | Create a snapshot on a share with no remote; assert the open fails with a clear error and no export is registered. |
+| A snapshot of a share with no remote is refused, not served as zeros | Assert on the guard directly: no share can be constructed without a block store, and both store types wire a remote, so the refusal is verified by unit assertion rather than by an end-to-end fixture. The invariant it protects — a shadow with no remote reads as a blank disk with no error — is what the guard is for. |
 | A snapshot cannot be deleted while it is open | Open a snapshot export, attempt `DeleteSnapshot`, assert `ErrSnapshotOpen` (409) and that the export still reads correctly; close, assert the delete then succeeds. |
 | Deleting one snapshot does not affect another that is open | Open A, delete B, assert B is deleted and A still reads correctly. This is the per-snapshot scoping test. |
 | A rehydrated volume is independent of its snapshot | Rehydrate, write a distinct pattern to the new volume, then read the same range through the snapshot and assert the original bytes. Assert the snapshot is still openable and still read-only. |

@@ -133,6 +133,22 @@ type nonClosingRemote struct {
 	remote.RemoteStore
 }
 
+// NonClosing wraps a remote store so closing the store that holds it does not
+// close the remote itself. Exported for a second store sharing one remote — a
+// snapshot's read-only shadow over the volume production is still writing —
+// which cannot reach the unexported wrapper.
+//
+// Use this rather than a bare remote.RemoteStore embedding: the wrapper also
+// forwards Durable and ReadChunk, and dropping either makes the shadow report
+// NOT durable for every commit and fail to read a chunk whose only copy lives
+// inside a packed block.
+func NonClosing(rs remote.RemoteStore) remote.RemoteStore {
+	if rs == nil {
+		return nil
+	}
+	return &nonClosingRemote{rs}
+}
+
 func (n *nonClosingRemote) Close() error { return nil }
 
 // Durable delegates to the wrapped remote chain so the no-op-Close wrapper
