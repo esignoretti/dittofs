@@ -185,6 +185,10 @@ type Runtime struct {
 	// reading, so nothing should be refused.
 	openSnapshots openSnapshotRegistry
 
+	// rehydrates tracks in-flight and recently finished snapshot-to-volume
+	// rehydrations so a caller can poll one by id. See snapshot_rehydrate.go.
+	rehydrates *rehydrateRegistry
+
 	// restoreLocks serializes RestoreSnapshot per share. Restore requires
 	// the share be disabled, but two concurrent restore calls both observe
 	// "disabled" and would otherwise interleave their destructive metadata
@@ -262,6 +266,7 @@ func New(s store.Store) *Runtime {
 		identitySvc:      identity.New(),
 		statusCheckers:   newCheckerCache(StatusCacheTTL),
 		gcReg:            newGCRegistry(),
+		rehydrates:       newRehydrateRegistry(64),
 	}
 
 	// Long-lived ctx for snapshot orchestration goroutines.

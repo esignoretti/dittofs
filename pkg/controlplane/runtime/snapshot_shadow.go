@@ -276,15 +276,19 @@ func (r *Runtime) resolveVolumeInShadow(ctx context.Context, svc *metadata.Servi
 		return nil, fmt.Errorf("shadow metadata has no root handle for share %q: %w", shareName, err)
 	}
 	authCtx := &metadata.AuthContext{Context: ctx, Identity: id}
-	volumes, err := svc.Lookup(authCtx, root, "volumes")
-	if err != nil {
-		return nil, fmt.Errorf("shadow metadata: look up volumes/: %w", err)
+	// <share>/volumes/<volume> is the layout the NBD adapter provisions, and it is
+	// tried first. A share whose files sit at its root is also legal — that is how
+	// the snapshot tests and older shares lay them out — so a missing volumes/
+	// directory falls back to the root rather than failing. The layout belongs to
+	// the share, not to this code.
+	if volumes, lerr := svc.Lookup(authCtx, root, "volumes"); lerr == nil {
+		if volumesHandle, herr := metadata.EncodeFileHandle(volumes); herr == nil {
+			if file, ferr := svc.Lookup(authCtx, volumesHandle, volume); ferr == nil {
+				return file, nil
+			}
+		}
 	}
-	volumesHandle, err := metadata.EncodeFileHandle(volumes)
-	if err != nil {
-		return nil, fmt.Errorf("shadow metadata: encode volumes/ handle: %w", err)
-	}
-	file, err := svc.Lookup(authCtx, volumesHandle, volume)
+	file, err := svc.Lookup(authCtx, root, volume)
 	if err != nil {
 		return nil, fmt.Errorf("shadow metadata: look up volume %q: %w", volume, err)
 	}
