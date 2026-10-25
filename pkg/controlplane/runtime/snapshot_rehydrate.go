@@ -191,6 +191,11 @@ func (r *Runtime) RehydrateSnapshot(ctx context.Context, share, snapID, srcVolum
 		// Chunks are addressed by hash inside one remote store. Without one there
 		// is nothing for the new volume's references to resolve to, and the copy
 		// would produce a volume that reads as zeros.
+		//
+		// Not shared with the shadow's checkShareCanHydrate: that one returns the
+		// shadow's sentinel and says "open snapshot", both wrong here, and
+		// factoring two three-line guards behind a parameterised sentinel would
+		// cost more than it saves.
 		return nil, fmt.Errorf("rehydrate into share %q: the share has no remote store: %w",
 			share, errRehydrateNoRemote)
 	}
