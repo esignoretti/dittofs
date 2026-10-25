@@ -24,13 +24,29 @@ import (
 // fakeSnapshotRuntime is a minimal SnapshotRuntime test double. Each
 // field overrides the corresponding method; the zero value returns nil.
 type fakeSnapshotRuntime struct {
-	createFn  func(ctx context.Context, share string, opts runtime.CreateSnapshotOpts) (string, error)
-	waitFn    func(ctx context.Context, share, snapID string) (*models.Snapshot, error)
-	restoreFn func(ctx context.Context, share, snapID string, opts runtime.RestoreSnapshotOpts) (string, error)
-	getFn     func(ctx context.Context, share, snapID string) (*models.Snapshot, error)
-	listFn    func(ctx context.Context, share string) ([]*models.Snapshot, error)
-	deleteFn  func(ctx context.Context, share, snapID string) error
-	usageFn   func(ctx context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error)
+	createFn     func(ctx context.Context, share string, opts runtime.CreateSnapshotOpts) (string, error)
+	waitFn       func(ctx context.Context, share, snapID string) (*models.Snapshot, error)
+	restoreFn    func(ctx context.Context, share, snapID string, opts runtime.RestoreSnapshotOpts) (string, error)
+	getFn        func(ctx context.Context, share, snapID string) (*models.Snapshot, error)
+	listFn       func(ctx context.Context, share string) ([]*models.Snapshot, error)
+	deleteFn     func(ctx context.Context, share, snapID string) error
+	usageFn      func(ctx context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error)
+	rehydrateFn  func(ctx context.Context, share, snapID, src, dst string) (*runtime.RehydrateJob, error)
+	rehydrateJob *runtime.RehydrateJob
+}
+
+func (f *fakeSnapshotRuntime) RehydrateSnapshot(ctx context.Context, share, snapID, src, dst string) (*runtime.RehydrateJob, error) {
+	if f.rehydrateFn != nil {
+		return f.rehydrateFn(ctx, share, snapID, src, dst)
+	}
+	return &runtime.RehydrateJob{ID: "job-1", Share: share, SnapshotID: snapID, SourceVolume: src, Volume: dst}, nil
+}
+
+func (f *fakeSnapshotRuntime) GetRehydrateJob(id string) (*runtime.RehydrateJob, bool) {
+	if f.rehydrateJob != nil && f.rehydrateJob.ID == id {
+		return f.rehydrateJob, true
+	}
+	return nil, false
 }
 
 func (f *fakeSnapshotRuntime) SnapshotUsage(ctx context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error) {
@@ -87,9 +103,11 @@ func newSnapshotRouter(h *SnapshotHandler) http.Handler {
 			r.Post("/", h.Create)
 			r.Get("/", h.List)
 			r.Get("/usage", h.Usage)
+			r.Get("/rehydrate/{jobID}", h.GetRehydrateJob)
 			r.Get("/{id}", h.Get)
 			r.Delete("/{id}", h.Remove)
 			r.Post("/{id}/restore", h.Restore)
+			r.Post("/{id}/rehydrate", h.Rehydrate)
 		})
 	})
 	return r
@@ -104,6 +122,7 @@ func newSnapshotRouterWithGlobalTimeout(h *SnapshotHandler, d time.Duration) htt
 	r.Route("/api/v1/shares", func(r chi.Router) {
 		r.Route("/{name}/snapshots", func(r chi.Router) {
 			r.Post("/{id}/restore", h.Restore)
+			r.Post("/{id}/rehydrate", h.Rehydrate)
 		})
 	})
 	return r
@@ -606,5 +625,101 @@ func TestSnapshotHandler_Usage_PassesTheIDFilter(t *testing.T) {
 	}
 	if gotID != "snap-abc" {
 		t.Errorf("handler saw id %q, want %q", gotID, "snap-abc")
+	}
+}
+
+// TestSnapshotHandler_Rehydrate_Returns202AndTheJob pins the asynchronous
+// contract: a rehydrate that returned 200 would tell the caller the volume is
+// ready when the job has only started, and a caller that then mounted it would
+// find nothing there.
+func TestSnapshotHandler_Rehydrate_Returns202AndTheJob(t *testing.T) {
+	var gotSrc, gotDst string
+	fake := &fakeSnapshotRuntime{
+		rehydrateFn: func(_ context.Context, share, snapID, src, dst string) (*runtime.RehydrateJob, error) {
+			gotSrc, gotDst = src, dst
+			return &runtime.RehydrateJob{
+				ID:           "job-42",
+				State:        runtime.RehydrateStatePending,
+				Share:        share,
+				SnapshotID:   snapID,
+				SourceVolume: src,
+				Volume:       dst,
+				StartedAt:    time.Now(),
+			}, nil
+		},
+	}
+	h := NewSnapshotHandler(fake, time.Second, nil)
+
+	body := `{"source_volume":"boot","volume":"restored"}`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/shares/data/snapshots/snap-1/rehydrate",
+		strings.NewReader(body))
+	newSnapshotRouter(h).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body %s)", rr.Code, rr.Body.String())
+	}
+	if gotSrc != "boot" || gotDst != "restored" {
+		t.Errorf("handler saw src=%q dst=%q, want boot and restored", gotSrc, gotDst)
+	}
+	var job dto.RehydrateJob
+	if err := json.Unmarshal(rr.Body.Bytes(), &job); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if job.ID != "job-42" || job.State != runtime.RehydrateStatePending {
+		t.Errorf("job = %+v, want id job-42 state pending", job)
+	}
+}
+
+// TestSnapshotHandler_Rehydrate_RefusesARequestWithoutBothNames pins that the
+// two names are not silently defaulted. A snapshot holds every volume in the
+// share, so there is no sensible default source, and defaulting the destination
+// would create a volume the caller did not name.
+func TestSnapshotHandler_Rehydrate_RefusesARequestWithoutBothNames(t *testing.T) {
+	called := false
+	fake := &fakeSnapshotRuntime{
+		rehydrateFn: func(_ context.Context, _, _, _, _ string) (*runtime.RehydrateJob, error) {
+			called = true
+			return nil, errors.New("rehydrate: both the snapshot's volume name and the destination volume name are required")
+		},
+	}
+	h := NewSnapshotHandler(fake, time.Second, nil)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/shares/data/snapshots/snap-1/rehydrate",
+		strings.NewReader(`{"volume":"restored"}`))
+	newSnapshotRouter(h).ServeHTTP(rr, req)
+
+	if !called {
+		t.Fatal("the handler never reached the runtime, so the missing-name error path is untested")
+	}
+	if rr.Code == http.StatusAccepted {
+		t.Fatalf("status = 202 for a request with no source volume")
+	}
+}
+
+// TestSnapshotHandler_GetRehydrateJob_RefusesAnotherSharesJob pins the scope
+// check. A job ID is a UUID, but an operator in one share must not be able to
+// read another share's volume names through it.
+func TestSnapshotHandler_GetRehydrateJob_RefusesAnotherSharesJob(t *testing.T) {
+	fake := &fakeSnapshotRuntime{
+		rehydrateJob: &runtime.RehydrateJob{ID: "job-9", Share: "/other", Volume: "secret"},
+	}
+	h := NewSnapshotHandler(fake, time.Second, nil)
+
+	rr := httptest.NewRecorder()
+	newSnapshotRouter(h).ServeHTTP(rr,
+		httptest.NewRequest(http.MethodGet, "/api/v1/shares/data/snapshots/rehydrate/job-9", nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: a job on another share must not be readable", rr.Code)
+	}
+
+	// The owning share gets it.
+	fake.rehydrateJob = &runtime.RehydrateJob{ID: "job-9", Share: "/data", Volume: "restored"}
+	rr = httptest.NewRecorder()
+	newSnapshotRouter(h).ServeHTTP(rr,
+		httptest.NewRequest(http.MethodGet, "/api/v1/shares/data/snapshots/rehydrate/job-9", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for the owning share (body %s)", rr.Code, rr.Body.String())
 	}
 }

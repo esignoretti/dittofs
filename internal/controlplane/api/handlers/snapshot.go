@@ -38,6 +38,10 @@ type SnapshotRuntime interface {
 	// that already wires a snapshot runtime gets the report without new
 	// plumbing.
 	SnapshotUsage(ctx context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error)
+	// RehydrateSnapshot starts a job that copies a snapshot into a new volume.
+	RehydrateSnapshot(ctx context.Context, share, snapID, srcVolume, dstVolume string) (*runtime.RehydrateJob, error)
+	// GetRehydrateJob reports a job's current state.
+	GetRehydrateJob(id string) (*runtime.RehydrateJob, bool)
 }
 
 // SnapshotHandler serves the per-share REST surface for snapshot
@@ -239,6 +243,78 @@ func (h *SnapshotHandler) Usage(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	WriteJSON(w, http.StatusOK, out)
+}
+
+// Rehydrate handles POST /api/v1/shares/{name}/snapshots/{id}/rehydrate.
+//
+// It starts the job and returns 202 with the job record. Rehydration is
+// asynchronous because it replays the snapshot's metadata and writes one chunk
+// reference per block: both scale with the volume, so a synchronous request
+// would time out on exactly the volumes worth snapshotting.
+//
+// The snapshot itself is untouched and stays bootable. This is a copy OUT of it,
+// never a promotion of it, which is why it can be done repeatedly.
+func (h *SnapshotHandler) Rehydrate(w http.ResponseWriter, r *http.Request) {
+	name, snapID := h.resolveShareAndSnap(w, r)
+	if name == "" {
+		return
+	}
+	var req dto.RehydrateSnapshotRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	job, err := h.runtime.RehydrateSnapshot(r.Context(), name, snapID, req.SourceVolume, req.Volume)
+	if err != nil {
+		handleErr(w, "snapshot rehydrate", []any{"share", name, "snapshot_id", snapID}, err)
+		return
+	}
+	WriteJSON(w, http.StatusAccepted, rehydrateJobToWire(job))
+}
+
+// GetRehydrateJob handles GET /api/v1/shares/{name}/snapshots/rehydrate/{jobID}.
+//
+// 404 when the id is unknown, which includes a job evicted from the registry's
+// bounded window. That is deliberate: the alternative is unbounded retention of
+// finished job records, and a caller polling a job from an hour ago has already
+// lost interest.
+func (h *SnapshotHandler) GetRehydrateJob(w http.ResponseWriter, r *http.Request) {
+	name := h.resolveShare(w, r)
+	if name == "" {
+		return
+	}
+	jobID := chi.URLParam(r, "jobID")
+	job, ok := h.runtime.GetRehydrateJob(jobID)
+	if !ok {
+		NotFound(w, "rehydrate job not found")
+		return
+	}
+	// A job is scoped to a share; answering for the wrong share would leak one
+	// share's volume names to another's operator.
+	if job.Share != name {
+		NotFound(w, "rehydrate job not found")
+		return
+	}
+	WriteJSON(w, http.StatusOK, rehydrateJobToWire(job))
+}
+
+// rehydrateJobToWire converts a runtime job into its wire form.
+func rehydrateJobToWire(job *runtime.RehydrateJob) dto.RehydrateJob {
+	out := dto.RehydrateJob{
+		ID:           job.ID,
+		State:        job.State,
+		Share:        job.Share,
+		SnapshotID:   job.SnapshotID,
+		SourceVolume: job.SourceVolume,
+		Volume:       job.Volume,
+		Blocks:       job.Blocks,
+		Bytes:        job.Bytes,
+		StartedAt:    job.StartedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		Error:        job.Err,
+	}
+	if !job.FinishedAt.IsZero() {
+		out.FinishedAt = job.FinishedAt.UTC().Format("2006-01-02T15:04:05Z")
+	}
+	return out
 }
 
 // Restore handles POST /api/v1/shares/{name}/snapshots/{id}/restore.

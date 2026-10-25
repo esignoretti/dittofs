@@ -67,6 +67,12 @@ type SnapshotUsageReport = dto.SnapshotUsageReport
 // SnapshotUsage mirrors the per-snapshot wire DTO.
 type SnapshotUsage = dto.SnapshotUsage
 
+// RehydrateSnapshotRequest mirrors the wire DTO.
+type RehydrateSnapshotRequest = dto.RehydrateSnapshotRequest
+
+// RehydrateJob mirrors the wire DTO.
+type RehydrateJob = dto.RehydrateJob
+
 // SnapshotUsage returns what the share's snapshots hold and what deleting one
 // would free. Pass an empty snapID for the whole share, or a snapshot ID to
 // report that one alone — its unique/shared split is still measured against
@@ -81,6 +87,52 @@ func (c *Client) SnapshotUsage(share, snapID string) (*SnapshotUsageReport, erro
 		return nil, err
 	}
 	return &report, nil
+}
+
+// RehydrateSnapshot starts a job that copies the snapshot's volume into a new
+// volume. It returns as soon as the job is accepted; poll GetRehydrateJob or
+// use WaitForRehydrateJob.
+func (c *Client) RehydrateSnapshot(share, id string, req RehydrateSnapshotRequest) (*RehydrateJob, error) {
+	var job RehydrateJob
+	if err := c.post(snapshotPath(share, id)+"/rehydrate", req, &job); err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+// GetRehydrateJob reports a job's current state.
+func (c *Client) GetRehydrateJob(share, jobID string) (*RehydrateJob, error) {
+	var job RehydrateJob
+	if err := c.get(snapshotsPath(share)+"/rehydrate/"+url.PathEscape(jobID), &job); err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+// WaitForRehydrateJob polls until the job reaches a terminal state or ctx ends.
+//
+// It returns the job in whatever state it reached, including "failed" — a failed
+// job is a result the caller must report, not an error to hide, because the
+// server's message is the only explanation of why the copy did not happen.
+func (c *Client) WaitForRehydrateJob(ctx context.Context, share, jobID string, pollEvery time.Duration) (*RehydrateJob, error) {
+	if pollEvery <= 0 {
+		pollEvery = 500 * time.Millisecond
+	}
+	for {
+		job, err := c.GetRehydrateJob(share, jobID)
+		if err != nil {
+			return nil, err
+		}
+		switch job.State {
+		case "done", "failed":
+			return job, nil
+		}
+		select {
+		case <-ctx.Done():
+			return job, ctx.Err()
+		case <-time.After(pollEvery):
+		}
+	}
 }
 
 // GetSnapshot returns the detail view of a single snapshot.

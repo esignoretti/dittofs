@@ -26,6 +26,9 @@ type fakeClient struct {
 	usageReport    *apiclient.SnapshotUsageReport
 	usageErr       error
 	usageCalls     []string
+	rehydrateJob   *apiclient.RehydrateJob
+	rehydrateErr   error
+	rehydrateReqs  []apiclient.RehydrateSnapshotRequest
 }
 
 func (f *fakeClient) CreateSnapshot(share string, req apiclient.CreateSnapshotRequest) (*apiclient.CreateSnapshotResponse, error) {
@@ -57,6 +60,35 @@ func (f *fakeClient) GetSnapshot(share, id string) (*apiclient.Snapshot, error) 
 		return s, nil
 	}
 	return nil, &apiclient.APIError{Title: "Not Found", Detail: "snapshot not found", StatusCode: 404}
+}
+
+func (f *fakeClient) RehydrateSnapshot(share, id string, req apiclient.RehydrateSnapshotRequest) (*apiclient.RehydrateJob, error) {
+	f.rehydrateReqs = append(f.rehydrateReqs, req)
+	if f.rehydrateErr != nil {
+		return nil, f.rehydrateErr
+	}
+	if f.rehydrateJob != nil {
+		return f.rehydrateJob, nil
+	}
+	return &apiclient.RehydrateJob{
+		ID:           "job-new",
+		State:        "pending",
+		Share:        share,
+		SnapshotID:   id,
+		SourceVolume: req.SourceVolume,
+		Volume:       req.Volume,
+	}, nil
+}
+
+func (f *fakeClient) GetRehydrateJob(share, jobID string) (*apiclient.RehydrateJob, error) {
+	if f.rehydrateJob != nil && f.rehydrateJob.ID == jobID {
+		return f.rehydrateJob, nil
+	}
+	return nil, &apiclient.APIError{Title: "Not Found", StatusCode: 404}
+}
+
+func (f *fakeClient) WaitForRehydrateJob(ctx context.Context, share, jobID string, _ time.Duration) (*apiclient.RehydrateJob, error) {
+	return f.GetRehydrateJob(share, jobID)
 }
 
 func (f *fakeClient) SnapshotUsage(share, snapID string) (*apiclient.SnapshotUsageReport, error) {

@@ -19,6 +19,9 @@ type snapshotClient interface {
 	GetSnapshot(share, id string) (*apiclient.Snapshot, error)
 	RemoveSnapshot(share, id string) error
 	SnapshotUsage(share, snapID string) (*apiclient.SnapshotUsageReport, error)
+	RehydrateSnapshot(share, id string, req apiclient.RehydrateSnapshotRequest) (*apiclient.RehydrateJob, error)
+	GetRehydrateJob(share, jobID string) (*apiclient.RehydrateJob, error)
+	WaitForRehydrateJob(ctx context.Context, share, jobID string, pollEvery time.Duration) (*apiclient.RehydrateJob, error)
 	RestoreSnapshot(share, id string, req apiclient.RestoreSnapshotRequest) (*apiclient.RestoreSnapshotResponse, error)
 	WaitForSnapshot(ctx context.Context, share, id string, pollEvery time.Duration) (*apiclient.Snapshot, error)
 	GetShare(name string) (*apiclient.Share, error)

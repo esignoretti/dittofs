@@ -243,9 +243,11 @@ func NewRouter(rt *runtime.Runtime, jwtService *auth.JWTService, cpStore store.S
 					// Registered before /{id} so "usage" is a literal segment
 					// rather than a snapshot ID.
 					r.Get("/usage", snapshotHandler.Usage)
+					r.Get("/rehydrate/{jobID}", snapshotHandler.GetRehydrateJob)
 					r.Get("/{id}", snapshotHandler.Get)
 					r.Delete("/{id}", snapshotHandler.Remove)
 					r.Post("/{id}/restore", snapshotHandler.Restore)
+					r.Post("/{id}/rehydrate", snapshotHandler.Rehydrate)
 				})
 
 				// Per-share snapshot policy (schedule + retention). RequireAdmin

@@ -61,6 +61,36 @@ type SnapshotUsageReport struct {
 	Skipped []string `json:"skipped,omitempty"`
 }
 
+// RehydrateSnapshotRequest is the body for POST .../snapshots/{id}/rehydrate.
+type RehydrateSnapshotRequest struct {
+	// SourceVolume is the volume inside the snapshot to copy. A snapshot is
+	// share-scoped, so it holds every volume in the share and one must be named.
+	SourceVolume string `json:"source_volume"`
+	// Volume is the name of the NEW volume to create.
+	Volume string `json:"volume"`
+}
+
+// RehydrateJob is a snapshot-to-volume rehydration in progress or finished.
+//
+// Rehydration is a job rather than a request because replaying the snapshot's
+// metadata and writing one chunk reference per block both scale with the
+// volume. The caller polls GET .../rehydrate/{jobID} for the outcome.
+type RehydrateJob struct {
+	ID           string `json:"id"`
+	State        string `json:"state"`
+	Share        string `json:"share"`
+	SnapshotID   string `json:"snapshot_id"`
+	SourceVolume string `json:"source_volume"`
+	Volume       string `json:"volume"`
+	// Blocks is how many chunk references the copy placed: the volume's size in
+	// chunks, which is what the copy produced without moving bytes.
+	Blocks     int    `json:"blocks"`
+	Bytes      uint64 `json:"bytes"`
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
 // CreateSnapshotRequest is the body for POST .../snapshots.
 type CreateSnapshotRequest struct {
 	Name     string `json:"name,omitempty"`
