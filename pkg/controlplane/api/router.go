@@ -240,6 +240,9 @@ func NewRouter(rt *runtime.Runtime, jwtService *auth.JWTService, cpStore store.S
 				r.Route("/{name}/snapshots", func(r chi.Router) {
 					r.Post("/", snapshotHandler.Create)
 					r.Get("/", snapshotHandler.List)
+					// Registered before /{id} so "usage" is a literal segment
+					// rather than a snapshot ID.
+					r.Get("/usage", snapshotHandler.Usage)
 					r.Get("/{id}", snapshotHandler.Get)
 					r.Delete("/{id}", snapshotHandler.Remove)
 					r.Post("/{id}/restore", snapshotHandler.Restore)

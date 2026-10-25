@@ -18,6 +18,7 @@ type snapshotClient interface {
 	ListSnapshots(share string) ([]apiclient.Snapshot, error)
 	GetSnapshot(share, id string) (*apiclient.Snapshot, error)
 	RemoveSnapshot(share, id string) error
+	SnapshotUsage(share, snapID string) (*apiclient.SnapshotUsageReport, error)
 	RestoreSnapshot(share, id string, req apiclient.RestoreSnapshotRequest) (*apiclient.RestoreSnapshotResponse, error)
 	WaitForSnapshot(ctx context.Context, share, id string, pollEvery time.Duration) (*apiclient.Snapshot, error)
 	GetShare(name string) (*apiclient.Share, error)

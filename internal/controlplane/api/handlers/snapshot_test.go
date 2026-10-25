@@ -30,6 +30,14 @@ type fakeSnapshotRuntime struct {
 	getFn     func(ctx context.Context, share, snapID string) (*models.Snapshot, error)
 	listFn    func(ctx context.Context, share string) ([]*models.Snapshot, error)
 	deleteFn  func(ctx context.Context, share, snapID string) error
+	usageFn   func(ctx context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error)
+}
+
+func (f *fakeSnapshotRuntime) SnapshotUsage(ctx context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error) {
+	if f.usageFn != nil {
+		return f.usageFn(ctx, share, snapID)
+	}
+	return &runtime.SnapshotUsageReport{Share: share}, nil
 }
 
 func (f *fakeSnapshotRuntime) CreateSnapshot(ctx context.Context, share string, opts runtime.CreateSnapshotOpts) (string, error) {
@@ -78,6 +86,7 @@ func newSnapshotRouter(h *SnapshotHandler) http.Handler {
 		r.Route("/{name}/snapshots", func(r chi.Router) {
 			r.Post("/", h.Create)
 			r.Get("/", h.List)
+			r.Get("/usage", h.Usage)
 			r.Get("/{id}", h.Get)
 			r.Delete("/{id}", h.Remove)
 			r.Post("/{id}/restore", h.Restore)
@@ -517,5 +526,85 @@ func TestSnapshotHandler_Restore_SanitizedMessage(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "secret") || strings.Contains(rr.Body.String(), "/var/lib") {
 		t.Fatalf("body leaks internal detail: %s", rr.Body.String())
+	}
+}
+
+// TestSnapshotHandler_Usage_RouteIsReachable asserts that /snapshots/usage is
+// matched as a literal segment and not swallowed by /{id}. Registering the
+// routes in the wrong order would make every usage request look up a snapshot
+// named "usage", which is a 404 an operator would read as "no snapshots".
+func TestSnapshotHandler_Usage_RouteIsReachable(t *testing.T) {
+	var gotShare, gotID string
+	fake := &fakeSnapshotRuntime{
+		usageFn: func(_ context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error) {
+			gotShare, gotID = share, snapID
+			return &runtime.SnapshotUsageReport{
+				Share:               share,
+				TotalChunks:         7,
+				SumOfSnapshotChunks: 20,
+				Snapshots: []runtime.SnapshotUsage{
+					{ID: "snap-a", Chunks: 7, Unique: 2, Shared: 5},
+					{ID: "snap-b", Chunks: 7, Unique: 0, Shared: 7},
+					{ID: "snap-c", Chunks: 6, Unique: 5, Shared: 1},
+				},
+			}, nil
+		},
+	}
+	h := NewSnapshotHandler(fake, time.Second, nil)
+
+	rr := httptest.NewRecorder()
+	newSnapshotRouter(h).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/shares/data/snapshots/usage", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rr.Code, rr.Body.String())
+	}
+	// resolveShare normalizes to a leading slash, so the runtime sees "/data".
+	if gotShare != "/data" {
+		t.Errorf("handler saw share %q, want %q", gotShare, "/data")
+	}
+	if gotID != "" {
+		t.Errorf("handler saw id %q, want empty: no ?id= was given", gotID)
+	}
+
+	var body dto.SnapshotUsageReport
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The arithmetic must survive the wire: a report that drops the union or the
+	// sum loses the whole point of the endpoint.
+	if body.TotalChunks != 7 || body.SumOfSnapshotChunks != 20 {
+		t.Errorf("total=%d sum=%d, want 7 and 20", body.TotalChunks, body.SumOfSnapshotChunks)
+	}
+	if len(body.Snapshots) != 3 {
+		t.Fatalf("snapshots = %d, want 3", len(body.Snapshots))
+	}
+	if body.Snapshots[1].Unique != 0 || body.Snapshots[1].Shared != 7 {
+		t.Errorf("snap-b unique=%d shared=%d, want 0 and 7: a snapshot sharing everything must say so",
+			body.Snapshots[1].Unique, body.Snapshots[1].Shared)
+	}
+}
+
+// TestSnapshotHandler_Usage_PassesTheIDFilter asserts the ?id= form reaches the
+// runtime, since that is the whole difference between the share report and the
+// per-snapshot one.
+func TestSnapshotHandler_Usage_PassesTheIDFilter(t *testing.T) {
+	var gotID string
+	fake := &fakeSnapshotRuntime{
+		usageFn: func(_ context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error) {
+			gotID = snapID
+			return &runtime.SnapshotUsageReport{Share: share}, nil
+		},
+	}
+	h := NewSnapshotHandler(fake, time.Second, nil)
+
+	rr := httptest.NewRecorder()
+	newSnapshotRouter(h).ServeHTTP(rr,
+		httptest.NewRequest(http.MethodGet, "/api/v1/shares/data/snapshots/usage?id=snap-abc", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if gotID != "snap-abc" {
+		t.Errorf("handler saw id %q, want %q", gotID, "snap-abc")
 	}
 }

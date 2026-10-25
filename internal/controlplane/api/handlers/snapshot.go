@@ -33,6 +33,11 @@ type SnapshotRuntime interface {
 	GetSnapshot(ctx context.Context, share, snapID string) (*models.Snapshot, error)
 	ListSnapshots(ctx context.Context, share string) ([]*models.Snapshot, error)
 	DeleteSnapshot(ctx context.Context, share, snapID string) error
+	// SnapshotUsage reports what each snapshot holds and what deleting one
+	// would free. Added to this interface rather than a new one so a caller
+	// that already wires a snapshot runtime gets the report without new
+	// plumbing.
+	SnapshotUsage(ctx context.Context, share, snapID string) (*runtime.SnapshotUsageReport, error)
 }
 
 // SnapshotHandler serves the per-share REST surface for snapshot
@@ -192,6 +197,48 @@ func (h *SnapshotHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteNoContent(w)
+}
+
+// Usage handles GET /api/v1/shares/{name}/snapshots/usage.
+//
+// With ?id=<snapshot-id> it reports that snapshot alone; its unique/shared split
+// is still measured against every other snapshot in the share, because "unique"
+// has no meaning otherwise.
+//
+// Read-only and cheap: one pass over the manifests already on local disk, no
+// remote traffic, no new storage. It exists because "how much would deleting
+// this free" is otherwise unanswerable — snapshots share chunks, so neither the
+// snapshot list nor the disk usage of the snapshot directory answers it.
+func (h *SnapshotHandler) Usage(w http.ResponseWriter, r *http.Request) {
+	name := h.resolveShare(w, r)
+	if name == "" {
+		return
+	}
+	report, err := h.runtime.SnapshotUsage(r.Context(), name, r.URL.Query().Get("id"))
+	if err != nil {
+		handleErr(w, "snapshot usage", []any{"share", name}, err)
+		return
+	}
+	out := dto.SnapshotUsageReport{
+		Share:                report.Share,
+		TotalChunks:          report.TotalChunks,
+		SumOfSnapshotChunks:  report.SumOfSnapshotChunks,
+		UniqueToSomeSnapshot: report.UniqueToSomeSnapshot,
+		Skipped:              report.Skipped,
+		Snapshots:            make([]dto.SnapshotUsage, 0, len(report.Snapshots)),
+	}
+	for _, u := range report.Snapshots {
+		out.Snapshots = append(out.Snapshots, dto.SnapshotUsage{
+			ID:        u.ID,
+			CreatedAt: u.CreatedAt,
+			Chunks:    u.Chunks,
+			Unique:    u.Unique,
+			Shared:    u.Shared,
+			Open:      u.Open,
+			Holders:   u.Holders,
+		})
+	}
+	WriteJSON(w, http.StatusOK, out)
 }
 
 // Restore handles POST /api/v1/shares/{name}/snapshots/{id}/restore.

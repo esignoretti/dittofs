@@ -23,6 +23,9 @@ type fakeClient struct {
 	listOverride   []apiclient.Snapshot
 	listErr        error
 	waitFinalState string
+	usageReport    *apiclient.SnapshotUsageReport
+	usageErr       error
+	usageCalls     []string
 }
 
 func (f *fakeClient) CreateSnapshot(share string, req apiclient.CreateSnapshotRequest) (*apiclient.CreateSnapshotResponse, error) {
@@ -54,6 +57,17 @@ func (f *fakeClient) GetSnapshot(share, id string) (*apiclient.Snapshot, error) 
 		return s, nil
 	}
 	return nil, &apiclient.APIError{Title: "Not Found", Detail: "snapshot not found", StatusCode: 404}
+}
+
+func (f *fakeClient) SnapshotUsage(share, snapID string) (*apiclient.SnapshotUsageReport, error) {
+	f.usageCalls = append(f.usageCalls, snapID)
+	if f.usageErr != nil {
+		return nil, f.usageErr
+	}
+	if f.usageReport != nil {
+		return f.usageReport, nil
+	}
+	return &apiclient.SnapshotUsageReport{Share: share}, nil
 }
 
 func (f *fakeClient) RemoveSnapshot(share, id string) error {

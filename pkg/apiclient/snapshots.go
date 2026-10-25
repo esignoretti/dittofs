@@ -61,6 +61,28 @@ func (c *Client) ListSnapshots(share string) ([]Snapshot, error) {
 	return snaps, nil
 }
 
+// SnapshotUsageReport mirrors the wire DTO.
+type SnapshotUsageReport = dto.SnapshotUsageReport
+
+// SnapshotUsage mirrors the per-snapshot wire DTO.
+type SnapshotUsage = dto.SnapshotUsage
+
+// SnapshotUsage returns what the share's snapshots hold and what deleting one
+// would free. Pass an empty snapID for the whole share, or a snapshot ID to
+// report that one alone — its unique/shared split is still measured against
+// every other snapshot, because "unique" has no meaning otherwise.
+func (c *Client) SnapshotUsage(share, snapID string) (*SnapshotUsageReport, error) {
+	path := snapshotsPath(share) + "/usage"
+	if snapID != "" {
+		path += "?id=" + url.QueryEscape(snapID)
+	}
+	var report SnapshotUsageReport
+	if err := c.get(path, &report); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
 // GetSnapshot returns the detail view of a single snapshot.
 func (c *Client) GetSnapshot(share, id string) (*Snapshot, error) {
 	return getResource[Snapshot](c, snapshotPath(share, id))
