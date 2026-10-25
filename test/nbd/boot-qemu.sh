@@ -70,7 +70,11 @@ Options:
                        written-by-the-kernel-client).
   --no-mkfs            Do not mkfs; the export already holds a filesystem.
   --export NAME        Export name, <share>/<volume> (default $DITTOFS_NBD_EXPORT,
-                       else export/boot). -N is mandatory; see the header.
+                       else export/boot). A snapshot export is
+                       <share>/snapshots/<id>/<volume>: its volume is not a file
+                       on the share, so the pre-boot volume check is skipped and
+                       the guest mounts -o noload,ro. -N is mandatory; see the
+                       header.
   --port PORT          DittoFS NBD port (default $DITTOFS_NBD_PORT, else 10809).
   --host ADDR          Guest-visible server address (default 10.0.2.2, QEMU's
                        user-net gateway to the host).
@@ -236,21 +240,56 @@ share_name=${export_name%%/*}
 [ -n "$share_name" ] && [ -n "$volume_name" ] ||
 	die "export name '$export_name' must have a non-empty share and volume (e.g. export/boot)"
 
+# A SNAPSHOT export names a volume that deliberately has no file on the share:
+# <share>/snapshots/<id>/<volume> is served from the snapshot's own replayed
+# metadata (internal/adapter/nbd/snapshot.go), and the point of it is that the
+# live volume is not what gets read. The pre-boot checks below walk the share
+# mount to prove a volume exists, which is exactly what does not apply here, so
+# the snapshot shape is split out and checked for shape only.
+#
+# The id must be a full UUID: parseSnapshotExportName accepts any non-empty
+# segment, but a partial id would reach the exporter and fail there as
+# "snapshot export unavailable" instead of here as a wrong argument.
+snapshot_export=0
+case $export_name in
+*/snapshots/*/*)
+	snapshot_export=1
+	snap_id=${export_name#*/snapshots/}
+	snap_id=${snap_id%%/*}
+	volume_name=${export_name##*/}
+	case $snap_id in
+	????????-????-????-????-????????????) ;;
+	*) die "snapshot export '$export_name' must carry a full snapshot id, e.g. export/snapshots/631d7329-7938-43ef-afb4-9676f5b917bf/boot (got '$snap_id')" ;;
+	esac
+	;;
+esac
+
 # The volume must exist BEFORE the guest boots. Nothing in the repo creates a
 # volume (grep -rn "volume" cmd/dfsctl/ is empty): the operator provisions it
 # through the share's own NFS/SMB mount, and its size IS the export size. A
 # missing volume otherwise surfaces at the handshake as "nbd: unknown export",
 # which reads as an export-name problem and is not one.
-[ -d "$volume_path" ] ||
-	die "share mount '$volume_path' is not a directory. Mount the share over NFS/SMB there (or pass --volume-path DIR / set DITTOFS_VOLUME_PATH). This script checks volumes/ through the share, because no dfsctl command creates a volume."
-[ -e "$volume_path/volumes" ] ||
-	die "'$volume_path/volumes/' does not exist. Provision the share's volumes directory through the share mount first; the NBD adapter resolves <share>/<volume> through it. Note it must be created by the adapter's identity (UID/GID 65534, pkg/adapter/nbd/config.go:26-27) or the adapter's own file creation fails with 'Permission denied'."
-[ -e "$volume_path/volumes/$volume_name" ] ||
-	die "volume '$volume_name' not found at '$volume_path/volumes/$volume_name'. Create it through the share as the adapter's identity (UID/GID 65534 — e.g. dfsctl user create --uid 65534 --gid 65534, then a read-write share grant) and set its size AFTER creating it: ApplyCreateDefaults (pkg/metadata/validation.go:492) sets Size = 0 for every non-symlink, so CreateFile with a size yields a zero-length export. Without this the guest fails the handshake with 'nbd: unknown export', which names neither the volume nor the identity."
+# The volume must exist BEFORE the guest boots. Nothing in the repo creates a
+# volume (grep -rn "volume" cmd/dfsctl/ is empty): the operator provisions it
+# through the share's own NFS/SMB mount, and its size IS the export size. A
+# missing volume otherwise surfaces at the handshake as "nbd: unknown export",
+# which reads as an export-name problem and is not one.
+#
+# Skipped for a snapshot export: its volume is not a file on the share at all.
+if [ "$snapshot_export" = 0 ]; then
+	[ -d "$volume_path" ] ||
+		die "share mount '$volume_path' is not a directory. Mount the share over NFS/SMB there (or pass --volume-path DIR / set DITTOFS_VOLUME_PATH). This script checks volumes/ through the share, because no dfsctl command creates a volume."
+	[ -e "$volume_path/volumes" ] ||
+		die "'$volume_path/volumes/' does not exist. Provision the share's volumes directory through the share mount first; the NBD adapter resolves <share>/<volume> through it. Note it must be created by the adapter's identity (UID/GID 65534, pkg/adapter/nbd/config.go:26-27) or the adapter's own file creation fails with 'Permission denied'."
+	[ -e "$volume_path/volumes/$volume_name" ] ||
+		die "volume '$volume_name' not found at '$volume_path/volumes/$volume_name'. Create it through the share as the adapter's identity (UID/GID 65534 — e.g. dfsctl user create --uid 65534 --gid 65534, then a read-write share grant) and set its size AFTER creating it: ApplyCreateDefaults (pkg/metadata/validation.go:492) sets Size = 0 for every non-symlink, so CreateFile with a size yields a zero-length export. Without this the guest fails the handshake with 'nbd: unknown export', which names neither the volume nor the identity."
 
-volume_bytes=$(wc -c <"$volume_path/volumes/$volume_name" | tr -d ' ')
-[ "$volume_bytes" -gt 0 ] 2>/dev/null ||
-	die "volume '$volume_name' at '$volume_path/volumes/$volume_name' is $volume_bytes bytes. CreateFile with FileAttr{Size: N} does NOT produce a file of size N (ApplyCreateDefaults, pkg/metadata/validation.go:492), so the size must be set afterwards. A zero-length export fails the handshake."
+	volume_bytes=$(wc -c <"$volume_path/volumes/$volume_name" | tr -d ' ')
+	[ "$volume_bytes" -gt 0 ] 2>/dev/null ||
+		die "volume '$volume_name' at '$volume_path/volumes/$volume_name' is $volume_bytes bytes. CreateFile with FileAttr{Size: N} does NOT produce a file of size N (ApplyCreateDefaults, pkg/metadata/validation.go:492), so the size must be set afterwards. A zero-length export fails the handshake."
+else
+		volume_bytes="n/a (snapshot export: served from the snapshot's replayed metadata, not from a file on the share)"
+fi
 
 # ---------------------------------------------------------------- self-describing run
 
@@ -464,8 +503,8 @@ fi
 EOF
 	# Values the readback block below needs, baked in as guest-side literals: the
 	# block is a QUOTED heredoc, so host variables do not expand inside it.
-	printf 'do_mkfs=%s\nexpect_file=%s\nexpect_content=%s\n' \
-		"$do_mkfs" "$expect_file" "$expect_content"
+	printf 'do_mkfs=%s\nread_only_export=%s\nexpect_file=%s\nexpect_content=%s\n' \
+		"$do_mkfs" "$snapshot_export" "$expect_file" "$expect_content"
 	if [ "$do_mkfs" = 1 ]; then
 		cat <<'EOF'
 echo "INIT: mkfs.ext4 /dev/nbd0 (first boot)"
@@ -477,7 +516,19 @@ echo "INIT: --no-mkfs, expecting an existing filesystem on /dev/nbd0"
 EOF
 	fi
 	cat <<'EOF'
-mount -t ext4 /dev/nbd0 /root || { echo "INIT-FAIL: mount /dev/nbd0 failed (device exists and mkfs succeeded, so this is the mount, not the handshake)"; exec sh; }
+# A read-only export (a snapshot) cannot replay a journal, and ext4 REFUSES to
+# mount one that needs replay: "write access unavailable, cannot proceed (try
+# mounting with noload)". The journal is dirty for a legitimate reason — the
+# previous boot wrote and powered off without unmounting, which is precisely the
+# crash-consistent case a snapshot is for — so noload is the correct answer here,
+# not a workaround for a bug. noload discards the journal and mounts the
+# committed filesystem, which is what the snapshot froze.
+if [ "$read_only_export" = 1 ]; then
+	echo "INIT: read-only export, mounting with noload,ro (a snapshot cannot replay a journal)"
+	mount -t ext4 -o noload,ro /dev/nbd0 /root || { echo "INIT-FAIL: mount -o noload,ro /dev/nbd0 failed (read-only export: the snapshot's filesystem could not be mounted even without journal replay)"; exec sh; }
+else
+	mount -t ext4 /dev/nbd0 /root || { echo "INIT-FAIL: mount /dev/nbd0 failed (device exists and mkfs succeeded, so this is the mount, not the handshake)"; exec sh; }
+fi
 echo "INIT: mount /dev/nbd0 /root ok"
 echo "INIT: guest page cache: $(grep -i '^Cached:' /proc/meminfo)"
 echo "INIT: nbd0 write_cache: $(cat /sys/block/nbd0/queue/write_cache 2>/dev/null || echo unavailable)"

@@ -391,6 +391,45 @@ under test, so an `fsck` there judges a crash it is also recovering from. The
 check belongs on the host, against the volume read as a file over NFS — the B1
 property (spec §2.2) earning its place.
 
+### Booting a snapshot export
+
+`--export` also accepts the snapshot shape
+`<share>/snapshots/<id>/<volume>`, and the rig handles the two things that make
+it different from a volume:
+
+```
+# Boot the snapshot a volume was taken from.
+./test/nbd/boot-qemu.sh --initramfs-dir test/nbd/artifacts/initramfs \
+    --volume-path /mnt/dittofs/export --no-mkfs \
+    --export export/snapshots/631d7329-7938-43ef-afb4-9676f5b917bf/boot
+```
+
+1. **The pre-boot volume check is skipped.** A snapshot's volume is deliberately
+   not a file on the share — it is served from the snapshot's own replayed
+   metadata — so walking `volumes/` to prove it exists would fail for the one
+   export whose whole point is not to read the live file. The id must be a full
+   UUID; a partial one is rejected here rather than surfacing later as
+   "snapshot export unavailable".
+2. **The guest mounts with `-o noload,ro`.** ext4 refuses to mount a filesystem
+   whose journal needs replay when the device is read-only, and a snapshot's
+   journal is dirty for a legitimate reason: the boot it froze wrote and powered
+   off without unmounting, which is exactly the crash-consistent case a snapshot
+   exists for. `noload` discards the journal and mounts the committed
+   filesystem, which is what the snapshot captured. Without this the boot fails
+   with `EXT4-fs (nbd0): write access unavailable, cannot proceed (try mounting
+   with noload)`.
+
+Measured, on 2026-10-25, against a 1 GiB volume whose first boot wrote
+`hello.txt`: the snapshot export mounted, listed the file and read its contents
+back (`VERDICT: PASS`). The production export was then corrupted deliberately
+(1024 bytes of `0xdeadbeef` written at the ext4 superblock offset, 1024) and
+confirmed unbootable (`mount /dev/nbd0 failed`), while the same snapshot boot
+still mounted and still read `hello.txt` back. The snapshot is not a view of the
+live volume.
+
+A snapshot export advertises `NBD_FLAG_READ_ONLY`, so the guest kernel's NBD
+client refuses writes itself; a WRITE sent to it anyway is answered `EPERM`.
+
 ## `crash-restart.sh` — SIGKILL the server and watch I/O pause then resume
 
 **Linux only, root only.** macOS has no `nbd-client` and no Linux block layer to
