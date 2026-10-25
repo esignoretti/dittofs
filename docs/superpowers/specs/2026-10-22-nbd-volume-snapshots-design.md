@@ -719,8 +719,22 @@ Each anti-goal maps to a check. The last one is the claim that matters.
 | A snapshot cannot be deleted while it is open | Open a snapshot export, attempt `DeleteSnapshot`, assert `ErrSnapshotOpen` (409) and that the export still reads correctly; close, assert the delete then succeeds. |
 | Deleting one snapshot does not affect another that is open | Open A, delete B, assert B is deleted and A still reads correctly. This is the per-snapshot scoping test. |
 | A rehydrated volume is independent of its snapshot | Rehydrate, write a distinct pattern to the new volume, then read the same range through the snapshot and assert the original bytes. Assert the snapshot is still openable and still read-only. |
-| A rehydrated volume survives the snapshot being deleted | **Not yet, and it is the one worth doing next.** The design's claim is that `CopyPayload`'s rows make the new volume a real GC reference rather than a borrowed hold, and only a delete-then-GC-then-read sequence proves it. `TestRehydrateSnapshot_ProducesAnIndependentWritableVolume` proves the volume's content is its own; it does not run GC. |
+| A rehydrated volume survives the snapshot being deleted | **Done** — `TestRehydratedVolumeSurvivesTheSnapshotBeingDeleted`: rehydrate, delete the snapshot, run GC with grace zero, read the volume back. It carries a **negative control**, because "GC swept nothing" is also what a broken GC reports: deleting the rehydrated volume too must make the same chunks sweepable (measured: 0 swept with the volume present, 2 swept and 2,097,260 bytes freed once it was gone). Without that control the survival assertion passes for two reasons and proves neither. |
 | Rehydration refuses a share with no remote | **Guard only, not covered by a test.** Verified while building: a `memory` block store reports `RemoteStore() != nil` even with no remote configured, so the refusal cannot be reached through any fixture this suite can build, and `RehydrateSnapshot` checks the snapshot's existence first anyway. The check stays because the invariant it protects — a copied reference resolving to nothing and reading as zeros — is silent if it is ever broken. |
 | Rehydration rollback leaves nothing behind | **Partly.** `TestRehydrateSnapshot_RollsBackOnFailure` covers the caller-context case (a cancelled request must not abort a detached job). The failure-after-create case is implemented in the job but not asserted. |
+
+Two things the tests found that are now fixed in the code rather than only
+described:
+
+- **The job reported `done` before releasing its open registration**, so a caller
+  that polled to `done` and immediately deleted the snapshot was refused with
+  "held open by 1". `runRehydrate` now returns the terminal state instead of
+  publishing it, and the goroutine releases the hold *then* publishes — the
+  window was microseconds wide and would have read as "you cannot delete what you
+  just rehydrated".
+- **The usage report filtered snapshots before reading their manifests**, which
+  made every chunk of the reported snapshot look unique — a report that says a
+  delete frees everything when it frees nothing. Manifests are now always all
+  read; the filter applies only to what is reported.
 | The usage report matches reality | **Done** — `TestSnapshotUsage_CountsSharingNotSize` builds three snapshots with known overlap and asserts every number against values derived by hand from the fixture, not from a previous run. |
 | The snapshot's bytes equal production's at capture time | **Not yet.** The unit-level proof exists (a snapshot export reads the snapshot's manifest, not production's). Booting a kernel from a snapshot export needs `test/nbd/boot-qemu.sh` pointed at a snapshot export name; that is the one end-to-end claim this design makes that has not been run. |

@@ -230,10 +230,19 @@ func (r *Runtime) RehydrateSnapshot(ctx context.Context, share, snapID, srcVolum
 	// the result, and a client that hangs up mid-rehydrate must not leave a
 	// half-copied volume behind. The job's own timeout is the bound.
 	go func() {
-		defer release()
 		jobCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Minute)
 		defer cancel()
-		r.runRehydrate(jobCtx, job, snap, share, srcVolume, dstVolume, localStoreDir)
+		// Release the hold as the LAST thing the job does, before it reports a
+		// terminal state — not via defer after runRehydrate returns. A caller that
+		// polls until "done" and then deletes the snapshot must not be refused
+		// because the job is still winding down; the window is microseconds wide
+		// and would be reported as "you cannot delete what you just rehydrated".
+		//
+		// runRehydrate therefore does not set the terminal state itself; it returns
+		// the state to publish and this closure publishes it after releasing.
+		state, failure := r.runRehydrate(jobCtx, job, snap, share, srcVolume, dstVolume, localStoreDir)
+		release()
+		job.setState(state, failure)
 	}()
 
 	return job.clone(), nil
@@ -247,8 +256,12 @@ func (r *Runtime) GetRehydrateJob(id string) (*RehydrateJob, bool) {
 // runRehydrate is the job body. Every failure unwinds to a rollback: the
 // destination volume is removed, so there is no partial state to clean up by
 // hand. The snapshot is never modified, so the operator just retries.
+// runRehydrate returns the terminal state to publish and the error that explains
+// it, rather than publishing either itself: the caller must release the open
+// registration first, so a poller that sees "done" can delete the snapshot
+// immediately. See the goroutine in RehydrateSnapshot.
 func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *models.Snapshot,
-	share, srcVolume, dstVolume, localStoreDir string) {
+	share, srcVolume, dstVolume, localStoreDir string) (string, error) {
 
 	job.setState(RehydrateStateReplaying, nil)
 
@@ -258,8 +271,7 @@ func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *mod
 	tmpDir := filepath.Join(snap.SnapshotDir(localStoreDir), "rehydrate-meta-"+job.ID)
 	replayed, err := r.replaySnapshotMetadata(ctx, snap, localStoreDir, tmpDir)
 	if err != nil {
-		job.setState(RehydrateStateFailed, err)
-		return
+		return RehydrateStateFailed, err
 	}
 	// The replay directory is a scratch copy; it is removed whatever happens.
 	defer func() { _ = os.RemoveAll(tmpDir) }()
@@ -267,8 +279,7 @@ func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *mod
 	srcFile, err := resolveSnapshotSourceVolume(ctx, r.metadataServiceOver(replayed, share), share, srcVolume, r.rehydrateIdentity())
 	if err != nil {
 		_ = replayed.Close()
-		job.setState(RehydrateStateFailed, err)
-		return
+		return RehydrateStateFailed, err
 	}
 	srcBlocks := srcFile.Blocks
 	srcSize := srcFile.Size
@@ -281,8 +292,7 @@ func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *mod
 
 	created, createdHandle, payloadID, err := r.createRehydrateDestination(ctx, share, dstVolume)
 	if err != nil {
-		job.setState(RehydrateStateFailed, err)
-		return
+		return RehydrateStateFailed, err
 	}
 	// Rollback: the volume is removed on any failure below. Nothing about the
 	// snapshot needs undoing.
@@ -301,14 +311,12 @@ func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *mod
 
 	target, err := r.sharesSvc.GetShare(share)
 	if err != nil {
-		job.setState(RehydrateStateFailed, err)
-		return
+		return RehydrateStateFailed, err
 	}
 	bs := target.BlockStore
 	metaStore, err := r.metadataStoreForShare(share)
 	if err != nil {
-		job.setState(RehydrateStateFailed, err)
-		return
+		return RehydrateStateFailed, err
 	}
 
 	// (3) Copy the manifest, in one transaction, exactly as the clone path does:
@@ -340,8 +348,7 @@ func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *mod
 		return nil
 	})
 	if err != nil {
-		job.setState(RehydrateStateFailed, err)
-		return
+		return RehydrateStateFailed, err
 	}
 
 	// (4) After the commit, tell the local tier which ranges the manifest places.
@@ -349,8 +356,7 @@ func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *mod
 	// destination's replaced ranges back to holes, then the seed accounts for the
 	// ones the copy gave it.
 	if err := bs.SeedColdRefs(ctx, string(payloadID), copied); err != nil {
-		job.setState(RehydrateStateFailed, fmt.Errorf("seed the destination's cold ranges: %w", err))
-		return
+		return RehydrateStateFailed, fmt.Errorf("seed the destination's cold ranges: %w", err)
 	}
 
 	committed = true
@@ -358,11 +364,11 @@ func (r *Runtime) runRehydrate(ctx context.Context, job *RehydrateJob, snap *mod
 	job.Blocks = len(copied)
 	job.Bytes = srcSize
 	job.mu.Unlock()
-	job.setState(RehydrateStateDone, nil)
 
 	logger.Info("rehydrate complete", "job", job.ID, "share", share,
 		"snapshot", job.SnapshotID, "source", srcVolume, "volume", dstVolume,
 		"blocks", len(copied), "bytes", srcSize)
+	return RehydrateStateDone, nil
 }
 
 // resolveSnapshotSourceVolume finds the snapshot's copy of volume, which is
