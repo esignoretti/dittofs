@@ -683,12 +683,15 @@ Global flags:
       - [`dfsctl share permission revoke`](#dfsctl-share-permission-revoke) — Revoke permission from a share
     - [`dfsctl share remove`](#dfsctl-share-remove) — Remove a share
     - [`dfsctl share show`](#dfsctl-share-show) — Show share details
-    - [`dfsctl share snapshot`](#dfsctl-share-snapshot) — Manage share snapshots (create, list, show, remove, restore)
+    - [`dfsctl share snapshot`](#dfsctl-share-snapshot) — Manage share snapshots (create, list, show, remove, restore, usage, rehydrate)
       - [`dfsctl share snapshot create`](#dfsctl-share-snapshot-create) — Create a snapshot of a share
       - [`dfsctl share snapshot list`](#dfsctl-share-snapshot-list) — List snapshots for a share
+      - [`dfsctl share snapshot rehydrate`](#dfsctl-share-snapshot-rehydrate) — Copy a snapshot into a new writable volume
+        - [`dfsctl share snapshot rehydrate status`](#dfsctl-share-snapshot-rehydrate-status) — Report a rehydrate job's state
       - [`dfsctl share snapshot remove`](#dfsctl-share-snapshot-remove) — Remove a snapshot
       - [`dfsctl share snapshot restore`](#dfsctl-share-snapshot-restore) — Restore a snapshot into a (disabled) share
       - [`dfsctl share snapshot show`](#dfsctl-share-snapshot-show) — Show details of a snapshot
+      - [`dfsctl share snapshot usage`](#dfsctl-share-snapshot-usage) — Report what each snapshot holds and what a delete frees
     - [`dfsctl share snapshot-policy`](#dfsctl-share-snapshot-policy) — Manage scheduled snapshot policies (schedule + retention)
       - [`dfsctl share snapshot-policy list`](#dfsctl-share-snapshot-policy-list) — List all snapshot policies
       - [`dfsctl share snapshot-policy remove`](#dfsctl-share-snapshot-policy-remove) — Remove a share's snapshot policy
@@ -4842,6 +4845,167 @@ Global flags:
   -v, --verbose              Enable verbose output
 ```
 
+### `dfsctl share snapshot rehydrate`
+
+Create a new writable volume from a snapshot
+
+Create a new writable volume whose content is a snapshot's.
+
+No bytes are copied. Chunks are immutable and content-addressed, so the new
+volume shares every chunk with the snapshot it came from — a reflink. The cost
+is the metadata: one chunk reference per block, which is why this runs as a job
+rather than a request and why a large volume takes a few seconds.
+
+The snapshot is NOT modified and stays bootable. This is a copy out of it, never
+a promotion of it, so a snapshot can be rehydrated any number of times — the
+usual pattern is to keep one golden snapshot and rehydrate a fresh volume from it
+per test run or per restore.
+
+A snapshot is share-scoped: it holds every volume in the share, so the volume to
+copy must be named with `--source`. `--volume` names the new one.
+
+Failure is a rollback: the destination is removed and the job reports why. The
+snapshot is untouched, so retrying is just retrying.
+
+```
+dfsctl share snapshot rehydrate <share> <id> [flags]
+```
+
+**Examples:**
+
+```bash
+# Rehydrate the boot volume from a snapshot, and wait for it
+dfsctl share snapshot rehydrate /vm snap-abc123 --source boot --volume boot-2
+
+# Start the job and return immediately (poll with 'rehydrate status')
+dfsctl share snapshot rehydrate /vm snap-abc123 --source boot --volume boot-2 --wait=false
+
+# Report a job's state
+dfsctl share snapshot rehydrate status /vm job-3f2a1b4c
+```
+
+Flags:
+
+```
+      --poll duration      Poll interval while waiting (default 500ms)
+      --source string      Volume inside the snapshot to copy (required)
+      --timeout duration   How long to wait for the job (default 30m0s)
+      --volume string      Name of the new volume (required)
+      --wait               Wait for the job to finish (default true)
+```
+
+Global flags:
+
+```
+      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
+      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
+      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
+      --no-color             Disable colored output
+  -o, --output string        Output format (table|json|yaml) (default "table")
+      --server string        Server URL (overrides stored credential)
+      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
+      --token string         Bearer token (overrides stored credential)
+  -v, --verbose              Enable verbose output
+```
+
+### `dfsctl share snapshot rehydrate status`
+
+Report a rehydrate job's state
+
+Poll a rehydrate job started with `--wait=false`. States are `pending`,
+`replaying`, `copying`, `done` and `failed`; a failed job carries the reason and
+the destination volume has already been rolled back.
+
+```
+dfsctl share snapshot rehydrate status <share> <job-id>
+```
+
+**Examples:**
+
+```bash
+dfsctl share snapshot rehydrate status /vm job-3f2a1b4c
+dfsctl share snapshot rehydrate status /vm job-3f2a1b4c -o json
+```
+
+Global flags:
+
+```
+      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
+      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
+      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
+      --no-color             Disable colored output
+  -o, --output string        Output format (table|json|yaml) (default "table")
+      --server string        Server URL (overrides stored credential)
+      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
+      --token string         Bearer token (overrides stored credential)
+  -v, --verbose              Enable verbose output
+```
+### `dfsctl share snapshot usage`
+
+Show what snapshots hold and what deleting one would free
+
+Show how much of a share's snapshot set each snapshot actually pins.
+
+Snapshots share chunks with each other — an hourly snapshot of a slowly-changing
+volume re-references almost everything the previous one held — so neither the
+snapshot list nor the size of the snapshot directories answers "how much space do
+my snapshots use, and what would deleting this one free".
+
+This reports both:
+
+| Column | Meaning |
+|---|---|
+| `CHUNKS` | distinct chunks this snapshot references |
+| `UNIQUE` | chunks no OTHER snapshot references: what deleting it would free |
+| `SHARED` | the rest, still held by something else |
+
+The footer gives the union across all snapshots and the sum of the per-snapshot
+counts. The gap between them is the sharing, which is why retaining many
+snapshots costs far less than many volumes.
+
+Counts, not bytes: a manifest line is a content hash with no size, so converting
+to bytes would need one remote request per distinct chunk. For bytes, read
+`bytes_freed` from `dfsctl store block gc-status` after a real delete.
+
+A snapshot held open by a running export or a rehydrate reports `OPEN` yes; a
+delete would be refused with 409 until that holder releases it.
+
+```
+dfsctl share snapshot usage <share> [flags]
+```
+
+**Examples:**
+
+```bash
+# Every snapshot on the share
+dfsctl share snapshot usage /archive
+
+# One snapshot, still measured against the others
+dfsctl share snapshot usage /archive --id snap-abc123
+
+# JSON, for scripting
+dfsctl share snapshot usage /archive -o json
+```
+
+Flags:
+
+```
+      --id string   Report one snapshot instead of the whole share
+```
+
+Global flags:
+
+```
+      --cacert string        Path to a PEM CA bundle trusted for the server certificate (overrides stored)
+      --client-cert string   Path to a PEM client certificate for mutual TLS (overrides stored)
+      --client-key string    Path to the PEM client private key for mutual TLS (overrides stored)
+      --no-color             Disable colored output
+  -o, --output string        Output format (table|json|yaml) (default "table")
+      --server string        Server URL (overrides stored credential)
+      --tls-skip-verify      Disable TLS certificate verification (insecure; overrides stored)
+      --token string         Bearer token (overrides stored credential)
+  -v, --verbose              Enable verbose output
+```
 ### `dfsctl share snapshot remove`
 
 Remove a snapshot

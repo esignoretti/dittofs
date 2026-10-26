@@ -20,6 +20,10 @@ Operator guide: model, CLI, restore runbook, recovery paths, failure modes.
 - [12. Scheduled snapshots (policies)](#12-scheduled-snapshots-policies)
 - [13. Limitations](#13-limitations)
 - [14. REST API reference](#14-rest-api-reference)
+- [15. Using snapshots from a block client](#15-using-snapshots-from-a-block-client)
+  - [15.1 Booting a volume's snapshot over NBD](#151-booting-a-volumes-snapshot-over-nbd)
+  - [15.2 Rehydrating a snapshot into a new volume](#152-rehydrating-a-snapshot-into-a-new-volume)
+  - [15.3 Measuring what snapshots cost](#153-measuring-what-snapshots-cost)
 
 ## 1. Overview
 
@@ -112,8 +116,8 @@ truth.
 
 ## 3. CLI walkthrough
 
-All snapshot operations live under `dfsctl share snapshot`. The five
-leaf commands are:
+All snapshot operations live under `dfsctl share snapshot`. The leaf
+commands are:
 
 ```
 dfsctl share snapshot create <share>          # create a new snapshot
@@ -121,6 +125,9 @@ dfsctl share snapshot list <share>            # list snapshots for a share
 dfsctl share snapshot show <share> <id>       # detail view for one snapshot
 dfsctl share snapshot remove <share> <id>     # remove a snapshot (Y/N prompt)
 dfsctl share snapshot restore <share> <id>    # restore a share from a snapshot
+dfsctl share snapshot usage <share>           # what each snapshot holds, what a delete frees
+dfsctl share snapshot rehydrate <share> <id>  # copy a snapshot into a new writable volume
+  dfsctl share snapshot rehydrate status <share> <job-id>   # poll that job
 ```
 
 Every command accepts the global `--output, -o` flag (`table|json|yaml`).
@@ -936,8 +943,17 @@ spec:
 ## 13. Limitations
 
 - **No cross-share restore.** A snapshot of `/photos` can only be
-  restored back into `/photos`. There is no surface to clone or
-  fork a share through the snapshots feature.
+  restored back into `/photos`, and `rehydrate` can only copy into a volume of
+  the same share. There is no surface to clone or fork a share through the
+  snapshots feature.
+- **No byte accounting in `snapshot usage`.** It reports chunk counts, which are
+  exact and local. Bytes would need one remote HEAD per distinct chunk; read
+  `bytes_freed` from `dfsctl store block gc-status` after a real delete instead.
+- **A snapshot is read-only, always.** It cannot be promoted to read-write. To get
+  a writable volume with a snapshot's content, `rehydrate` it into a new volume.
+  (This is not a missing feature so much as a wire constraint: NBD flags are
+  written once at handshake, so "flip the export to read-write" would require the
+  client to reconnect anyway.)
 - **No encryption.** Snapshot artifacts inherit whatever
   encryption (or lack thereof) is configured on the block store
   and the file system holding `<localStoreDir>/snapshots/`. There
@@ -946,7 +962,9 @@ spec:
   safety snap. Operators delete them after validation.
 - **Synchronous restore.** The HTTP request blocks; the CLI
   blocks. Bounded by `snapshot.restore_http_timeout` (default 30
-  minutes). There is no async restore with a poll endpoint.
+  minutes). There is no async restore with a poll endpoint. `rehydrate` is the
+  exception — it runs as a job with `status` to poll — but `restore` itself
+  remains synchronous.
 - **Single-node only.** Snapshots live alongside the share inside
   one daemon's local store. There is no cluster-aware snapshot
   surface yet.
@@ -975,6 +993,9 @@ the brief reference.
 | `GET` | `/api/v1/shares/{name}/snapshots/{id}` | Get one snapshot record | `200 OK` + full record |
 | `DELETE` | `/api/v1/shares/{name}/snapshots/{id}` | Delete a snapshot | `204 No Content` |
 | `POST` | `/api/v1/shares/{name}/snapshots/{id}/restore` | Restore a share from a snapshot (sync) | `200 OK` + body `{snapshot_id, safety_snapshot_id, share}` |
+| `GET` | `/api/v1/shares/{name}/snapshots/usage` | What each snapshot holds and what a delete frees | `200 OK` + usage report |
+| `POST` | `/api/v1/shares/{name}/snapshots/{id}/rehydrate` | Copy a snapshot into a new writable volume (async job) | `202 Accepted` + job record |
+| `GET` | `/api/v1/shares/{name}/snapshots/rehydrate/{jobID}` | Poll a rehydrate job | `200 OK` + job record |
 | `PUT` | `/api/v1/shares/{name}/snapshot-policy` | Create/update the share's snapshot policy | `200 OK` + policy record |
 | `GET` | `/api/v1/shares/{name}/snapshot-policy` | Get the share's snapshot policy | `200 OK` (or `404`) |
 | `DELETE` | `/api/v1/shares/{name}/snapshot-policy` | Delete the share's snapshot policy | `204 No Content` |
@@ -1063,3 +1084,125 @@ snapshot:
 
 For very large shares, raise the timeout on both the server config
 and the CLI's HTTP client (`apiclient.WithRestoreTimeout`).
+
+## 15. Using snapshots from a block client
+
+Sections 3–14 describe snapshots as an administrative object: create, list,
+remove, restore. There are three more things you can do with one, and they are
+what makes a snapshot useful for a VM rather than just for a filesystem:
+
+- **boot it** — a client can mount a snapshot directly, read-only, while the
+  volume it came from keeps running;
+- **rehydrate it** — copy it into a new, independent, writable volume;
+- **measure it** — ask what each snapshot actually pins, and what deleting one
+  would free.
+
+All three are share-scoped, like every other snapshot operation: a snapshot
+holds *every* volume in its share, so the volume has to be named explicitly.
+
+### 15.1 Booting a volume's snapshot over NBD
+
+An NBD export of a snapshot lives at a different name from the volume's:
+
+```
+<share>/<volume>                        the live volume, read-write
+<share>/snapshots/<snapshot-id>/<volume>  that volume as of the snapshot, read-only
+```
+
+With an NBD adapter serving the share, a client connects to the second form and
+sees the snapshot's bytes. The export advertises `NBD_FLAG_READ_ONLY`, so a
+kernel client refuses writes itself; a write sent anyway is answered `EPERM`.
+
+Two properties are worth stating because they surprise people:
+
+**The snapshot's volume is not a file on the share.** It is served from the
+snapshot's own replayed metadata, so it does not appear under `volumes/` and a
+tool that checks for the file first will not find it.
+
+**A snapshot's filesystem may need `noload`.** A snapshot taken while a guest was
+running captures a *dirty* journal — that is what crash-consistency means, and it
+is the whole point. ext4 will not replay a journal on a read-only device, so mount
+with `-o noload,ro`, which discards the journal and mounts the committed
+filesystem. Without it the mount fails with
+`EXT4-fs (nbd0): write access unavailable, cannot proceed (try mounting with noload)`.
+
+For a worked end-to-end example — a real kernel booting from a snapshot, then the
+production volume being deliberately corrupted and the snapshot still booting —
+see `test/nbd/README.md` § "Booting a snapshot export".
+
+**Deleting a snapshot that is being served is refused** with `409` and
+`ErrSnapshotOpen`. The hold is per snapshot, not per share, so one booting export
+does not block deleting a different snapshot of the same share.
+
+### 15.2 Rehydrating a snapshot into a new volume
+
+`rehydrate` copies a snapshot into a **new, independent, writable** volume:
+
+```
+dfsctl share snapshot rehydrate /vm snap-abc123 --source boot --volume boot-2
+```
+
+`--source` names the volume inside the snapshot; `--volume` names the new one.
+They are different flags because they are different things — the same name is
+legal but means "copy `boot` into a new volume also called `boot`", which fails
+if `boot` already exists.
+
+No bytes are copied. Chunks are immutable and content-addressed, so the new
+volume shares every chunk with the snapshot — a reflink. The cost is the
+metadata: one chunk reference per block, which is why this is a **job** rather
+than a request.
+
+The snapshot is **not** modified and stays bootable. Rehydrate is a copy *out*
+of a snapshot, never a promotion *of* it, so one golden snapshot can be
+rehydrated any number of times — the usual pattern is one golden image, a fresh
+volume per test run.
+
+The job runs detached. `--wait` (the default) polls until it finishes;
+`--wait=false` returns the job id immediately, and `rehydrate status` polls it:
+
+```text
+$ dfsctl share snapshot rehydrate /vm snap-abc123 --source boot --volume boot-2 --wait=false
+Rehydrate job rj-7f2a1c queued: /vm snap-abc123 boot -> boot-2
+$ dfsctl share snapshot rehydrate status /vm rj-7f2a1c
+ID       rj-7f2a1c
+STATE    copying
+SOURCE   boot
+VOLUME   boot-2
+```
+
+States are `pending`, `replaying`, `copying`, `done`, `failed`. Failure is a
+rollback: the destination volume is removed and the job records why. The snapshot
+is untouched, so retrying is just retrying.
+
+### 15.3 Measuring what snapshots cost
+
+Snapshots share chunks with each other — an hourly snapshot of a slowly-changing
+volume re-references almost everything the previous one held — so neither the
+snapshot list nor the size of the snapshot directories answers "how much space do
+my snapshots use, and what would deleting this one free".
+
+```text
+$ dfsctl share snapshot usage /archive
+ID                                     CREATED               CHUNKS  UNIQUE  SHARED  OPEN
+7a3ec1b2-9c5e-4ab8-bd31-7f60c2e814a0   2026-10-24 09:00:00      842       0     842  no
+9f2dab17-1a8c-4e02-b6d4-0c2f7a91e3b5   2026-10-24 10:00:00      850       8     842  no
+b41c6e08-77d5-4c19-8f3e-2a9c11d4e6f0   2026-10-24 11:00:00      861      19     842  no
+
+union across snapshots: 861 chunks; sum of per-snapshot counts: 2553
+retaining 3 snapshots costs 861 chunks, not 2553 — 1692 are shared
+unique to some snapshot: 27
+```
+
+`UNIQUE` is what deleting that snapshot would free; `SHARED` is the rest, still
+held by something else. The footer's gap between the union and the sum *is* the
+sharing.
+
+`--id` reports one snapshot while still measuring it against all the others,
+which is the number that matters before a delete.
+
+The report gives **counts, not bytes**: a manifest line is a content hash with no
+size, so converting to bytes would need one remote request per distinct chunk. For
+bytes, read `bytes_freed` from `dfsctl store block gc-status` after a real delete.
+
+`OPEN yes` means an export or a rehydrate holds the snapshot; a delete would be
+refused with `409` until that holder releases it.
