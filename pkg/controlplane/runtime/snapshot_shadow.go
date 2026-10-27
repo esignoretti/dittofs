@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/block/engine"
 	"github.com/marmos91/dittofs/pkg/block/journal"
@@ -28,6 +29,17 @@ const shadowJournalCapDivisor = 16
 
 // shadowMetaDirName and shadowJournalDirName are the two directories an open
 // snapshot creates inside its snapshot directory. Both are removed on close.
+//
+// Each open gets its own pair, suffixed with the open's ID, and that is
+// load-bearing rather than tidy: replaySnapshotMetadata starts with
+// os.RemoveAll(dir), so a shared path means a second client connecting to the
+// same snapshot deletes the first client's Badger directory while it is being
+// read. The damage is silent — the second open succeeds (it removed the lock
+// file with everything else), reads still work out of Badger's memtable, and the
+// only symptom is that Close never returns, because Badger's shutdown waits for
+// a memtable flush retrying "no such file or directory" forever. Two VMs booting
+// one golden snapshot is the documented use case, so a shared path is a bug and
+// not a saving.
 const (
 	shadowMetaDirName    = "shadow-meta"
 	shadowJournalDirName = "shadow-journal"
@@ -65,8 +77,12 @@ type OpenSnapshotExport struct {
 	// metadata.Service has no Close of its own, it only holds stores, and
 	// leaving the Badger handle open would keep the shadow directory locked.
 	metaStore metadata.Store
-	metaDir   string
-	jrnlDir   string
+	// openID makes this open's shadow directories unique. The directories are
+	// per-open, not per-snapshot: see the constants' comment for the bug that
+	// made a shared path wrong.
+	openID  string
+	metaDir string
+	jrnlDir string
 
 	// closeOnce guards every field Close reads and clears. Close is reachable
 	// from two places that do not coordinate — the connection's deferred release
@@ -142,12 +158,17 @@ func (r *Runtime) OpenSnapshotAsExport(ctx context.Context, shareName, snapID, v
 	// the replay is refused instead of removing the dump we are about to read.
 	release := r.OpenSnapshot(shareName, snapID)
 
+	// A fresh ID per open, so two clients on one snapshot get two independent
+	// shadow stores instead of racing over one directory pair.
+	openID := uuid.NewString()
+
 	exp := &OpenSnapshotExport{
 		ShareName:  shareName,
 		SnapshotID: snapID,
+		openID:     openID,
 		release:    release,
-		metaDir:    filepath.Join(snap.SnapshotDir(localStoreDir), shadowMetaDirName),
-		jrnlDir:    filepath.Join(snap.SnapshotDir(localStoreDir), shadowJournalDirName),
+		metaDir:    filepath.Join(snap.SnapshotDir(localStoreDir), shadowMetaDirName+"-"+openID),
+		jrnlDir:    filepath.Join(snap.SnapshotDir(localStoreDir), shadowJournalDirName+"-"+openID),
 	}
 	// One teardown for every acquired resource, so the failure paths below can
 	// simply return and the ordered release happens once.

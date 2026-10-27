@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -395,5 +396,170 @@ func TestSnapshotShadow_RefusesAShareWithNoRemote(t *testing.T) {
 	}
 	if err := checkShareCanHydrate("snap", fx.shareName, share); err != nil {
 		t.Fatalf("the guard refused a share with a remote: %v", err)
+	}
+}
+
+// takeShadowSnapshot creates a snapshot and waits for it to be ready.
+func takeShadowSnapshot(t *testing.T, ctx context.Context, fx *shadowFixture) string {
+	t.Helper()
+	snapID, err := fx.rt.CreateSnapshot(ctx, fx.shareName, CreateSnapshotOpts{})
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	snap, werr := fx.rt.WaitForSnapshot(ctx, fx.shareName, snapID)
+	if werr != nil {
+		t.Fatalf("WaitForSnapshot: %v", werr)
+	}
+	if snap.State != models.StateReady {
+		t.Fatalf("snapshot state = %q, want ready", snap.State)
+	}
+	return snapID
+}
+
+// readExport reads n bytes through an open snapshot export's shadow store.
+func readExport(t *testing.T, ctx context.Context, exp *OpenSnapshotExport, n int) []byte {
+	t.Helper()
+	buf := make([]byte, n)
+	if _, err := exp.BlockStore().ReadAt(ctx, string(exp.PayloadID), buf, 0); err != nil {
+		t.Fatalf("read through export: %v", err)
+	}
+	return buf
+}
+
+// readExportWithin reads through an export but gives up after budget, failing
+// the test instead of blocking.
+//
+// It exists because the failure mode this guards against is not an error: when
+// the shadow directory is deleted underneath a live Badger handle, every
+// memtable flush retries "no such file or directory" forever and the read never
+// returns. A regression that hangs the suite for the test timeout is much worse
+// than one that fails it in seconds — and with the bug present the read does not
+// respect the caller's context, so a deadline on ctx would not help.
+func readExportWithin(t *testing.T, ctx context.Context, exp *OpenSnapshotExport, n int, budget time.Duration) []byte {
+	t.Helper()
+	done := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, n)
+		if _, err := exp.BlockStore().ReadAt(ctx, string(exp.PayloadID), buf, 0); err != nil {
+			done <- nil
+			return
+		}
+		done <- buf
+	}()
+	select {
+	case buf := <-done:
+		if buf == nil {
+			t.Fatalf("read through export failed")
+		}
+		return buf
+	case <-time.After(budget):
+		t.Fatalf("read through the export did not return within %s: the shadow "+
+			"directory was deleted underneath a live handle, so Badger is retrying "+
+			"forever. The shadow directories must be per-open, not per-snapshot.", budget)
+		return nil
+	}
+}
+
+// closeWithin closes an export but gives up after budget.
+//
+// Close is not bounded either once the shadow directory is gone: Badger's own
+// shutdown waits for a memtable flush that is retrying "no such file or
+// directory" forever, so the deferred Close in a failing test would hang the
+// binary after the assertion had already failed. The test's job is to report the
+// bug, not to wait for it to finish being a bug.
+func closeWithin(t *testing.T, exp *OpenSnapshotExport, budget time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		_ = exp.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(budget):
+		t.Logf("Close did not return within %s; leaving it to the test process to reap", budget)
+	}
+}
+
+// TestSnapshotShadow_TwoOpensOfOneSnapshotAreIndependent is the regression
+// guard for the bug this task fixes.
+//
+// The shadow metadata and journal directories used to be derived from the
+// snapshot ID alone, and replay starts with os.RemoveAll(dir) — so a second
+// client connecting to the same snapshot deleted the first client's Badger
+// directory out from under it.
+//
+// The damage is silent, which is why this asserts the DIRECTORY PROPERTY rather
+// than only the reads. Measured with the bug present: the second open succeeds
+// (it removed the lock file along with everything else), both reads return the
+// right bytes because the data is still in Badger's memtable, and the only
+// symptom is that Close never returns — Badger's shutdown waits for a memtable
+// flush that retries "no such file or directory" forever. A test that asserted
+// only on read results would pass while the server was in that state.
+//
+// Two VMs booting one golden snapshot is the documented use case, so this is not
+// a corner: it is the second user.
+func TestSnapshotShadow_TwoOpensOfOneSnapshotAreIndependent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	fx := newShadowFixture(t, true)
+
+	const volumeSize = 256 << 10
+	pid := fx.makeVolume(ctx, "boot", volumeSize)
+	original := distinctBytes(volumeSize, 0x51)
+	fx.write(ctx, pid, original)
+
+	snapID := takeShadowSnapshot(t, ctx, fx)
+
+	first, err := fx.rt.OpenSnapshotAsExport(ctx, fx.shareName, snapID, "boot", &fx.identity)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	t.Cleanup(func() { closeWithin(t, first, 10*time.Second) })
+
+	before := readExportWithin(t, ctx, first, 4096, 10*time.Second)
+
+	second, err := fx.rt.OpenSnapshotAsExport(ctx, fx.shareName, snapID, "boot", &fx.identity)
+	if err != nil {
+		t.Fatalf("second open of the same snapshot failed: %v\n"+
+			"two clients must be able to boot one snapshot; the shadow "+
+			"directories must be per-open, not per-snapshot", err)
+	}
+	t.Cleanup(func() { closeWithin(t, second, 10*time.Second) })
+
+	// THE ASSERTION. Replay removes its target directory, so two opens sharing a
+	// path means the second destroyed the first. Checked before any read, because
+	// a read can still succeed out of a memtable while the directory underneath
+	// it is gone.
+	if first.metaDir == second.metaDir {
+		t.Fatalf("two opens share the shadow metadata directory %q: the second "+
+			"replay deletes it while the first is reading", first.metaDir)
+	}
+	if first.jrnlDir == second.jrnlDir {
+		t.Fatalf("two opens share the shadow journal directory %q", first.jrnlDir)
+	}
+	// The first's directory must still be there, which is the observable form of
+	// the same property.
+	if _, err := os.Stat(first.metaDir); err != nil {
+		t.Fatalf("the first open's shadow metadata directory is gone after the "+
+			"second open: %v", err)
+	}
+
+	// And both must serve the snapshot's bytes.
+	for i, exp := range []*OpenSnapshotExport{first, second} {
+		got := readExportWithin(t, ctx, exp, 4096, 10*time.Second)
+		if !bytes.Equal(got, before) {
+			t.Errorf("open %d reads different bytes: %s", i, firstDiff(before, got))
+		}
+	}
+
+	// Closing one must not disturb the other, which is the property that makes
+	// two concurrent boots safe rather than merely possible.
+	closeWithin(t, second, 30*time.Second)
+	after := readExportWithin(t, ctx, first, 4096, 10*time.Second)
+	if !bytes.Equal(after, before) {
+		t.Errorf("the first export changed after the second closed: %s",
+			firstDiff(before, after))
 	}
 }
