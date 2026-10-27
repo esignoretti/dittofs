@@ -141,6 +141,15 @@ func (a *Adapter) Serve(ctx context.Context) error {
 	// configured value would be silently ignored. This is the one place they are
 	// connected.
 	handler.SetPipelining(a.config.MaxInFlight, a.config.MaxInFlightBytes)
+
+	// The runtime's metrics handle is nil-safe, but storing a nil *Metrics in
+	// this interface would make it a non-nil interface holding a nil pointer, and
+	// then dispatch's own nil check would pass and RecordRequest would be called
+	// on a nil receiver. Guard on the handle, not on the interface.
+	if m := a.runtime.Metrics(); m != nil {
+		handler.SetMetrics(m)
+	}
+
 	a.handler.Store(handler)
 
 	return a.ServeWithFactory(ctx, a, nil, nil)

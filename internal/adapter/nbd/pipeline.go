@@ -607,6 +607,12 @@ func (h *Handler) SetPipelining(maxInFlight int, maxInFlightBytes int64) {
 	}
 }
 
+// SetMetrics installs the metrics recorder.
+//
+// Must be called before Serve: the field is read by dispatch on every worker
+// goroutine, so setting it while a connection is live would be a data race.
+func (h *Handler) SetMetrics(m Metrics) { h.metrics = m }
+
 // PeakInFlightBytes returns the highest payload memory this handler's pipelines
 // held at once. It exists for the backpressure test: the pipeline itself is gone
 // by the time serve returns, so the observation has to be recorded somewhere the
@@ -738,6 +744,28 @@ func (p *pipeline) post(ctx context.Context, cmd command, rep reply, replies cha
 // command that cannot be served has an error reply, which is a different thing
 // from a broken connection.
 func (p *pipeline) dispatch(ctx context.Context, cmd command) reply {
+	// Timed here rather than in serve, because serve returns before the reply is
+	// written: a duration measured there would exclude the socket write and
+	// understate what the client actually waits for. This is handler time, which
+	// is what the NFS and SMB adapters record.
+	//
+	// Every command passes through here exactly once, including the ones the
+	// reader already refused, so nothing can be counted twice or missed.
+	start := time.Now()
+	rep := p.dispatchCommand(ctx, cmd)
+	if p.h.metrics != nil {
+		status := "ok"
+		if rep.nbdErr != 0 {
+			status = "error"
+		}
+		p.h.metrics.RecordRequest("nbd", commandMetricName(cmd.req.Type), status,
+			time.Since(start))
+	}
+	return rep
+}
+
+// dispatchCommand turns one command into one reply.
+func (p *pipeline) dispatchCommand(ctx context.Context, cmd command) reply {
 	// A command the reader already refused: its answer is fixed, and the payload
 	// (if any) was drained by the reader.
 	if cmd.pre != nil {
@@ -816,6 +844,45 @@ func (p *pipeline) writeLoop(replies <-chan reply) error {
 // which is the one guarantee NBD_FLAG_SEND_FUA and NBD_CMD_FLUSH exist to make.
 func isWriteLike(t Command) bool {
 	return t == CmdWrite || t == CmdTrim || t == CmdWriteZeroes
+}
+
+// Metrics is the subset of the metrics surface the NBD adapter reports.
+//
+// An interface rather than *metrics.Metrics for two reasons. The wire layer
+// imports no pkg/metrics today, and every other adapter reaches metrics through
+// the registry rather than through the wire package — the nbd package already
+// reaches the runtime only through interfaces (Exporter, StoreResolver,
+// BlockStore), so this keeps that shape. And it makes the recorder trivially
+// testable without a Prometheus registry.
+//
+// Implementations must be safe for concurrent use: dispatch calls this from
+// every worker goroutine.
+type Metrics interface {
+	RecordRequest(protocol, op, status string, d time.Duration)
+}
+
+// commandMetricName maps a command to its metric label.
+//
+// Bounded by construction: the switch enumerates every command the adapter
+// serves plus one label for everything else. Labelling by raw command value
+// would let a client mint unlimited series just by sending new command numbers,
+// which is the same cardinality trap NFS avoids by recording ok|error rather
+// than a status code.
+func commandMetricName(cmd Command) string {
+	switch cmd {
+	case CmdRead:
+		return "read"
+	case CmdWrite:
+		return "write"
+	case CmdFlush:
+		return "flush"
+	case CmdTrim:
+		return "trim"
+	case CmdWriteZeroes:
+		return "write_zeroes"
+	default:
+		return "unknown"
+	}
 }
 
 // DefaultMaxInFlight is how many commands one connection may have in flight.

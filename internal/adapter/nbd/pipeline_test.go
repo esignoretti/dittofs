@@ -401,3 +401,116 @@ func (s *blockingWriteStore) WriteAt(ctx context.Context, id string, currentBloc
 	s.onWrite()
 	return s.storeFake.WriteAt(ctx, id, currentBlocks, data, off)
 }
+
+// recordingMetrics captures what the adapter reports, so a test can assert on
+// labels rather than on a Prometheus registry.
+type recordingMetrics struct {
+	mu    sync.Mutex
+	calls []metricCall
+}
+
+type metricCall struct {
+	protocol, op, status string
+	d                    time.Duration
+}
+
+func (m *recordingMetrics) RecordRequest(protocol, op, status string, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, metricCall{protocol, op, status, d})
+}
+
+func (m *recordingMetrics) ops() map[string]bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]bool{}
+	for _, c := range m.calls {
+		out[c.op] = true
+	}
+	return out
+}
+
+func (m *recordingMetrics) opList() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, c := range m.calls {
+		out = append(out, c.op+"/"+c.status)
+	}
+	return out
+}
+
+func (m *recordingMetrics) errorCalls() []metricCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []metricCall
+	for _, c := range m.calls {
+		if c.status == "error" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// TestPipeline_RecordsEachCommand is the regression guard for the adapter
+// emitting no metrics at all: NFS and SMB both record per-request RED metrics,
+// and NBD recorded nothing, so an operator could see a connection accepted and
+// then no evidence of what it did.
+//
+// It uses the real-metadata fixture rather than newTestHandler, because FLUSH
+// commits through the metadata service and newTestHandler passes a nil one: the
+// flush would panic in FlushStableWrite and the test would be measuring the
+// fixture's limitation instead of the adapter's labels. That panic is caught by
+// the worker's recover and surfaces as EIO, which is exactly the kind of thing a
+// metric exists to make visible.
+func TestPipeline_RecordsEachCommand(t *testing.T) {
+	rec := &recordingMetrics{}
+	f := newWriteVolumeFixture(t)
+	st := newStoreFake()
+	h := f.newHandler(t, st)
+	h.SetMetrics(rec)
+
+	// serveHandler already completes the handshake.
+	client, server := serveHandler(t, h, f.exp.Name)
+
+	// One of each command the adapter serves, plus one it does not.
+	writeThroughClient(t, client, 0, []byte("hello"), 0)
+	flushThroughClient(t, client)
+	trimThroughClient(t, client, 0, 4096, 0)
+	writeZeroesThroughClient(t, client, 0, 4096, 0)
+	sendRequest(t, client, &Request{Type: Command(0x7f), Cookie: 9})
+	readReplyHeader(t, client)
+
+	_ = client.Close()
+	<-server
+
+	want := []string{"write", "flush", "trim", "write_zeroes", "unknown"}
+	got := rec.ops()
+	for _, op := range want {
+		if !got[op] {
+			t.Errorf("no metric recorded for %q; recorded: %v", op, rec.opList())
+		}
+	}
+	// The unknown command was refused, so its status must say so — a counter
+	// that only ever increments "ok" cannot show a client sending garbage.
+	if len(rec.errorCalls()) == 0 {
+		t.Errorf("the unknown command was refused but no error status was "+
+			"recorded; recorded: %v", rec.opList())
+	}
+	// Every call must be labelled with the protocol, so an NBD series is
+	// distinguishable from an NFS or SMB one in the same counter.
+	rec.mu.Lock()
+	calls := append([]metricCall(nil), rec.calls...)
+	rec.mu.Unlock()
+	for _, c := range calls {
+		if c.protocol != "nbd" {
+			t.Errorf("recorded protocol %q, want \"nbd\"", c.protocol)
+		}
+	}
+	// A recorded duration of zero would mean the timer is measuring nothing.
+	for _, c := range calls {
+		if c.d <= 0 {
+			t.Errorf("command %q recorded a non-positive duration %v", c.op, c.d)
+		}
+	}
+}

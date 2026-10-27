@@ -80,6 +80,11 @@ type Handler struct {
 	// own, so the two can never disagree.
 	draining func() bool
 
+	// metrics records per-request RED metrics. Nil until SetMetrics, and every
+	// call site checks, so a test handler and a handler built without a runtime
+	// both work without needing a no-op recorder.
+	metrics Metrics
+
 	// degraded counts export and block-store resolutions that failed. A probe
 	// consumes the count (see TakeDegraded), so it is "since the last probe"
 	// rather than a running total.
